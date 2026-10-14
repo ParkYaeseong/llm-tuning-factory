@@ -88,3 +88,13 @@ provider-side billing controls remain separate.
 The local Docker/Rancher startup command was rejected by automatic approval review with 'blocked by policy'. It was not
 retried through another route. The GPU image build remains pending; the approved existing Pod uses a separate hash-locked
 venv for the real worker acceptance test instead. Its actual package versions are recorded in runtime.json.
+
+## Complete collection and native checkpoint restore
+
+The separately authorized 20-minute follow-up stopped early with EXITED confirmed. All 40 original remote
+artifact hashes match locally, and an MLflow adapter upload/download round trip matches. No retraining was
+needed: run f0c5f94e8a04426c88eb8bbbd500115c is FINISHED after reconciliation.
+Native checkpoint-10 restoration reached global step 12 with preserved training history; resumed run
+27163d2c46ce4bd28fa23badee294cc5 is FINISHED. Receipt files are listed in PROGRESS.md.
+The initial cancellation was late: GPU computation had already finished. This distinction is tagged in
+MLflow and is not accepted as mid-training cancellation. The GPU-local observer is prepared for a later trial.

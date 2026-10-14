@@ -183,3 +183,23 @@ def test_reconciliation_reuses_verified_files_and_repairs_partial_downloads(tmp_
     assert executor.collect_result(directory)["status"] == "COMPLETED"
     assert any(path.endswith("/output/evidence.txt") for path in transfers)
     assert (directory / "output" / "evidence.txt").read_text() == "mock transport fixture"
+
+
+def test_new_attempt_does_not_upload_previous_completion_or_controller_receipts(tmp_path, monkeypatch):
+    directory = tmp_path / ("e" * 32)
+    directory.mkdir()
+    names = ('result.json', 'result.tmp', 'cancel', 'remote-result.json', 'remote-artifacts.json')
+    for name in names:
+        (directory / name).write_text('{"status":"COMPLETED"}')
+    client = FakeSSH(tmp_path / 'remote')
+    client.sftp.root.mkdir()
+    original_exec = client.exec_command
+
+    def inspect(command, timeout):
+        remote = client.sftp.path(shlex.split(command)[4])
+        assert all(not (remote / name).exists() for name in names)
+        return original_exec(command, timeout)
+
+    monkeypatch.setattr(client, 'exec_command', inspect)
+    executor = SSHExecutor('test-host', 22, 'root', 'unused', client=client)
+    executor.run(LlamaFactoryBackend(), directory, 5, lambda: False)

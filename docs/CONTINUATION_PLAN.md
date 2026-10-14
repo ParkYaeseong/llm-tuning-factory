@@ -15,3 +15,8 @@ Subsequent explicit user approvals authorized 20 minutes plus an additional 10 m
 synthetic examples only, followed by stop and EXITED confirmation. No further paid extension is authorized.
 Live production tracking/artifact checks, registered native prediction and detached result reconciliation
 are implemented; consult PROGRESS.md for the latest actual acceptance results and remaining limits.
+
+Follow-up: all 40 original GPU artifacts and the MLflow adapter round trip are verified. Native checkpoint-10
+to step 12 restoration and preserved history are verified; the restored run is FINISHED. The Pod is EXITED.
+Actual mid-training forced cancellation remains unverified because the first control request arrived late.
+GPU-local observation and smaller checkpoint-state transfer are prepared for a separately authorized trial.

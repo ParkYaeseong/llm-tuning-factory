@@ -72,7 +72,8 @@ uv pip compile pyproject.toml containers/gpu-requirements.in --python-version 3.
 ```
 
 The isolated existing-Pod venv has been GPU-tested with BF16 LoRA/native generation. The container image itself
-has not been built or tested. See PROGRESS.md for the interrupted complete-artifact collection and remaining checks.
+has not been built or tested. Complete artifact collection and native checkpoint restoration have since
+been verified; actual mid-training interruption remains unverified. See PROGRESS.md for exact evidence.
 
 ## Approved existing Pod — first real test
 

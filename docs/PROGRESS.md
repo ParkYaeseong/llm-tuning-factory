@@ -2,7 +2,7 @@
 
 ## Latest live verification (supersedes the earlier baseline below)
 
-Fresh full suite after distribution setup: **49 passed, 1 skipped**. Ruff src/tests passes; wheel build succeeds.
+Fresh full suite after recovery hardening: **52 passed, 1 skipped**. Ruff src/tests passes; wheel build succeeds.
 The skipped pytest is the opt-in GPU case; manual paid GPU evidence is separate.
 
 Distribution uses one installation and local state per PC, with common MLflow records. Local .env loading
@@ -31,15 +31,15 @@ BF16 is the default; the worker rejects non-finite loss/gradient metrics and wri
 The source-hash gate also correctly rejected a stale remote worker. One provider read temporarily omitted SSH mappings.
 
 Registered validation generation and detached result reconciliation are now implemented and CPU-tested.
-Actual healthy BF16 and generation outcomes are recorded in the final session evidence below.
-Actual GPU checkpoint resume, QLoRA, multi-AI GPU batch, numerical reproducibility and Model Registry
+Actual healthy BF16, generation, complete collection and checkpoint resume are recorded below.
+Mid-training forced interruption, QLoRA, multi-AI GPU batch, numerical reproducibility and Model Registry
 version publication remain unverified. Real task quality requires authorized representative validation data.
 
 The GPU image has not been built. Automatic approval review rejected Rancher startup with 'blocked by policy';
 no alternate startup was attempted. The approved Pod uses an isolated hash-locked venv.
 Source is now shared in the private repository and CPU CI passes. Preserve local state/ and the remote persistent volume.
 
-### Final session evidence
+### Earlier session evidence (before the collection follow-up)
 
 H200 worker job 260aa618906147cf9d4da5bc92e29ebd completed two BF16 LoRA steps and native generation
 for one synthetic validation example. Observed result.json was COMPLETED (engine 0.9.5);
@@ -58,6 +58,36 @@ The transfer code now preserves remote result/hash evidence before large downloa
 files before nested checkpoint directories. A regression test reproduces interrupted collection and verifies
 that remote completion evidence survives. This prevents loss of the completion marker on future interrupted
 transfers; it does not retroactively certify missing artifacts from this session.
+
+### Collection and native checkpoint restore follow-up
+
+The user authorized one additional bounded session of at most 20 minutes at the live $5.29/hour rate.
+Only synthetic data was used. The independent watcher ran before start. Pod q17zwk1tbndy45 was stopped
+after roughly 17 minutes of the bounded session, and provider desiredStatus EXITED was confirmed.
+The requested additional 10-minute extension had not been approved and was not used.
+
+The original job 260aa618906147cf9d4da5bc92e29ebd was reconciled without retraining. All **40** files in its
+original remote hash inventory matched locally. The adapter uploaded to MLflow was downloaded and matched
+the remote inventory hash. The original run f0c5f94e8a04426c88eb8bbbd500115c is now FINISHED.
+Receipt: state/gpu-acceptance/full-recovery-receipt.json. Strict JSON validity is 0 for the single fenced
+synthetic answer; this is an infrastructure acceptance, not qualified task quality.
+
+Recovery job 4a7ee3739e8a4747b9c0d25b55f813be preserved checkpoint-10 with adapter, optimizer, scheduler,
+RNG and trainer state. Actual LLaMA-Factory/Transformers logs confirm loading output/checkpoint-10,
+resuming at global step 10, fast-forwarding the dataloader, then finishing global step 12. The checkpoint
+history prefix was preserved, and training-health.json checked 25 finite statistics. All **55** files in
+the final local job inventory verify. The resumed run 27163d2c46ce4bd28fa23badee294cc5 is FINISHED.
+Receipt: state/gpu-recovery/recovery-receipt.json, also uploaded to both attempt runs.
+
+The first control-plane cancellation arrived after its GPU worker finished all 12 steps. The control run
+f5979946c27e479fbdbc5b97a97ea912 is KILLED, but worker_cancellation_observed=false is explicitly recorded.
+This proves native saved-checkpoint restoration, **not an actual mid-training forced-interruption test**.
+A GPU-local checkpoint observer and smaller resume transfer were prepared and unit-tested for that remaining
+case, but were not GPU-executed in this session. No unapproved extension or additional Pod start was used.
+
+Collection now skips already hash-verified files and atomically replaces corrupted/partial downloads.
+New attempts exclude previous completion/cancellation markers and controller receipts from upload.
+Regression tests cover interrupted collection, hash-based reuse/repair and stale-marker exclusion.
 
 ## Earlier CPU baseline (historical)
 

@@ -176,6 +176,10 @@ class SSHExecutor(ExecutionBackend):
     def upload(self, sftp, local, remote):
         self.mkdir(sftp, remote)
         for path in local.rglob("*"):
+            if path.parent == local and path.name in {
+                "result.json", "result.tmp", "cancel", "remote-result.json", "remote-artifacts.json"
+            }:
+                continue
             if path.is_symlink():
                 raise ValueError("symlinks are not transferable")
             target = remote + "/" + path.relative_to(local).as_posix()

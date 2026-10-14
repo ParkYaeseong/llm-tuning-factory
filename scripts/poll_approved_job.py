@@ -1,4 +1,5 @@
 """Read logs of the approved synthetic job; never inspect unrelated workloads."""
+import argparse
 import json
 import os
 from pathlib import Path
@@ -8,7 +9,10 @@ import paramiko
 from tuning_factory.connections import load_connection
 from tuning_factory.execution import RunPodController
 
-local = json.loads(Path('.factory/smoke-job.json').read_text())
+parser = argparse.ArgumentParser()
+parser.add_argument('--job-file', type=Path, default=Path('.factory/smoke-job.json'))
+args = parser.parse_args()
+local = json.loads(args.job_file.read_text())
 directory = Path(local['state']) / 'jobs' / local['job_id']
 marker = directory / 'remote-attempt.json'
 if not marker.exists():
