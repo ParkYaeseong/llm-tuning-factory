@@ -103,7 +103,8 @@ async fn pick_file(kind: String) -> Result<Option<String>, String> {
 fn allowed(action: &str) -> bool {
     matches!(action, "catalog" | "save_profile" | "dataset" | "plan" | "submit" | "execute" |
         "jobs" | "logs" | "cancel" | "recover" | "reconcile" | "resume" | "connection" |
-        "pod" | "runtime_check" | "runtime_prepare" | "live_logs" | "history" | "compare" | "model_revision")
+        "pod" | "runtime_check" | "runtime_prepare" | "live_logs" | "history" | "compare" | "model_revision" |
+        "dataset_preview" | "job_progress")
 }
 
 #[tauri::command]

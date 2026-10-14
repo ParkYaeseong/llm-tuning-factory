@@ -1,5 +1,22 @@
 # Progress and acceptance status — 2026-10-14
 
+## Windows workbench refinement — 0.2.1
+
+User selected the light Linear/Vercel direction after requesting getdesign.md references and similar open-source
+research. DESIGN.md records original product rules; docs/OPEN_SOURCE_REVIEW.md records upstream links, fit and limits.
+Removed the marketing hero/numbered sidebar; added compact workspace navigation, actual recent-run summary,
+bundled Pretendard font, local sample inspection, same-snapshot validation guard, fetched-history filters,
+nested parameter differences, reuse-as-new-plan and actual native progress visualization.
+
+Current source checks: **74 passed, 1 skipped**; Ruff passes; UI workflows **8 passed**; TypeScript/Vite and Rust
+allowlist test pass. Actual previously recovered GPU trainer_log.jsonl parsed as step 12/12 with finite loss
+0.4167558252811432. This is a read of existing evidence, not a new training run.
+The added tests cover duplicate/sample bounds, invalid samples, partial/nonfinite trainer records, downsampling,
+missing/nested parameter differences, validation leakage, keyboard navigation, search and progress empty states.
+
+0.2.1 packaging and native installed-app checks are in progress. No GPU was started or dataset transferred.
+New desktop GPU bootstrap/training/cancellation/recovery acceptance and the other limits below remain outstanding.
+
 ## Windows desktop pilot — current work
 
 Approved Windows-only design and implementation plan are in docs/plans/2026-10-14-windows-desktop*.

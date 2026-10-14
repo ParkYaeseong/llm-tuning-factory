@@ -1,15 +1,6 @@
 name: Windows desktop pilot
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'desktop/**'
-      - 'src/**'
-      - 'scripts/build_desktop.py'
-      - 'scripts/desktop_entry.py'
-      - '.github/workflows/windows-desktop.yml'
-      - 'uv.lock'
-      - 'containers/gpu-requirements.lock'
   pull_request:
     paths:
       - 'desktop/**'
@@ -19,6 +10,9 @@ on:
       - '.github/workflows/windows-desktop.yml'
 permissions:
   contents: read
+concurrency:
+  group: desktop-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 jobs:
   package:
     runs-on: windows-latest
@@ -47,7 +41,7 @@ jobs:
         working-directory: desktop
       - run: npm run build
         working-directory: desktop
-      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --release
         working-directory: desktop
       - run: npm run tauri -- build --ci
         working-directory: desktop

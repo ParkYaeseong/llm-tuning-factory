@@ -162,3 +162,21 @@ def live_logs(settings, state_root, directory):
                 except FileNotFoundError:
                     pass
             return {"text": "\n".join(chunks)}
+
+
+def read_progress(settings, directory):
+    from .desktop_inspection import parse_progress
+    record = json.loads((Path(directory) / "remote-attempt.json").read_bytes())
+    expected = REMOTE + "/jobs/" + Path(directory).name + "/"
+    remote = record["remote_path"]
+    if (record.get("pod_id") != settings.get("pod_id") or not remote.startswith(expected)
+            or not re.fullmatch("[0-9a-f]{32}", remote[len(expected):])):
+        raise ValueError("progress request differs from original Pod or job namespace")
+    with connection(settings) as (_, client):
+        with client.open_sftp() as sftp:
+            try:
+                with sftp.open(remote + "/output/trainer_log.jsonl", "rb") as handle:
+                    handle.seek(max(0, handle.stat().st_size - 2 * 1024 * 1024))
+                    return parse_progress(handle.read(2 * 1024 * 1024).decode("utf-8", errors="replace"))
+            except FileNotFoundError:
+                return parse_progress("")

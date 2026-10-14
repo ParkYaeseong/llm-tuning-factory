@@ -74,3 +74,14 @@ def test_runtime_preparation_refuses_a_reserved_pod(tmp_path, monkeypatch):
     monkeypatch.setattr(app.factory.store, "gpu_locked", lambda pod: True)
     with pytest.raises(ValueError, match="reserved"):
         app.dispatch("runtime_prepare", {"approved": True})
+
+
+def test_plan_rejects_identical_training_and_validation_snapshot(tmp_path):
+    app = desktop.DesktopService(tmp_path)
+    config = app.dispatch("catalog", {})["templates"][0]["config"]
+    source = tmp_path / "input.json"
+    source.write_text('[{"instruction":"q","output":"a"}]')
+    app.dispatch("dataset", {"dataset_id": "dummy", "version": "1", "path": str(source)})
+    config["evaluation_profile"].update(kind="json", dataset_id="dummy", dataset_version="1")
+    with pytest.raises(ValueError, match="identical"):
+        app.dispatch("plan", {"config": config})

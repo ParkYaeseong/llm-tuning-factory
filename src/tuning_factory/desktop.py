@@ -11,6 +11,7 @@ import yaml
 
 from .config import AIConfig
 from .connections import ENV_SETTINGS
+from .desktop_inspection import inspect_dataset, parameter_changes, parse_progress
 from .execution import Policy, RunPodController
 from .manifest import resolve
 from .registry import canonical, safe_name
@@ -32,6 +33,7 @@ def compare_runs(base, candidate):
     ) and not base.get("simulation")
     return {"comparable": comparable,
             "reason": "" if comparable else "동일 업무·검증 데이터·평가 방식의 실제 실행만 지표를 비교합니다.",
+            "parameter_changes": parameter_changes(base.get("config", {}), candidate.get("config", {})),
             "deltas": {key: candidate["metrics"][key] - value
                        for key, value in base.get("metrics", {}).items()
                        if key in candidate.get("metrics", {})} if comparable else {}}
@@ -59,6 +61,13 @@ class DesktopService:
         if not re.fullmatch(r"[0-9a-f]{32}", job_id):
             raise ValueError("invalid job ID")
         return self.factory.directory(job_id)
+
+    def manifest(self, config):
+        manifest = resolve(config, self.factory.registry, simulation=False)
+        validation = manifest.get("validation_dataset")
+        if validation and validation["sha256"] == manifest["dataset"]["sha256"]:
+            raise ValueError("training and validation snapshots are identical; 별도 검증 데이터를 선택하세요.")
+        return manifest
 
     def dispatch(self, action, data):
         if action == "catalog":
@@ -92,20 +101,22 @@ class DesktopService:
             directory.mkdir(exist_ok=True)
             (directory / (safe_name(config.ai_id) + ".json")).write_bytes(canonical(config.model_dump()))
             return {"saved": True}
+        if action == "dataset_preview":
+            return inspect_dataset(data["path"])
         if action == "dataset":
             return self.factory.registry.register_dataset(
                 data["dataset_id"], data["version"], Path(data["path"]),
                 export_allowed=data.get("export_allowed") is True, synthetic=data.get("synthetic") is True)
         if action == "plan":
             config = AIConfig.model_validate(data["config"])
-            manifest = resolve(config, self.factory.registry, simulation=False)
+            manifest = self.manifest(config)
             estimate = self.factory.policy.check(config, manifest["dataset"])
             return {"dry_run": True, "manifest": manifest, "estimated_cost_usd": estimate,
                     "note": "저장·전송·대기 비용 별도. 실행 버튼 전에는 GPU 작업을 시작하지 않습니다."}
         if action == "submit":
             self.require_approval(data)
             config = AIConfig.model_validate(data["config"])
-            manifest = resolve(config, self.factory.registry, simulation=False)
+            manifest = self.manifest(config)
             self.factory.policy.check(config, manifest["dataset"], execute=True, approved_transfer=True)
             if manifest.get("validation_dataset"):
                 self.factory.policy.check(config, manifest["validation_dataset"], execute=True, approved_transfer=True)
@@ -164,6 +175,17 @@ class DesktopService:
         if action == "live_logs":
             from .desktop_runtime import live_logs
             return live_logs(self.settings, self.root, self.job_directory(data["job_id"]))
+        if action == "job_progress":
+            directory = self.job_directory(data["job_id"])
+            if data.get("remote") is True:
+                from .desktop_runtime import read_progress
+                return read_progress(self.settings, directory)
+            path = directory / "output/trainer_log.jsonl"
+            if not path.is_file():
+                return parse_progress("")
+            with path.open("rb") as handle:
+                handle.seek(max(0, path.stat().st_size - 2 * 1024 * 1024))
+                return parse_progress(handle.read().decode("utf-8", errors="replace"))
         if action == "history":
             return self.history(data)
         if action == "compare":
