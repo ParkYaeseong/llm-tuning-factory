@@ -78,9 +78,12 @@ class LlamaFactoryBackend(TrainingBackend):
         return plan
 
     def train(self, directory, timeout, canceled=lambda: False):
+        self.run_config(directory, timeout, canceled, "train.yaml", "train.log")
+
+    def run_config(self, directory, timeout, canceled, filename, log_name):
         directory = Path(directory).resolve()
-        with (directory / "train.log").open("ab") as log:
-            process = subprocess.Popen([*self.command, "train.yaml"], cwd=directory,
+        with (directory / log_name).open("ab") as log:
+            process = subprocess.Popen([*self.command, filename], cwd=directory,
                                        stdout=log, stderr=subprocess.STDOUT,
                                        start_new_session=os.name != "nt")
             deadline = time.monotonic() + timeout
@@ -100,6 +103,47 @@ class LlamaFactoryBackend(TrainingBackend):
                     else:
                         os.killpg(process.pid, signal.SIGKILL)
                     process.wait()
+
+    def prepare_validation(self, directory, raw):
+        directory = Path(directory)
+        _, formatting, file_format = parse_dataset(raw)
+        filename = "validation." + file_format
+        (directory / "data" / filename).write_bytes(raw)
+        info_path = directory / "data" / "dataset_info.json"
+        info = json.loads(info_path.read_text())
+        descriptor = {"file_name": filename, "formatting": formatting,
+                      "columns": {"prompt": "instruction", "query": "input", "response": "output"}}
+        if formatting == "sharegpt":
+            descriptor.update(columns={"messages": "messages"}, tags={
+                "role_tag": "role", "content_tag": "content", "user_tag": "user",
+                "assistant_tag": "assistant", "system_tag": "system"})
+        info["factory_validation"] = descriptor
+        info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    def predict(self, config, directory, validation_sha256, timeout, canceled=lambda: False):
+        directory = Path(directory)
+        profile = config.evaluation_profile
+        plan = {"model_name_or_path": config.base_model, "model_revision": config.model_revision,
+                "trust_remote_code": False, "stage": "sft", "do_train": False, "do_predict": True,
+                "finetuning_type": "lora", "adapter_name_or_path": "./output", "template": config.template,
+                "eval_dataset": "factory_validation", "dataset_dir": "./data", "output_dir": "./prediction",
+                "predict_with_generate": True, "max_samples": profile.max_samples,
+                "max_new_tokens": profile.max_new_tokens, "do_sample": False,
+                "cutoff_len": config.hyperparameters.cutoff_len, "per_device_eval_batch_size": 1,
+                "report_to": "none", "fp16": True}
+        if config.training_method == "qlora":
+            plan.update(quantization_bit=4, quantization_method="bitsandbytes")
+        (directory / "predict.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
+        self.run_config(directory, timeout, canceled, "predict.yaml", "predict.log")
+        source = directory / "prediction" / "generated_predictions.jsonl"
+        rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not rows or len(rows) > profile.max_samples:
+            raise ValueError("native prediction result has invalid sample count")
+        result = {"predictions": [row["predict"].strip() for row in rows],
+                  "references": [row["label"].strip() for row in rows],
+                  "validation_sha256": validation_sha256, "source": "llamafactory-native-generation"}
+        (directory / "output").mkdir(exist_ok=True)
+        (directory / "output" / "predictions.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
 
     def resume(self, directory, checkpoint, timeout, canceled=lambda: False):
         directory, checkpoint = Path(directory).resolve(), Path(checkpoint).resolve()

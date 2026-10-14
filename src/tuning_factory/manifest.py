@@ -29,6 +29,9 @@ def resolve(config, registry, simulation=True):
                 "versions": {name: importlib.metadata.version(name)
                              for name in ("llm-tuning-factory", "pydantic", "PyYAML")},
                 "training_engine": "llamafactory==0.9.5"}
+    if config.evaluation_profile.dataset_id:
+        manifest["validation_dataset"] = registry.get_dataset(config.evaluation_profile.dataset_id,
+                                                               config.evaluation_profile.dataset_version)
     manifest["sha256"] = digest(canonical(manifest))
     return manifest
 

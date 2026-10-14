@@ -72,14 +72,14 @@ class Registry:
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
 
-    def register_dataset(self, dataset_id, version, source, export_allowed=False):
+    def register_dataset(self, dataset_id, version, source, export_allowed=False, synthetic=False):
         dataset_id, version = safe_name(dataset_id), safe_name(version)
         raw = Path(source).read_bytes()
         rows, formatting, file_format = parse_dataset(raw)
         sha = digest(raw)
         record = {"dataset_id": dataset_id, "version": version, "sha256": sha,
                   "rows": len(rows), "export_allowed": bool(export_allowed), "format": formatting,
-                  "file_format": file_format}
+                  "file_format": file_format, "synthetic": bool(synthetic)}
         metadata = self.root / "datasets" / dataset_id / f"{version}.json"
         if metadata.exists() and metadata.read_bytes() != canonical(record):
             raise ValueError("immutable dataset version already registered")

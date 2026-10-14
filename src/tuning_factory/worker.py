@@ -4,6 +4,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import time
 import traceback
 from pathlib import Path
 
@@ -24,6 +25,7 @@ def main():
     directory = args.directory.resolve()
     backend = LlamaFactoryBackend()
     result = {"status": "FAILED"}
+    started = time.monotonic()
     try:
         manifest = json.loads((directory / "manifest.json").read_text())
         verify_manifest(manifest)
@@ -51,6 +53,13 @@ def main():
             raise ValueError("training YAML hash differs from resolved manifest")
         if plan != backend.translate(config):
             raise ValueError("training YAML differs from resolved configuration")
+        validation = manifest.get("validation_dataset")
+        if validation:
+            validation_format = validation.get("file_format", "json")
+            if validation_format not in {"json", "jsonl"}:
+                raise ValueError("invalid validation file format")
+            if digest((directory / "data" / ("validation." + validation_format)).read_bytes()) != validation["sha256"]:
+                raise ValueError("validation data hash mismatch")
         def canceled():
             return (directory / "cancel").exists()
         if args.checkpoint:
@@ -60,6 +69,11 @@ def main():
         required = ["adapter_config.json", "adapter_model.safetensors"]
         if not all((directory / "output" / name).is_file() for name in required):
             raise RuntimeError("training exited without final LoRA adapter")
+        if validation:
+            remaining = args.timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError("job budget exhausted before evaluation generation")
+            backend.predict(config, directory, validation["sha256"], remaining, canceled)
         result = {"status": "COMPLETED", "engine_version": "0.9.5"}
     except CanceledError as exc:
         result = {"status": "CANCELED", "error": str(exc)}

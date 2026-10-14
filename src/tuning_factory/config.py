@@ -29,6 +29,18 @@ class Hyperparameters(StrictModel):
 class EvaluationProfile(StrictModel):
     kind: Literal["pipeline", "classification", "extraction", "json", "kbf_extraction"] = "pipeline"
     thresholds: dict[str, float] = Field(default_factory=dict)
+    dataset_id: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_-]+$")
+    dataset_version: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_.-]+$")
+    max_samples: int = Field(default=32, ge=1, le=1000)
+    max_new_tokens: int = Field(default=256, ge=1, le=2048)
+
+    @model_validator(mode="after")
+    def paired_dataset(self):
+        if bool(self.dataset_id) != bool(self.dataset_version):
+            raise ValueError("evaluation dataset ID and version must be supplied together")
+        if self.dataset_id and self.kind == "pipeline":
+            raise ValueError("validation data requires a task evaluation kind")
+        return self
 
 
 class ResourceProfile(StrictModel):

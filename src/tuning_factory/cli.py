@@ -23,20 +23,32 @@ def output(value):
 
 @app.callback()
 def main(ctx: typer.Context, state_dir: Path = Path("state"), policy_file: Path | None = None,
-         tracking_uri: str | None = None):
+         tracking_uri: str | None = None, connection_file: Path | None = None):
+    connection = None
+    if connection_file:
+        from .connections import load_connection
+        connection = load_connection(connection_file)
     policy = Policy.model_validate_json(policy_file.read_text()) if policy_file else Policy()
     tracker = None
     uri = tracking_uri or os.environ.get("MLFLOW_TRACKING_URI")
     if uri:
-        from .tracking import MLflowTracker
-        tracker = MLflowTracker(uri)
+        from .tracking import LazyMLflowTracker
+        tracker = LazyMLflowTracker(uri)
     ctx.obj = Factory(state_dir, policy=policy, tracker=tracker)
+    ctx.obj.connection = connection
+
+
+@app.command()
+def doctor(ctx: typer.Context, pod_id: str | None = None, write_test: bool = False):
+    from .diagnostics import check_connections
+    connection = ctx.obj.connection
+    output(check_connections(ctx.obj.root, pod_id or (connection.pod_id if connection else None), write_test))
 
 
 @app.command("dataset-register")
 def dataset_register(ctx: typer.Context, dataset_id: str, version: str, source: Path,
-                     export_allowed: bool = False):
-    output(ctx.obj.registry.register_dataset(dataset_id, version, source, export_allowed))
+                     export_allowed: bool = False, synthetic: bool = False):
+    output(ctx.obj.registry.register_dataset(dataset_id, version, source, export_allowed, synthetic))
 
 
 @app.command()
@@ -153,6 +165,16 @@ def resume(ctx: typer.Context, job_id: str, checkpoint: Path | None = None):
 @app.command()
 def recover(ctx: typer.Context, stale_after_seconds: int = 120):
     output({"recovered": ctx.obj.store.recover(stale_after_seconds)})
+
+
+@app.command()
+def reconcile(ctx: typer.Context, job_id: str, pod_id: str, host: str, key_file: Path, port: int = 22):
+    controller = RunPodController(os.environ["RUNPOD_API_KEY"])
+    pod = controller.status(pod_id)
+    if pod.get("desiredStatus") != "RUNNING" or pod.get("publicIp") != host or int(pod.get("portMappings", {}).get("22", 0)) != port:
+        raise typer.BadParameter("running Pod and matching direct SSH endpoint required for result retrieval")
+    executor = SSHExecutor(host, port, "root", key_file, pod=pod)
+    output(ctx.obj.reconcile(job_id, executor))
 
 
 @app.command("release-lock")

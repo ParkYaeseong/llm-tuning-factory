@@ -1,11 +1,14 @@
 """Explicit MLflow client: tracking, artifact storage and candidate registry are separate."""
 import json
+import os
 import time
 from pathlib import Path
 
 
 class MLflowTracker:
-    def __init__(self, uri, experiment="llm-tuning-factory", client=None):
+    def __init__(self, uri, experiment="llm-tuning-factory", client=None, artifact_location=None):
+        # MLflow's terminal URL output breaks machine-readable JSON and legacy Windows consoles.
+        os.environ["MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT"] = "true"
         from .auth import configure_oidc
         self.auth_refresher = configure_oidc()
         if client is None:
@@ -13,7 +16,8 @@ class MLflowTracker:
             client = MlflowClient(tracking_uri=uri)
         self.client = client
         found = client.get_experiment_by_name(experiment)
-        self.experiment_id = found.experiment_id if found else client.create_experiment(experiment)
+        artifact_location = artifact_location or os.environ.get("FACTORY_MLFLOW_ARTIFACT_LOCATION")
+        self.experiment_id = found.experiment_id if found else client.create_experiment(experiment, artifact_location=artifact_location)
 
     def start(self, job_id, manifest):
         tags = {"factory.job_id": job_id, "factory.simulation": str(manifest["simulation"]).lower(),
@@ -29,6 +33,15 @@ class MLflowTracker:
         return run_id
 
     def finish(self, run_id, metrics, directory, status, error=None):
+        try:
+            self._persist(run_id, metrics, directory, error)
+        except Exception:
+            self.client.set_tag(run_id, "factory.persistence_error", "Artifact or metric persistence failed")
+            self.client.set_terminated(run_id, status="FAILED")
+            raise
+        self.client.set_terminated(run_id, status={"COMPLETED": "FINISHED", "CANCELED": "KILLED"}.get(status, "FAILED"))
+
+    def _persist(self, run_id, metrics, directory, error):
         from mlflow.entities import Metric
         if metrics:
             self.client.log_batch(run_id, metrics=[Metric(k, float(v), int(time.time() * 1000), 0)
@@ -42,7 +55,6 @@ class MLflowTracker:
             self.client.log_artifacts(run_id, str(directory / "output"), artifact_path="output")
         if error:
             self.client.set_tag(run_id, "factory.error", error[:2000])
-        self.client.set_terminated(run_id, status={"COMPLETED": "FINISHED", "CANCELED": "KILLED"}.get(status, "FAILED"))
 
     def register_candidate(self, run_id, manifest, qualified):
         if manifest["simulation"]:
@@ -56,3 +68,15 @@ class MLflowTracker:
                 "engine": manifest["training_engine"], "manifest_sha256": manifest["sha256"],
                 "quality_qualified": str(qualified).lower(), "approval": "pending"}
         return self.client.create_model_version(name, source=f"runs:/{run_id}/output", run_id=run_id, tags=tags)
+
+
+class LazyMLflowTracker:
+    """Validation/status/dry-run do not create remote experiments or authenticate."""
+    def __init__(self, uri):
+        self.uri = uri
+        self._tracker = None
+
+    def __getattr__(self, name):
+        if self._tracker is None:
+            self._tracker = MLflowTracker(self.uri)
+        return getattr(self._tracker, name)

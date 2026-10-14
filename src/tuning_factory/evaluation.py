@@ -60,14 +60,22 @@ class CommonEvaluator(Evaluator):
         if kind == "extraction":
             tp = fp = fn = exact = 0
             for prediction, reference in zip(predictions, references):
+                if isinstance(reference, str):
+                    reference = json.loads(reference)
+                invalid = False
+                if isinstance(prediction, str):
+                    try:
+                        prediction = json.loads(prediction)
+                    except ValueError:
+                        prediction, invalid = {}, True
                 if not isinstance(prediction, dict) or not isinstance(reference, dict):
                     raise ValueError("extraction inputs must be JSON objects")
                 p = {(k, json.dumps(v, sort_keys=True)) for k, v in prediction.items()}
                 r = {(k, json.dumps(v, sort_keys=True)) for k, v in reference.items()}
-                tp += len(p & r)
-                fp += len(p - r)
+                tp += 0 if invalid else len(p & r)
+                fp += 1 if invalid else len(p - r)
                 fn += len(r - p)
-                exact += p == r
+                exact += p == r and not invalid
             return {"accuracy": exact / len(predictions), "f1": 2 * tp / (2 * tp + fp + fn) if tp + fp + fn else 1.0}
         raise ValueError("unsupported evaluation kind")
 

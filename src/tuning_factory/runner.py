@@ -91,6 +91,13 @@ class Factory:
                 run_id = self.tracker.start(job_id, manifest)
                 self.store.set_run_id(job_id, run_id)
             backend.prepare(config, directory, self.registry.dataset_path(dataset).read_bytes())
+            validation = manifest.get("validation_dataset")
+            if validation:
+                actual = self.registry.get_dataset(validation["dataset_id"], validation["version"])
+                if actual != validation:
+                    raise ValueError("validation data differs from immutable manifest")
+                self.policy.check(config, actual, execute=executor.remote, approved_transfer=approved_transfer)
+                backend.prepare_validation(directory, self.registry.dataset_path(actual).read_bytes())
             if getattr(executor, "pod", None):
                 pod = executor.pod
                 (directory / "execution.json").write_bytes(canonical({
@@ -109,10 +116,14 @@ class Factory:
             if self.store.get(job_id)["cancel_requested"]:
                 raise CanceledError("cancellation requested")
             self.store.transition(job_id, "EVALUATING")
-            metrics, quality = self.evaluate(directory, config, manifest["simulation"])
+            metrics, quality = self.evaluate(directory, config, manifest["simulation"],
+                                             (manifest.get("validation_dataset") or {}).get("sha256"))
+            if dataset.get("synthetic") or (manifest.get("validation_dataset") or {}).get("synthetic"):
+                quality["quality_status"] = "synthetic_only"
+                quality["note"] = "Synthetic data verifies pipeline mechanics only; not actual AI quality."
             (directory / "evaluation.json").write_bytes(canonical(quality))
             (directory / "artifacts.json").write_bytes(canonical(backend.collect_artifacts(directory)))
-            if not manifest["simulation"]:
+            if not manifest["simulation"] and not manifest["dataset"].get("synthetic"):
                 candidate = {"job_id": job_id, "manifest_sha256": manifest["sha256"],
                              "config": manifest["config"], "run_id": run_id, "approval": "pending",
                              "quality_status": quality["quality_status"],
@@ -138,7 +149,7 @@ class Factory:
             if self.tracker and run_id:
                 try:
                     self.tracker.finish(run_id, metrics, directory, status, error)
-                    if status == "COMPLETED" and not manifest["simulation"]:
+                    if status == "COMPLETED" and not manifest["simulation"] and not manifest["dataset"].get("synthetic"):
                         quality = json.loads((directory / "evaluation.json").read_text())
                         self.tracker.register_candidate(run_id, manifest, quality["quality_status"] == "qualified")
                 except Exception as exc:
@@ -163,14 +174,16 @@ class Factory:
         return self.store.get(job_id)
 
     @staticmethod
-    def evaluate(directory, config, simulation):
+    def evaluate(directory, config, simulation, validation_sha=None):
         metrics = {"pipeline_completed": 1.0}
         quality_status = "not_evaluated"
         evaluator = CommonEvaluator()
         profile = config.evaluation_profile
         predictions = directory / "output" / "predictions.json"
-        if not simulation and predictions.is_file() and profile.kind != "pipeline":
+        if not simulation and predictions.is_file() and profile.kind != "pipeline" and validation_sha:
             data = json.loads(predictions.read_text())
+            if data.get("validation_sha256") != validation_sha:
+                raise ValueError("predictions do not match registered validation data")
             metrics.update(evaluator.evaluate(data["predictions"], data.get("references"), profile.kind))
             quality_status = "measured"
             if profile.thresholds:
@@ -194,3 +207,33 @@ class Factory:
             if not path.is_relative_to(directory) or digest(path.read_bytes()) != expected:
                 raise ValueError("artifact hash mismatch")
         return hashes
+
+    def reconcile(self, job_id, executor):
+        job = self.store.get(job_id)
+        if job["status"] != "FAILED":
+            raise ValueError("recover stale active jobs before reconciling; only FAILED jobs are eligible")
+        manifest = job["manifest"]
+        verify_manifest(manifest)
+        directory = self.directory(job_id)
+        result = executor.collect_result(directory)
+        if result is None:
+            return job
+        status = result.get("status")
+        if status not in {"COMPLETED", "FAILED", "CANCELED"}:
+            raise ValueError("unknown remote completion status")
+        metrics, error = {}, result.get("error")
+        if status == "COMPLETED":
+            config = AIConfig.model_validate(manifest["config"])
+            metrics, quality = self.evaluate(directory, config, manifest["simulation"],
+                                             (manifest.get("validation_dataset") or {}).get("sha256"))
+            if manifest["dataset"].get("synthetic") or (manifest.get("validation_dataset") or {}).get("synthetic"):
+                quality["quality_status"] = "synthetic_only"
+            (directory / "evaluation.json").write_bytes(canonical(quality))
+        (directory / "artifacts.json").write_bytes(canonical(LlamaFactoryBackend().collect_artifacts(directory)))
+        if self.tracker and job["run_id"]:
+            self.tracker.finish(job["run_id"], metrics, directory, status, error)
+            if status == "COMPLETED" and not manifest["simulation"] and not manifest["dataset"].get("synthetic"):
+                self.tracker.register_candidate(job["run_id"], manifest, quality["quality_status"] == "qualified")
+        self.store.reconcile_result(job_id, status, error)
+        (directory / "reconciliation.json").write_bytes(canonical({"status": status, "run_id": job["run_id"], "at": time.time()}))
+        return self.store.get(job_id)

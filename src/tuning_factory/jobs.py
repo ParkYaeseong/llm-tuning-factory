@@ -167,3 +167,15 @@ class JobStore:
             db.execute("UPDATE jobs SET status='QUEUED',cancel_requested=0,error=NULL,updated=? WHERE id=?",
                        (time.time(), job_id))
             db.execute("INSERT INTO events VALUES (?,?,?,?)", (job_id, "QUEUED", time.time(), "manual resume"))
+
+    def reconcile_result(self, job_id, status, error=None):
+        if status not in {"COMPLETED", "FAILED", "CANCELED"}:
+            raise ValueError("invalid reconciled terminal status")
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["status"] != "FAILED":
+                raise ValueError("only failed jobs may be reconciled")
+            db.execute("UPDATE jobs SET status=?,error=?,updated=? WHERE id=?", (status, error, time.time(), job_id))
+            db.execute("INSERT INTO events VALUES (?,?,?,?)", (job_id, status, time.time(), "remote result reconciled"))
+            db.execute("DELETE FROM gpu_locks WHERE job_id=?", (job_id,))

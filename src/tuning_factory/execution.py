@@ -66,7 +66,18 @@ class RunPodController:
         return response.json() if response.content else {}
 
     def status(self, pod_id):
-        return self.request("GET", f"/pods/{self.identifier(pod_id)}?includeNetworkVolume=true")
+        return self.normalize(self.request("GET", f"/pods/{self.identifier(pod_id)}?includeMachine=true&includeNetworkVolume=true"))
+
+    @staticmethod
+    def normalize(pod):
+        pod = dict(pod)
+        if not pod.get("gpu"):
+            machine = pod.get("machine") or {}
+            gpu_type = machine.get("gpuType") or {}
+            pod["gpu"] = {"id": machine.get("gpuTypeId") or pod.get("gpuTypeId"),
+                          "displayName": machine.get("gpuDisplayName") or gpu_type.get("displayName"),
+                          "count": pod.get("gpuCount") or gpu_type.get("count")}
+        return pod
 
     @staticmethod
     def identifier(value):
@@ -188,6 +199,8 @@ class SSHExecutor(ExecutionBackend):
             raise ValueError("invalid remote job directory")
         # Fresh remote attempt namespace prevents stale completion markers after resume/retry.
         remote = self.root + "/" + directory.name + "/" + uuid.uuid4().hex
+        (directory / "remote-attempt.json").write_text(json.dumps({"remote_path": remote,
+            "pod_id": self.pod.get("id") if self.pod else None, "created": time.time()}), encoding="utf-8")
         submitted = False
         finished = False
         try:
@@ -235,5 +248,38 @@ class SSHExecutor(ExecutionBackend):
             if submitted and not finished:
                 raise ExecutionUncertain("remote execution uncertain; reconcile before releasing GPU lock") from exc
             raise
+        finally:
+            self.client.close()
+
+    def collect_result(self, directory):
+        directory = Path(directory).resolve()
+        record = json.loads((directory / "remote-attempt.json").read_text())
+        remote = record["remote_path"]
+        expected_prefix = self.root + "/" + directory.name + "/"
+        if not remote.startswith(expected_prefix) or not re.fullmatch(r"[0-9a-f]{32}", remote[len(expected_prefix):]):
+            raise ValueError("remote attempt path is outside the original job namespace")
+        if self.pod and record.get("pod_id") != self.pod.get("id"):
+            raise ValueError("reconciliation Pod differs from original execution")
+        try:
+            with self.client.open_sftp() as sftp:
+                try:
+                    with sftp.open(remote + "/result.json") as f:
+                        result = json.loads(f.read())
+                except OSError as exc:
+                    if exc.errno == 2:
+                        return None
+                    raise
+                with sftp.open(remote + "/manifest.json") as f:
+                    recovered_manifest = json.loads(f.read())
+                original = json.loads((directory / "manifest.json").read_text())
+                if recovered_manifest != original:
+                    raise ValueError("remote manifest differs from original job")
+                self.download(sftp, remote, directory)
+                hashes = json.loads((directory / "artifacts.json").read_text())
+                for name, expected in hashes.items():
+                    path = (directory / name).resolve()
+                    if not path.is_relative_to(directory) or digest(path.read_bytes()) != expected:
+                        raise ValueError("recovered artifact hash mismatch")
+                return result
         finally:
             self.client.close()

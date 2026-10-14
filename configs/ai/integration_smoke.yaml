@@ -1,0 +1,28 @@
+# Synthetic pipeline acceptance only. Real execution requires explicit paid/transfer approval.
+ai_id: integration_smoke
+workflow_id: infrastructure_acceptance
+dataset_id: synthetic_smoke
+dataset_version: '1'
+base_model: Qwen/Qwen2.5-0.5B-Instruct
+model_revision: 7ae557604adf67be50417f59c2c2f167def9a775
+tokenizer_revision: 7ae557604adf67be50417f59c2c2f167def9a775
+training_method: lora
+template: qwen
+hyperparameters:
+  max_steps: 2
+  save_steps: 1
+  cutoff_len: 128
+  gradient_accumulation_steps: 1
+evaluation_profile:
+  kind: json
+  dataset_id: synthetic_validation
+  dataset_version: '1'
+  max_samples: 1
+  max_new_tokens: 32
+resource_profile:
+  gpu_count: 1
+  gpu_type: NVIDIA H200
+  timeout_seconds: 1200
+  hourly_cost_usd: 5.29
+  max_cost_usd: 2
+artifact_destination: control-plane
