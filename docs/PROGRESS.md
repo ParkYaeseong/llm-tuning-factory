@@ -9,7 +9,10 @@ Distribution uses one installation and local state per PC, with common MLflow re
 supports only known settings, preserves shell environment precedence and never copies secrets into manifests.
 FACTORY_OPERATOR labels common runs. The Git history/staging secret check found no known credentials or
 supported token/private-key patterns across 142 file versions before the distribution commit.
-The initial sharing target is the private ParkYaeseong/llm-tuning-factory repository; see README.md for setup.
+Published to the private https://github.com/ParkYaeseong/llm-tuning-factory repository; see README.md for setup.
+GitHub Actions run 38520574497 passed on Windows and Ubuntu for source commit 2bfc561, including
+locked installation, lint, history secret scan and CPU tests. A separate clean local clone also installed
+successfully and completed the synthetic CLI example without accessing paid infrastructure.
 
 Production MLflow authentication, registry reads, successful/failed diagnostic runs and artifact upload/download
 checksums pass at https://mlflow.kbiofoundry.kr. The legacy URL redirects here. Receipts are
@@ -34,7 +37,7 @@ version publication remain unverified. Real task quality requires authorized rep
 
 The GPU image has not been built. Automatic approval review rejected Rancher startup with 'blocked by policy';
 no alternate startup was attempted. The approved Pod uses an isolated hash-locked venv.
-GitHub CI has not run; commits remain local. Preserve local state/ and the remote persistent volume.
+Source is now shared in the private repository and CPU CI passes. Preserve local state/ and the remote persistent volume.
 
 ### Final session evidence
 
