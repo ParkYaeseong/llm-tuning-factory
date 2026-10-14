@@ -1,0 +1,158 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use serde_json::{json, Map, Value};
+use std::{fs, io::Write, path::PathBuf, process::{Command, Stdio}, sync::Mutex};
+use tauri::Manager;
+
+const SECRETS: [&str; 3] = ["RUNPOD_API_KEY", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLOW_TRACKING_TOKEN"];
+const FIELDS: [&str; 12] = [
+    "MLFLOW_TRACKING_URI", "FACTORY_MLFLOW_ARTIFACT_LOCATION", "FACTORY_OPERATOR",
+    "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "pod_id", "ssh_key_file",
+    "ssh_fingerprint", "RUNPOD_API_KEY", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLOW_TRACKING_TOKEN", "auth_mode",
+];
+struct SaveLock(Mutex<()>);
+
+fn app_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let root = app.path().app_data_dir().map_err(|_| "앱 저장 폴더를 찾을 수 없습니다.")?;
+    fs::create_dir_all(&root).map_err(|_| "앱 저장 폴더를 만들 수 없습니다.")?;
+    Ok(root)
+}
+
+fn entry(name: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new("kr.kbiofoundry.tuningfactory", name).map_err(|_| "Windows 자격 증명 저장소 오류".into())
+}
+
+fn read_settings(root: &PathBuf, secrets: bool) -> Result<Value, String> {
+    let path = root.join("settings.json");
+    let mut value = if path.exists() {
+        serde_json::from_slice::<Value>(&fs::read(path).map_err(|_| "설정을 읽을 수 없습니다.")?)
+            .map_err(|_| "설정 파일이 손상되었습니다.")?
+    } else { json!({}) };
+    if !value.is_object() { return Err("설정 파일이 손상되었습니다.".into()); }
+    for name in SECRETS {
+        match entry(name)?.get_password() {
+            Ok(secret) => {
+                value[format!("{name}_saved")] = json!(true);
+                if secrets { value[name] = json!(secret); }
+            },
+            Err(keyring::Error::NoEntry) => {},
+            Err(_) => return Err("Windows 자격 증명에 접근할 수 없습니다.".into()),
+        }
+    }
+    if value["auth_mode"] == "token" {
+        value.as_object_mut().unwrap().remove("MLFLOW_OIDC_TOKEN_URL");
+        value.as_object_mut().unwrap().remove("MLFLOW_OIDC_CLIENT_ID");
+        value.as_object_mut().unwrap().remove("MLFLOW_OIDC_CLIENT_SECRET");
+    } else if secrets {
+        value.as_object_mut().unwrap().remove("MLFLOW_TRACKING_TOKEN");
+    }
+    Ok(value)
+}
+
+#[tauri::command]
+fn settings_get(app: tauri::AppHandle) -> Result<Value, String> {
+    read_settings(&app_root(&app)?, false)
+}
+
+#[tauri::command]
+fn settings_save(app: tauri::AppHandle, values: Value, lock: tauri::State<SaveLock>) -> Result<Value, String> {
+    let _guard = lock.0.lock().map_err(|_| "설정 잠금 오류")?;
+    let root = app_root(&app)?;
+    let input = values.as_object().ok_or("잘못된 설정")?;
+    if input.keys().any(|key| !FIELDS.contains(&key.as_str())) {
+        return Err("허용하지 않은 설정 항목".into());
+    }
+    let mut public = Map::new();
+    for (name, value) in input {
+        let text = value.as_str().ok_or("설정은 문자열이어야 합니다.")?;
+        if text.len() > 2048 { return Err("설정값이 너무 깁니다.".into()); }
+        if SECRETS.contains(&name.as_str()) {
+            if !text.is_empty() {
+                entry(name)?.set_password(text).map_err(|_| "인증값 보안 저장 실패")?;
+            }
+        } else { public.insert(name.clone(), json!(text)); }
+    }
+    let temporary = root.join("settings.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(&public).unwrap()).map_err(|_| "설정 저장 실패")?;
+    // Windows rename cannot replace an existing file. Keep credentials exclusively in Credential Manager.
+    fs::copy(&temporary, root.join("settings.json")).map_err(|_| "설정 저장 실패")?;
+    fs::remove_file(temporary).ok();
+    read_settings(&root, false)
+}
+
+#[tauri::command]
+fn forget_credentials() -> Result<(), String> {
+    for name in SECRETS {
+        match entry(name)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {},
+            Err(_) => return Err("인증값 삭제 실패".into()),
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn pick_file(kind: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut dialog = rfd::FileDialog::new();
+        if kind == "dataset" { dialog = dialog.add_filter("학습 데이터", &["json", "jsonl"]); }
+        dialog.pick_file().map(|p| p.to_string_lossy().into_owned())
+    }).await.map_err(|_| "파일 선택 오류".into())
+}
+
+fn allowed(action: &str) -> bool {
+    matches!(action, "catalog" | "save_profile" | "dataset" | "plan" | "submit" | "execute" |
+        "jobs" | "logs" | "cancel" | "recover" | "reconcile" | "resume" | "connection" |
+        "pod" | "runtime_check" | "runtime_prepare" | "live_logs" | "history" | "compare" | "model_revision")
+}
+
+#[tauri::command]
+async fn factory_action(app: tauri::AppHandle, action: String, data: Value) -> Result<Value, String> {
+    if !allowed(&action) { return Err("허용하지 않은 작업".into()); }
+    let root = app_root(&app)?;
+    let settings = read_settings(&root, true)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let binary = if cfg!(debug_assertions) {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries/factory-bridge-x86_64-pc-windows-msvc.exe")
+        } else {
+            std::env::current_exe().map_err(|_| "앱 경로 오류")?.parent().ok_or("앱 경로 오류")?.join("factory-bridge.exe")
+        };
+        let mut command = Command::new(binary);
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        #[cfg(windows)] {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW; credentials are only sent through stdin.
+        }
+        let mut child = command.spawn().map_err(|_| "학습 엔진을 실행할 수 없습니다. 설치 파일을 확인해 주세요.")?;
+        let request = json!({"root": root.join("state"), "settings": settings, "action": action, "data": data});
+        {
+            let mut stdin = child.stdin.take().ok_or("엔진 입력 연결 오류")?;
+            writeln!(stdin, "{}", request).map_err(|_| "엔진 요청 전송 실패")?;
+        }
+        let output = child.wait_with_output().map_err(|_| "엔진 응답 오류")?;
+        let response: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| "엔진 응답을 해석할 수 없습니다.")?;
+        if response["ok"] == true { Ok(response["result"].clone()) }
+        else { Err(response["error"].as_str().unwrap_or("실행 오류").to_owned()) }
+    }).await.map_err(|_| "엔진 작업 오류")?
+}
+
+fn main() {
+    tauri::Builder::default()
+        .manage(SaveLock(Mutex::new(())))
+        .invoke_handler(tauri::generate_handler![settings_get, settings_save, forget_credentials, pick_file, factory_action])
+        .run(tauri::generate_context!())
+        .expect("Windows application startup failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_named_operations_are_available() {
+        assert!(allowed("plan"));
+        assert!(!allowed("shell"));
+        assert!(!allowed("pod-start"));
+        assert!(!allowed("pod-stop"));
+    }
+}

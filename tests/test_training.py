@@ -21,11 +21,11 @@ def test_yaml_translation_and_real_subprocess(tmp_path):
 
 
 def test_failures_and_timeouts(tmp_path):
-    for command, exception in [([sys.executable, "-c", "raise SystemExit(2)"], RuntimeError),
-                               ([sys.executable, "-c", "import time;time.sleep(10)"], TimeoutError)]:
+    for command, exception, timeout in [([sys.executable, "-c", "raise SystemExit(2)"], RuntimeError, 10),
+                                        ([sys.executable, "-c", "import time;time.sleep(10)"], TimeoutError, 1)]:
         backend = LlamaFactoryBackend(command=command)
         with pytest.raises(exception):
-            backend.train(tmp_path, 1)
+            backend.train(tmp_path, timeout)
 
 
 def test_checkpoint_compatibility_and_collection(tmp_path):

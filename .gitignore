@@ -27,3 +27,16 @@ state/
 mlruns/
 dist/
 build/
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/binaries/*.exe
+desktop/src-tauri/gen/
+*.spec
+desktop/test-results/
+desktop/playwright-report/
+desktop/src-tauri/icons/android/
+desktop/src-tauri/icons/ios/
+desktop/src-tauri/icons/*.icns
+desktop/src-tauri/icons/Square*.png
+desktop/src-tauri/icons/StoreLogo.png

@@ -1,5 +1,32 @@
 # Progress and acceptance status — 2026-10-14
 
+## Windows desktop pilot — current work
+
+Approved Windows-only design and implementation plan are in docs/plans/2026-10-14-windows-desktop*.
+Rust/Tauri UI wraps the existing Python controller. Windows Credential Manager retains API/OIDC secrets;
+the sidecar receives them only through stdin. UI profiles, datasets, queue and logs stay in per-user app data.
+No paid infrastructure was started and no dataset was transferred during desktop development.
+
+Current source checks: **68 passed, 1 skipped**; Ruff src/tests passes; TypeScript/Vite production build passes;
+four Playwright UI workflows pass; Rust command-allowlist test passes. A preexisting 1-second subprocess
+failure assertion was flaky under simultaneous compiler load; its nonzero-exit case now allows 10 seconds
+while the actual timeout case retains its 1-second deadline.
+
+First native build produced an unsigned Windows x64 NSIS installer (~41 MiB). Native WebView2 smoke checks
+verified bundled catalog, local synthetic dataset registration, offline plan with dependency lock, and actual
+Credential Manager save/masked read/delete using a synthetic value (then restored prior non-secret settings).
+The bundled engine authenticated to the existing MLflow server and read 12 experiment-16 runs; RunPod read-only
+status confirmed EXITED. Public Hugging Face revision lookup also returned a valid immutable 40-character commit.
+These were reads; no MLflow runs were created by the probes.
+
+Final-source packaging and installer smoke are being repeated after the last UI/default revisions.
+**Outstanding paid verification:** the new desktop runtime bootstrap and complete UI-triggered GPU
+training/generation/cancel/reconcile/resume flow have not been GPU-executed. Historical CLI H200 evidence below
+must not be presented as desktop acceptance. QLoRA, gated-model authentication, a clean second-PC installation,
+Windows signing, large-data streaming and multi-PC scheduling remain unverified or outside this release.
+The UI's existing-Pod flow has no automatic start/stop/delete controls. Assigned Pods and operator shutdown
+remain required. See docs/WINDOWS_APP.md for limits and exact setup.
+
 ## Latest live verification (supersedes the earlier baseline below)
 
 Fresh full suite after cancellation hardening: **57 passed, 1 skipped**. Ruff src/tests passes; wheel build succeeds.

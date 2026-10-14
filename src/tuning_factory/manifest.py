@@ -1,11 +1,14 @@
 import importlib.metadata
 import subprocess
+import sys
 from pathlib import Path
 
 from .registry import canonical, digest
 
 
 def code_revision():
+    if hasattr(sys, "_MEIPASS"):
+        return (Path(sys._MEIPASS) / "assets/commit.txt").read_text().strip()
     result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
     return result.stdout.strip() if result.returncode == 0 else "uncommitted"
 
@@ -18,7 +21,8 @@ def source_hash():
 def resolve(config, registry, simulation=True):
     from .training import LlamaFactoryBackend
     dataset = registry.get_dataset(config.dataset_id, config.dataset_version)
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = (Path(sys._MEIPASS) / "assets" if hasattr(sys, "_MEIPASS")
+                    else Path(__file__).resolve().parents[2])
     locks = {name: digest((project_root / name).read_bytes()) for name in
              ("pyproject.toml", "uv.lock", "containers/gpu-requirements.lock") if (project_root / name).is_file()}
     manifest = {"schema_version": 1, "config": config.model_dump(), "dataset": dataset,

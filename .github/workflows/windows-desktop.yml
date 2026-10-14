@@ -1,0 +1,58 @@
+name: Windows desktop pilot
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'desktop/**'
+      - 'src/**'
+      - 'scripts/build_desktop.py'
+      - 'scripts/desktop_entry.py'
+      - '.github/workflows/windows-desktop.yml'
+      - 'uv.lock'
+      - 'containers/gpu-requirements.lock'
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - 'src/**'
+      - 'scripts/build_desktop.py'
+      - 'scripts/desktop_entry.py'
+      - '.github/workflows/windows-desktop.yml'
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.11.23'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+      - run: uv sync --python 3.12 --extra dev --extra tracking --locked
+      - run: uv run pytest
+      - run: uv run ruff check src tests
+      - run: uv run python scripts/build_desktop.py
+      - run: npm ci
+        working-directory: desktop
+      - run: npm exec playwright install chromium
+        working-directory: desktop
+      - run: npm test
+        working-directory: desktop
+      - run: npm run build
+        working-directory: desktop
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+        working-directory: desktop
+      - run: npm run tauri -- build --ci
+        working-directory: desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-pilot-installer
+          path: desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+          retention-days: 30
