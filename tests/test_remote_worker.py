@@ -124,3 +124,19 @@ def test_controller_interrupt_preserves_uncertain_execution(tmp_path):
     executor = SSHExecutor("test-host", 22, "root", "unused", client=client)
     with pytest.raises(ExecutionUncertain):
         executor.run(LlamaFactoryBackend(), directory, 5, lambda: False)
+
+
+def test_sftp_reconciliation_checks_original_manifest(tmp_path):
+    directory = tmp_path / ("b" * 32)
+    directory.mkdir()
+    (directory / "manifest.json").write_text('{"identity":"original"}')
+    (directory / "train.yaml").write_text("test: true")
+    client = FakeSSH(tmp_path / "remote")
+    client.sftp.root.mkdir()
+    executor = SSHExecutor("test-host", 22, "root", "unused", client=client)
+    executor.run(LlamaFactoryBackend(), directory, 5, lambda: False)
+    assert executor.collect_result(directory)["status"] == "COMPLETED"
+    remote = json.loads((directory / "remote-attempt.json").read_text())["remote_path"]
+    client.sftp.path(remote + "/manifest.json").write_text('{"identity":"wrong"}')
+    with pytest.raises(ValueError, match="manifest"):
+        executor.collect_result(directory)

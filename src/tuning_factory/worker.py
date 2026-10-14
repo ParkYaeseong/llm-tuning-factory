@@ -4,6 +4,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -17,6 +18,8 @@ from .training import CanceledError, LlamaFactoryBackend
 
 
 def main():
+    # A worker launched through an isolated venv must delegate to that venv's engine CLI.
+    os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", type=Path)
     parser.add_argument("timeout", type=int)

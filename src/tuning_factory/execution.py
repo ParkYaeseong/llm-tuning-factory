@@ -135,7 +135,8 @@ class SSHExecutor(ExecutionBackend):
     """Existing Pod with a preinstalled factory image. Strict known_hosts verification."""
     remote = True
 
-    def __init__(self, host, port, username, key_file, remote_root="/workspace/factory", client=None, pod=None):
+    def __init__(self, host, port, username, key_file, remote_root="/workspace/factory", client=None, pod=None,
+                 remote_python="python", worker_lock_file=None, hf_home=None):
         if not re.fullmatch(r"/[a-zA-Z0-9_/-]+", remote_root) or ".." in remote_root:
             raise ValueError("remote_root must be a safe absolute Linux path")
         self.client = client or paramiko.SSHClient()
@@ -146,6 +147,9 @@ class SSHExecutor(ExecutionBackend):
                                 allow_agent=False, look_for_keys=False)
         self.root = remote_root
         self.pod = pod
+        self.remote_python = remote_python
+        self.worker_lock_file = worker_lock_file
+        self.hf_home = hf_home
 
     def validate_config(self, config):
         pod = self.pod
@@ -206,7 +210,14 @@ class SSHExecutor(ExecutionBackend):
         try:
             with self.client.open_sftp() as sftp:
                 self.upload(sftp, directory, remote)
-                command = ["python", "-m", "tuning_factory.worker", remote, str(timeout)]
+                command = [self.remote_python, "-m", "tuning_factory.worker", remote, str(timeout)]
+                environment = []
+                if self.worker_lock_file:
+                    environment.append("FACTORY_GPU_LOCK_FILE=" + self.worker_lock_file)
+                if self.hf_home:
+                    environment.append("HF_HOME=" + self.hf_home)
+                if environment:
+                    command = ["env", *environment, *command]
                 if checkpoint:
                     command += ["--checkpoint", Path(checkpoint).resolve().relative_to(directory).as_posix()]
                 # Worker remains alive on controller disconnect and enforces its own deadline.
