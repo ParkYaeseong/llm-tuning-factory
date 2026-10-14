@@ -19,7 +19,16 @@ The bundled engine authenticated to the existing MLflow server and read 12 exper
 status confirmed EXITED. Public Hugging Face revision lookup also returned a valid immutable 40-character commit.
 These were reads; no MLflow runs were created by the probes.
 
-Final-source packaging and installer smoke are being repeated after the last UI/default revisions.
+Final source commit **251d63e0cf3d075e819010596ac104768d0a5145** was packaged and verified:
+the frozen engine's source hash equals the local package and all worker-wheel Python sources match.
+Source SHA256: 7a3e8dff7b1ff5bfbb356899f73465f962c71c2e96b5d45e9da360f76150f128.
+The frozen plan carries the exact GPU dependency lock. Final catalog has three epoch-based task templates.
+The final NSIS installer installed into a test folder with exit code 0; the installed native app passed
+catalog, synthetic local registration, offline plan and real vault masked-read checks. No system Python
+was used by the installed app. This remains a test on the development Windows PC, not a clean second PC.
+Final bundled read-only probes again read 12 MLflow runs and provider EXITED. Hosted CPU verification
+38534264783 passed on both Windows and Ubuntu. Desktop packaging CI is tracked separately.
+
 **Outstanding paid verification:** the new desktop runtime bootstrap and complete UI-triggered GPU
 training/generation/cancel/reconcile/resume flow have not been GPU-executed. Historical CLI H200 evidence below
 must not be presented as desktop acceptance. QLoRA, gated-model authentication, a clean second-PC installation,
