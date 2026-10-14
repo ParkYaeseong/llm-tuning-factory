@@ -105,6 +105,9 @@ class RunPodController:
 class ExecutionBackend(ABC):
     remote = False
 
+    def validate_config(self, config):
+        pass
+
     @abstractmethod
     def run(self, backend, directory, timeout, canceled, checkpoint=None): ...
 
@@ -121,7 +124,7 @@ class SSHExecutor(ExecutionBackend):
     """Existing Pod with a preinstalled factory image. Strict known_hosts verification."""
     remote = True
 
-    def __init__(self, host, port, username, key_file, remote_root="/workspace/factory", client=None):
+    def __init__(self, host, port, username, key_file, remote_root="/workspace/factory", client=None, pod=None):
         if not re.fullmatch(r"/[a-zA-Z0-9_/-]+", remote_root) or ".." in remote_root:
             raise ValueError("remote_root must be a safe absolute Linux path")
         self.client = client or paramiko.SSHClient()
@@ -131,6 +134,19 @@ class SSHExecutor(ExecutionBackend):
             self.client.connect(host, port=port, username=username, key_filename=str(key_file), timeout=20,
                                 allow_agent=False, look_for_keys=False)
         self.root = remote_root
+        self.pod = pod
+
+    def validate_config(self, config):
+        pod = self.pod
+        resource = config.resource_profile
+        if not pod:
+            raise ValueError("live RunPod metadata required before transfer")
+        if pod.get("gpu", {}).get("count") != resource.gpu_count:
+            raise ValueError("claimed job GPU count differs from live Pod")
+        if resource.gpu_type not in {pod.get("gpu", {}).get("id"), pod.get("gpu", {}).get("displayName")}:
+            raise ValueError("claimed job GPU type differs from live Pod")
+        if float(pod["costPerHr"]) > resource.hourly_cost_usd * resource.gpu_count:
+            raise ValueError("claimed job price exceeds approved resource budget")
 
     def mkdir(self, sftp, path):
         current = ""
@@ -215,7 +231,7 @@ class SSHExecutor(ExecutionBackend):
                     raise CanceledError("remote training canceled")
                 if result["status"] != "COMPLETED":
                     raise RuntimeError(result.get("error", "remote training failed"))
-        except Exception as exc:
+        except BaseException as exc:
             if submitted and not finished:
                 raise ExecutionUncertain("remote execution uncertain; reconcile before releasing GPU lock") from exc
             raise

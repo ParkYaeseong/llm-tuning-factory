@@ -83,13 +83,15 @@ class JobStore:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is not None and row["status"] == status:
+                return
             if row is None or status not in TRANSITIONS.get(row["status"], set()):
                 raise ValueError(f"invalid state transition to {status}")
             now = time.time()
             db.execute("UPDATE jobs SET status=?,error=?,updated=? WHERE id=?", (status, error, now, job_id))
             db.execute("INSERT INTO events VALUES (?,?,?,?)", (job_id, status, now, error))
 
-    def claim(self, gpu, max_concurrent=1, max_gpus=None, simulation=None):
+    def claim(self, gpu, max_concurrent=1, max_gpus=None, simulation=None, job_id=None):
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be positive")
         with self.connection() as db:
@@ -98,8 +100,8 @@ class JobStore:
             if active >= max_concurrent or db.execute("SELECT 1 FROM gpu_locks WHERE gpu=?", (gpu,)).fetchone():
                 return None
             candidates = db.execute("SELECT * FROM jobs WHERE status='QUEUED' ORDER BY priority DESC,created").fetchall()
-            row = next((r for r in candidates if simulation is None
-                        or json.loads(r["manifest"]).get("simulation") == simulation), None)
+            row = next((r for r in candidates if (job_id is None or r["id"] == job_id)
+                        and (simulation is None or json.loads(r["manifest"]).get("simulation") == simulation)), None)
             if row is None:
                 return None
             if max_gpus is not None:

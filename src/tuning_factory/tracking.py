@@ -18,8 +18,12 @@ class MLflowTracker:
                 "factory.ai_id": manifest["config"]["ai_id"],
                 "factory.workflow_id": manifest["config"]["workflow_id"]}
         run_id = self.client.create_run(self.experiment_id, tags=tags).info.run_id
-        for key, value in manifest.items():
-            self.client.log_param(run_id, key, json.dumps(value, sort_keys=True)[:5900])
+        try:
+            for key, value in manifest.items():
+                self.client.log_param(run_id, key, json.dumps(value, sort_keys=True)[:5900])
+        except Exception:
+            self.client.set_terminated(run_id, status="FAILED")
+            raise
         return run_id
 
     def finish(self, run_id, metrics, directory, status, error=None):
@@ -29,7 +33,7 @@ class MLflowTracker:
                                                   for k, v in metrics.items()])
         # Upload individual evidence files; never recursively upload the tracking store itself.
         directory = Path(directory)
-        for name in ("manifest.json", "train.yaml", "train.log", "artifacts.json", "evaluation.json", "result.json", "error.txt"):
+        for name in ("manifest.json", "train.yaml", "train.log", "artifacts.json", "evaluation.json", "result.json", "error.txt", "runtime.json", "execution.json"):
             if (directory / name).is_file():
                 self.client.log_artifact(run_id, str(directory / name), artifact_path="evidence")
         if (directory / "output").is_dir():

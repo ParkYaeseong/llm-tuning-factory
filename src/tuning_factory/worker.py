@@ -3,6 +3,7 @@ import argparse
 import importlib.metadata
 import json
 import os
+import platform
 import traceback
 from pathlib import Path
 
@@ -32,6 +33,13 @@ def main():
             raise ValueError("worker source differs from resolved manifest; rebuild image")
         if importlib.metadata.version("llamafactory") != "0.9.5":
             raise ValueError("worker engine version differs from manifest")
+        lock_path = Path(os.environ.get("FACTORY_GPU_LOCK_FILE", "/opt/factory/containers/gpu-requirements.lock"))
+        expected_lock = manifest["dependency_file_hashes"].get("containers/gpu-requirements.lock")
+        if not expected_lock or digest(lock_path.read_bytes()) != expected_lock:
+            raise ValueError("worker dependency lock differs from resolved manifest")
+        runtime = {"python": platform.python_version(), "packages": {name: importlib.metadata.version(name)
+                   for name in ("llamafactory", "torch", "transformers", "peft", "datasets", "accelerate", "bitsandbytes")}}
+        (directory / "runtime.json").write_bytes(canonical(runtime))
         if digest((directory / "data" / "dataset.json").read_bytes()) != manifest["dataset"]["sha256"]:
             raise ValueError("transferred dataset hash mismatch")
         config = AIConfig.model_validate(manifest["config"])

@@ -46,3 +46,13 @@ def test_recovery_does_not_release_unknown_remote_execution(tmp_path):
     assert store.gpu_locked("pod1")
     store.release_gpu(job["id"])
     assert not store.gpu_locked("pod1")
+
+
+def test_gpu_budget_separate_from_concurrent_job_count(tmp_path):
+    store = JobStore(tmp_path / "jobs.db")
+    for key in ("a", "b"):
+        job = store.submit({"sha256": key, "simulation": False,
+                            "config": {"resource_profile": {"gpu_count": 2}}}, key)
+        store.transition(job["id"], "QUEUED")
+    assert store.claim("pod-a", max_concurrent=4, max_gpus=2)
+    assert store.claim("pod-b", max_concurrent=4, max_gpus=2) is None

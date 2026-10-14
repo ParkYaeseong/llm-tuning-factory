@@ -12,7 +12,7 @@ def code_revision():
 
 def source_hash():
     root = Path(__file__).parent
-    return digest(canonical({str(p.relative_to(root)): digest(p.read_bytes()) for p in sorted(root.rglob("*.py"))}))
+    return digest(canonical({p.relative_to(root).as_posix(): digest(p.read_bytes()) for p in sorted(root.rglob("*.py"))}))
 
 
 def resolve(config, registry, simulation=True):

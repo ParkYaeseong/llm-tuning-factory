@@ -62,7 +62,7 @@ def run(ctx: typer.Context, config: Path, mock: bool = False, submit: bool = Fal
         return
     job = ctx.obj.submit(load_config(config), request_key, priority, simulation=not real)
     if mock and job["status"] == "QUEUED":
-        job = ctx.obj.work()
+        job = ctx.obj.work(target_job_id=job["id"])
     output(job)
 
 
@@ -110,7 +110,7 @@ def work(ctx: typer.Context, drain: bool = False, pod_id: str | None = None,
                 raise typer.BadParameter("SSH host/port must match this Pod's public TCP SSH mapping")
             if not pod.get("networkVolume", {}).get("id") or pod.get("volumeMountPath") != "/workspace":
                 raise typer.BadParameter("verified network volume mounted at /workspace required")
-            executor = SSHExecutor(host, port, username, key_file)
+            executor = SSHExecutor(host, port, username, key_file, pod=pod)
         try:
             result = factory.work(executor=executor, gpu=pod_id or "mock-cpu",
                                   approved_transfer=approve_execution_and_transfer, select_mode=True)

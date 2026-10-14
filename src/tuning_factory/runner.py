@@ -51,10 +51,10 @@ class Factory:
             (directory / "resume.json").write_bytes(canonical({"checkpoint": path.relative_to(directory).as_posix()}))
         self.store.reset_for_resume(job_id)
 
-    def work(self, executor=None, backend=None, gpu="mock-cpu", approved_transfer=False, select_mode=False):
+    def work(self, executor=None, backend=None, gpu="mock-cpu", approved_transfer=False, select_mode=False, target_job_id=None):
         executor = executor or LocalExecutor()
         job = self.store.claim(gpu, self.policy.max_concurrent, self.policy.max_gpus,
-                               simulation=not executor.remote if select_mode else None)
+                               simulation=not executor.remote if select_mode else None, job_id=target_job_id)
         if job is None:
             return None
         job_id = job["id"]
@@ -84,12 +84,19 @@ class Factory:
                 raise ValueError("real training requires the approved RunPod executor")
             dataset = self.registry.get_dataset(config.dataset_id, config.dataset_version)
             self.policy.check(config, dataset, execute=executor.remote, approved_transfer=approved_transfer)
+            executor.validate_config(config)
             if dataset != manifest["dataset"]:
                 raise ValueError("dataset registration differs from manifest")
             if self.tracker:
                 run_id = self.tracker.start(job_id, manifest)
                 self.store.set_run_id(job_id, run_id)
             backend.prepare(config, directory, self.registry.dataset_path(dataset).read_bytes())
+            if getattr(executor, "pod", None):
+                pod = executor.pod
+                (directory / "execution.json").write_bytes(canonical({
+                    "pod_id": gpu, "gpu": pod["gpu"], "image": pod.get("image"),
+                    "cost_per_hour_usd": float(pod["costPerHr"]),
+                    "network_volume": pod["networkVolume"]["id"]}))
             # Remove markers from an earlier attempt, without touching its output/checkpoints.
             for name in ("result.json", "cancel", "error.txt", "tracking-error.txt"):
                 (directory / name).unlink(missing_ok=True)
@@ -140,7 +147,7 @@ class Factory:
             # Preserve attempt evidence before any retry/resume overwrites live logs.
             archive = directory / "attempts" / str(job["attempts"])
             archive.mkdir(parents=True, exist_ok=True)
-            for name in ("train.log", "train.yaml", "error.txt", "evaluation.json", "tracking-error.txt"):
+            for name in ("train.log", "train.yaml", "error.txt", "evaluation.json", "tracking-error.txt", "runtime.json", "execution.json"):
                 if (directory / name).is_file():
                     (archive / name).write_bytes((directory / name).read_bytes())
             (archive / "outcome.json").write_bytes(canonical({"status": status, "error": error,

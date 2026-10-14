@@ -96,3 +96,72 @@ def test_no_execution_for_simulation_with_real_backend(tmp_path):
     job = factory.work(backend=LlamaFactoryBackend())
     assert job["status"] == "FAILED"
     assert "simulation" in job["error"]
+
+
+def test_uncertain_remote_failure_keeps_gpu_reserved(tmp_path):
+    from tuning_factory.execution import ExecutionUncertain
+
+    class Disconnected(LocalExecutor):
+        def run(self, *args, **kwargs):
+            raise ExecutionUncertain("connection lost")
+
+    factory = setup_factory(tmp_path)
+    factory.submit(load_config("configs/ai/paper_extraction.yaml"))
+    job = factory.work(executor=Disconnected(), gpu="locked-pod")
+    assert job["status"] == "FAILED"
+    assert factory.store.gpu_locked("locked-pod")
+
+
+def test_training_failure_is_recorded_in_tracking(tmp_path):
+    class Tracker:
+        calls = []
+
+        def start(self, job_id, manifest):
+            return "test-run-id"
+
+        def finish(self, run_id, metrics, directory, status, error):
+            self.calls.append((status, error))
+
+    class Broken(MockTrainingBackend):
+        def train(self, *args, **kwargs):
+            raise RuntimeError("training fixture failure")
+
+    factory = setup_factory(tmp_path)
+    factory.tracker = Tracker()
+    factory.submit(load_config("configs/ai/paper_extraction.yaml"))
+    job = factory.work(backend=Broken())
+    assert job["run_id"] == "test-run-id"
+    assert factory.tracker.calls[0][0] == "FAILED"
+    assert "fixture failure" in factory.tracker.calls[0][1]
+
+
+def test_parallel_duplicate_factory_submissions(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    factory = setup_factory(tmp_path)
+    config = load_config("configs/ai/paper_extraction.yaml")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        jobs = list(pool.map(lambda _: factory.submit(config), range(4)))
+    assert len({job["id"] for job in jobs}) == 1
+
+
+def test_real_pipeline_candidate_contract_with_mock_remote_transport(tmp_path):
+    from tuning_factory.training import LlamaFactoryBackend
+
+    class TransportFixture(LocalExecutor):
+        remote = True
+
+        def run(self, backend, directory, timeout, canceled, checkpoint=None):
+            output = directory / "output"
+            output.mkdir()
+            (output / "adapter_config.json").write_text("{}")
+            (output / "adapter_model.safetensors").write_bytes(b"transport fixture only")
+
+    factory = Factory(tmp_path)
+    factory.registry.register_dataset("dummy", "1", "examples/dummy.json", export_allowed=True)
+    factory.submit(load_config("configs/ai/paper_extraction.yaml"), simulation=False)
+    job = factory.work(executor=TransportFixture(), backend=LlamaFactoryBackend(), approved_transfer=True)
+    assert job["status"] == "COMPLETED"
+    candidates = list((factory.root / "candidates").glob("*.json"))
+    assert len(candidates) == 1
+    assert json.loads(candidates[0].read_text())["approval"] == "pending"
+    factory.verify_artifacts(job["id"])

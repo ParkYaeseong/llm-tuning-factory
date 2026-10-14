@@ -1,7 +1,9 @@
 """Immutable registry revisions, with hashes checked at every use."""
 import hashlib
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 
 
@@ -21,12 +23,21 @@ def safe_name(value: str) -> str:
 
 def immutable_write(path: Path, data: bytes):
     path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
     try:
-        with path.open("xb") as f:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as f:
+            temporary = Path(f.name)
             f.write(data)
-    except FileExistsError:
-        if path.read_bytes() != data:
-            raise ValueError(f"immutable version already exists: {path.name}") from None
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.read_bytes() != data:
+                raise ValueError(f"immutable version already exists: {path.name}") from None
+    finally:
+        if temporary:
+            temporary.unlink(missing_ok=True)
 
 
 class Registry:

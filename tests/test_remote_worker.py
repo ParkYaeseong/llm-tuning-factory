@@ -1,0 +1,126 @@
+import json
+import shlex
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
+
+import pytest
+
+from tuning_factory import worker
+from tuning_factory.config import load_config
+from tuning_factory.execution import ExecutionUncertain, SSHExecutor
+from tuning_factory.manifest import resolve
+from tuning_factory.registry import Registry, canonical
+from tuning_factory.training import LlamaFactoryBackend
+
+
+def test_worker_checks_integrity_and_publishes_real_completion_contract(tmp_path, monkeypatch):
+    registry = Registry(tmp_path / "registry")
+    registry.register_dataset("dummy", "1", "examples/dummy.json", export_allowed=True)
+    config = load_config("configs/ai/paper_extraction.yaml")
+    manifest = resolve(config, registry, simulation=False)
+    directory = tmp_path / "job"
+    backend = LlamaFactoryBackend()
+    backend.prepare(config, directory, Path("examples/dummy.json").read_bytes())
+    (directory / "manifest.json").write_bytes(canonical(manifest))
+
+    class FixtureBackend(LlamaFactoryBackend):
+        def train(self, directory, timeout, canceled=lambda: False):
+            (directory / "output").mkdir(exist_ok=True)
+            (directory / "output" / "adapter_config.json").write_text("{}")
+            (directory / "output" / "adapter_model.safetensors").write_bytes(b"unit-test fixture; not weights")
+
+    monkeypatch.setattr(worker, "LlamaFactoryBackend", FixtureBackend)
+    monkeypatch.setattr(worker.importlib.metadata, "version", lambda _: "0.9.5")
+    monkeypatch.setenv("FACTORY_GPU_LOCK_FILE", str(Path("containers/gpu-requirements.lock").resolve()))
+    monkeypatch.setattr("sys.argv", ["worker", str(directory), "5"])
+    worker.main()
+    assert json.loads((directory / "result.json").read_text())["status"] == "COMPLETED"
+    assert (directory / "artifacts.json").exists()
+    (directory / "train.yaml").write_text("model_name_or_path: altered\n")
+    worker.main()
+    result = json.loads((directory / "result.json").read_text())
+    assert result["status"] == "FAILED"
+    assert "YAML hash" in result["error"]
+
+
+class FakeSFTP:
+    def __init__(self, root):
+        self.root = root
+
+    def path(self, path):
+        return self.root.joinpath(*PurePosixPath(path).parts[1:])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def mkdir(self, path):
+        self.path(path).mkdir()
+
+    def lstat(self, path):
+        return self.path(path).lstat()
+
+    def put(self, source, target):
+        self.path(target).write_bytes(Path(source).read_bytes())
+
+    def get(self, source, target):
+        Path(target).write_bytes(self.path(source).read_bytes())
+
+    def open(self, path, mode="r"):
+        return self.path(path).open(mode)
+
+    def listdir_attr(self, path):
+        return [SimpleNamespace(filename=p.name, st_mode=p.lstat().st_mode) for p in self.path(path).iterdir()]
+
+
+class FakeSSH:
+    def __init__(self, root):
+        self.sftp = FakeSFTP(root)
+        self.commands = []
+
+    def open_sftp(self):
+        return self.sftp
+
+    def exec_command(self, command, timeout):
+        self.commands.append(command)
+        args = shlex.split(command)
+        directory = self.sftp.path(args[4])
+        (directory / "output").mkdir(exist_ok=True)
+        (directory / "output" / "evidence.txt").write_text("mock transport fixture")
+        hashes = LlamaFactoryBackend().collect_artifacts(directory)
+        (directory / "artifacts.json").write_bytes(canonical(hashes))
+        (directory / "result.json").write_text('{"status":"COMPLETED"}')
+        stream = SimpleNamespace(channel=SimpleNamespace(recv_exit_status=lambda: 0))
+        return None, stream, None
+
+    def close(self):
+        pass
+
+
+def test_ssh_transfers_and_verifies_artifacts_with_unique_attempt_names(tmp_path):
+    directory = tmp_path / ("a" * 32)
+    directory.mkdir()
+    (directory / "train.yaml").write_text("test: true")
+    client = FakeSSH(tmp_path / "remote")
+    client.sftp.root.mkdir()
+    executor = SSHExecutor("test-host", 22, "root", "unused", client=client)
+    executor.run(LlamaFactoryBackend(), directory, 5, lambda: False)
+    assert (directory / "output" / "evidence.txt").read_text() == "mock transport fixture"
+    executor.run(LlamaFactoryBackend(), directory, 5, lambda: False)
+    assert client.commands[0] != client.commands[1]
+
+
+def test_controller_interrupt_preserves_uncertain_execution(tmp_path):
+    class InterruptedSSH(FakeSSH):
+        def exec_command(self, command, timeout):
+            raise KeyboardInterrupt
+
+    directory = tmp_path / ("a" * 32)
+    directory.mkdir()
+    client = InterruptedSSH(tmp_path / "remote")
+    client.sftp.root.mkdir()
+    executor = SSHExecutor("test-host", 22, "root", "unused", client=client)
+    with pytest.raises(ExecutionUncertain):
+        executor.run(LlamaFactoryBackend(), directory, 5, lambda: False)
