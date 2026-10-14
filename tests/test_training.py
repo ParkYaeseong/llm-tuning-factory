@@ -1,11 +1,12 @@
 import json
 import sys
+import time
 
 import pytest
 import yaml
 
 from tuning_factory.config import load_config
-from tuning_factory.training import LlamaFactoryBackend, MockTrainingBackend
+from tuning_factory.training import CanceledError, LlamaFactoryBackend, MockTrainingBackend
 
 
 def test_yaml_translation_and_real_subprocess(tmp_path):
@@ -55,3 +56,11 @@ def test_qlora_config(tmp_path):
     plan = yaml.safe_load((tmp_path / "train.yaml").read_text())
     assert plan["quantization_bit"] == 4
     assert plan["quantization_method"] == "bitsandbytes"
+
+
+def test_active_subprocess_cancellation(tmp_path):
+    backend = LlamaFactoryBackend(command=[sys.executable, "-c", "import time; time.sleep(20)"])
+    start = time.monotonic()
+    with pytest.raises(CanceledError):
+        backend.train(tmp_path, 30, canceled=lambda: time.monotonic() - start > 0.2)
+    assert time.monotonic() - start < 10
