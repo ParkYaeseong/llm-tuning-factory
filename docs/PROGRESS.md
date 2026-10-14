@@ -2,8 +2,14 @@
 
 ## Latest live verification (supersedes the earlier baseline below)
 
-Fresh full suite: **47 passed, 1 skipped**. Ruff src/tests passes; wheel build succeeds.
+Fresh full suite after distribution setup: **49 passed, 1 skipped**. Ruff src/tests passes; wheel build succeeds.
 The skipped pytest is the opt-in GPU case; manual paid GPU evidence is separate.
+
+Distribution uses one installation and local state per PC, with common MLflow records. Local .env loading
+supports only known settings, preserves shell environment precedence and never copies secrets into manifests.
+FACTORY_OPERATOR labels common runs. The Git history/staging secret check found no known credentials or
+supported token/private-key patterns across 142 file versions before the distribution commit.
+The initial sharing target is the private ParkYaeseong/llm-tuning-factory repository; see README.md for setup.
 
 Production MLflow authentication, registry reads, successful/failed diagnostic runs and artifact upload/download
 checksums pass at https://mlflow.kbiofoundry.kr. The legacy URL redirects here. Receipts are

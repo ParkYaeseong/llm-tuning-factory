@@ -9,6 +9,21 @@ from pydantic import model_validator
 
 from .config import StrictModel
 
+ENV_SETTINGS = frozenset({
+    "RUNPOD_API_KEY", "MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_TOKEN",
+    "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "MLFLOW_OIDC_CLIENT_SECRET",
+    "FACTORY_MLFLOW_ARTIFACT_LOCATION", "FACTORY_OPERATOR",
+})
+
+
+def load_environment(path=Path(".env")):
+    """Read local settings without executing shell syntax or overriding process settings."""
+    path = Path(path)
+    if path.is_file():
+        for key, value in read_env_file(path).items():
+            if key in ENV_SETTINGS and value:
+                os.environ.setdefault(key, value)
+
 
 def read_env_file(path):
     result = {}

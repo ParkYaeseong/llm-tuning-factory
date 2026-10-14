@@ -23,6 +23,8 @@ class MLflowTracker:
         tags = {"factory.job_id": job_id, "factory.simulation": str(manifest["simulation"]).lower(),
                 "factory.ai_id": manifest["config"]["ai_id"],
                 "factory.workflow_id": manifest["config"]["workflow_id"]}
+        if os.environ.get("FACTORY_OPERATOR"):
+            tags["factory.operator"] = os.environ["FACTORY_OPERATOR"]
         run_id = self.client.create_run(self.experiment_id, tags=tags).info.run_id
         try:
             for key, value in manifest.items():

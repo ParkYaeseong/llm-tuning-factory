@@ -23,7 +23,11 @@ def output(value):
 
 @app.callback()
 def main(ctx: typer.Context, state_dir: Path = Path("state"), policy_file: Path | None = None,
-         tracking_uri: str | None = None, connection_file: Path | None = None):
+         tracking_uri: str | None = None, connection_file: Path | None = None, env_file: Path = Path(".env")):
+    from .connections import load_environment
+    if env_file != Path(".env") and not env_file.is_file():
+        raise typer.BadParameter("Specified environment file does not exist", param_hint="--env-file")
+    load_environment(env_file)
     connection = None
     if connection_file:
         from .connections import load_connection

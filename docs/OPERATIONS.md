@@ -4,7 +4,10 @@
 
 Use Python 3.12 and `uv sync --python 3.12 --extra dev --extra tracking --locked` from the project root.
 MLflow is optional: omit --extra tracking when unused. Keep all runner processes on one host and use one state directory.
-The CLI does not automatically read .env; supply environment variables through your shell or secret manager.
+The CLI reads supported settings from .env in the current working directory, without overriding existing
+process environment variables. Use --env-file PATH for another local file. Never commit a populated file.
+The distributed-PC setup and first installation steps are in README.md. Each PC has its own queue/leases;
+use separate Pods or one designated operator per Pod. MLflow does not coordinate cross-PC GPU ownership.
 
 ```powershell
 uv run factory --state-dir state/demo dataset-register dummy 1 examples/dummy.json
@@ -36,8 +39,8 @@ configs/integrations/kbf.env.example. Its existing scripts/mlflow_util.py refres
 set MLFLOW_OIDC_TOKEN_URL, MLFLOW_OIDC_CLIENT_ID and MLFLOW_OIDC_CLIENT_SECRET in the process environment/secret manager.
 The client obtains an HTTPS client-credentials token before creating the tracking client and refreshes it in a daemon
 thread before expiry. MLflow reads MLFLOW_TRACKING_TOKEN per request. Authentication failures are not silently ignored;
-token/client-secret values are never printed. Existing /workspace/kc.env or local .env secrets are not imported automatically.
-The existing server returned HTTP 308 to unauthenticated health/version probes; authenticated tracking remains unverified.
+token/client-secret values are never printed. Files outside the local .env are loaded only by explicit reference.
+Authenticated production tracking and artifact round trips have now been verified; see LIVE_INTEGRATION.md.
 
 Each attempt creates a run and logs the resolved manifest, training YAML, metrics, logs and output/checkpoints.
 Job metadata stores the current run ID; attempts/N/outcome.json preserves older IDs. Production candidates are registered
@@ -68,7 +71,8 @@ Regenerate the Linux dependency lock deliberately with:
 uv pip compile pyproject.toml containers/gpu-requirements.in --python-version 3.12 --python-platform x86_64-manylinux_2_28 --generate-hashes --output-file containers/gpu-requirements.lock --no-header
 ```
 
-GPU engine/container dependencies are **resolved**, not installed or GPU-tested here.
+The isolated existing-Pod venv has been GPU-tested with BF16 LoRA/native generation. The container image itself
+has not been built or tested. See PROGRESS.md for the interrupted complete-artifact collection and remaining checks.
 
 ## Approved existing Pod — first real test
 

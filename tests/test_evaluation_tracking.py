@@ -26,6 +26,7 @@ def test_json_and_extraction_no_invented_scores():
 def test_mlflow_real_local_tracking(tmp_path, monkeypatch):
     # Local filesystem backend explicitly enabled only inside this isolated test.
     monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+    monkeypatch.setenv("FACTORY_OPERATOR", "test-operator")
     tracker = MLflowTracker(tmp_path.as_uri() + "/mlruns")
     run_id = tracker.start("job-test", {"config": {"ai_id": "test", "workflow_id": "test"}, "simulation": True})
     artifact = tmp_path / "manifest.json"
@@ -34,6 +35,7 @@ def test_mlflow_real_local_tracking(tmp_path, monkeypatch):
     run = tracker.client.get_run(run_id)
     assert run.info.status == "FINISHED"
     assert run.data.tags["factory.job_id"] == "job-test"
+    assert run.data.tags["factory.operator"] == "test-operator"
     assert run.data.metrics["pipeline_completed"] == 1.0
     assert tracker.client.list_artifacts(run_id, "evidence")
 
