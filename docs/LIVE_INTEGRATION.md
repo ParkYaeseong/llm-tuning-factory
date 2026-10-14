@@ -75,6 +75,11 @@ The session controller persists approval/deadline metadata, starts an independen
 and confirms EXITED on stop. It does not take ownership of any other user's running Pod.
 
 The isolated runtime is /workspace/factory-acceptance/runtime; existing virtual environments are not modified.
+After the first session stopped with EXITED confirmed, the user explicitly approved an additional 10 minutes
+for BF16, native generation and recovery checks. The independent deadline guard also covers that session.
+Actual dependency/FP16 failures are retained as failed runs. Matching Torch audio/vision versions and
+prediction dependencies are pinned; BF16 and finite-gradient health checks replace the failed FP16 default.
+See PROGRESS.md for the final collected results; code implementation alone is not GPU acceptance.
 The public SSH key changed on restart. A first-use fingerprint was explicitly pinned for the API-reported Pod endpoint;
 it was not independently verified by the provider. Subsequent connections enforce that pin and do not use AutoAddPolicy.
 The pin/session files are local and ignored. The guard reduces risk but cannot stop billing during host/network failure;

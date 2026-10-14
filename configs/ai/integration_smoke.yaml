@@ -9,8 +9,11 @@ tokenizer_revision: 7ae557604adf67be50417f59c2c2f167def9a775
 training_method: lora
 template: qwen
 hyperparameters:
+  precision: bf16
+  lora_target: q_proj,v_proj
   max_steps: 2
   save_steps: 1
+  save_total_limit: 1
   cutoff_len: 128
   gradient_accumulation_steps: 1
 evaluation_profile:

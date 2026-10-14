@@ -1,5 +1,57 @@
 # Progress and acceptance status — 2026-10-14
 
+## Latest live verification (supersedes the earlier baseline below)
+
+Fresh full suite: **47 passed, 1 skipped**. Ruff src/tests passes; wheel build succeeds.
+The skipped pytest is the opt-in GPU case; manual paid GPU evidence is separate.
+
+Production MLflow authentication, registry reads, successful/failed diagnostic runs and artifact upload/download
+checksums pass at https://mlflow.kbiofoundry.kr. The legacy URL redirects here. Receipts are
+state/live-integration/connection-check.json and state/production-acceptance/acceptance.json.
+Three synthetic CPU AI workflows completed with distinct production runs. These are infrastructure checks.
+
+Actual RunPod REST metadata, pinned SSH and H200 SFT were exercised using synthetic data only.
+The first authorized 20-minute session stopped with EXITED confirmed before its deadline. A separately
+authorized additional 10-minute session is recorded in .factory/gpu-session.json; no further extension is authorized.
+Existing runtimes were preserved; all remote changes are under /workspace/factory-acceptance.
+
+Real failed attempts exposed an incompatible optional torchaudio version, missing prediction dependencies,
+and FP16 non-finite gradients with all-zero adapter B weights. Those attempts are FAILED and are not accepted tuning.
+The Linux lock now pins matching torch/torchaudio/torchvision 2.7.1/2.7.1/0.22.1 and prediction dependencies.
+BF16 is the default; the worker rejects non-finite loss/gradient metrics and writes training-health.json.
+The source-hash gate also correctly rejected a stale remote worker. One provider read temporarily omitted SSH mappings.
+
+Registered validation generation and detached result reconciliation are now implemented and CPU-tested.
+Actual healthy BF16 and generation outcomes are recorded in the final session evidence below.
+Actual GPU checkpoint resume, QLoRA, multi-AI GPU batch, numerical reproducibility and Model Registry
+version publication remain unverified. Real task quality requires authorized representative validation data.
+
+The GPU image has not been built. Automatic approval review rejected Rancher startup with 'blocked by policy';
+no alternate startup was attempted. The approved Pod uses an isolated hash-locked venv.
+GitHub CI has not run; commits remain local. Preserve local state/ and the remote persistent volume.
+
+### Final session evidence
+
+H200 worker job 260aa618906147cf9d4da5bc92e29ebd completed two BF16 LoRA steps and native generation
+for one synthetic validation example. Observed result.json was COMPLETED (engine 0.9.5);
+training-health.json checked five finite statistics at global step 2. Train loss was about 0.7071;
+gradient norms were 6.089 and 9.449. The downloaded adapter contains 196,608 finite, nonzero LoRA B values.
+Native prediction produced a fenced JSON answer, so strict JSON validity must not be described as a quality pass.
+
+The approved stop interrupted the large artifact download after worker completion. The overall job and MLflow
+run f0c5f94e8a04426c88eb8bbbd500115c are FAILED, not end-to-end accepted. The partial adapter/predictions
+are local; complete remote evidence remains on the persistent volume and needs reconciliation after a separately
+authorized restart. Local receipt: state/gpu-acceptance/verified-gpu-evidence.json. GPU checkpoint recovery
+was not attempted because remaining approved time was insufficient. Pod q17zwk1tbndy45 is STOPPED;
+provider desiredStatus EXITED was confirmed. No further paid session was started.
+
+The transfer code now preserves remote result/hash evidence before large downloads and downloads top-level
+files before nested checkpoint directories. A regression test reproduces interrupted collection and verifies
+that remote completion evidence survives. This prevents loss of the completion marker on future interrupted
+transfers; it does not retroactively certify missing artifacts from this session.
+
+## Earlier CPU baseline (historical)
+
 ## Delivered implementation
 
 - Strict AI configuration, conservative Qwen/Llama3 template catalog and pinned model/tokenizer revisions.

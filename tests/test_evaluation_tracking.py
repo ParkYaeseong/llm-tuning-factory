@@ -36,3 +36,24 @@ def test_mlflow_real_local_tracking(tmp_path, monkeypatch):
     assert run.data.tags["factory.job_id"] == "job-test"
     assert run.data.metrics["pipeline_completed"] == 1.0
     assert tracker.client.list_artifacts(run_id, "evidence")
+
+
+def test_artifact_failure_terminates_run_as_failed(tmp_path, monkeypatch):
+    monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+    tracker = MLflowTracker(tmp_path.as_uri() + "/mlruns")
+    run_id = tracker.start("failed-persistence", {"config": {"ai_id": "test", "workflow_id": "test"}, "simulation": True})
+    (tmp_path / "manifest.json").write_text("{}")
+
+    def broken_upload(*args, **kwargs):
+        raise RuntimeError("test artifact failure")
+
+    monkeypatch.setattr(tracker.client, "log_artifact", broken_upload)
+    with pytest.raises(RuntimeError, match="artifact failure"):
+        tracker.finish(run_id, {}, tmp_path, "COMPLETED")
+    assert tracker.client.get_run(run_id).info.status == "FAILED"
+
+
+def test_invalid_generated_extraction_json_cannot_score_as_empty_object():
+    metrics = CommonEvaluator().evaluate(["invalid JSON"], ["{}"], "extraction")
+    assert metrics["accuracy"] == 0
+    assert metrics["f1"] == 0

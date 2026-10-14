@@ -46,11 +46,14 @@ def main():
     parser.add_argument("--session", type=Path, default=Path(".factory/gpu-session.json"))
     parser.add_argument("--connection", type=Path, default=Path(".factory/connection.json"))
     parser.add_argument("--approve-paid-start-and-stop", action="store_true")
+    parser.add_argument("--max-seconds", type=int, default=1200)
     args = parser.parse_args()
     session = args.session.resolve()
     if args.action == "start":
         if not args.approve_paid_start_and_stop:
             raise ValueError("explicit approval flag required")
+        if not 60 <= args.max_seconds <= 1200:
+            raise ValueError("approved session duration must be between 60 and 1200 seconds")
         profile = load_connection(args.connection)
         controller = RunPodController(os.environ["RUNPOD_API_KEY"])
         pod = controller.status(profile.pod_id)
@@ -58,7 +61,8 @@ def main():
             raise ValueError("Pod state/price differs from approved stopped $5.29/hour allocation")
         data = {"authorization": "explicit-user-approved-start-test-stop", "pod_id": profile.pod_id,
                 "connection_file": str(args.connection.resolve()), "original_status": "EXITED",
-                "deadline": time.time() + 1200, "hourly_cost_usd": float(pod["costPerHr"]), "state": "STARTING"}
+                "deadline": time.time() + args.max_seconds, "authorized_duration_seconds": args.max_seconds,
+                "hourly_cost_usd": float(pod["costPerHr"]), "state": "STARTING"}
         session.parent.mkdir(parents=True, exist_ok=True)
         save(session, data)
         flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS if os.name == "nt" else 0

@@ -140,3 +140,21 @@ def test_sftp_reconciliation_checks_original_manifest(tmp_path):
     client.sftp.path(remote + "/manifest.json").write_text('{"identity":"wrong"}')
     with pytest.raises(ValueError, match="manifest"):
         executor.collect_result(directory)
+
+
+def test_completed_worker_evidence_survives_interrupted_artifact_download(tmp_path, monkeypatch):
+    directory = tmp_path / ("c" * 32)
+    directory.mkdir()
+    client = FakeSSH(tmp_path / "remote")
+    client.sftp.root.mkdir()
+    executor = SSHExecutor("test-host", 22, "root", "unused", client=client)
+
+    def interrupted(*args):
+        raise OSError("connection lost during large checkpoint download")
+
+    monkeypatch.setattr(executor, "download", interrupted)
+    with pytest.raises(OSError):
+        executor.run(LlamaFactoryBackend(), directory, 5, lambda: False)
+    evidence = json.loads((directory / "remote-result.json").read_text())
+    assert evidence["status"] == "COMPLETED"
+    assert (directory / "remote-artifacts.json").is_file()

@@ -1,10 +1,12 @@
 import json
 
+import pytest
 import yaml
 
 from tuning_factory.config import AIConfig, load_config
 from tuning_factory.manifest import resolve
 from tuning_factory.registry import Registry
+from tuning_factory.runner import Factory
 from tuning_factory.training import LlamaFactoryBackend
 
 
@@ -39,3 +41,5 @@ def test_registered_validation_native_prediction_yaml_and_output(tmp_path):
     output = json.loads((directory / "output" / "predictions.json").read_text())
     assert output["predictions"] == ["record"]
     assert output["validation_sha256"] == manifest["validation_dataset"]["sha256"]
+    with pytest.raises(ValueError, match="validation data"):
+        Factory.evaluate(directory, config, False, validation_sha="wrong-hash")

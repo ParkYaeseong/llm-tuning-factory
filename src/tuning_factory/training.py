@@ -1,5 +1,6 @@
 """Training engine interface and the only production engine adapter."""
 import json
+import math
 import os
 import signal
 import subprocess
@@ -72,7 +73,9 @@ class LlamaFactoryBackend(TrainingBackend):
                 "finetuning_type": "lora", "template": config.template,
                 "dataset": "factory_dataset", "dataset_dir": "./data", "output_dir": "./output",
                 "overwrite_output_dir": False, "report_to": "none", "logging_steps": 1,
-                "save_only_model": False, "fp16": True, **config.hyperparameters.model_dump()}
+                "save_only_model": False, "fp16": config.hyperparameters.precision == "fp16",
+                "bf16": config.hyperparameters.precision == "bf16",
+                **config.hyperparameters.model_dump(exclude={"precision"})}
         if config.training_method == "qlora":
             plan.update(quantization_bit=4, quantization_method="bitsandbytes")
         return plan
@@ -130,7 +133,8 @@ class LlamaFactoryBackend(TrainingBackend):
                 "predict_with_generate": True, "max_samples": profile.max_samples,
                 "max_new_tokens": profile.max_new_tokens, "do_sample": False,
                 "cutoff_len": config.hyperparameters.cutoff_len, "per_device_eval_batch_size": 1,
-                "report_to": "none", "fp16": True}
+                "report_to": "none", "fp16": config.hyperparameters.precision == "fp16",
+                "bf16": config.hyperparameters.precision == "bf16"}
         if config.training_method == "qlora":
             plan.update(quantization_bit=4, quantization_method="bitsandbytes")
         (directory / "predict.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
@@ -167,6 +171,21 @@ class LlamaFactoryBackend(TrainingBackend):
         return {p.relative_to(directory).as_posix(): digest(p.read_bytes())
                 for p in sorted(directory.rglob("*")) if p.is_file() and not p.is_symlink()
                 and p.name not in {"artifacts.json", "tracking-error.txt"}}
+
+    def validate_training_result(self, directory):
+        state_path = Path(directory) / "output" / "trainer_state.json"
+        if not state_path.is_file():
+            return
+        state = json.loads(state_path.read_text())
+        checked = 0
+        for item in state.get("log_history", []):
+            for key in ("loss", "train_loss", "grad_norm"):
+                if key in item:
+                    checked += 1
+                    if not math.isfinite(float(item[key])):
+                        raise ValueError(f"non-finite {key} in training state; review precision and optimizer configuration")
+        (Path(directory) / "training-health.json").write_text(json.dumps({"finite_statistics_checked": checked,
+                                                                         "global_step": state.get("global_step")}))
 
     def cleanup(self, directory):
         # Retain all evidence; lifecycle ownership is the executor's responsibility.

@@ -64,3 +64,22 @@ def test_active_subprocess_cancellation(tmp_path):
     with pytest.raises(CanceledError):
         backend.train(tmp_path, 30, canceled=lambda: time.monotonic() - start > 0.2)
     assert time.monotonic() - start < 10
+
+
+def test_bf16_translation_for_supported_gpu():
+    config = load_config("configs/ai/integration_smoke.yaml")
+    plan = LlamaFactoryBackend.translate(config)
+    assert plan["bf16"] is True
+    assert plan["fp16"] is False
+    assert "precision" not in plan
+
+
+def test_nonfinite_gradients_fail_training_health_check(tmp_path):
+    (tmp_path / "output").mkdir()
+    state = tmp_path / "output" / "trainer_state.json"
+    state.write_text('{"global_step":2,"log_history":[{"loss":0.7,"grad_norm":NaN}]}')
+    with pytest.raises(ValueError, match="non-finite grad_norm"):
+        LlamaFactoryBackend().validate_training_result(tmp_path)
+    state.write_text('{"global_step":2,"log_history":[{"loss":0.7,"grad_norm":1.2}]}')
+    LlamaFactoryBackend().validate_training_result(tmp_path)
+    assert json.loads((tmp_path / "training-health.json").read_text())["global_step"] == 2

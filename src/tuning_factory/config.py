@@ -14,6 +14,7 @@ Identifier = str
 
 
 class Hyperparameters(StrictModel):
+    precision: Literal["fp16", "bf16"] = "bf16"
     learning_rate: float = Field(default=0.0001, gt=0, le=1)
     num_train_epochs: float = Field(default=1, gt=0, le=100)
     per_device_train_batch_size: int = Field(default=1, ge=1, le=64)
@@ -24,6 +25,7 @@ class Hyperparameters(StrictModel):
     seed: int = 42
     max_steps: int = Field(default=-1, ge=-1)
     save_steps: int = Field(default=50, ge=1)
+    save_total_limit: int = Field(default=2, ge=1, le=20)
 
 
 class EvaluationProfile(StrictModel):

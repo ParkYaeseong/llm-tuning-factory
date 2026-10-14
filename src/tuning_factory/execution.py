@@ -186,7 +186,9 @@ class SSHExecutor(ExecutionBackend):
 
     def download(self, sftp, remote, local):
         local.mkdir(parents=True, exist_ok=True)
-        for entry in sftp.listdir_attr(remote):
+        # Preserve small top-level evidence before descending into large checkpoints.
+        entries = sorted(sftp.listdir_attr(remote), key=lambda item: (stat.S_ISDIR(item.st_mode), item.filename))
+        for entry in entries:
             if entry.filename in {".", ".."} or "/" in entry.filename or "\\" in entry.filename:
                 raise ValueError("unsafe remote artifact name")
             source, target = remote + "/" + entry.filename, local / entry.filename
@@ -244,6 +246,7 @@ class SSHExecutor(ExecutionBackend):
                     if time.monotonic() >= deadline:
                         raise ExecutionUncertain("remote worker deadline exceeded; reconcile Pod and retain GPU lock")
                     time.sleep(1)
+                self.save_remote_evidence(sftp, remote, directory, result)
                 self.download(sftp, remote, directory)
                 hashes = json.loads((directory / "artifacts.json").read_text())
                 for name, sha in hashes.items():
@@ -261,6 +264,13 @@ class SSHExecutor(ExecutionBackend):
             raise
         finally:
             self.client.close()
+
+    @staticmethod
+    def save_remote_evidence(sftp, remote, directory, result):
+        (directory / "remote-result.json").write_text(json.dumps(result), encoding="utf-8")
+        with sftp.open(remote + "/artifacts.json") as stream:
+            hashes = json.loads(stream.read())
+        (directory / "remote-artifacts.json").write_text(json.dumps(hashes), encoding="utf-8")
 
     def collect_result(self, directory):
         directory = Path(directory).resolve()
@@ -285,6 +295,7 @@ class SSHExecutor(ExecutionBackend):
                 original = json.loads((directory / "manifest.json").read_text())
                 if recovered_manifest != original:
                     raise ValueError("remote manifest differs from original job")
+                self.save_remote_evidence(sftp, remote, directory, result)
                 self.download(sftp, remote, directory)
                 hashes = json.loads((directory / "artifacts.json").read_text())
                 for name, expected in hashes.items():
