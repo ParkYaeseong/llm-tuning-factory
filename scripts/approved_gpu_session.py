@@ -52,8 +52,8 @@ def main():
     if args.action == "start":
         if not args.approve_paid_start_and_stop:
             raise ValueError("explicit approval flag required")
-        if not 60 <= args.max_seconds <= 1200:
-            raise ValueError("approved session duration must be between 60 and 1200 seconds")
+        if not 60 <= args.max_seconds <= 5400:
+            raise ValueError("approved session duration must be between 60 and 5400 seconds")
         profile = load_connection(args.connection)
         controller = RunPodController(os.environ["RUNPOD_API_KEY"])
         pod = controller.status(profile.pod_id)

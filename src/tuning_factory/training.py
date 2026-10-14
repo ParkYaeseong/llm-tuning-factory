@@ -170,7 +170,8 @@ class LlamaFactoryBackend(TrainingBackend):
         directory = Path(directory)
         return {p.relative_to(directory).as_posix(): digest(p.read_bytes())
                 for p in sorted(directory.rglob("*")) if p.is_file() and not p.is_symlink()
-                and p.name not in {"artifacts.json", "tracking-error.txt"}}
+                  and p.name not in {"artifacts.json", "tracking-error.txt"}
+                  and p != directory / "cancel"}
 
     def validate_training_result(self, directory):
         state_path = Path(directory) / "output" / "trainer_state.json"

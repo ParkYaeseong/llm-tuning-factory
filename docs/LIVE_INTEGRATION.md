@@ -98,3 +98,10 @@ Native checkpoint-10 restoration reached global step 12 with preserved training 
 27163d2c46ce4bd28fa23badee294cc5 is FINISHED. Receipt files are listed in PROGRESS.md.
 The initial cancellation was late: GPU computation had already finished. This distinction is tagged in
 MLflow and is not accepted as mid-training cancellation. The GPU-local observer is prepared for a later trial.
+
+The later explicitly authorized 90-minute-maximum session completed in 25.3 minutes with EXITED confirmed.
+Actual worker cancellation, expired-heartbeat reconciliation after controller termination, native checkpoint-10
+to step 12 resume and artifact recovery all pass. Resumed run e41e7b766172475fbdc58e74919dbc7c is FINISHED;
+its preceding run 4e09a31fca8442428f44a75fd816d044 is KILLED. The actual worker result and receipt are attached
+to both runs. All 34 final remote immutable hashes and 51 final local inventory entries verify, including
+the MLflow adapter round trip. No actual institutional dataset was used.

@@ -18,5 +18,10 @@ are implemented; consult PROGRESS.md for the latest actual acceptance results an
 
 Follow-up: all 40 original GPU artifacts and the MLflow adapter round trip are verified. Native checkpoint-10
 to step 12 restoration and preserved history are verified; the restored run is FINISHED. The Pod is EXITED.
-Actual mid-training forced cancellation remains unverified because the first control request arrived late.
-GPU-local observation and smaller checkpoint-state transfer are prepared for a separately authorized trial.
+That earlier control request arrived late; a subsequent user-authorized 90-minute maximum session used the
+GPU-local observer and smaller state transfer. Actual mid-training cancellation, controller restart
+reconciliation and checkpoint-10 to step 12 resume now pass. Final artifacts and MLflow round trips verify;
+the Pod was stopped after 25.3 minutes and EXITED confirmed. See the latest PROGRESS.md evidence.
+
+Remaining optional acceptance: QLoRA, GPU batch, numerical reproducibility, image build, registry publication,
+and abrupt hardware/Pod loss during checkpoint writing. Real task quality needs representative authorized data.

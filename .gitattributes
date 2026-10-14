@@ -1,0 +1,8 @@
+# Immutable manifests compare exact source and lockfile bytes across Windows and Linux.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.png binary
+*.jpg binary
+*.pdf binary
+*.whl binary

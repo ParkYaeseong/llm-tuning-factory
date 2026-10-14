@@ -196,6 +196,8 @@ class SSHExecutor(ExecutionBackend):
         for entry in entries:
             if entry.filename in {".", ".."} or "/" in entry.filename or "\\" in entry.filename:
                 raise ValueError("unsafe remote artifact name")
+            if local == root and entry.filename == "cancel":
+                continue  # Mutable control signal, never a model artifact.
             source, target = remote + "/" + entry.filename, local / entry.filename
             if stat.S_ISLNK(entry.st_mode):
                 raise ValueError("remote symlink artifact rejected")
@@ -247,8 +249,13 @@ class SSHExecutor(ExecutionBackend):
                 cancellation_sent = False
                 while True:
                     if canceled() and not cancellation_sent:
-                        with sftp.open(remote + "/cancel", "w") as f:
-                            f.write("cancel")
+                        try:
+                            with sftp.open(remote + "/cancel", "x"):
+                                pass
+                        except OSError:
+                            # SFTP v3 may report existing-file errors without an errno.
+                            # Confirm the competing signal exists; propagate transport errors.
+                            sftp.lstat(remote + "/cancel")
                         cancellation_sent = True
                     try:
                         with sftp.open(remote + "/result.json") as f:
@@ -263,7 +270,6 @@ class SSHExecutor(ExecutionBackend):
                     time.sleep(1)
                 hashes = self.save_remote_evidence(sftp, remote, directory, result)
                 self.download(sftp, remote, directory, hashes)
-                hashes = json.loads((directory / "artifacts.json").read_text())
                 for name, sha in hashes.items():
                     target = (directory / name).resolve()
                     if not target.is_relative_to(directory) or digest(target.read_bytes()) != sha:
@@ -286,7 +292,8 @@ class SSHExecutor(ExecutionBackend):
         with sftp.open(remote + "/artifacts.json") as stream:
             hashes = json.loads(stream.read())
         (directory / "remote-artifacts.json").write_text(json.dumps(hashes), encoding="utf-8")
-        return hashes
+        # Older workers included the signal while another writer could still change it.
+        return {name: value for name, value in hashes.items() if name != "cancel"}
 
     def collect_result(self, directory):
         directory = Path(directory).resolve()
@@ -313,7 +320,6 @@ class SSHExecutor(ExecutionBackend):
                     raise ValueError("remote manifest differs from original job")
                 hashes = self.save_remote_evidence(sftp, remote, directory, result)
                 self.download(sftp, remote, directory, hashes)
-                hashes = json.loads((directory / "artifacts.json").read_text())
                 for name, expected in hashes.items():
                     path = (directory / name).resolve()
                     if not path.is_relative_to(directory) or digest(path.read_bytes()) != expected:

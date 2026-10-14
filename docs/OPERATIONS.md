@@ -73,7 +73,8 @@ uv pip compile pyproject.toml containers/gpu-requirements.in --python-version 3.
 
 The isolated existing-Pod venv has been GPU-tested with BF16 LoRA/native generation. The container image itself
 has not been built or tested. Complete artifact collection and native checkpoint restoration have since
-been verified; actual mid-training interruption remains unverified. See PROGRESS.md for exact evidence.
+been verified, including controlled mid-training cancellation and subsequent native resume. Abrupt Pod loss
+during checkpoint writing is not covered by that test. See PROGRESS.md for exact evidence.
 
 ## Approved existing Pod — first real test
 
@@ -95,6 +96,8 @@ uv run factory work --pod-id POD_ID --host PUBLIC_IP --port SSH_PORT --key-file 
 
 The API response's price, GPU and endpoint must match the configuration. Transfer is blocked for unapproved data or
 simulation manifests. Existing borrowed Pods are left running: their owner remains responsible for billing and shutdown.
+During acceptance, the user may explicitly authorize starting and stopping a named existing test Pod for a bounded
+session. That exception applies only to that Pod/session; it grants no ownership of other borrowed Pods.
 Do not use an unrelated SSH host even if you control its key; the live provider mapping is checked before transfer.
 
 ## Managed paid Pod

@@ -8,19 +8,23 @@ from pathlib import Path
 
 import paramiko
 import yaml
+from recovery_transfer import RecoveryExecutor
 
 from tuning_factory.config import AIConfig, load_config
 from tuning_factory.connections import load_connection
-from tuning_factory.execution import Policy, RunPodController, SSHExecutor
+from tuning_factory.execution import Policy, RunPodController
 from tuning_factory.runner import Factory
 from tuning_factory.tracking import MLflowTracker
 
 session = json.loads(Path('.factory/gpu-session.json').read_text())
 remaining = int(session['deadline'] - time.time())
-if session.get('state') == 'STOPPED' or remaining < 420:
+if (session.get('authorization') != 'explicit-user-approved-start-test-stop'
+        or session.get('state') == 'STOPPED' or remaining < 420):
     raise ValueError('insufficient approved session time for cancellation plus resume; do not extend automatically')
 profile = load_connection('.factory/connection.json')
 pod = RunPodController(os.environ['RUNPOD_API_KEY']).status(profile.pod_id)
+if pod['id'] != session['pod_id'] or pod['desiredStatus'] != 'RUNNING':
+    raise ValueError('approved Pod is not running')
 factory = Factory('state/gpu-recovery', policy=Policy(max_timeout_seconds=1200, max_cost_usd=2),
                   tracker=MLflowTracker(profile.tracking_uri))
 factory.registry.register_dataset('synthetic_smoke', '1', 'examples/dummy.json', export_allowed=True, synthetic=True)
@@ -69,31 +73,6 @@ def monitor_checkpoint():
         monitor_errors.append(type(exc).__name__)
     finally:
         c.close()
-
-
-class RecoveryExecutor(SSHExecutor):
-    def upload(self, sftp, local, remote):
-        marker = local / 'resume.json'
-        if not marker.exists():
-            return super().upload(sftp, local, remote)
-        # The pinned base tokenizer is loaded from HF cache, not from the trainer checkpoint.
-        # Send the selected complete trainer state, avoiding other checkpoints and duplicate tokenizers.
-        checkpoint = json.loads(marker.read_text())['checkpoint']
-        state_files = {'adapter_config.json', 'adapter_model.safetensors', 'optimizer.pt',
-                       'scheduler.pt', 'rng_state.pth', 'trainer_state.json', 'training_args.bin'}
-        root_files = {'manifest.json', 'config.json', 'train.yaml', 'execution.json',
-                      'remote-attempt.json', 'resume.json'}
-        self.mkdir(sftp, remote)
-        for path in local.rglob('*'):
-            relative = path.relative_to(local)
-            include = (relative.as_posix() in root_files or relative.parts[0] == 'data'
-                       or (relative.parent.as_posix() == checkpoint and path.name in state_files))
-            if path.is_file() and include:
-                if path.is_symlink():
-                    raise ValueError('checkpoint symlink rejected')
-                target = remote + '/' + relative.as_posix()
-                self.mkdir(sftp, target.rsplit('/', 1)[0])
-                sftp.put(str(path), target)
 
 
 def executor():

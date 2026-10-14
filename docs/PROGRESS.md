@@ -2,7 +2,7 @@
 
 ## Latest live verification (supersedes the earlier baseline below)
 
-Fresh full suite after recovery hardening: **52 passed, 1 skipped**. Ruff src/tests passes; wheel build succeeds.
+Fresh full suite after cancellation hardening: **57 passed, 1 skipped**. Ruff src/tests passes; wheel build succeeds.
 The skipped pytest is the opt-in GPU case; manual paid GPU evidence is separate.
 
 Distribution uses one installation and local state per PC, with common MLflow records. Local .env loading
@@ -20,8 +20,8 @@ state/live-integration/connection-check.json and state/production-acceptance/acc
 Three synthetic CPU AI workflows completed with distinct production runs. These are infrastructure checks.
 
 Actual RunPod REST metadata, pinned SSH and H200 SFT were exercised using synthetic data only.
-The first authorized 20-minute session stopped with EXITED confirmed before its deadline. A separately
-authorized additional 10-minute session is recorded in .factory/gpu-session.json; no further extension is authorized.
+Earlier 20-minute and 10-minute sessions stopped with EXITED confirmed. The latest explicitly authorized
+90-minute-maximum session is recorded in .factory/gpu-session.json and ended early with EXITED confirmed.
 Existing runtimes were preserved; all remote changes are under /workspace/factory-acceptance.
 
 Real failed attempts exposed an incompatible optional torchaudio version, missing prediction dependencies,
@@ -32,7 +32,8 @@ The source-hash gate also correctly rejected a stale remote worker. One provider
 
 Registered validation generation and detached result reconciliation are now implemented and CPU-tested.
 Actual healthy BF16, generation, complete collection and checkpoint resume are recorded below.
-Mid-training forced interruption, QLoRA, multi-AI GPU batch, numerical reproducibility and Model Registry
+Controlled mid-training process cancellation, native checkpoint resume and controller restart recovery are now verified.
+QLoRA, multi-AI GPU batch, numerical reproducibility and Model Registry
 version publication remain unverified. Real task quality requires authorized representative validation data.
 
 The GPU image has not been built. Automatic approval review rejected Rancher startup with 'blocked by policy';
@@ -59,7 +60,7 @@ files before nested checkpoint directories. A regression test reproduces interru
 that remote completion evidence survives. This prevents loss of the completion marker on future interrupted
 transfers; it does not retroactively certify missing artifacts from this session.
 
-### Collection and native checkpoint restore follow-up
+### Earlier collection and saved-checkpoint restore follow-up
 
 The user authorized one additional bounded session of at most 20 minutes at the live $5.29/hour rate.
 Only synthetic data was used. The independent watcher ran before start. Pod q17zwk1tbndy45 was stopped
@@ -88,6 +89,44 @@ case, but were not GPU-executed in this session. No unapproved extension or addi
 Collection now skips already hash-verified files and atomically replaces corrupted/partial downloads.
 New attempts exclude previous completion/cancellation markers and controller receipts from upload.
 Regression tests cover interrupted collection, hash-based reuse/repair and stale-marker exclusion.
+
+### Actual mid-training cancellation and recovery — latest evidence
+
+The user explicitly allowed more than one hour after the short earlier limits. A new **90-minute maximum**
+was selected at the live $5.29/hour rate, with an independent local deadline watcher and synthetic data only.
+The session ended early after **25.3 minutes**, with stop and provider desiredStatus **EXITED** confirmed.
+The watcher was rearmed when the original local controller process terminated. Host-local guards cannot
+enforce provider billing limits during host/process downtime; they are not provider-side billing caps.
+
+The first real cancellation exposed a race: the mutable cancel signal was hashed while a control writer
+could truncate/change it. GPU cancellation succeeded, but collection correctly rejected the changed bytes.
+That attempt's immutable artifacts were subsequently recovered and its run is KILLED; its failure is retained.
+The fix excludes only the root cancel signal from immutable inventories, preserves the raw remote inventory,
+and creates cancellation signals exclusively without overwriting an existing signal. Legacy inventories
+containing that mutable signal remain recoverable while all model/data/checkpoint hashes are still checked.
+Regression tests reproduce both the mutation and SFTP v3 existing-file errors without an errno.
+
+The corrected real trial is job **1772b42a93d94bcdab0f6b9ea0e58c8c**:
+
+- Initial GPU worker actually published `status=CANCELED`, before a final trainer state existed.
+- Complete checkpoint-10 retained adapter, optimizer, scheduler, RNG and trainer state.
+- After the local control process terminated, expired-heartbeat recovery retained the GPU lease;
+  reconciliation recovered the original result without duplicate training and released the lease.
+- Native LLaMA-Factory resumed with `output/checkpoint-10`, retained the saved history prefix,
+  and finished at global step **12**. Training health checked **25** finite statistics.
+- **34** immutable files in the final remote inventory match locally. All **51** files in the final
+  control-plane inventory also verify. The MLflow adapter upload/download hash matches.
+- The recovered adapter contains **196,608** finite, nonzero LoRA B values.
+- Canceled run **4e09a31fca8442428f44a75fd816d044** is KILLED; resumed run
+  **e41e7b766172475fbdc58e74919dbc7c** is FINISHED, both in experiment 16.
+
+The receipt state/gpu-recovery/recovery-receipt.json and actual first-worker result were uploaded to both
+MLflow runs. Receipt flags worker_cancellation_observed=true and controller_restart_recovery_verified=true
+distinguish this result from the earlier late control-plane cancellation. It remains synthetic-only and is
+not a production model-quality qualification. Abrupt hardware/Pod loss during checkpoint writing was not tested.
+
+Git LF checkout rules now preserve exact source/lockfile bytes across Windows and Linux. Actual index checkouts
+with core.autocrlf=true and false matched the control-plane source hash and all three dependency file hashes.
 
 ## Earlier CPU baseline (historical)
 

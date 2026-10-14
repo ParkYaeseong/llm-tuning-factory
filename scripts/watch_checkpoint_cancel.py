@@ -20,7 +20,7 @@ def watch(directory, timeout_seconds, target_step):
                 step = int(state['global_step'])
                 if not 0 < step < target_step or checkpoint.name != f'checkpoint-{step}':
                     continue
-                (directory / 'cancel').write_text('checkpoint observer requested cancellation')
+                (directory / 'cancel').touch(exist_ok=True)
                 return {'checkpoint': checkpoint.name, 'step': step, 'cancel_requested': True}
             except (OSError, ValueError, KeyError):
                 continue

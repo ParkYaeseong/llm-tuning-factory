@@ -9,7 +9,7 @@ from tuning_factory import worker
 from tuning_factory.config import load_config
 from tuning_factory.execution import ExecutionUncertain, SSHExecutor
 from tuning_factory.manifest import resolve
-from tuning_factory.registry import Registry, canonical
+from tuning_factory.registry import Registry, canonical, digest
 from tuning_factory.training import LlamaFactoryBackend
 
 
@@ -203,3 +203,57 @@ def test_new_attempt_does_not_upload_previous_completion_or_controller_receipts(
     monkeypatch.setattr(client, 'exec_command', inspect)
     executor = SSHExecutor('test-host', 22, 'root', 'unused', client=client)
     executor.run(LlamaFactoryBackend(), directory, 5, lambda: False)
+
+
+def test_legacy_mutable_cancel_signal_does_not_invalidate_model_artifacts(tmp_path):
+    class ChangedCancelSSH(FakeSSH):
+        def exec_command(self, command, timeout):
+            directory = self.sftp.path(shlex.split(command)[4])
+            (directory / 'cancel').touch()
+            result = super().exec_command(command, timeout)
+            hashes = json.loads((directory / 'artifacts.json').read_text())
+            hashes['cancel'] = digest(b'')
+            (directory / 'artifacts.json').write_bytes(canonical(hashes))
+            (directory / 'cancel').write_text('late control-plane signal')
+            return result
+
+    directory = tmp_path / ('f' * 32)
+    directory.mkdir()
+    client = ChangedCancelSSH(tmp_path / 'remote')
+    client.sftp.root.mkdir()
+    executor = SSHExecutor('test-host', 22, 'root', 'unused', client=client)
+    executor.run(LlamaFactoryBackend(), directory, 5, lambda: False)
+    assert (directory / 'output' / 'evidence.txt').read_text() == 'mock transport fixture'
+    assert not (directory / 'cancel').exists()
+
+
+def test_control_cancel_marker_is_excluded_from_immutable_artifact_inventory(tmp_path):
+    (tmp_path / 'cancel').touch()
+    (tmp_path / 'checkpoint-state').write_text('immutable trainer fixture')
+    hashes = LlamaFactoryBackend().collect_artifacts(tmp_path)
+    assert 'cancel' not in hashes
+    assert 'checkpoint-state' in hashes
+
+
+def test_cancel_signal_is_idempotent_with_sftp_v3_existing_file_error(tmp_path):
+    class V3SFTP(FakeSFTP):
+        def open(self, path, mode='r'):
+            if path.endswith('/cancel') and mode == 'x' and self.path(path).exists():
+                raise OSError('Failure')  # SFTP v3 does not preserve EEXIST.
+            return super().open(path, mode)
+
+    class SignaledSSH(FakeSSH):
+        def exec_command(self, command, timeout):
+            directory = self.sftp.path(shlex.split(command)[4])
+            (directory / 'cancel').write_text('observer signal must remain unchanged')
+            return super().exec_command(command, timeout)
+
+    directory = tmp_path / ('1' * 32)
+    directory.mkdir()
+    client = SignaledSSH(tmp_path / 'remote')
+    client.sftp = V3SFTP(client.sftp.root)
+    client.sftp.root.mkdir()
+    executor = SSHExecutor('test-host', 22, 'root', 'unused', client=client)
+    executor.run(LlamaFactoryBackend(), directory, 5, lambda: True)
+    remote = json.loads((directory / 'remote-attempt.json').read_text())['remote_path']
+    assert client.sftp.path(remote + '/cancel').read_text() == 'observer signal must remain unchanged'
