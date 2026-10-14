@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import paramiko
+import yaml
 
 from tuning_factory.config import AIConfig, load_config
 from tuning_factory.connections import load_connection
@@ -15,7 +16,7 @@ from tuning_factory.tracking import MLflowTracker
 
 session = json.loads(Path('.factory/gpu-session.json').read_text())
 remaining = int(session['deadline'] - time.time())
-if remaining < 210:
+if session.get('state') == 'STOPPED' or remaining < 420:
     raise ValueError('insufficient approved session time for cancellation plus resume; do not extend automatically')
 profile = load_connection('.factory/connection.json')
 pod = RunPodController(os.environ['RUNPOD_API_KEY']).status(profile.pod_id)
@@ -25,10 +26,11 @@ factory.registry.register_dataset('synthetic_smoke', '1', 'examples/dummy.json',
 factory.registry.register_dataset('synthetic_validation', '1', 'examples/dummy.json', export_allowed=True, synthetic=True)
 data = load_config('configs/ai/integration_smoke.yaml').model_dump()
 data['ai_id'] = 'integration_recovery'
-data['hyperparameters']['max_steps'] = 40
+data['hyperparameters']['max_steps'] = 12
+data['hyperparameters']['save_steps'] = 2
 data['hyperparameters']['save_total_limit'] = 2
 data['evaluation_profile'] = {'kind': 'pipeline'}
-data['resource_profile']['timeout_seconds'] = min(240, remaining - 60)
+data['resource_profile']['timeout_seconds'] = min(360, remaining - 120)
 config = AIConfig.model_validate(data)
 job = factory.submit(config, simulation=False)
 directory = factory.directory(job['id'])
@@ -91,10 +93,29 @@ checkpoints = sorted((directory / 'output').glob('checkpoint-*'), key=lambda p: 
 checkpoint = next((p for p in checkpoints if all((p / name).is_file() for name in required)), None)
 if checkpoint is None:
     raise RuntimeError('no complete checkpoint retrieved from the canceled real worker')
+saved_state = json.loads((checkpoint / 'trainer_state.json').read_text())
+checkpoint_step = saved_state['global_step']
+if not 0 < checkpoint_step < data['hyperparameters']['max_steps']:
+    raise RuntimeError('cancellation did not preserve an intermediate resumable step')
 factory.resume(job['id'], checkpoint)
 resumed = factory.work(executor=executor(), gpu=profile.pod_id, approved_transfer=True, target_job_id=job['id'])
+final_state = json.loads((directory / 'output' / 'trainer_state.json').read_text())
+resume_plan = yaml.safe_load((directory / 'train.yaml').read_text())
+if resumed['status'] == 'COMPLETED':
+    if final_state['global_step'] != data['hyperparameters']['max_steps']:
+        raise RuntimeError('resumed trainer did not reach the requested final step')
+    if not resume_plan.get('resume_from_checkpoint', '').endswith(checkpoint.name):
+        raise RuntimeError('native engine did not receive the original checkpoint')
+    history = saved_state.get('log_history', [])
+    if final_state.get('log_history', [])[:len(history)] != history:
+        raise RuntimeError('resumed trainer history does not preserve checkpoint progress')
+    factory.verify_artifacts(job['id'])
 receipt = {'job_id': job['id'], 'canceled_run_id': canceled['run_id'], 'resumed_run_id': resumed['run_id'],
            'checkpoint': checkpoint.name, 'first_status': canceled['status'], 'resumed_status': resumed['status'],
+           'checkpoint_step': checkpoint_step, 'final_step': final_state['global_step'],
+           'checkpoint_history_preserved': final_state.get('log_history', [])[:len(saved_state.get('log_history', []))]
+               == saved_state.get('log_history', []),
+           'native_resume_argument': resume_plan.get('resume_from_checkpoint'),
            'simulation': False, 'synthetic_data': True, 'error': resumed['error']}
 (factory.root / 'recovery-receipt.json').write_text(json.dumps(receipt, indent=2))
 print(json.dumps(receipt, indent=2))

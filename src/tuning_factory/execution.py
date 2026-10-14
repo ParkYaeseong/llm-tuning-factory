@@ -184,7 +184,8 @@ class SSHExecutor(ExecutionBackend):
             elif path.is_file():
                 sftp.put(str(path), target)
 
-    def download(self, sftp, remote, local):
+    def download(self, sftp, remote, local, hashes=None, root=None):
+        root = root or local
         local.mkdir(parents=True, exist_ok=True)
         # Preserve small top-level evidence before descending into large checkpoints.
         entries = sorted(sftp.listdir_attr(remote), key=lambda item: (stat.S_ISDIR(item.st_mode), item.filename))
@@ -195,9 +196,19 @@ class SSHExecutor(ExecutionBackend):
             if stat.S_ISLNK(entry.st_mode):
                 raise ValueError("remote symlink artifact rejected")
             if stat.S_ISDIR(entry.st_mode):
-                self.download(sftp, source, target)
+                self.download(sftp, source, target, hashes, root)
             elif stat.S_ISREG(entry.st_mode):
-                sftp.get(source, str(target))
+                expected = (hashes or {}).get(target.relative_to(root).as_posix())
+                if expected and target.is_file() and digest(target.read_bytes()) == expected:
+                    continue
+                temporary = target.with_name(target.name + ".download-" + uuid.uuid4().hex)
+                try:
+                    sftp.get(source, str(temporary))
+                    if expected and digest(temporary.read_bytes()) != expected:
+                        raise ValueError("remote artifact hash mismatch during transfer")
+                    temporary.replace(target)
+                finally:
+                    temporary.unlink(missing_ok=True)
 
     def run(self, backend, directory, timeout, canceled, checkpoint=None):
         directory = Path(directory).resolve()
@@ -246,8 +257,8 @@ class SSHExecutor(ExecutionBackend):
                     if time.monotonic() >= deadline:
                         raise ExecutionUncertain("remote worker deadline exceeded; reconcile Pod and retain GPU lock")
                     time.sleep(1)
-                self.save_remote_evidence(sftp, remote, directory, result)
-                self.download(sftp, remote, directory)
+                hashes = self.save_remote_evidence(sftp, remote, directory, result)
+                self.download(sftp, remote, directory, hashes)
                 hashes = json.loads((directory / "artifacts.json").read_text())
                 for name, sha in hashes.items():
                     target = (directory / name).resolve()
@@ -271,6 +282,7 @@ class SSHExecutor(ExecutionBackend):
         with sftp.open(remote + "/artifacts.json") as stream:
             hashes = json.loads(stream.read())
         (directory / "remote-artifacts.json").write_text(json.dumps(hashes), encoding="utf-8")
+        return hashes
 
     def collect_result(self, directory):
         directory = Path(directory).resolve()
@@ -295,8 +307,8 @@ class SSHExecutor(ExecutionBackend):
                 original = json.loads((directory / "manifest.json").read_text())
                 if recovered_manifest != original:
                     raise ValueError("remote manifest differs from original job")
-                self.save_remote_evidence(sftp, remote, directory, result)
-                self.download(sftp, remote, directory)
+                hashes = self.save_remote_evidence(sftp, remote, directory, result)
+                self.download(sftp, remote, directory, hashes)
                 hashes = json.loads((directory / "artifacts.json").read_text())
                 for name, expected in hashes.items():
                     path = (directory / name).resolve()

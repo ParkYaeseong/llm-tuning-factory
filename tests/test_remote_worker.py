@@ -149,7 +149,7 @@ def test_completed_worker_evidence_survives_interrupted_artifact_download(tmp_pa
     client.sftp.root.mkdir()
     executor = SSHExecutor("test-host", 22, "root", "unused", client=client)
 
-    def interrupted(*args):
+    def interrupted(*args, **kwargs):
         raise OSError("connection lost during large checkpoint download")
 
     monkeypatch.setattr(executor, "download", interrupted)
@@ -158,3 +158,28 @@ def test_completed_worker_evidence_survives_interrupted_artifact_download(tmp_pa
     evidence = json.loads((directory / "remote-result.json").read_text())
     assert evidence["status"] == "COMPLETED"
     assert (directory / "remote-artifacts.json").is_file()
+
+
+def test_reconciliation_reuses_verified_files_and_repairs_partial_downloads(tmp_path, monkeypatch):
+    directory = tmp_path / ("d" * 32)
+    directory.mkdir()
+    (directory / "manifest.json").write_text('{"identity":"original"}')
+    client = FakeSSH(tmp_path / "remote")
+    client.sftp.root.mkdir()
+    executor = SSHExecutor("test-host", 22, "root", "unused", client=client)
+    executor.run(LlamaFactoryBackend(), directory, 5, lambda: False)
+    transfers = []
+    original_get = client.sftp.get
+
+    def observe(source, target):
+        transfers.append(source)
+        original_get(source, target)
+
+    monkeypatch.setattr(client.sftp, "get", observe)
+    assert executor.collect_result(directory)["status"] == "COMPLETED"
+    assert not any(path.endswith("/output/evidence.txt") for path in transfers)
+    (directory / "output" / "evidence.txt").write_text("partial or corrupted bytes")
+    transfers.clear()
+    assert executor.collect_result(directory)["status"] == "COMPLETED"
+    assert any(path.endswith("/output/evidence.txt") for path in transfers)
+    assert (directory / "output" / "evidence.txt").read_text() == "mock transport fixture"
