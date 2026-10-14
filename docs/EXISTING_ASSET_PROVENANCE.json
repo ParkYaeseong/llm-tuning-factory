@@ -1,0 +1,10 @@
+{
+  "source_repository": "D:/workflow/kbl-llm-repo",
+  "source_commit": "c93556831afb49a2ea409a9da2ff8c62c661bc58",
+  "note": "Hashes identify inspected working-tree files, which may differ from the source commit. No credentials or datasets copied.",
+  "sources": [
+    {"path": "scripts/mlflow_util.py", "sha256": "fe54eaec95f5310356286fecb437db67d250a760717b5b5d3704547d765fd3cc", "reuse": "configurable client-credentials bearer refresh contract in auth.py"},
+    {"path": "scripts/eval_extraction_pc.py", "sha256": "87d91c5b9f592198aed2cec37339a7de75a083989e685eb442f2952bc797ccbc", "reuse": "pure name/catalog-id extraction and set-F1 semantics in evaluation_kbf.py"},
+    {"path": "ops/dataset_info.json", "sha256": "b66c414e7110c1aa1e0bb345baab375c351168e7add1cdc719e51b308d136776", "reuse": "ShareGPT JSONL messages/role/content mapping in training.py"}
+  ]
+}

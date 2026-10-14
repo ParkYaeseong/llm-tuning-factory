@@ -6,6 +6,8 @@ from pathlib import Path
 
 class MLflowTracker:
     def __init__(self, uri, experiment="llm-tuning-factory", client=None):
+        from .auth import configure_oidc
+        self.auth_refresher = configure_oidc()
         if client is None:
             from mlflow import MlflowClient
             client = MlflowClient(tracking_uri=uri)

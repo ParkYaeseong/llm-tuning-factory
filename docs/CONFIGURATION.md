@@ -14,10 +14,10 @@ tokenizer_revision. Other fields have explicit validated defaults. Unknown keys 
 |---|---|
 | ai_id / dataset_id | Letters, digits, underscore or hyphen |
 | dataset_version | Immutable registry version; letters, digits, dots, underscore or hyphen |
-| base_model | Qwen/Qwen2.5-{0.5B,1.5B,7B}-Instruct allowlist |
+| base_model | Qwen/Qwen2.5-{0.5B,1.5B,7B}-Instruct or meta-llama/Llama-{3.1-8B,3.2-3B}-Instruct allowlist |
 | model_revision | Exact 40-character lowercase Hugging Face commit SHA |
 | tokenizer_revision | Must equal model_revision for the initial adapter |
-| template | qwen |
+| template | qwen for Qwen2.5, llama3 for supported Llama3 models |
 | training_backend | llamafactory |
 | training_method | lora or qlora (4-bit bitsandbytes) |
 | artifact_destination | control-plane; actual files are retained under the chosen state directory |
@@ -42,8 +42,11 @@ Costs are estimates and a software guard, not a provider-enforced spend cap.
 
 ## Dataset registry
 
-Input is a UTF-8 JSON array in Alpaca instruction format. Every row requires nonempty string instruction and output;
-input is an optional string. The platform validates/copies data but does not create real datasets or annotations.
+Input is UTF-8 JSON or JSONL in Alpaca instruction format or the existing project's ShareGPT messages format.
+Alpaca rows require nonempty string instruction and output; input is an optional string. ShareGPT rows require messages
+with system/user/assistant roles and nonempty content, a user prompt and a final assistant answer. The existing
+ops/dataset_info.json role/content mapping is preserved. The platform snapshots original bytes and does not create
+real datasets or annotations. All records in a dataset must use one compatible format.
 
 ```json
 [{"instruction":"Your task", "input":"Provided source", "output":"Provided reference answer"}]
@@ -57,7 +60,7 @@ AI config revisions are stored by content hash under registry/ai/AI_ID/ for hist
 
 ## Evaluation
 
-`evaluation_profile.kind`: pipeline, json, classification or extraction.
+`evaluation_profile.kind`: pipeline, json, classification, extraction or kbf_extraction.
 `thresholds` is an optional dictionary of **minimum** metric values. A missing metric fails its threshold.
 Training completion and quality qualification are recorded separately; low quality retains the successful experiment.
 
@@ -65,6 +68,11 @@ For evaluator use, supply a JSON object with predictions and references arrays. 
 Classification uses exact string labels, accuracy and macro F1 over the union of predicted/reference labels.
 Extraction uses JSON objects; each (field, canonical JSON value) is an exact item, with micro F1 and whole-object accuracy.
 JSON validity is the valid JSON fraction and does not measure semantic correctness.
+
+`kbf_extraction` reuses the canonical existing eval_extraction_pc.py name/catalog-ID regex and per-record set-F1 semantics.
+It accepts generation/reference strings and reports mean_name_f1, mean_id_f1 and strict json_validity. A truncated JSON
+string may score partial credit while failing JSON validity. These are heuristic extraction metrics, not general semantic
+correctness, and are not interchangeable with the common dictionary-extraction micro F1.
 
 `factory evaluate FILE --kind KIND` evaluates caller-supplied results and prints metrics; it does not attach them to a run
 or claim they came from a model. For automatic orchestration evaluation, a future generation evaluator should write

@@ -2,7 +2,7 @@
 
 ## Delivered implementation
 
-- Strict AI configuration, conservative Qwen model/template catalog and pinned model/tokenizer revisions.
+- Strict AI configuration, conservative Qwen/Llama3 template catalog and pinned model/tokenizer revisions.
 - Immutable dataset snapshots, data validation/export permission, content hashes and AI revision history.
 - Resolved manifests containing source/commit, translated YAML hash and dependency lock hashes.
 - TrainingBackend interface and LLaMA-Factory LoRA/4-bit QLoRA SFT adapter; real CLI subprocess delegation.
@@ -13,10 +13,12 @@
 - JSON validity, classification accuracy/macro F1, extraction exact accuracy/micro F1 and metric deltas.
 - CLI, three AI examples, dummy fixtures, pinned control/GPU dependency locks, GPU image recipe and CPU CI definition.
 - Explicit paid-allocation approval, managed ownership, live price checks and persistent-volume-preserving stop/watchdog.
+- Canonical existing-project reuse: unchanged ShareGPT JSONL ingestion/mapping, configurable Keycloak bearer refresh,
+  and the pure partial-credit extraction helpers. Source paths/commit/hashes are recorded in EXISTING_ASSET_PROVENANCE.json.
 
 ## Actual verification
 
-Final full suite: **33 passed, 1 skipped**. The skipped case is the opt-in real GPU integration test.
+Final full suite: **36 passed, 1 skipped**. The skipped case is the opt-in real GPU integration test.
 `uv run ruff check src tests` passes. `uv sync --python 3.12 --extra dev --extra tracking --locked` succeeds.
 The control-plane dependency graph contains 59 installed packages. GPU dependencies were resolved into a Linux hash lock,
 not installed. `uv build --wheel --out-dir dist` succeeds and produces
@@ -27,9 +29,10 @@ real CPU subprocess exit/timeout/cancellation, checkpoint completeness, atomic p
 GPU budget vs concurrency, recovery retaining leases, retry exhaustion, simulation safety, candidate metadata,
 official REST request shapes through HTTP mocks, managed-budget lifecycle, SFTP artifact transport, isolated remote attempts,
 remote interruption uncertainty, worker integrity gates, evaluator metrics and real local MLflow logging/artifact retrieval.
+Existing ShareGPT compatibility, mocked OIDC grant/token refresh and the reused KBF partial-credit scorer are tested.
 Mock remote/adapter fixtures are test-only bytes, not trained models or GPU evidence.
 
-Additional subprocess CLI acceptance used state/cli-acceptance with the real installed MLflow client and temporary local
+Additional subprocess CLI acceptance used state/cli-acceptance-v2 with the real installed MLflow client and temporary local
 file tracking backend (explicit MLFLOW_ALLOW_FILE_STORE=true). Verified:
 
 - Default run produces a dry-run plan without training.
@@ -38,7 +41,7 @@ file tracking backend (explicit MLFLOW_ALLOW_FILE_STORE=true). Verified:
 - A deliberate repeated submission preserves the same resolved manifest hash and has a new job/run identity.
 - Comparing these repeated simulations reports pipeline_completed delta=0; this is not a model quality result.
 
-The local acceptance receipt is state/cli-acceptance/acceptance.json (ignored by Git). No external datasets were sent,
+The local acceptance receipt is state/cli-acceptance-v2/acceptance.json (ignored by Git). No external datasets were sent,
 no Pod was created/changed, no paid GPU ran, and no operating service was reconfigured.
 
 ## Phase and scenario status

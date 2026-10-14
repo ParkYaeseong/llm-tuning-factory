@@ -31,7 +31,7 @@ def test_failures_and_timeouts(tmp_path):
 def test_checkpoint_compatibility_and_collection(tmp_path):
     backend = MockTrainingBackend()
     config = load_config("configs/ai/paper_extraction.yaml")
-    backend.prepare(config, tmp_path, b"[]")
+    backend.prepare(config, tmp_path, b'[{"instruction":"test","output":"fixture"}]')
     backend.train(tmp_path, 5)
     artifacts = backend.collect_artifacts(tmp_path)
     assert "output/simulation.json" in artifacts
@@ -52,7 +52,7 @@ def test_checkpoint_compatibility_and_collection(tmp_path):
 def test_qlora_config(tmp_path):
     config = load_config("configs/ai/paper_extraction.yaml")
     config = type(config).model_validate(config.model_dump() | {"training_method": "qlora"})
-    LlamaFactoryBackend().prepare(config, tmp_path, b"[]")
+    LlamaFactoryBackend().prepare(config, tmp_path, b'[{"instruction":"test","output":"fixture"}]')
     plan = yaml.safe_load((tmp_path / "train.yaml").read_text())
     assert plan["quantization_bit"] == 4
     assert plan["quantization_method"] == "bitsandbytes"

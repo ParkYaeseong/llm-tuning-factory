@@ -39,6 +39,13 @@ class CommonEvaluator(Evaluator):
             raise ValueError("ground truth required for this evaluator")
         if len(predictions) != len(references):
             raise ValueError("prediction/reference counts differ")
+        if kind == "kbf_extraction":
+            from .evaluation_kbf import f1, ids_of, names_of
+            if not all(isinstance(x, str) for x in [*predictions, *references]):
+                raise ValueError("KBF extraction inputs must be generation/reference text")
+            return {"mean_name_f1": sum(f1(names_of(p), names_of(r)) for p, r in zip(predictions, references)) / len(predictions),
+                    "mean_id_f1": sum(f1(ids_of(p), ids_of(r)) for p, r in zip(predictions, references)) / len(predictions),
+                    "json_validity": sum(map(self.validate_output, predictions)) / len(predictions)}
         if kind == "classification":
             if not all(isinstance(x, str) for x in [*predictions, *references]):
                 raise ValueError("classification labels must be strings")

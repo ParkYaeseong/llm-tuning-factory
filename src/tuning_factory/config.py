@@ -27,7 +27,7 @@ class Hyperparameters(StrictModel):
 
 
 class EvaluationProfile(StrictModel):
-    kind: Literal["pipeline", "classification", "extraction", "json"] = "pipeline"
+    kind: Literal["pipeline", "classification", "extraction", "json", "kbf_extraction"] = "pipeline"
     thresholds: dict[str, float] = Field(default_factory=dict)
 
 
@@ -61,6 +61,8 @@ class AIConfig(StrictModel):
             "Qwen/Qwen2.5-0.5B-Instruct": "qwen",
             "Qwen/Qwen2.5-1.5B-Instruct": "qwen",
             "Qwen/Qwen2.5-7B-Instruct": "qwen",
+            "meta-llama/Llama-3.1-8B-Instruct": "llama3",
+            "meta-llama/Llama-3.2-3B-Instruct": "llama3",
         }
         if supported_models.get(self.base_model) != self.template:
             raise ValueError("unsupported model/template combination; extend the tested model catalog first")

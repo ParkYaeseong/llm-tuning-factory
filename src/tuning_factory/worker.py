@@ -40,7 +40,10 @@ def main():
         runtime = {"python": platform.python_version(), "packages": {name: importlib.metadata.version(name)
                    for name in ("llamafactory", "torch", "transformers", "peft", "datasets", "accelerate", "bitsandbytes")}}
         (directory / "runtime.json").write_bytes(canonical(runtime))
-        if digest((directory / "data" / "dataset.json").read_bytes()) != manifest["dataset"]["sha256"]:
+        file_format = manifest["dataset"].get("file_format", "json")
+        if file_format not in {"json", "jsonl"}:
+            raise ValueError("unsupported dataset file format")
+        if digest((directory / "data" / ("dataset." + file_format)).read_bytes()) != manifest["dataset"]["sha256"]:
             raise ValueError("transferred dataset hash mismatch")
         config = AIConfig.model_validate(manifest["config"])
         plan = yaml.safe_load((directory / "train.yaml").read_text())

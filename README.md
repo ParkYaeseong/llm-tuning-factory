@@ -2,6 +2,7 @@
 
 여러 업무 AI를 같은 설정 규격과 실행 파이프라인으로 관리하는 Python CLI 플랫폼입니다.
 LLaMA-Factory 학습 엔진과 RunPod 실행기를 분리하고, 데이터·명세서·산출물을 해시로 추적합니다.
+기존 `D:/workflow/kbl-llm-repo`의 ShareGPT 데이터 규격·Keycloak 인증 방식·순수 추출 평가 함수를 재사용합니다.
 
 **현재 검증 범위:** CPU 모의 실행과 로컬 MLflow 기록. Docker 이미지 빌드, 실제 RunPod 학습,
 실제 모델 평가·등록은 아직 검증하지 않았습니다. 더미 예시는 실제 AI 품질 결과가 아닙니다.

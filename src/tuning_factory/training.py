@@ -10,7 +10,7 @@ from pathlib import Path
 import yaml
 
 from .config import AIConfig
-from .registry import digest
+from .registry import digest, parse_dataset
 
 
 class CanceledError(RuntimeError):
@@ -48,10 +48,18 @@ class LlamaFactoryBackend(TrainingBackend):
         self.validate_config(config)
         directory = Path(directory)
         (directory / "data").mkdir(parents=True, exist_ok=True)
-        (directory / "data" / "dataset.json").write_bytes(dataset)
+        _, formatting, file_format = parse_dataset(dataset)
+        file_name = "dataset." + file_format
+        (directory / "data" / file_name).write_bytes(dataset)
+        descriptor = {"file_name": file_name, "formatting": formatting,
+                      "columns": {"prompt": "instruction", "query": "input", "response": "output"}}
+        if formatting == "sharegpt":
+            # Preserve the canonical kbl-llm-repo ops/dataset_info.json mapping.
+            descriptor.update(columns={"messages": "messages"}, tags={
+                "role_tag": "role", "content_tag": "content", "user_tag": "user",
+                "assistant_tag": "assistant", "system_tag": "system"})
         (directory / "data" / "dataset_info.json").write_text(json.dumps({
-            "factory_dataset": {"file_name": "dataset.json", "formatting": "alpaca",
-                                "columns": {"prompt": "instruction", "query": "input", "response": "output"}}
+            "factory_dataset": descriptor
         }), encoding="utf-8")
         plan = self.translate(config)
         (directory / "train.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")

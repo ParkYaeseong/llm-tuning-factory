@@ -31,6 +31,14 @@ authenticated network access and a separately backed-up artifact store. Install 
 own environment if needed; the control plane only installs mlflow-skinny. Do not expose an unauthenticated tracking server
 to the public internet. The platform does not change or start an existing tracking server.
 
+The existing canonical project documents a Keycloak-protected server. Non-secret endpoint settings are in
+configs/integrations/kbf.env.example. Its existing scripts/mlflow_util.py refresh contract is reused by auth.py:
+set MLFLOW_OIDC_TOKEN_URL, MLFLOW_OIDC_CLIENT_ID and MLFLOW_OIDC_CLIENT_SECRET in the process environment/secret manager.
+The client obtains an HTTPS client-credentials token before creating the tracking client and refreshes it in a daemon
+thread before expiry. MLflow reads MLFLOW_TRACKING_TOKEN per request. Authentication failures are not silently ignored;
+token/client-secret values are never printed. Existing /workspace/kc.env or local .env secrets are not imported automatically.
+The existing server returned HTTP 308 to unauthenticated health/version probes; authenticated tracking remains unverified.
+
 Each attempt creates a run and logs the resolved manifest, training YAML, metrics, logs and output/checkpoints.
 Job metadata stores the current run ID; attempts/N/outcome.json preserves older IDs. Production candidates are registered
 with approval=pending and compatibility tags. Model registration is separate from deployment and human approval.
