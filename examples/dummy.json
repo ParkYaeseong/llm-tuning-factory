@@ -1,0 +1,5 @@
+[
+  {"instruction":"Return the sample identifier as JSON.","input":"Sample DEMO-001","output":"{\"sample_id\":\"DEMO-001\"}"},
+  {"instruction":"Classify this fictional action.","input":"Record a fictional observation.","output":"record"},
+  {"instruction":"Summarize this fictional note.","input":"Dummy sample was inspected.","output":"A dummy sample was inspected."}
+]

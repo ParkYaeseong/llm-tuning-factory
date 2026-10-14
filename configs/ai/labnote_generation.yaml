@@ -1,0 +1,20 @@
+ai_id: labnote_generation
+workflow_id: labnote_processing
+dataset_id: dummy
+dataset_version: '1'
+base_model: Qwen/Qwen2.5-0.5B-Instruct
+model_revision: 7ae557604adf67be50417f59c2c2f167def9a775
+tokenizer_revision: 7ae557604adf67be50417f59c2c2f167def9a775
+training_backend: llamafactory
+training_method: lora
+template: qwen
+hyperparameters:
+  max_steps: 2
+evaluation_profile:
+  kind: pipeline
+resource_profile:
+  timeout_seconds: 3600
+  hourly_cost_usd: 0.5
+  max_cost_usd: 1
+artifact_destination: control-plane
+
