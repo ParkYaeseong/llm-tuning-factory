@@ -14,7 +14,15 @@ allowlist test pass. Actual previously recovered GPU trainer_log.jsonl parsed as
 The added tests cover duplicate/sample bounds, invalid samples, partial/nonfinite trainer records, downsampling,
 missing/nested parameter differences, validation leakage, keyboard navigation, search and progress empty states.
 
-0.2.1 packaging and native installed-app checks are in progress. No GPU was started or dataset transferred.
+0.2.1 NSIS installer build completed (~42.83 MiB), installed with exit code 0, and the installed app passed:
+local synthetic registration, source/lock-bearing offline plan, actual Windows vault save/masked read/delete,
+Ctrl+K navigation and actual-file sample inspection through the UI. The frozen engine and worker wheel
+have identical Python source bytes and the GPU dependency-lock hash matches.
+Packaged source commit: 7bc7171b63ddab2752a4f930ecb67d2c3d902437.
+Source SHA256: 3ff133ebb8d5e507b6cf512c8a2f6c3feefe849d50b787aebe5788906a40897a.
+Bundled authenticated read-only checks again read 12 MLflow runs and provider EXITED.
+No GPU was started or dataset transferred. Installer removal is tested on the development Windows host;
+clean second-PC acceptance and code signing are not covered.
 New desktop GPU bootstrap/training/cancellation/recovery acceptance and the other limits below remain outstanding.
 
 ## Windows desktop pilot — current work

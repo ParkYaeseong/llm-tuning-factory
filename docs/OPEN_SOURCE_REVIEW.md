@@ -15,6 +15,11 @@ RunPod Pods, institution MLflow authentication, immutable dataset/config provena
 The reviewed setup guides do not establish a drop-in replacement for that complete workflow. This is an assessment
 of the documented fit, not a claim that other tools cannot be integrated with RunPod or MLflow.
 Moving to a different training engine would require a separate compatibility/acceptance project.
+Unsloth also exposes MLflow as a CLI reporting option in
+[its upstream CLI](https://github.com/unslothai/unsloth/blob/main/unsloth-cli.py).
+MLflow logging by itself is therefore not a unique feature of this application.
+For a general-purpose standalone trainer, evaluating Unsloth Desktop directly is a valid alternative;
+the custom workbench is justified by the specific remote-control, provenance and institutional-auth workflow.
 
 ## Applied in 0.2.1
 
