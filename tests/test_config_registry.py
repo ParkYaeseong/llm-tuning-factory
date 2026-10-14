@@ -4,8 +4,8 @@ import pytest
 from pydantic import ValidationError
 
 from tuning_factory.config import AIConfig, load_config
-from tuning_factory.registry import Registry
 from tuning_factory.manifest import resolve, verify_manifest
+from tuning_factory.registry import Registry
 
 
 def test_examples_resolve_and_verify(tmp_path):

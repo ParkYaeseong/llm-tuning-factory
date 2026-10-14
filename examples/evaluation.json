@@ -1,0 +1,5 @@
+{
+  "note": "Synthetic evaluator unit fixture only; not output from a trained model.",
+  "predictions": ["record", "extract", "record"],
+  "references": ["record", "record", "record"]
+}

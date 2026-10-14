@@ -1,0 +1,7 @@
+{
+  "max_gpus": 1,
+  "max_concurrent": 1,
+  "max_timeout_seconds": 14400,
+  "max_cost_usd": 5,
+  "max_attempts": 2
+}

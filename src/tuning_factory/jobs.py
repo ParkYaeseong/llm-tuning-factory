@@ -89,7 +89,7 @@ class JobStore:
             db.execute("UPDATE jobs SET status=?,error=?,updated=? WHERE id=?", (status, error, now, job_id))
             db.execute("INSERT INTO events VALUES (?,?,?,?)", (job_id, status, now, error))
 
-    def claim(self, gpu, max_concurrent=1):
+    def claim(self, gpu, max_concurrent=1, max_gpus=None, simulation=None):
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be positive")
         with self.connection() as db:
@@ -97,9 +97,18 @@ class JobStore:
             active = db.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('PROVISIONING','RUNNING','EVALUATING')").fetchone()[0]
             if active >= max_concurrent or db.execute("SELECT 1 FROM gpu_locks WHERE gpu=?", (gpu,)).fetchone():
                 return None
-            row = db.execute("SELECT * FROM jobs WHERE status='QUEUED' ORDER BY priority DESC,created LIMIT 1").fetchone()
+            candidates = db.execute("SELECT * FROM jobs WHERE status='QUEUED' ORDER BY priority DESC,created").fetchall()
+            row = next((r for r in candidates if simulation is None
+                        or json.loads(r["manifest"]).get("simulation") == simulation), None)
             if row is None:
                 return None
+            if max_gpus is not None:
+                locks = db.execute("SELECT jobs.manifest FROM jobs JOIN gpu_locks ON jobs.id=gpu_locks.job_id").fetchall()
+                def gpu_count(raw):
+                    manifest = json.loads(raw)
+                    return 0 if manifest.get("simulation") else manifest.get("config", {}).get("resource_profile", {}).get("gpu_count", 1)
+                if sum(gpu_count(r[0]) for r in locks) + gpu_count(row["manifest"]) > max_gpus:
+                    return None
             now = time.time()
             db.execute("INSERT INTO gpu_locks VALUES (?,?)", (gpu, row["id"]))
             db.execute("UPDATE jobs SET status='PROVISIONING',attempts=attempts+1,updated=? WHERE id=?", (now, row["id"]))

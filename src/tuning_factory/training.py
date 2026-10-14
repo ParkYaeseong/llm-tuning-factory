@@ -53,6 +53,12 @@ class LlamaFactoryBackend(TrainingBackend):
             "factory_dataset": {"file_name": "dataset.json", "formatting": "alpaca",
                                 "columns": {"prompt": "instruction", "query": "input", "response": "output"}}
         }), encoding="utf-8")
+        plan = self.translate(config)
+        (directory / "train.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
+        (directory / "config.json").write_text(config.model_dump_json(), encoding="utf-8")
+
+    @staticmethod
+    def translate(config):
         plan = {"model_name_or_path": config.base_model, "model_revision": config.model_revision,
                 "trust_remote_code": False, "stage": "sft", "do_train": True,
                 "finetuning_type": "lora", "template": config.template,
@@ -61,8 +67,7 @@ class LlamaFactoryBackend(TrainingBackend):
                 "save_only_model": False, "fp16": True, **config.hyperparameters.model_dump()}
         if config.training_method == "qlora":
             plan.update(quantization_bit=4, quantization_method="bitsandbytes")
-        (directory / "train.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
-        (directory / "config.json").write_text(config.model_dump_json(), encoding="utf-8")
+        return plan
 
     def train(self, directory, timeout, canceled=lambda: False):
         directory = Path(directory).resolve()
