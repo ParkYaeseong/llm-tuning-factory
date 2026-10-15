@@ -13,7 +13,7 @@ import paramiko
 from pydantic import Field
 
 from .config import StrictModel
-from .registry import digest
+from .registry import file_digest
 
 
 class CapacityUnavailable(RuntimeError):
@@ -205,12 +205,12 @@ class SSHExecutor(ExecutionBackend):
                 self.download(sftp, source, target, hashes, root)
             elif stat.S_ISREG(entry.st_mode):
                 expected = (hashes or {}).get(target.relative_to(root).as_posix())
-                if expected and target.is_file() and digest(target.read_bytes()) == expected:
+                if expected and target.is_file() and file_digest(target) == expected:
                     continue
                 temporary = target.with_name(target.name + ".download-" + uuid.uuid4().hex)
                 try:
                     sftp.get(source, str(temporary))
-                    if expected and digest(temporary.read_bytes()) != expected:
+                    if expected and file_digest(temporary) != expected:
                         raise ValueError("remote artifact hash mismatch during transfer")
                     temporary.replace(target)
                 finally:
@@ -272,7 +272,7 @@ class SSHExecutor(ExecutionBackend):
                 self.download(sftp, remote, directory, hashes)
                 for name, sha in hashes.items():
                     target = (directory / name).resolve()
-                    if not target.is_relative_to(directory) or digest(target.read_bytes()) != sha:
+                    if not target.is_relative_to(directory) or file_digest(target) != sha:
                         raise ValueError("remote artifact hash mismatch")
                 if result["status"] == "CANCELED":
                     from .training import CanceledError
@@ -322,7 +322,7 @@ class SSHExecutor(ExecutionBackend):
                 self.download(sftp, remote, directory, hashes)
                 for name, expected in hashes.items():
                     path = (directory / name).resolve()
-                    if not path.is_relative_to(directory) or digest(path.read_bytes()) != expected:
+                    if not path.is_relative_to(directory) or file_digest(path) != expected:
                         raise ValueError("recovered artifact hash mismatch")
                 return result
         finally:

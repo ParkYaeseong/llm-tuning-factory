@@ -6,8 +6,12 @@ on:
       - 'desktop/**'
       - 'src/**'
       - 'scripts/build_desktop.py'
+      - 'scripts/pyinstaller-hooks/**'
       - 'scripts/desktop_entry.py'
       - 'scripts/verify_desktop_package.py'
+      - 'containers/gpu*.lock'
+      - 'pyproject.toml'
+      - 'uv.lock'
       - '.github/workflows/windows-desktop.yml'
 permissions:
   contents: read

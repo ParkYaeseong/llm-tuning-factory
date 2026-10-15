@@ -10,7 +10,8 @@ const state: Obj = {
   config: null, jobs: [], plan: null, logs: "", experiments: [], runs: [], nextToken: null,
   selected: [], experiment: "16", busy: "", notice: "", error: "", active: "", comparison: null,
   preview: null, datasetDraft: {}, historyQuery: "", historyStatus: "", progress: null,
-  connectionReport: null, runtimeReport: null, settingsDraft: null,
+  jobCapabilities: null, connectionReport: null, runtimeReport: null, settingsDraft: null, s3SettingsDraft: null,
+  capabilities: null, capabilityPending: false, s3Draft: { bucket: "", prefix: "", key: "", version_id: "", dataset_id: "s3_dataset", version: "1", kind: "instruction" }, s3Listing: null, s3Object: null,
 };
 const pages: Record<string, string> = {
   overview: "작업 공간", connections: "연결 설정", datasets: "데이터", training: "학습 설정",
@@ -38,10 +39,10 @@ const descriptions: Obj = {
 };
 const taskNames: Obj = { paper_extraction: "논문 정보 추출", labnote_generation: "실험노트 생성", workflow_classification: "업무 분류" };
 function field(label: string, key: string, value: unknown = "", type = "text", help = "") {
-  return `<label class="field"><span>${label}</span><input data-key="${key}" type="${type}" value="${esc(value)}" ${type === "password" ? 'autocomplete="new-password"' : ""}>${help ? `<small>${help}</small>` : ""}</label>`;
+  return `<label class="field"><span>${label}</span><input aria-label="${esc(label)}" data-key="${key}" type="${type}" value="${esc(value)}" ${type === "password" ? 'autocomplete="new-password"' : ""}>${help ? `<small>${help}</small>` : ""}</label>`;
 }
 function select(label: string, key: string, value: string, options: [string, string][]) {
-  return `<label class="field"><span>${label}</span><select data-key="${key}">${options.map(([id, title]) => `<option value="${esc(id)}" ${id === value ? "selected" : ""}>${esc(title)}</option>`).join("")}</select></label>`;
+  return `<label class="field"><span>${label}</span><select aria-label="${esc(label)}" data-key="${key}">${options.map(([id, title]) => `<option value="${esc(id)}" ${id === String(value ?? "") ? "selected" : ""}>${esc(title)}</option>`).join("")}</select></label>`;
 }
 async function api(action: string, data: Obj = {}) {
   return invoke<any>("factory_action", { action, data });
@@ -56,6 +57,10 @@ async function task(label: string, operation: () => Promise<void>) {
 function captureDrafts() {
   const settings = document.querySelector<HTMLFormElement>("#settings-form");
   if (settings) state.settingsDraft = settingsFromForm(settings);
+  const s3Settings = document.querySelector<HTMLFormElement>("#s3-settings-form");
+  if (s3Settings) state.s3SettingsDraft = settingsFromForm(s3Settings);
+  const s3 = document.querySelector<HTMLFormElement>("#s3-form");
+  if (s3) state.s3Draft = { ...settingsFromForm(s3), synthetic: (s3.elements.namedItem("synthetic") as HTMLInputElement).checked, export_allowed: (s3.elements.namedItem("export_allowed") as HTMLInputElement).checked };
   const data = document.querySelector<HTMLFormElement>("#dataset-form");
   if (data) state.datasetDraft = { ...settingsFromForm(data),
     synthetic: (data.elements.namedItem("synthetic") as HTMLInputElement).checked,
@@ -90,18 +95,127 @@ function captureConfig() {
   document.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-config]").forEach(el => {
     const parts = el.dataset.config!.split(".");
     let target = state.config;
-    for (const part of parts.slice(0, -1)) target = target[part];
-    target[parts.at(-1)!] = el.dataset.number ? Number(el.value) : el.value;
+    for (const part of parts.slice(0, -1)) target = target[part] ??= {};
+    target[parts.at(-1)!] = el instanceof HTMLInputElement && el.type === "checkbox" ? el.checked : el.value === "" && el.dataset.optional ? null : el.dataset.number ? Number(el.value) : el.value;
   });
 }
 function configField(label: string, path: string, type = "text", help = "") {
-  let v = state.config; for (const p of path.split(".")) v = v[p];
+  let v = state.config; for (const p of path.split(".")) v = v?.[p];
   return field(label, path, v, type, help).replace('data-key=', 'data-config=')
     .replace("<input ", `<input ${type === "number" ? 'data-number="true" step="any" ' : ""}`);
 }
 function configSelect(label: string, path: string, options: [string, string][]) {
-  let v = state.config; for (const p of path.split(".")) v = v[p];
+  let v = state.config; for (const p of path.split(".")) v = v?.[p];
   return select(label, path, v, options).replace("data-key=", "data-config=");
+}
+function methodSelect() {
+  const methods = [["lora", "LoRA"], ["qlora", "QLoRA · 양자화 LoRA"], ["full", "Full · 전체 갱신"], ["freeze", "Freeze · 일부 레이어"], ["oft", "OFT"]];
+  const supported = state.capabilities?.methods;
+  return `<label class="field"><span>학습 방법</span><select aria-label="학습 방법" data-config="training_method">${methods.map(([id, name]) => `<option value="${id}" ${state.config.training_method === id ? "selected" : ""} ${supported && !supported.includes(id) ? "disabled" : ""}>${name}${supported && !supported.includes(id) ? " · 현재 단계 미지원" : ""}</option>`).join("")}</select></label>`;
+}
+function configCheck(label: string, path: string) {
+  let v = state.config; for (const p of path.split(".")) v = v?.[p];
+  return `<label class="check"><input type="checkbox" data-config="${path}" ${v ? "checked" : ""}>${label}</label>`;
+}
+function optionalConfigField(label: string, path: string, type = "text", help = "") {
+  return configField(label, path, type, help).replace("<input ", '<input data-optional="true" ');
+}
+function normalizeConfig() {
+  if (!state.config) return;
+  state.config.training_stage ??= "sft";
+  state.config.quantization_bit ??= 4;
+  state.config.finetuning_options = { lora_alpha: null, lora_dropout: 0, use_rslora: false, use_dora: false, loraplus_lr_ratio: null, loraplus_lr_embedding: 0.000001, pissa_init: false, pissa_iter: 16, pissa_convert: false, freeze_trainable_layers: 2, freeze_trainable_modules: "all", freeze_extra_modules: null, oft_rank: 0, oft_block_size: 32, oft_target: "all", module_dropout: 0, ...state.config.finetuning_options };
+  state.config.stage_options = { pref_loss: "sigmoid", pref_beta: 0.1, pref_ftx: 0, pref_bco_weight: 0, dpo_label_smoothing: 0, kto_chosen_weight: 1, kto_rejected_weight: 1, simpo_gamma: 0.5, ppo_buffer_size: 1, ppo_epochs: 4, ppo_score_norm: false, ppo_target: 6, ppo_whiten_rewards: false, reward_model: null, reward_model_type: "lora", reward_model_sha256: null, ...state.config.stage_options };
+}
+let capabilityRequest = 0;
+async function checkCapabilities() {
+  normalizeConfig();
+  const request = ++capabilityRequest;
+  const config = structuredClone(state.config);
+  state.capabilityPending = true;
+  try {
+    const result = await api("capabilities", { config });
+    if (request === capabilityRequest && JSON.stringify(state.config) === JSON.stringify(config)) state.capabilities = result;
+    return result;
+  } finally { if (request === capabilityRequest) state.capabilityPending = false; }
+}
+function invalidatePlan() {
+  state.plan = null; state.capabilities = null;
+  document.querySelector(".plan")?.remove();
+  document.querySelector<HTMLButtonElement>('#training-form button[type="submit"]')?.setAttribute("disabled", "");
+}
+async function configChanged(rerender = false, captured = false) {
+  if (!captured) captureConfig(); invalidatePlan();
+  if (rerender) render();
+  try { await checkCapabilities(); } catch (error) { state.error = String(error); }
+  if (state.page === "training") render();
+}
+function compatibilityView() {
+  const result = state.capabilities;
+  if (state.capabilityPending || !result) return '<div class="compatibility pending" aria-live="polite">모델·단계·데이터 호환성을 확인하고 있습니다.</div>';
+  return `<section class="compatibility ${result.valid ? "ready" : "blocked"}" aria-label="설정 호환성"><div class="section-title"><h3>${result.valid ? "설정 호환성 확인됨" : "설정 수정이 필요합니다"}</h3><span class="badge ${result.valid ? "green" : "red"}">${result.valid ? "실행 계획 확인 가능" : "실행 불가"}</span></div>
+    ${(result.errors || []).map((message: string) => `<p class="error-text">${esc(message)}</p>`).join("")}
+    ${(result.warnings || []).map((message: string) => `<p>${esc(message)}</p>`).join("")}
+    ${result.model?.verification_scope ? `<p>GPU 검증 이력: ${esc(result.model.verification_scope)}</p>` : ""}<small>필요한 데이터 종류: ${esc(result.dataset_kind || "학습 단계에 따른 데이터")} · 학습 엔진 ${esc(result.engine_version || "확인 필요")} · ${result.resume_supported === false ? "이 조합은 체크포인트 재개를 지원하지 않습니다." : "재개 시 완전한 체크포인트가 필요합니다."}<br>설정 호환성은 실제 GPU 학습 성공이나 모든 모델의 검증을 보장하지 않습니다.</small></section>`;
+}
+const datasetKinds: [string, string][] = [["instruction", "지시·대화 · SFT"], ["text", "텍스트 · PT"], ["preference", "선호 쌍 · RM/DPO"], ["kto", "선호 라벨 · KTO"], ["prompt", "프롬프트 · PPO"]];
+function dataSize(value: unknown) {
+  if (typeof value !== "number") return "—";
+  if (value < 1024) return `${num(value)} B`;
+  if (value < 1024 ** 2) return `${num(value / 1024)} KiB`;
+  return `${num(value / 1024 ** 2)} MiB`;
+}
+function s3Connections() {
+  const s = { ...state.settings, ...(state.s3SettingsDraft || {}) };
+  return `<form id="s3-settings-form"><section class="card"><div class="section-title"><h3>S3 데이터 저장소</h3><span class="badge">S3 → 내 PC</span></div><p>AWS S3 또는 S3 호환 저장소를 연결합니다. 가져온 데이터는 PC에 불변 사본으로 등록되며 S3 키는 GPU에 전달하지 않습니다.</p><div class="grid">
+    ${field("S3 Endpoint URL", "S3_ENDPOINT_URL", s.S3_ENDPOINT_URL, "url", "AWS 기본 endpoint는 비워 두세요. S3 호환 저장소는 경로·서명·인증값 없는 HTTPS 기본 주소만 입력하세요.")}
+    ${field("S3 Region", "S3_REGION", s.S3_REGION || "us-east-1")}
+    ${select("S3 주소 방식", "S3_ADDRESSING_STYLE", s.S3_ADDRESSING_STYLE || "auto", [["auto", "자동"], ["virtual", "Virtual hosted"], ["path", "Path style · MinIO 등"]])}
+    ${field("S3 Access Key ID", "S3_ACCESS_KEY_ID", s.S3_ACCESS_KEY_ID || "", "password", s.S3_ACCESS_KEY_ID_saved ? "보안 저장됨 · 변경할 때만 입력" : "읽기 권한의 키를 권장합니다.")}
+    ${field("S3 Secret Access Key", "S3_SECRET_ACCESS_KEY", s.S3_SECRET_ACCESS_KEY || "", "password", s.S3_SECRET_ACCESS_KEY_saved ? "보안 저장됨" : "Windows 자격 증명 저장소에 보관합니다.")}
+    ${field("S3 Session Token", "S3_SESSION_TOKEN", s.S3_SESSION_TOKEN || "", "password", s.S3_SESSION_TOKEN_saved ? "보안 저장됨" : "임시 자격 증명을 사용할 때 입력하세요.")}
+    </div><div class="actions"><button class="primary" type="submit">S3 연결 정보 저장</button></div><p class="muted">저장된 인증값 삭제는 RunPod·MLflow·S3의 인증값을 함께 삭제합니다. 목록 권한이 없어도 데이터 화면에서 정확한 객체 key로 확인할 수 있습니다.</p></section></form>`;
+}
+function s3Datasets() {
+  const d = state.s3Draft;
+  const object = state.s3Object;
+  const listing = state.s3Listing;
+  return `<section class="card"><div class="section-title"><h3>S3에서 데이터 가져오기</h3><span class="badge">JSON · JSONL</span></div><p>버킷과 key를 지정해 S3에서 PC로 사본을 가져옵니다. 파일 한도는 32 MiB입니다. 현재 전체 파일 가져오기를 지원하며 무제한 스트리밍은 지원하지 않습니다.</p>
+  <form id="s3-form"><div class="grid">${field("S3 버킷", "bucket", d.bucket)}${field("S3 Prefix · 폴더", "prefix", d.prefix)}
+  ${field("S3 객체 key · 직접 입력 가능", "key", d.key, "text", "목록 권한이 없으면 key를 직접 입력하고 객체 확인을 누르세요.")}${field("S3 Version ID · 선택", "version_id", d.version_id)}
+  </div><div class="actions">${button("S3 목록 조회", "s3-list")}${button("선택한 객체 확인", "s3-head")}</div>
+  ${listing ? `<div class="s3-list table-scroll"><table><thead><tr><th>객체·폴더</th><th>크기</th><th>수정 시각</th><th></th></tr></thead><tbody>
+  ${(listing.common_prefixes || []).map((prefix: any, i: number) => `<tr><td>${esc(typeof prefix === "string" ? prefix : prefix.prefix)}</td><td>폴더</td><td>—</td><td>${button("폴더 열기", "s3-folder:" + i, "quiet")}</td></tr>`).join("")}
+  ${(listing.objects || []).map((item: Obj, i: number) => `<tr><td class="object-key">${esc(item.key)}</td><td>${dataSize(item.size)}</td><td>${item.last_modified ? esc(formatDate(Date.parse(item.last_modified) / 1000)) : "—"}</td><td>${button("객체 선택", "s3-object:" + i, "quiet")}</td></tr>`).join("")}
+  </tbody></table>${!(listing.objects || []).length && !(listing.common_prefixes || []).length ? '<div class="empty">이 prefix에서 조회된 객체가 없습니다.</div>' : ""}</div>${listing.next_token ? `<div class="actions">${button("다음 S3 목록", "s3-next")}</div>` : ""}` : ""}
+  ${object ? `<div class="s3-object"><h3>가져올 객체</h3><dl class="object-details"><div><dt>객체</dt><dd>${esc(object.bucket || d.bucket)}/${esc(object.key || d.key)}</dd></div><div><dt>크기</dt><dd>${dataSize(object.size)}</dd></div><div><dt>Version ID</dt><dd>${esc(object.version_id || "버전 없음 · ETag 조건부 읽기")}</dd></div><div><dt>ETag · 내용 해시와 구분</dt><dd>${esc(object.etag)}</dd></div>${object.import_max_bytes ? `<div><dt>파일 가져오기 한도</dt><dd>${dataSize(object.import_max_bytes)}</dd></div>` : ""}${object.free_bytes ? `<div><dt>PC 사용 가능 공간</dt><dd>${dataSize(object.free_bytes)}</dd></div>` : ""}</dl><p class="muted">확인한 버전 또는 ETag가 바뀌면 가져오기를 중단합니다. 실제 SHA256과 데이터 형식 검사를 통과한 사본만 등록합니다.</p></div>` : ""}
+  <div class="grid s3-registration">${field("S3 등록 데이터 ID", "dataset_id", d.dataset_id)}${field("S3 등록 버전", "version", d.version)}${select("S3 데이터 종류", "kind", d.kind || "instruction", datasetKinds)}</div>
+  <label class="check"><input name="synthetic" type="checkbox" ${d.synthetic ? "checked" : ""}> 가져올 파일은 더미·합성 데이터입니다</label>
+  <label class="check"><input name="export_allowed" type="checkbox" ${d.export_allowed ? "checked" : ""}> 등록한 사본을 선택한 GPU로 전송할 수 있습니다</label>
+  <div class="actions"><button type="button" data-action="s3-import" class="primary" ${!object ? "disabled" : ""}>S3에서 PC로 가져오기</button></div><p class="muted">가져오기 동의와 RunPod 학습 전송 동의는 별도입니다. 여기서는 GPU를 사용하지 않습니다.</p></form></section>`;
+}
+function trainingOptions() {
+  const c = state.config;
+  const stage = c.training_stage;
+  const method = c.training_method;
+  const options = c.stage_options;
+  let fields = "";
+  if (["dpo", "kto"].includes(stage)) {
+    if (stage === "dpo") fields += configSelect("선호 학습 loss", "stage_options.pref_loss", [["sigmoid", "DPO · sigmoid"], ["hinge", "Hinge"], ["ipo", "IPO"], ["kto_pair", "KTO pair"], ["orpo", "ORPO"], ["simpo", "SimPO"]]);
+    fields += configField("선호 학습 beta", "stage_options.pref_beta", "number");
+    if (stage === "dpo") fields += configField("SFT 보조 loss 비중", "stage_options.pref_ftx", "number") + configField("DPO label smoothing", "stage_options.dpo_label_smoothing", "number") + configField("BCO 가중치", "stage_options.pref_bco_weight", "number");
+    if (stage === "dpo" && options.pref_loss === "simpo") fields += configField("SimPO gamma", "stage_options.simpo_gamma", "number");
+    if (stage === "kto") fields += configField("Chosen 가중치", "stage_options.kto_chosen_weight", "number") + configField("Rejected 가중치", "stage_options.kto_rejected_weight", "number");
+  }
+  if (stage === "ppo") fields += optionalConfigField("보상 모델 원격 경로", "stage_options.reward_model", "text", "GPU에 관리자가 미리 준비한 보상 모델의 절대 경로입니다.") + configSelect("보상 모델 종류", "stage_options.reward_model_type", [["lora", "LoRA 어댑터"], ["full", "전체 모델"]]) + optionalConfigField("보상 모델 SHA256", "stage_options.reward_model_sha256", "text", "관리자가 제공한 파일 목록 {상대경로: SHA256}의 정규 JSON SHA256을 입력하세요.") + configField("PPO buffer size", "stage_options.ppo_buffer_size", "number") + configField("PPO epoch", "stage_options.ppo_epochs", "number") + configField("PPO KL target", "stage_options.ppo_target", "number");
+  let methods = "";
+  if (["lora", "qlora"].includes(method)) {
+    methods += configField("LoRA rank", "hyperparameters.lora_rank", "number") + configSelect("LoRA 대상", "hyperparameters.lora_target", [["all", "전체"], ["q_proj,v_proj", "q_proj · v_proj"]]) + optionalConfigField("LoRA alpha · 비우면 자동", "finetuning_options.lora_alpha", "number") + configField("LoRA dropout", "finetuning_options.lora_dropout", "number") + optionalConfigField("LoRA+ 학습률 비율 · 선택", "finetuning_options.loraplus_lr_ratio", "number") + configField("LoRA+ embedding 학습률", "finetuning_options.loraplus_lr_embedding", "number") + configField("PiSSA 초기화 반복 수", "finetuning_options.pissa_iter", "number");
+    if (method === "qlora") methods += configSelect("양자화 비트", "quantization_bit", (state.capabilities?.quantization_bits || [4, 8]).map((bit: number) => [String(bit), `${bit}-bit · bitsandbytes`])).replace('<select ', '<select data-number="true" ');
+  }
+  if (method === "freeze") methods += configField("학습할 레이어 수", "finetuning_options.freeze_trainable_layers", "number") + configSelect("학습할 모듈", "finetuning_options.freeze_trainable_modules", [["all", "전체"], ["self_attn", "Attention"], ["mlp", "MLP"], ["self_attn,mlp", "Attention + MLP"]]) + configSelect("추가 학습 모듈 · 선택", "finetuning_options.freeze_extra_modules", [["", "추가 없음"], ["embed_tokens", "Embedding"], ["lm_head", "LM head"], ["norm", "Normalization"], ["embed_tokens,lm_head", "Embedding + LM head"]]).replace("<select ", '<select data-optional="true" ');
+  if (method === "oft") methods += configField("OFT rank", "finetuning_options.oft_rank", "number") + configField("OFT block size", "finetuning_options.oft_block_size", "number") + configSelect("OFT 대상", "finetuning_options.oft_target", [["all", "전체"], ["q_proj,v_proj", "q_proj · v_proj"]]) + configField("OFT module dropout", "finetuning_options.module_dropout", "number");
+  return `${fields ? `<section class="card"><h3>학습 단계별 설정</h3><div class="grid">${fields}</div>${stage === "ppo" ? configCheck("PPO score normalization", "stage_options.ppo_score_norm") + configCheck("PPO reward whitening", "stage_options.ppo_whiten_rewards") : ""}</section>` : ""}${methods ? `<section class="card"><h3>파라미터 갱신 설정</h3><div class="grid">${methods}</div>${["lora", "qlora"].includes(method) ? configCheck("rsLoRA 사용", "finetuning_options.use_rslora") + configCheck("DoRA 사용", "finetuning_options.use_dora") + configCheck("PiSSA 초기화", "finetuning_options.pissa_init") + configCheck("PiSSA 변환 저장", "finetuning_options.pissa_convert") : ""}</section>` : ""}`;
 }
 async function approve(title: string, body: string): Promise<boolean> {
   const dialog = document.createElement("dialog");
@@ -151,23 +265,26 @@ function connections() {
   ${field("클라이언트 인증값", "MLFLOW_OIDC_CLIENT_SECRET", s.MLFLOW_OIDC_CLIENT_SECRET || "", "password", s.MLFLOW_OIDC_CLIENT_SECRET_saved ? "보안 저장됨" : "관리자에게 별도로 전달받으세요.")}
   ${field("별도 발급 토큰", "MLFLOW_TRACKING_TOKEN", s.MLFLOW_TRACKING_TOKEN || "", "password", s.MLFLOW_TRACKING_TOKEN_saved ? "보안 저장됨" : "토큰 인증 방식을 선택한 경우에만 입력")}
   </div><div class="actions"><button class="primary" type="submit">연결 정보 저장</button>${button("연결 검사", "check")}${button("저장된 인증값 삭제", "forget", "danger")}</div></section></form>
-  <section class="card"><h3>GPU 학습 환경</h3><p>선택한 Pod의 별도 폴더에 이 앱과 일치하는 학습 엔진을 설치합니다. 첫 준비는 다운로드 용량에 따라 시간이 걸립니다.</p>
+  <section class="card"><h3>GPU 학습 환경</h3><p>선택한 학습 단계에 맞는 학습 엔진을 Pod의 별도 폴더에 설치합니다. PPO는 별도 환경을 사용합니다. 첫 준비는 다운로드 용량에 따라 시간이 걸립니다.</p>
   <div class="actions">${button("환경 확인", "runtime_check")}${button("학습 환경 준비", "runtime_prepare", "primary")}${button("GPU 정보 → 학습 설정에 적용", "apply-pod")}</div></section>
+  ${s3Connections()}
   ${state.connectionReport ? `<section class="card"><h3>연결 검사 결과</h3><dl class="connection-list"><div><dt>MLflow 인증·조회</dt><dd>${state.connectionReport.mlflow_authenticated_read ? "확인됨" : "확인 필요"}</dd></div><div><dt>Pod 상태</dt><dd>${esc(state.connectionReport.runpod?.status || "조회하지 않음")}</dd></div></dl></section>` : ""}`;
 }
 function datasets() {
-  return `<section class="card"><h3>새 데이터 버전 등록</h3><p>Alpaca 또는 ShareGPT 형식의 JSON·JSONL을 등록합니다. 등록 시 로컬 사본과 해시를 보존하며, 같은 버전은 덮어쓰지 않습니다.</p>
+  return `<section class="card"><h3>새 데이터 버전 등록</h3><p>학습 단계에 맞는 JSON·JSONL을 등록합니다. 지시·대화, 텍스트, 선호 쌍, 선호 라벨, 프롬프트를 검사합니다. 등록 시 로컬 사본과 해시를 보존하며, 같은 버전은 덮어쓰지 않습니다.</p>
   <form id="dataset-form"><div class="grid">${field("데이터 ID", "dataset_id", state.datasetDraft.dataset_id || "my_dataset")}${field("버전", "version", state.datasetDraft.version || "1")}
-  ${field("파일 경로", "path", state.datasetDraft.path || "")}<div class="field"><span>데이터 선택</span>${button(icon("folder") + " 파일 찾기", "pick:dataset")}</div></div>
+  ${select("데이터 종류", "kind", state.datasetDraft.kind || "instruction", datasetKinds)}${field("파일 경로", "path", state.datasetDraft.path || "")}<div class="field"><span>데이터 선택</span>${button(icon("folder") + " 파일 찾기", "pick:dataset")}</div></div>
   <label class="check"><input name="synthetic" type="checkbox" ${state.datasetDraft.synthetic ? "checked" : ""}> 더미·합성 데이터입니다</label>
   <label class="check"><input name="export_allowed" type="checkbox" ${state.datasetDraft.export_allowed ? "checked" : ""}> 이 데이터를 선택한 GPU로 전송해도 됩니다</label>
   <p class="muted">여기서는 PC에만 등록합니다. 실제 전송은 학습 실행 시 별도로 확인합니다.</p><div class="actions">${button("샘플 미리보기", "dataset-preview")}<button class="primary" type="submit">검사하고 등록</button></div></form></section>
+  ${s3Datasets()}
   ${state.preview ? `<section class="card"><div class="section-title"><h3>데이터 미리보기</h3><span class="badge">${esc(state.preview.format)} · ${num(state.preview.rows)}건</span></div>
   <p class="${state.preview.duplicate_rows ? "warning-text" : "muted"}">중복 레코드 ${num(state.preview.duplicate_rows)}건 · 앞 3건 미리보기 · 긴 내용은 일부만 표시합니다.</p><div class="sample-list">${state.preview.samples.map((sample: Obj, i: number) => `<article><small>SAMPLE ${String(i + 1).padStart(2, "0")}</small><pre>${esc(JSON.stringify(sample, null, 2))}</pre></article>`).join("")}</div></section>` : ""}
   <section class="card"><h3>등록한 버전</h3>${state.catalog.datasets.length ? `<table><thead><tr><th>데이터</th><th>버전</th><th>건수</th><th>구분</th><th>GPU 전송</th></tr></thead><tbody>${state.catalog.datasets.map((d: Obj) => `<tr><td>${esc(d.dataset_id)}</td><td>${esc(d.version)}</td><td>${num(d.rows)}</td><td>${d.synthetic ? "합성" : "사용자 데이터"}</td><td>${d.export_allowed ? "허용" : "미허용"}</td></tr>`).join("")}</tbody></table>` : '<div class="empty">아직 등록한 데이터가 없습니다.</div>'}</section>`;
 }
 function training() {
   if (!state.config) return '<section class="card">학습 설정을 불러오는 중입니다.</section>';
+  normalizeConfig();
   const c = state.config;
   const datasetOptions: [string, string][] = [["", "선택해 주세요"], ...state.catalog.datasets.map((d: Obj) => [d.dataset_id + ":" + d.version, d.dataset_id + " · v" + d.version])];
   return `<form id="training-form"><section class="card"><div class="section-title"><h3>업무 AI 설정</h3>${button("설정 저장", "save-profile")}</div><div class="grid">
@@ -175,10 +292,11 @@ function training() {
   ${configField("업무 AI ID", "ai_id")}${configField("업무 흐름 ID", "workflow_id")}
   ${select("학습 데이터", "train_dataset", c.dataset_id + ":" + c.dataset_version, datasetOptions)}
   ${select("검증 데이터", "validation_dataset", c.evaluation_profile.dataset_id ? c.evaluation_profile.dataset_id + ":" + c.evaluation_profile.dataset_version : "", [["", "없음 · 학습 완료만 확인"], ...datasetOptions.slice(1)])}
-  ${configSelect("평가 방식", "evaluation_profile.kind", [["pipeline", "학습 완료 확인"], ["json", "JSON 형식"], ["classification", "분류"], ["extraction", "정보 추출"], ["kbf_extraction", "KBF 추출"]])}
+  ${configSelect("평가 방식", "evaluation_profile.kind", [["pipeline", "학습 완료 확인"], ["json", "JSON 형식"], ["classification", "분류"], ["extraction", "정보 추출"], ["kbf_extraction", "KBF 추출"], ["reward", "보상 점수 · RM"]])}
   </div></section><section class="card"><h3>모델과 학습</h3><div class="grid">
-  ${configSelect("기반 모델", "base_model", ["Qwen/Qwen2.5-0.5B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-7B-Instruct", "meta-llama/Llama-3.1-8B-Instruct", "meta-llama/Llama-3.2-3B-Instruct"].map(x => [x, x]))}
-  ${configSelect("학습 방법", "training_method", [["lora", "LoRA"], ["qlora", "QLoRA · 4-bit"]])}
+  ${configSelect("기반 모델", "base_model", (state.catalog.models || []).map((model: Obj) => [model.id, model.id + (model.gpu_verified ? " · GPU 검증 이력" : "")]))}
+  ${configSelect("학습 단계", "training_stage", (state.catalog.training_stages || []).map((stage: Obj) => [stage.id, stage.label]))}
+  ${methodSelect()}
   ${configField("학습 횟수 (epoch)", "hyperparameters.num_train_epochs", "number")}
   ${configField("학습률", "hyperparameters.learning_rate", "number")}
   ${configField("배치 크기", "hyperparameters.per_device_train_batch_size", "number")}
@@ -186,25 +304,23 @@ function training() {
   </div><div class="actions">${button("선택한 모델 버전 확인·고정", "model_revision")}</div><p class="muted">모델을 변경하면 버전 확인을 눌러 주세요. 최초에는 공개 Qwen 모델을 권장합니다. Llama 모델은 이용 승인과 GPU의 사전 다운로드가 필요합니다.</p><details><summary>고급 설정</summary><div class="grid">
   ${configField("모델 revision · 40자리 commit", "model_revision")}
   ${configField("토크나이저 revision · 모델과 일치", "tokenizer_revision")}
-  ${configField("모델 템플릿 (qwen / llama3)", "template")}
+  ${configField("모델 템플릿 · 모델에서 자동 적용", "template")}
   ${configSelect("정밀도", "hyperparameters.precision", [["bf16", "BF16 · 권장"], ["fp16", "FP16"]])}
   ${configField("최대 step (-1은 epoch 기준)", "hyperparameters.max_steps", "number")}
   ${configField("기울기 누적", "hyperparameters.gradient_accumulation_steps", "number")}
-  ${configField("LoRA rank", "hyperparameters.lora_rank", "number")}
-  ${configField("무작위 시드", "hyperparameters.seed", "number")}
-  ${configSelect("LoRA 대상", "hyperparameters.lora_target", [["all", "전체"], ["q_proj,v_proj", "q_proj · v_proj"]])}
-  ${configField("체크포인트 저장 간격 (step)", "hyperparameters.save_steps", "number")}
+    ${configField("무작위 시드", "hyperparameters.seed", "number")}
+    ${configField("체크포인트 저장 간격 (step)", "hyperparameters.save_steps", "number")}
   ${configField("체크포인트 보관 수", "hyperparameters.save_total_limit", "number")}
   ${configField("검증 최대 건수", "evaluation_profile.max_samples", "number")}
   ${configField("답변 최대 토큰", "evaluation_profile.max_new_tokens", "number")}
-  </div></details></section><section class="card"><h3>GPU와 실행 한도</h3><div class="grid">
+  </div></details></section>${trainingOptions()}<section class="card"><h3>GPU와 실행 한도</h3><div class="grid">
   ${configField("GPU 종류 · 연결 설정에서 가져오기", "resource_profile.gpu_type")}
   ${configField("GPU 수", "resource_profile.gpu_count", "number")}
   ${configField("GPU 한 개당 시간 요금 (USD)", "resource_profile.hourly_cost_usd", "number")}
   ${configField("최대 실행 시간 (초)", "resource_profile.timeout_seconds", "number")}
   ${configField("최대 예상 GPU 비용 (USD)", "resource_profile.max_cost_usd", "number")}
   </div><p class="muted">현재 앱 정책은 동시 GPU 1개, 최대 4시간·예상 비용 $5입니다. 기존 Pod의 실제 청구를 차단하는 한도는 아닙니다.</p>
-  <div class="actions"><button class="primary" type="submit">실행 계획 확인</button>${button("설정 저장", "save-profile")}</div></section></form>
+  ${compatibilityView()}<div class="actions"><button class="primary" type="submit" ${!state.capabilities?.valid || state.capabilityPending ? "disabled" : ""}>실행 계획 확인</button>${button("설정 저장", "save-profile")}</div></section></form>
   ${state.plan ? `<section class="card plan"><h3>실행 전 확인</h3><div class="stats"><article><small>업무 AI</small><b>${esc(state.plan.manifest.config.ai_id)}</b></article><article><small>학습 데이터</small><b>${esc(state.plan.manifest.dataset.dataset_id)} · ${num(state.plan.manifest.dataset.rows)}건</b></article><article><small>최대 시간 기준 예상 GPU 비용</small><b>$${num(state.plan.estimated_cost_usd)}</b></article></div>
   <p>${esc(state.plan.note)}</p><p class="muted">Pod: ${esc(state.settings.pod_id || "미설정")} · GPU: ${esc(state.plan.manifest.config.resource_profile.gpu_type)}</p>
   ${button("데이터 전송에 동의하고 학습 시작", "start", "primary")}
@@ -212,12 +328,13 @@ function training() {
 }
 function jobs() {
   const active = state.jobs.find((j: Obj) => j.id === state.active);
+  const resumeSupported = state.jobCapabilities && state.jobCapabilities.resume_supported !== false;
   return `<section class="card"><div class="section-title"><h3>이 PC의 작업</h3><div class="actions">${button("새로고침", "refresh")}${button("연결 끊긴 작업 확인", "recover")}</div></div>
   <p class="muted">학습은 원격에서 계속됩니다. PC를 다시 열면 이전 작업을 선택해 결과 회수를 시도하세요. GPU가 사용 중이면 종료하지 마세요.</p>
   ${state.jobs.length ? `<table><thead><tr><th>업무 AI / 작업</th><th>상태</th><th>시도</th><th>종류</th><th></th></tr></thead><tbody>${state.jobs.map((j: Obj) => `<tr><td><b>${esc(j.manifest.config.ai_id)}</b><small class="mono">${esc(j.id)}</small></td><td>${badge(j.status)}</td><td>${j.attempts}</td><td>${j.manifest.simulation ? "모의" : "실제"}</td><td>${button("선택", "job:" + j.id)}</td></tr>`).join("")}</tbody></table>` : '<div class="empty">실행 계획을 확인한 뒤 학습을 시작해 보세요.</div>'}</section>
   ${active ? `<section class="card"><div class="section-title"><h3>${esc(active.manifest.config.ai_id)} ${badge(active.status)}</h3><div class="actions">${button("저장된 진행 지표", "progress-local")}${button("원격 진행 지표", "progress-remote")}</div></div>${progressView(state.progress)}${active.error ? `<p class="error">${esc(active.error)}</p>` : ""}
   <div class="actions">${button("학습 로그", "logs")}${button("원격 실시간 로그", "live_logs")}${button("평가 결과", "evaluation")}${button("재연결 · 결과 회수", "reconcile")}${button("대기 작업 실행", "execute")}${button("취소 요청", "cancel", "danger")}</div>
-  <div class="actions"><label>재개할 체크포인트 <input id="checkpoint" value="${esc(state.checkpoint || "checkpoint-10")}" aria-label="재개할 체크포인트"></label>${button("체크포인트에서 재개", "resume")}</div><pre class="log">${esc(state.logs || "로그를 선택하세요.")}</pre></section>` : ""}`;
+  <div class="actions"><label>재개할 체크포인트 <input id="checkpoint" value="${esc(state.checkpoint || "checkpoint-10")}" aria-label="재개할 체크포인트"></label>${button("체크포인트에서 재개", "resume").replace("<button ", `<button ${!resumeSupported ? "disabled" : ""} `)}</div>${state.jobCapabilities?.resume_supported === false ? '<p class="warning-text">이 학습 단계·방식은 체크포인트 재개를 지원하지 않습니다. 회수 가능한 결과는 재연결로 확인하세요.</p>' : !state.jobCapabilities ? '<p class="muted">작업을 선택하면 재개 지원 여부를 확인합니다.</p>' : ""}<pre class="log">${esc(state.logs || "로그를 선택하세요.")}</pre></section>` : ""}`;
 }
 function history() {
   const options: [string, string][] = state.experiments.map((e: Obj) => [e.id, e.name + " · " + e.id]);
@@ -265,7 +382,7 @@ function settingsFromForm(form: HTMLFormElement) {
   return values;
 }
 async function execute(job: Obj) {
-  state.active = job.id; state.page = "jobs"; await refresh(); render();
+  state.active = job.id; state.jobCapabilities = null; state.page = "jobs"; await refresh(); render();
   // Deliberately do not block navigation: a separate bridge process owns this attempt.
   api("execute", { job_id: job.id, approved: true }).then(async result => {
     await refresh();
@@ -284,6 +401,16 @@ function bind() {
     e.preventDefault(); const values = settingsFromForm(e.currentTarget as HTMLFormElement);
     void task("연결 정보 저장 중", async () => { state.settings = await invoke("settings_save", { values }); state.settingsDraft = null; state.connectionReport = null; state.notice = "연결 정보를 저장했습니다."; });
   });
+  document.querySelector<HTMLFormElement>("#s3-settings-form")?.addEventListener("submit", e => {
+    e.preventDefault(); const values = settingsFromForm(e.currentTarget as HTMLFormElement);
+    void task("S3 연결 정보 저장 중", async () => { state.settings = await invoke("settings_save", { values }); state.s3SettingsDraft = null; state.s3Listing = null; state.s3Object = null; state.notice = "S3 연결 정보를 저장했습니다. 데이터 화면에서 버킷을 조회하세요."; });
+  });
+  document.querySelector<HTMLFormElement>("#s3-form")?.addEventListener("submit", e => e.preventDefault());
+  document.querySelectorAll<HTMLInputElement>('#s3-form [data-key="bucket"], #s3-form [data-key="key"], #s3-form [data-key="version_id"]').forEach(el => el.addEventListener("input", () => {
+    state.s3Object = null;
+    document.querySelector<HTMLButtonElement>('[data-action="s3-import"]')?.setAttribute("disabled", "");
+    document.querySelector(".s3-object")?.remove();
+  }));
   document.querySelector<HTMLFormElement>("#dataset-form")?.addEventListener("submit", e => {
     e.preventDefault(); const form = e.currentTarget as HTMLFormElement; const data = settingsFromForm(form);
     data.synthetic = (form.elements.namedItem("synthetic") as HTMLInputElement).checked;
@@ -291,18 +418,30 @@ function bind() {
     void task("데이터 검사·등록 중", async () => { await api("dataset", data); await catalog(); state.notice = "데이터 버전을 등록했습니다."; });
   });
   document.querySelector<HTMLFormElement>("#training-form")?.addEventListener("submit", e => {
-    e.preventDefault(); captureConfig(); void task("실행 계획 검사 중", async () => { state.plan = await api("plan", { config: state.config }); });
+    e.preventDefault(); captureConfig(); void task("실행 계획 검사 중", async () => { const result = await checkCapabilities(); if (!result.valid) throw new Error((result.errors || ["설정 호환성을 확인해 주세요."]).join("\n")); state.plan = await api("plan", { config: state.config }); });
   });
-  document.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-config]").forEach(el => el.addEventListener("change", () => { captureConfig(); state.plan = null; }));
-  document.querySelector<HTMLSelectElement>('[data-config="base_model"]')?.addEventListener("change", () => {
-    state.config.model_revision = ""; state.config.tokenizer_revision = "";
-    state.config.template = state.config.base_model.startsWith("Qwen/") ? "qwen" : "llama3";
-    render();
+  document.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-config]").forEach(el => {
+    el.addEventListener("input", () => { captureConfig(); invalidatePlan(); });
+    el.addEventListener("change", () => {
+      captureConfig();
+      if (el.dataset.config === "base_model") {
+        state.config.model_revision = ""; state.config.tokenizer_revision = "";
+        const model = state.catalog.models.find((item: Obj) => item.id === state.config.base_model);
+        state.config.template = model?.template || "";
+      }
+      if (el.dataset.config === "training_stage") {
+        if (state.config.evaluation_profile.dataset_id) {
+          if (state.config.training_stage === "rm") state.config.evaluation_profile.kind = "reward";
+          else if (state.config.evaluation_profile.kind === "reward") state.config.evaluation_profile.kind = "json";
+        }
+      }
+      void configChanged(el instanceof HTMLSelectElement || (el instanceof HTMLInputElement && el.type === "checkbox"), true);
+    });
   });
   document.querySelector<HTMLSelectElement>('[data-key="template"]')?.addEventListener("change", e => {
     const [kind, index] = (e.target as HTMLSelectElement).value.split(":");
     if (index) state.config = structuredClone(kind === "t" ? state.catalog.templates[Number(index)].config : state.catalog.profiles[Number(index)]);
-    state.plan = null; render();
+    normalizeConfig(); state.plan = null; void configChanged(true, true);
   });
   for (const key of ["train_dataset", "validation_dataset"]) {
     document.querySelector<HTMLSelectElement>(`[data-key="${key}"]`)?.addEventListener("change", e => {
@@ -310,8 +449,9 @@ function bind() {
       if (key === "train_dataset") { state.config.dataset_id = id; state.config.dataset_version = version || ""; }
       else { state.config.evaluation_profile.dataset_id = id || null; state.config.evaluation_profile.dataset_version = version || null;
         if (!id) state.config.evaluation_profile.kind = "pipeline";
+        else if (state.config.training_stage === "rm") state.config.evaluation_profile.kind = "reward";
         else if (state.config.evaluation_profile.kind === "pipeline") state.config.evaluation_profile.kind = "json"; }
-      state.plan = null; render();
+      state.plan = null; void configChanged(true, true);
     });
   }
   document.querySelector<HTMLInputElement | HTMLSelectElement>('[data-key="experiment"]')?.addEventListener("change", e => state.experiment = (e.target as HTMLInputElement).value);
@@ -331,10 +471,10 @@ function bind() {
 }
 async function action(name: string) {
   if (name === "search") { commandSearch(); return; }
-  if (name.startsWith("nav:")) { captureConfig(); captureDrafts(); state.page = name.split(":")[1]; render(); return; }
+  if (name.startsWith("nav:")) { captureConfig(); captureDrafts(); state.page = name.split(":")[1]; render(); if (state.page === "training" && !state.capabilities && !state.capabilityPending) { await checkCapabilities(); render(); } return; }
   if (name.startsWith("template:")) {
     state.config = structuredClone(state.catalog.templates[Number(name.split(":")[1])].config);
-    state.plan = null; state.page = "training"; render(); return;
+    normalizeConfig(); state.plan = null; state.capabilities = null; state.page = "training"; render(); await checkCapabilities(); render(); return;
   }
   if (name.startsWith("pick:")) {
     const dataset = name.endsWith("dataset");
@@ -346,18 +486,38 @@ async function action(name: string) {
     return;
   }
   if (name.startsWith("job:")) {
-    state.active = name.split(":")[1]; state.page = "jobs"; state.logs = ""; state.progress = null; state.liveProgress = false;
-    await task("학습 기록 불러오는 중", async () => { state.progress = await api("job_progress", { job_id: state.active }); }); return;
+    state.active = name.split(":")[1]; state.page = "jobs"; state.logs = ""; state.progress = null; state.liveProgress = false; state.jobCapabilities = null;
+    await task("학습 기록 불러오는 중", async () => {
+      const job = state.jobs.find((item: Obj) => item.id === state.active);
+      const [progress, capabilities] = await Promise.all([api("job_progress", { job_id: state.active }), api("capabilities", { config: job.manifest.config })]);
+      state.progress = progress; state.jobCapabilities = capabilities;
+    }); return;
   }
   if (name.startsWith("reuse:")) {
     await task("실행 설정 불러오는 중", async () => {
       const config = state.runs.find((run: Obj) => run.id === name.slice(6))?.config;
       if (!config?.ai_id || !config.hyperparameters || !config.resource_profile || !config.evaluation_profile) throw new Error("이 기록에는 재사용할 전체 설정이 없습니다.");
-      state.config = structuredClone(config); state.page = "training"; state.plan = null;
+      state.config = structuredClone(config); normalizeConfig(); state.page = "training"; state.plan = null; await checkCapabilities();
       state.notice = "설정을 불러왔습니다. 이 PC에 등록된 데이터 버전을 선택하고 실행 계획을 확인하세요.";
     }); return;
   }
+  if (name.startsWith("s3-folder:")) {
+    captureDrafts(); const prefix = state.s3Listing.common_prefixes[Number(name.split(":")[1])];
+    state.s3Draft.prefix = typeof prefix === "string" ? prefix : prefix.prefix; state.s3Listing = null; render();
+    await action("s3-list"); return;
+  }
+  if (name.startsWith("s3-object:")) {
+    captureDrafts(); const object = state.s3Listing.objects[Number(name.split(":")[1])];
+    state.s3Draft.key = object.key; state.s3Draft.version_id = ""; state.s3Object = null; render();
+    await action("s3-head"); return;
+  }
+  if (name === "s3-import") {
+    captureDrafts();
+    if (!state.s3Object) { state.error = "가져올 객체를 먼저 확인하세요."; render(); return; }
+    if (!await approve("S3에서 PC로 데이터 가져오기", `${state.s3Draft.bucket}/${state.s3Draft.key} (${dataSize(state.s3Object.size)})를 이 PC에 다운로드하고 검사한 사본으로 등록합니다. S3 다운로드 요금이 발생할 수 있습니다. RunPod로는 전송하지 않습니다. 학습 시작 시 별도 전송 동의가 필요합니다.`)) return;
+  }
   if (name === "runtime_prepare" && !await approve("GPU 학습 환경 준비", "저장된 연결의 현재 실행 중인 Pod에 앱 전용 학습 환경을 설치합니다. 의존성과 모델 실행 도구를 다운로드하며 GPU 요금은 계속 발생합니다. 사용자 데이터는 전송하지 않습니다.")) return;
+  if (name === "resume" && state.jobCapabilities?.resume_supported === false) { state.error = "이 학습 단계·방식은 체크포인트 재개를 지원하지 않습니다."; render(); return; }
   if (["start", "execute", "resume"].includes(name)) {
     captureConfig();
     if (name === "start" && !state.plan) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
@@ -368,14 +528,29 @@ async function action(name: string) {
   await task(name === "runtime_prepare" ? "GPU 환경 준비 중 · 첫 설치는 수 분 이상 걸릴 수 있습니다" : "처리 중", async () => {
     if (name === "check") { state.connectionReport = await api("connection"); state.notice = "저장된 연결 정보로 MLflow와 Pod 조회를 확인했습니다."; }
     else if (name === "forget") {
-      if (await approve("저장된 인증값 삭제", "Windows 자격 증명 저장소에 저장한 이 앱의 API 키와 MLflow 인증값을 삭제합니다. 진행 중인 작업에는 적용되지 않습니다.")) {
-        await invoke("forget_credentials"); state.settings = await invoke("settings_get"); state.settingsDraft = null; state.connectionReport = null; state.notice = "저장된 인증값을 삭제했습니다.";
+      if (await approve("저장된 인증값 삭제", "Windows 자격 증명 저장소에 저장한 이 앱의 RunPod·MLflow·S3 인증값을 삭제합니다. 진행 중인 작업에는 적용되지 않습니다.")) {
+        await invoke("forget_credentials"); state.settings = await invoke("settings_get"); state.settingsDraft = null; state.s3SettingsDraft = null; state.connectionReport = null; state.notice = "저장된 인증값을 삭제했습니다.";
       }
     }
-    else if (name === "runtime_check" || name === "runtime_prepare") { state.runtimeReport = await api(name, { approved: name === "runtime_prepare" }); state.notice = "선택한 Pod에서 앱과 일치하는 학습 환경과 CUDA를 확인했습니다."; }
+    else if (name === "runtime_check" || name === "runtime_prepare") { state.runtimeReport = await api(name, { approved: name === "runtime_prepare", training_stage: state.config?.training_stage || "sft" }); state.notice = "선택한 Pod에서 앱과 일치하는 학습 환경과 CUDA를 확인했습니다."; }
     else if (name === "dataset-preview") {
       if (!state.datasetDraft.path) throw new Error("먼저 데이터 파일을 선택하세요.");
-      state.preview = await api("dataset_preview", { path: state.datasetDraft.path });
+      state.preview = await api("dataset_preview", { path: state.datasetDraft.path, kind: state.datasetDraft.kind || "instruction" });
+    }
+    else if (["s3-list", "s3-next", "s3-head", "s3-import"].includes(name)) {
+      const d = state.s3Draft;
+      if (!d.bucket) throw new Error("S3 버킷을 입력하세요.");
+      if (["s3-list", "s3-next"].includes(name)) state.s3Listing = await api("s3_list", { bucket: d.bucket, prefix: d.prefix || "", continuation_token: name === "s3-next" ? state.s3Listing?.next_token : null });
+      else if (name === "s3-head") {
+        if (!d.key) throw new Error("S3 객체 key를 입력하세요.");
+        state.s3Object = null;
+        state.s3Object = await api("s3_head", { bucket: d.bucket, key: d.key, version_id: d.version_id || null });
+      } else {
+        const object = state.s3Object;
+        if (!object) throw new Error("가져올 객체를 먼저 확인하세요.");
+        const result = await api("s3_import", { bucket: d.bucket, key: d.key, version_id: object.version_id || d.version_id || null, expected: { bucket: object.bucket, key: object.key, etag: object.etag, version_id: object.version_id || null, size: object.size, checksum_sha256: object.checksum_sha256, checksum_type: object.checksum_type }, dataset_id: d.dataset_id, version: d.version, kind: d.kind || "instruction", synthetic: Boolean(d.synthetic), export_allowed: Boolean(d.export_allowed), approved: true });
+        await catalog(); state.notice = `S3 데이터를 PC에 등록했습니다. ${result.dataset_id} · v${result.version} · SHA256 ${result.sha256 || "확인됨"}`; state.s3Object = null;
+      }
     }
     else if (name === "progress-local" || name === "progress-remote") {
       state.progress = await api("job_progress", { job_id: state.active, remote: name === "progress-remote" });
@@ -386,11 +561,11 @@ async function action(name: string) {
       state.config.resource_profile.gpu_type = pod.gpu.id || pod.gpu.displayName;
       state.config.resource_profile.gpu_count = pod.gpu.count;
       state.config.resource_profile.hourly_cost_usd = Number(pod.costPerHr) / pod.gpu.count;
-      state.plan = null; state.notice = "실제 GPU 종류·수·현재 요금을 학습 설정에 적용했습니다.";
+      state.plan = null; await checkCapabilities(); state.notice = "실제 GPU 종류·수·현재 요금을 학습 설정에 적용했습니다.";
     }
     else if (name === "model_revision") {
       Object.assign(state.config, await api("model_revision", { model: state.config.base_model }));
-      state.plan = null; state.notice = "선택한 모델과 토크나이저 버전을 고정했습니다.";
+      state.plan = null; await checkCapabilities(); state.notice = "선택한 모델과 토크나이저 버전을 고정했습니다.";
     }
     else if (name === "save-profile") { await api("save_profile", { config: state.config }); await catalog(); state.notice = "업무 AI 설정을 저장했습니다."; }
     else if (name === "start") { const job = await api("submit", { config: state.plan.manifest.config, approved: true, request_key: crypto.randomUUID() }); await execute(job); state.plan = null; }
@@ -414,6 +589,7 @@ render();
 void task("작업 공간 불러오는 중", async () => {
   state.settings = await invoke("settings_get"); await catalog(); await refresh();
   state.config = structuredClone(state.catalog.profiles[0] || state.catalog.templates.find((t: Obj) => t.name === "paper_extraction")?.config);
+  normalizeConfig(); await checkCapabilities();
 });
 window.addEventListener("keydown", e => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); commandSearch(); } });
 let polling = false;

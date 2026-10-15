@@ -51,8 +51,8 @@ def doctor(ctx: typer.Context, pod_id: str | None = None, write_test: bool = Fal
 
 @app.command("dataset-register")
 def dataset_register(ctx: typer.Context, dataset_id: str, version: str, source: Path,
-                     export_allowed: bool = False, synthetic: bool = False):
-    output(ctx.obj.registry.register_dataset(dataset_id, version, source, export_allowed, synthetic))
+                     export_allowed: bool = False, synthetic: bool = False, kind: str = "instruction"):
+    output(ctx.obj.registry.register_dataset(dataset_id, version, source, export_allowed, synthetic, kind=kind))
 
 
 @app.command()

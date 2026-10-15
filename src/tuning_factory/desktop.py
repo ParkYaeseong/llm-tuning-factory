@@ -3,12 +3,15 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import yaml
 
+from .capabilities import compatibility, model_catalog, training_stages
 from .config import AIConfig
 from .connections import ENV_SETTINGS
 from .desktop_inspection import inspect_dataset, parameter_changes, parse_progress
@@ -30,7 +33,10 @@ def compare_runs(base, candidate):
     ) and base.get("status") == candidate.get("status") == "FINISHED" and all(
         base.get(key) == candidate.get(key)
         for key in ("ai_id", "validation_sha256", "simulation", "evaluation_kind")
-    ) and not base.get("simulation")
+    ) and not base.get("simulation") and (
+        base.get("config", {}).get("training_stage", "sft") ==
+        candidate.get("config", {}).get("training_stage", "sft")
+    )
     return {"comparable": comparable,
             "reason": "" if comparable else "동일 업무·검증 데이터·평가 방식의 실제 실행만 지표를 비교합니다.",
             "parameter_changes": parameter_changes(base.get("config", {}), candidate.get("config", {})),
@@ -80,21 +86,47 @@ class DesktopService:
             profiles = [json.loads(p.read_bytes()) for p in sorted((self.root / "profiles").glob("*.json"))]
             datasets = [json.loads(p.read_bytes()) for p in sorted(
                 (self.factory.registry.root / "datasets").glob("*/*.json"))]
-            return {"templates": templates, "profiles": profiles, "datasets": datasets}
+            return {"templates": templates, "profiles": profiles, "datasets": datasets,
+                    "models": model_catalog(), "training_stages": training_stages()}
+        if action == "capabilities":
+            result = compatibility(data["config"])
+            try:
+                config = AIConfig.model_validate(data["config"])
+            except ValueError as exc:
+                result = {**result, "valid": False,
+                          "errors": result["errors"] or [str(exc)]}
+            else:
+                try:
+                    dataset = self.factory.registry.get_dataset(config.dataset_id, config.dataset_version)
+                except FileNotFoundError:
+                    result["warnings"].append("학습 전에 이 PC에 데이터 버전을 등록하세요.")
+                else:
+                    if dataset.get("kind", "instruction") != result["dataset_kind"]:
+                        result["errors"].append(f"dataset kind must be {result['dataset_kind']} for {config.training_stage}")
+                        result["valid"] = False
+            return result
         if action == "model_revision":
             import httpx
             model = data["model"]
-            if model not in {"Qwen/Qwen2.5-0.5B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct",
-                             "Qwen/Qwen2.5-7B-Instruct", "meta-llama/Llama-3.1-8B-Instruct",
-                             "meta-llama/Llama-3.2-3B-Instruct"}:
+            profile = next((m for m in model_catalog() if m["id"] == model), None)
+            if not profile:
                 raise ValueError("supported model required")
             response = httpx.get("https://huggingface.co/api/models/" + model + "/revision/main", timeout=20)
             response.raise_for_status()
             revision = response.json().get("sha", "")
             if not re.fullmatch("[0-9a-f]{40}", revision):
                 raise ValueError("model revision lookup did not return an immutable commit")
+            response = httpx.get(f"https://huggingface.co/{model}/resolve/{revision}/config.json", timeout=20,
+                                 follow_redirects=True)
+            response.raise_for_status()
+            metadata = response.json()
+            if metadata.get("model_type") != profile["architecture"]:
+                raise ValueError("model architecture differs from the reviewed compatibility profile")
             return {"model_revision": revision, "tokenizer_revision": revision,
-                    "template": "qwen" if model.startswith("Qwen/") else "llama3"}
+                    "template": profile["template"], "architecture": profile["architecture"],
+                    "max_length": min(profile["max_length"], metadata.get("max_position_embeddings") or profile["max_length"]),
+                    "recommended_precision": metadata.get("torch_dtype", metadata.get("dtype")),
+                    "hidden_layers": metadata.get("num_hidden_layers"), "metadata_verified": True}
         if action == "save_profile":
             config = AIConfig.model_validate(data["config"])
             directory = self.root / "profiles"
@@ -102,11 +134,34 @@ class DesktopService:
             (directory / (safe_name(config.ai_id) + ".json")).write_bytes(canonical(config.model_dump()))
             return {"saved": True}
         if action == "dataset_preview":
-            return inspect_dataset(data["path"])
+            return inspect_dataset(data["path"], data.get("kind", "instruction"))
         if action == "dataset":
             return self.factory.registry.register_dataset(
                 data["dataset_id"], data["version"], Path(data["path"]),
-                export_allowed=data.get("export_allowed") is True, synthetic=data.get("synthetic") is True)
+                export_allowed=data.get("export_allowed") is True, synthetic=data.get("synthetic") is True,
+                kind=data.get("kind", "instruction"))
+        if action == "s3_list":
+            return self.storage().list_objects(data["bucket"], data.get("prefix", ""),
+                                               data.get("continuation_token"))
+        if action == "s3_head":
+            return {**self.storage().head(data["bucket"], data["key"], data.get("version_id")),
+                    "import_max_bytes": 32 * 1024 * 1024, "free_bytes": shutil.disk_usage(self.root).free}
+        if action == "s3_import":
+            if data.get("approved") is not True:
+                raise ValueError("explicit S3 download approval required")
+            safe_name(data["dataset_id"])
+            safe_name(data["version"])
+            if int((data.get("expected") or {}).get("size", 0)) > shutil.disk_usage(self.root).free:
+                raise ValueError("insufficient local disk space for S3 import")
+            temporary_root = self.root / "s3-imports"
+            temporary_root.mkdir(exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=temporary_root) as directory:
+                result = self.storage().download(data["bucket"], data["key"], directory,
+                                                 data.get("expected") or {}, maximum_bytes=32 * 1024 * 1024)
+                return self.factory.registry.register_dataset(
+                    data["dataset_id"], data["version"], result["path"],
+                    export_allowed=data.get("export_allowed") is True, synthetic=data.get("synthetic") is True,
+                    kind=data.get("kind", "instruction"), source_metadata=result["source"])
         if action == "plan":
             config = AIConfig.model_validate(data["config"])
             manifest = self.manifest(config)
@@ -126,7 +181,8 @@ class DesktopService:
             from .desktop_runtime import executor_for
             job_id = data["job_id"]
             self.job_directory(job_id)
-            with executor_for(self.settings, self.root) as executor:
+            stage = self.factory.store.get(job_id)["manifest"]["config"].get("training_stage", "sft")
+            with executor_for(self.settings, self.root, training_stage=stage) as executor:
                 return self.factory.work(executor=executor, gpu=self.settings["pod_id"],
                                          approved_transfer=True, select_mode=True, target_job_id=job_id)
         if action == "jobs":
@@ -171,7 +227,8 @@ class DesktopService:
                 raise ValueError("explicit runtime preparation approval required")
             if action == "runtime_prepare" and self.factory.store.gpu_locked(self.settings.get("pod_id", "")):
                 raise ValueError("Pod is reserved by a job; reconcile and finish it before preparing runtime")
-            return runtime(self.settings, self.root, prepare=action == "runtime_prepare")
+            return runtime(self.settings, self.root, prepare=action == "runtime_prepare",
+                           training_stage=data.get("training_stage", "sft"))
         if action == "live_logs":
             from .desktop_runtime import live_logs
             return live_logs(self.settings, self.root, self.job_directory(data["job_id"]))
@@ -196,6 +253,10 @@ class DesktopService:
     def require_approval(data):
         if data.get("approved") is not True:
             raise ValueError("explicit execution and dataset-transfer approval required")
+
+    def storage(self):
+        from .storage import S3Storage
+        return S3Storage(self.settings)
 
     def history(self, data):
         from mlflow import MlflowClient
@@ -227,6 +288,7 @@ class DesktopService:
                            "synthetic": parameter("dataset", {}).get("synthetic", False),
                            "validation_sha256": validation.get("sha256"),
                            "evaluation_kind": config.get("evaluation_profile", {}).get("kind"),
+                           "training_stage": config.get("training_stage", "sft"),
                            "metrics": run.data.metrics, "config": config,
                            "url": self.settings["MLFLOW_TRACKING_URI"].rstrip("/") +
                                   f"/#/experiments/{experiment}/runs/{run.info.run_id}"})

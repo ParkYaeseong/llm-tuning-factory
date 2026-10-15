@@ -1,3 +1,43 @@
+# Current extension acceptance — 2026-10-15, Windows 0.3.0
+
+Approved training-capability/S3 design implemented on codex/training-capabilities-s3. This section supersedes
+the feature-limit statements in older dated entries; it does not expand their real GPU evidence.
+
+Implemented PT/SFT/RM/PPO/DPO/KTO, DPO/IPO/ORPO/SimPO/KTO-pair losses, Full/Freeze/LoRA/QLoRA/OFT,
+typed method options and shared UI/config/worker compatibility rules. Fifteen reviewed text model profiles
+cover Qwen2.5/Llama/Mistral/Gemma2; actual immutable HF metadata and worker GPU/BF16/architecture facts are checked.
+Stage-specific datasets/descriptors, full model shards, adapters, value heads, generation and native RM evaluation
+are handled. Cross-stage metric deltas are refused. Large artifact transfer/hash checks use streaming file hashes.
+
+S3 connection uses explicit vault-held credentials, SigV4, list pagination/exact-key HEAD, VersionId/ETag frozen GET,
+32 MiB bounded local import, length/checksum/SHA256 validation, safe random paths and partial-file cleanup.
+HEAD checksum fields survive the UI import. Native settings reject secret-bearing/presigned endpoints before any
+vault or plaintext settings write. S3 import and subsequent GPU export approvals remain separate; no S3 keys go to GPU.
+
+Verification: Python 3.12 locked sync succeeds; **201 passed, 1 skipped**, Ruff passes. The skip is the opt-in
+GPU test. UI **21 passed**, TypeScript/Vite build passes. Full native Rust **3 tests passed** on version 0.3.0.
+S3 tests include actual boto3 SigV4 requests with independently verified signing to a local synthetic S3 endpoint;
+this is not an AWS/NCP/MinIO account acceptance. New regression failures were observed before fixes.
+
+Pinned LF0.9.5's main dependency check and PPO's old TRL API conflict. PPO therefore uses an isolated pristine
+LF0.9.3/TRL0.9.6/Transformers4.52.4/PEFT0.15.2/Accelerate1.7.0/Datasets3.6.0 environment, not disabled version checks.
+Actual CPU imports/API signatures/PPOConfig construction passed using Torch2.7.1+cpu; no model downloaded.
+PyArrow20 is pinned to avoid the NumPy2 requirement of PyArrow26 conflicting with legacy NumPy1.26.
+Both Linux GPU dependency locks are fully hash-resolved. The CPU probe is separate from CUDA validation.
+See [CPU receipt](acceptance/2026-10-15-ppo-cpu.json) and [feature guide](TRAINING_AND_STORAGE.md).
+
+Explicit remaining scope: new combinations have **not** been run on an actual GPU; no real S3 account/object or
+institution data was accessed. Historical 0.2.3 H100 evidence below is SFT/Qwen0.5 only. PPO resume, OFT resume,
+Full/Freeze RM resume and OFT standalone prediction/reward evaluation are blocked by upstream limits.
+PPO prompts currently require Alpaca; incompatible odd-length ShareGPT prompts are rejected before launch.
+PPO reward models must be pre-provisioned with a complete inventory hash; LoRA base model and Full tokenizer
+identity are checked. Multimodal/unknown architectures, alternate optimizers/quantizers/plugins, unbounded streaming,
+cross-PC scheduling, serving, clean second-PC install and signing are not accepted here.
+
+Windows package/installer verification and publication receipts will be appended after the final build.
+
+---
+
 # Current Windows GPU acceptance — 2026-10-15, app 0.2.3
 
 This section supersedes outstanding GPU statements in the dated historical entries below.

@@ -6,9 +6,9 @@ LLaMA-Factory 학습 엔진과 RunPod 실행기를 분리하고, 데이터·명�
 
 **운영 방식:** 각자 PC에 설치하여 작업을 관리하고, 학습은 각자 배정받은 RunPod GPU에서 실행합니다.
 실행 기록과 업로드한 산출물은 공용 MLflow에 모읍니다. 별도 NCP 관리 서버는 필요하지 않습니다.
-Windows 앱은 **0.2.3 내부 검토 버전**입니다.
+Windows 앱은 **0.3.0 내부 검토 버전**입니다.
 
-[Windows 설치 파일 다운로드](https://github.com/ParkYaeseong/llm-tuning-factory/releases/tag/v0.2.3) ·
+[Windows 설치 파일 다운로드](https://github.com/ParkYaeseong/llm-tuning-factory/releases/tag/v0.3.0) ·
 [Windows 사용 안내](docs/WINDOWS_APP.md) · [실제 GPU 검증 결과](docs/GPU_ACCEPTANCE_2026-10-15.md)
 
 연결 설정·로컬 데이터 미리보기·업무별 학습 설정·실행 관리·MLflow 기록 비교를 제공합니다.
@@ -19,9 +19,15 @@ Windows 앱은 Python을 포함하며 키는 연결 화면에서 입력하고 Wi
 취소·체크포인트 재개·연결 중단 복구, 산출물 전체 회수와 공용 MLflow 왕복 해시를 확인했습니다.
 더미 결과는 업무 AI 품질을 의미하지 않습니다.
 
-**지원 범위:** 정해진 모델 목록의 SFT LoRA/QLoRA와 로컬 JSON/JSONL 데이터입니다.
-LLaMA-Factory 전체 모델·학습 방식의 자동 호환 설정과 S3 데이터 직접 연결은 아직 없습니다.
-다른 모델의 실제 GPU 검증·대량 스트리밍·다중 PC 스케줄링·새 PC 설치 검증·코드 서명도 남아 있습니다.
+**새 기능:** PT·SFT·RM·PPO·DPO·KTO, Full·Freeze·LoRA·QLoRA·OFT와 단계별 옵션을 제공합니다.
+검토한 텍스트 모델 15개 프로필에서 호환 조건을 검사하고, 모델 변경 시 템플릿과 revision을 관리합니다.
+S3 버킷·파일 조회와 버전/해시를 고정한 PC 가져오기(파일당 32 MiB)를 지원합니다.
+[학습 방식·S3 사용 안내](docs/TRAINING_AND_STORAGE.md)를 확인하세요.
+
+**검증 구분:** 위 H100 결과는 0.2.3의 SFT 시험입니다. 새 학습 조합은 CPU/UI 검사,
+PPO 전용 실제 패키지 import, 로컬 S3 서명·전송 계약을 검증했으며 실제 GPU/클라우드 S3 시험은 남아 있습니다.
+PPO·OFT 등의 upstream 재개/평가 제한은 이유와 함께 차단합니다.
+멀티모달·임의 모델/플러그인·대량 스트리밍·다중 PC 스케줄링·서빙·코드 서명은 이번 범위에 포함하지 않습니다.
 
 ## 처음 설치하기
 

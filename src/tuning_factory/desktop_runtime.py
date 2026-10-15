@@ -13,6 +13,7 @@ import paramiko
 
 from .execution import RunPodController, SSHExecutor
 from .manifest import source_hash
+from .runtime_profiles import engine_profile
 
 REMOTE = "/workspace/factory-desktop"
 
@@ -75,8 +76,9 @@ def command(client, argv, timeout=60):
     return output.decode("utf-8", errors="replace")
 
 
-def runtime_path():
-    return REMOTE + "/runtime/" + source_hash()[:16]
+def runtime_path(training_stage="sft"):
+    profile = engine_profile(training_stage)
+    return REMOTE + "/runtime/" + source_hash()[:16] + ("-ppo" if profile["profile"] == "ppo" else "")
 
 
 def prerequisites(client):
@@ -87,27 +89,32 @@ def prerequisites(client):
                     '"or ask its administrator to install a C toolchain before preparing training." >&2; exit 1; }'])
 
 
-def check(client):
+def check(client, training_stage="sft"):
     prerequisites(client)
-    root = runtime_path()
+    root = runtime_path(training_stage)
+    profile = engine_profile(training_stage)
+    lock_name = Path(profile["lock_file"]).name
     probe = (
         "import json,torch,importlib.metadata;"
+        + ("from llamafactory.train.ppo.trainer import CustomPPOTrainer;" if training_stage == "ppo" else "") +
         "from pathlib import Path;"
         "from tuning_factory.manifest import source_hash;"
         "from tuning_factory.registry import digest;"
         "print(json.dumps(dict(source=source_hash(),engine=importlib.metadata.version('llamafactory'),"
-        "cuda=torch.cuda.is_available(),lock=digest(Path(" + repr(root + "/gpu-requirements.lock") +
+        "cuda=torch.cuda.is_available(),lock=digest(Path(" + repr(root + "/" + lock_name) +
         ").read_bytes()))))"
     )
     result = json.loads(command(client, [root + "/venv/bin/python", "-c", probe]).splitlines()[-1])
     from .desktop import assets_root
-    expected = hashlib.sha256((assets_root() / "containers/gpu-requirements.lock").read_bytes()).hexdigest()
-    if result != {"source": source_hash(), "engine": "0.9.5", "cuda": True, "lock": expected}:
+    expected = hashlib.sha256((assets_root() / profile["lock_file"]).read_bytes()).hexdigest()
+    if result != {"source": source_hash(), "engine": profile["engine_version"], "cuda": True, "lock": expected}:
         raise ValueError("GPU runtime source, lock, engine or CUDA preflight mismatch; prepare runtime first")
     return result
 
 
-def runtime(settings, state_root, prepare=False):
+def runtime(settings, state_root, prepare=False, training_stage="sft"):
+    profile = engine_profile(training_stage)
+    lock_name = Path(profile["lock_file"]).name
     with connection(settings) as (pod, client):
         if prepare:
             prerequisites(client)
@@ -116,11 +123,11 @@ def runtime(settings, state_root, prepare=False):
             wheels = list((assets / "dist").glob("llm_tuning_factory-*.whl"))
             if len(wheels) != 1:
                 raise ValueError("matching worker wheel missing; rebuild desktop package")
-            root = runtime_path()
+            root = runtime_path(training_stage)
             helper = SSHExecutor("", 22, "root", "", client=client, pod=pod)
             with client.open_sftp() as sftp:
                 helper.mkdir(sftp, root)
-                for path in [assets / "containers/gpu-requirements.lock", wheels[0]]:
+                for path in [assets / profile["lock_file"], wheels[0]]:
                     sftp.put(str(path), root + "/" + path.name)
             # uv bootstrap is private to this source-versioned namespace, including Python downloads.
             script = (
@@ -132,24 +139,26 @@ def runtime(settings, state_root, prepare=False):
                 f"export PYTHONPATH={shlex.quote(root + '/bootstrap')}\n"
                 f"python3 -m uv venv --python 3.12 --allow-existing {shlex.quote(root + '/venv')}\n"
                 f"python3 -m uv pip sync --python {shlex.quote(root + '/venv/bin/python')} --require-hashes "
-                f"{shlex.quote(root + '/gpu-requirements.lock')}\n"
+                f"{shlex.quote(root + '/' + lock_name)}\n"
                 f"python3 -m uv pip install --python {shlex.quote(root + '/venv/bin/python')} --no-deps "
                 f"{shlex.quote(root + '/' + wheels[0].name)}\n"
             )
             command(client, ["sh", "-c", script], timeout=1800)
-        result = check(client)
-        return {"ready": True, "pod_id": pod["id"], "runtime": runtime_path(), **result}
+        result = check(client, training_stage)
+        return {"ready": True, "pod_id": pod["id"], "runtime": runtime_path(training_stage),
+                "profile": profile["profile"], **result}
 
 
 @contextmanager
-def executor_for(settings, state_root, preflight=True):
+def executor_for(settings, state_root, preflight=True, training_stage="sft"):
     with connection(settings) as (pod, client):
         if preflight:
-            check(client)
-        root = runtime_path()
+            check(client, training_stage)
+        root = runtime_path(training_stage)
+        lock_name = Path(engine_profile(training_stage)["lock_file"]).name
         executor = SSHExecutor("", 22, "root", "", client=client, pod=pod,
                                remote_root=REMOTE + "/jobs", remote_python=root + "/venv/bin/python",
-                               worker_lock_file=root + "/gpu-requirements.lock", hf_home=REMOTE + "/hf-cache")
+                               worker_lock_file=root + "/" + lock_name, hf_home=REMOTE + "/hf-cache")
         yield executor
 
 

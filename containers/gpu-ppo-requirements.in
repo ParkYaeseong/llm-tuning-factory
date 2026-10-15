@@ -1,0 +1,22 @@
+# PPO uses the original TRL PPOTrainer API retained by LLaMA-Factory 0.9.3.
+# Official version checks: v0.9.3/src/llamafactory/extras/misc.py.
+# Keep this profile separate from the newer engine used by other stages.
+llamafactory==0.9.3
+torch==2.7.1
+torchaudio==2.7.1
+torchvision==0.22.1
+bitsandbytes==0.48.1
+transformers==4.52.4
+trl==0.9.6
+peft==0.15.2
+accelerate==1.7.0
+datasets==3.6.0
+tokenizers==0.21.1
+huggingface-hub==0.33.5
+numpy==1.26.4
+# New Arrow releases require NumPy 2, which this older engine explicitly excludes.
+pyarrow==20.0.0
+pydantic==2.10.6
+jieba==0.42.1
+rouge-chinese==1.0.3
+nltk==3.10.3

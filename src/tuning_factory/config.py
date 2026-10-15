@@ -28,8 +28,46 @@ class Hyperparameters(StrictModel):
     save_total_limit: int = Field(default=2, ge=1, le=20)
 
 
+class FinetuningOptions(StrictModel):
+    lora_alpha: int | None = Field(default=None, ge=1, le=4096)
+    lora_dropout: float = Field(default=0, ge=0, lt=1)
+    use_rslora: bool = False
+    use_dora: bool = False
+    loraplus_lr_ratio: float | None = Field(default=None, gt=0, le=1000)
+    loraplus_lr_embedding: float = Field(default=1e-6, gt=0, le=1)
+    pissa_init: bool = False
+    pissa_iter: int = Field(default=16, ge=-1, le=256)
+    pissa_convert: bool = False
+    freeze_trainable_layers: int = Field(default=2, ge=-128, le=128)
+    freeze_trainable_modules: Literal["all", "self_attn", "mlp", "self_attn,mlp"] = "all"
+    freeze_extra_modules: Literal["embed_tokens", "lm_head", "norm", "embed_tokens,lm_head"] | None = None
+    oft_rank: int = Field(default=0, ge=0, le=256)
+    oft_block_size: int = Field(default=32, ge=0, le=4096)
+    oft_target: Literal["all", "q_proj,v_proj"] = "all"
+    module_dropout: float = Field(default=0, ge=0, lt=1)
+
+
+class StageOptions(StrictModel):
+    pref_loss: Literal["sigmoid", "hinge", "ipo", "kto_pair", "orpo", "simpo"] = "sigmoid"
+    pref_beta: float = Field(default=0.1, gt=0, le=10)
+    pref_ftx: float = Field(default=0, ge=0, le=100)
+    pref_bco_weight: float = Field(default=0, ge=0, le=100)
+    dpo_label_smoothing: float = Field(default=0, ge=0, le=0.5)
+    kto_chosen_weight: float = Field(default=1, gt=0, le=100)
+    kto_rejected_weight: float = Field(default=1, gt=0, le=100)
+    simpo_gamma: float = Field(default=0.5, ge=0, le=100)
+    ppo_buffer_size: int = Field(default=1, ge=1, le=128)
+    ppo_epochs: int = Field(default=4, ge=1, le=100)
+    ppo_score_norm: bool = False
+    ppo_target: float = Field(default=6, gt=0, le=100)
+    ppo_whiten_rewards: bool = False
+    reward_model: str | None = Field(default=None, pattern=r"^/[a-zA-Z0-9_./-]+$")
+    reward_model_type: Literal["lora", "full"] = "lora"
+    reward_model_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
 class EvaluationProfile(StrictModel):
-    kind: Literal["pipeline", "classification", "extraction", "json", "kbf_extraction"] = "pipeline"
+    kind: Literal["pipeline", "classification", "extraction", "json", "kbf_extraction", "reward"] = "pipeline"
     thresholds: dict[str, float] = Field(default_factory=dict)
     dataset_id: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_-]+$")
     dataset_version: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_.-]+$")
@@ -42,6 +80,9 @@ class EvaluationProfile(StrictModel):
             raise ValueError("evaluation dataset ID and version must be supplied together")
         if self.dataset_id and self.kind == "pipeline":
             raise ValueError("validation data requires a task evaluation kind")
+        if self.kind == "reward" and (set(self.thresholds) - {"eval_accuracy"}
+                                      or any(not 0 <= value <= 1 for value in self.thresholds.values())):
+            raise ValueError("reward thresholds only support minimum eval_accuracy between 0 and 1")
         return self
 
 
@@ -62,8 +103,12 @@ class AIConfig(StrictModel):
     model_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     tokenizer_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     training_backend: Literal["llamafactory"] = "llamafactory"
-    training_method: Literal["lora", "qlora"] = "lora"
+    training_stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto"] = "sft"
+    training_method: Literal["lora", "qlora", "full", "freeze", "oft"] = "lora"
+    quantization_bit: Literal[4, 8] = 4
     template: str = "qwen"
+    finetuning_options: FinetuningOptions = Field(default_factory=FinetuningOptions)
+    stage_options: StageOptions = Field(default_factory=StageOptions)
     hyperparameters: Hyperparameters = Field(default_factory=Hyperparameters)
     evaluation_profile: EvaluationProfile = Field(default_factory=EvaluationProfile)
     resource_profile: ResourceProfile = Field(default_factory=ResourceProfile)
@@ -71,15 +116,10 @@ class AIConfig(StrictModel):
 
     @model_validator(mode="after")
     def supported(self):
-        supported_models = {
-            "Qwen/Qwen2.5-0.5B-Instruct": "qwen",
-            "Qwen/Qwen2.5-1.5B-Instruct": "qwen",
-            "Qwen/Qwen2.5-7B-Instruct": "qwen",
-            "meta-llama/Llama-3.1-8B-Instruct": "llama3",
-            "meta-llama/Llama-3.2-3B-Instruct": "llama3",
-        }
-        if supported_models.get(self.base_model) != self.template:
-            raise ValueError("unsupported model/template combination; extend the tested model catalog first")
+        from .capabilities import compatibility
+        result = compatibility(self.model_dump())
+        if not result["valid"]:
+            raise ValueError("; ".join(result["errors"]))
         if self.model_revision != self.tokenizer_revision:
             raise ValueError("this backend requires tokenizer_revision == model_revision")
         if self.dataset_version in {".", ".."}:

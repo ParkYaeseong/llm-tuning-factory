@@ -4,11 +4,13 @@ use serde_json::{json, Map, Value};
 use std::{fs, io::Write, path::PathBuf, process::{Command, Stdio}, sync::Mutex};
 use tauri::Manager;
 
-const SECRETS: [&str; 3] = ["RUNPOD_API_KEY", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLOW_TRACKING_TOKEN"];
-const FIELDS: [&str; 12] = [
+const SECRETS: [&str; 6] = ["RUNPOD_API_KEY", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLOW_TRACKING_TOKEN",
+    "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN"];
+const FIELDS: [&str; 18] = [
     "MLFLOW_TRACKING_URI", "FACTORY_MLFLOW_ARTIFACT_LOCATION", "FACTORY_OPERATOR",
     "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "pod_id", "ssh_key_file",
     "ssh_fingerprint", "RUNPOD_API_KEY", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLOW_TRACKING_TOKEN", "auth_mode",
+    "S3_ENDPOINT_URL", "S3_REGION", "S3_ADDRESSING_STYLE", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN",
 ];
 struct SaveLock(Mutex<()>);
 
@@ -29,6 +31,8 @@ fn read_settings(root: &PathBuf, secrets: bool) -> Result<Value, String> {
             .map_err(|_| "설정 파일이 손상되었습니다.")?
     } else { json!({}) };
     if !value.is_object() { return Err("설정 파일이 손상되었습니다.".into()); }
+    // Never return legacy or hand-edited plaintext credentials from the public settings file.
+    for name in SECRETS { value.as_object_mut().unwrap().remove(name); }
     for name in SECRETS {
         match entry(name)?.get_password() {
             Ok(secret) => {
@@ -54,23 +58,53 @@ fn settings_get(app: tauri::AppHandle) -> Result<Value, String> {
     read_settings(&app_root(&app)?, false)
 }
 
+fn merge_public_settings(existing: Value, input: &Map<String, Value>) -> Result<Map<String, Value>, String> {
+    if input.keys().any(|key| !FIELDS.contains(&key.as_str())) {
+        return Err("허용하지 않은 설정 항목".into());
+    }
+    for value in input.values() {
+        let text = value.as_str().ok_or("설정은 문자열이어야 합니다.")?;
+        if text.len() > 2048 { return Err("설정값이 너무 깁니다.".into()); }
+    }
+    let previous = existing.as_object().ok_or("설정 파일이 손상되었습니다.")?;
+    let mut public: Map<String, Value> = previous.iter()
+        .filter(|(name, value)| FIELDS.contains(&name.as_str()) && !SECRETS.contains(&name.as_str()) && value.is_string())
+        .map(|(name, value)| (name.clone(), value.clone())).collect();
+    for (name, value) in input {
+        if !SECRETS.contains(&name.as_str()) { public.insert(name.clone(), value.clone()); }
+    }
+    if let Some(endpoint) = public.get("S3_ENDPOINT_URL").and_then(Value::as_str) {
+        if !endpoint.is_empty() {
+            let url = tauri::Url::parse(endpoint).map_err(|_| "S3 endpoint는 인증값 없는 HTTPS 기본 주소여야 합니다.")?;
+            let authority_and_path = endpoint.split_once("://").map(|(_, rest)| rest).unwrap_or("");
+            let raw_path = authority_and_path.find('/').map(|index| &authority_and_path[index..]).unwrap_or("");
+            if (!raw_path.is_empty() && raw_path != "/") || endpoint.trim() != endpoint || endpoint.chars().any(char::is_control) || url.scheme() != "https" || url.host_str().is_none()
+                || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some()
+                || url.path() != "/" || authority_and_path.split('/').next().unwrap_or("").contains('@') {
+                return Err("S3 endpoint는 인증값·경로·query·fragment 없는 HTTPS 기본 주소여야 합니다.".into());
+            }
+        }
+    }
+    Ok(public)
+}
+
 #[tauri::command]
 fn settings_save(app: tauri::AppHandle, values: Value, lock: tauri::State<SaveLock>) -> Result<Value, String> {
     let _guard = lock.0.lock().map_err(|_| "설정 잠금 오류")?;
     let root = app_root(&app)?;
     let input = values.as_object().ok_or("잘못된 설정")?;
-    if input.keys().any(|key| !FIELDS.contains(&key.as_str())) {
-        return Err("허용하지 않은 설정 항목".into());
-    }
-    let mut public = Map::new();
+    let previous = root.join("settings.json");
+    let existing = if previous.exists() {
+        serde_json::from_slice::<Value>(&fs::read(previous).map_err(|_| "설정을 읽을 수 없습니다.")?)
+            .map_err(|_| "설정 파일이 손상되었습니다.")?
+    } else { json!({}) };
+    let public = merge_public_settings(existing, input)?;
+    // Validate all fields before writing any credential. Empty secret inputs preserve saved values.
     for (name, value) in input {
-        let text = value.as_str().ok_or("설정은 문자열이어야 합니다.")?;
-        if text.len() > 2048 { return Err("설정값이 너무 깁니다.".into()); }
-        if SECRETS.contains(&name.as_str()) {
-            if !text.is_empty() {
-                entry(name)?.set_password(text).map_err(|_| "인증값 보안 저장 실패")?;
-            }
-        } else { public.insert(name.clone(), json!(text)); }
+        let text = value.as_str().unwrap();
+        if SECRETS.contains(&name.as_str()) && !text.is_empty() {
+            entry(name)?.set_password(text).map_err(|_| "인증값 보안 저장 실패")?;
+        }
     }
     let temporary = root.join("settings.tmp");
     fs::write(&temporary, serde_json::to_vec_pretty(&public).unwrap()).map_err(|_| "설정 저장 실패")?;
@@ -104,7 +138,7 @@ fn allowed(action: &str) -> bool {
     matches!(action, "catalog" | "save_profile" | "dataset" | "plan" | "submit" | "execute" |
         "jobs" | "logs" | "cancel" | "recover" | "reconcile" | "resume" | "connection" |
         "pod" | "runtime_check" | "runtime_prepare" | "live_logs" | "history" | "compare" | "model_revision" |
-        "dataset_preview" | "job_progress")
+        "dataset_preview" | "job_progress" | "capabilities" | "s3_list" | "s3_head" | "s3_import")
 }
 
 #[tauri::command]
@@ -150,8 +184,40 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
+    fn partial_settings_save_preserves_other_connections_and_excludes_all_secrets() {
+        let input = json!({"S3_REGION": "kr-standard", "S3_SECRET_ACCESS_KEY": "new-secret"});
+        let existing = json!({"pod_id": "borrowed", "MLFLOW_TRACKING_URI": "https://tracking.example", "S3_ACCESS_KEY_ID": "legacy-plaintext", "unknown": "discard"});
+        let result = merge_public_settings(existing, input.as_object().unwrap()).unwrap();
+        assert_eq!(result.get("pod_id"), Some(&json!("borrowed")));
+        assert_eq!(result.get("MLFLOW_TRACKING_URI"), Some(&json!("https://tracking.example")));
+        assert_eq!(result.get("S3_REGION"), Some(&json!("kr-standard")));
+        for name in SECRETS { assert!(!result.contains_key(name)); }
+        assert!(!result.contains_key("unknown"));
+        assert!(merge_public_settings(json!({}), json!({"arbitrary": "secret"}).as_object().unwrap()).is_err());
+        assert!(merge_public_settings(json!({}), json!({"S3_REGION": 12}).as_object().unwrap()).is_err());
+    }
+    #[test]
+    fn s3_endpoint_only_accepts_https_origins_without_secrets() {
+        for endpoint in ["https://storage.example?X-Amz-Signature=synthetic-secret", "https://synthetic-user:synthetic-secret@storage.example", "https://user@storage.example", "https://storage.example/bucket", "https://storage.example/a/..", "https://storage.example/#secret", "http://localhost:9000", "https:///", "not-a-url"] {
+            let input = json!({"S3_ENDPOINT_URL": endpoint, "S3_SECRET_ACCESS_KEY": "do-not-save"});
+            assert!(merge_public_settings(json!({}), input.as_object().unwrap()).is_err(), "unsafe S3 endpoint was accepted");
+        }
+        for endpoint in ["", "https://storage.example", "https://storage.example:9443/"] {
+            let input = json!({"S3_ENDPOINT_URL": endpoint});
+            assert!(merge_public_settings(json!({}), input.as_object().unwrap()).is_ok());
+        }
+    }
+    #[test]
     fn only_named_operations_are_available() {
         assert!(allowed("plan"));
+        assert!(allowed("capabilities"));
+        assert!(allowed("s3_list"));
+        assert!(allowed("s3_head"));
+        assert!(allowed("s3_import"));
+        assert!(SECRETS.contains(&"S3_ACCESS_KEY_ID"));
+        assert!(SECRETS.contains(&"S3_SECRET_ACCESS_KEY"));
+        assert!(SECRETS.contains(&"S3_SESSION_TOKEN"));
+        assert!(FIELDS.contains(&"S3_ENDPOINT_URL"));
         assert!(!allowed("shell"));
         assert!(!allowed("pod-start"));
         assert!(!allowed("pod-stop"));

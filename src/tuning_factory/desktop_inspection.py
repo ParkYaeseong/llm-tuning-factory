@@ -8,13 +8,13 @@ from .registry import canonical, digest, parse_dataset
 PREVIEW_BYTES = 32 * 1024 * 1024
 
 
-def inspect_dataset(path):
+def inspect_dataset(path, kind="instruction"):
     path = Path(path)
     with path.open("rb") as handle:
         raw = handle.read(PREVIEW_BYTES + 1)
     if len(raw) > PREVIEW_BYTES:
         raise ValueError("미리보기는 32 MiB 이하 파일을 지원합니다. 큰 데이터는 버전을 나누어 검증하세요.")
-    rows, formatting, file_format = parse_dataset(raw)
+    rows, formatting, file_format = parse_dataset(raw, kind)
     seen = {digest(canonical(row)) for row in rows}
 
     def preview(value):
@@ -26,7 +26,7 @@ def inspect_dataset(path):
             return {key: preview(x) for key, x in list(value.items())[:12]}
         return value
 
-    return {"rows": len(rows), "format": formatting, "file_format": file_format, "bytes": len(raw),
+    return {"rows": len(rows), "kind": kind, "format": formatting, "file_format": file_format, "bytes": len(raw),
             "sha256": digest(raw), "duplicate_rows": len(rows) - len(seen),
             "samples": [preview(row) for row in rows[:3]], "sample_content_truncated": True}
 

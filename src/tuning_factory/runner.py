@@ -9,7 +9,7 @@ from .evaluation import CommonEvaluator
 from .execution import CapacityUnavailable, ExecutionUncertain, LocalExecutor, Policy
 from .jobs import JobStore
 from .manifest import resolve, source_hash, verify_manifest
-from .registry import Registry, canonical, digest, immutable_write
+from .registry import Registry, canonical, file_digest, immutable_write
 from .training import CanceledError, LlamaFactoryBackend, MockTrainingBackend
 
 
@@ -40,6 +40,9 @@ class Factory:
         job = self.store.get(job_id)
         directory = self.directory(job_id)
         verify_manifest(job["manifest"])
+        from .capabilities import compatibility
+        if not compatibility(job["manifest"]["config"])["resume_supported"]:
+            raise ValueError("checkpoint resume is unsupported for this training stage/method")
         if checkpoint:
             path = Path(checkpoint).resolve()
             if not path.is_relative_to(directory / "output") or not path.is_dir():
@@ -97,7 +100,8 @@ class Factory:
                 if actual != validation:
                     raise ValueError("validation data differs from immutable manifest")
                 self.policy.check(config, actual, execute=executor.remote, approved_transfer=approved_transfer)
-                backend.prepare_validation(directory, self.registry.dataset_path(actual).read_bytes())
+                validation_kind = "preference" if config.evaluation_profile.kind == "reward" else "instruction"
+                backend.prepare_validation(directory, self.registry.dataset_path(actual).read_bytes(), kind=validation_kind)
             if getattr(executor, "pod", None):
                 pod = executor.pod
                 (directory / "execution.json").write_bytes(canonical({
@@ -180,6 +184,17 @@ class Factory:
         evaluator = CommonEvaluator()
         profile = config.evaluation_profile
         predictions = directory / "output" / "predictions.json"
+        reward_metrics = directory / "output" / "reward_metrics.json"
+        if not simulation and profile.kind == "reward" and reward_metrics.is_file() and validation_sha:
+            data = json.loads(reward_metrics.read_text())
+            if data.get("validation_sha256") != validation_sha:
+                raise ValueError("reward metrics do not match registered validation data")
+            metrics.update({key: value for key, value in data["metrics"].items()
+                            if key in {"eval_accuracy", "eval_loss"}})
+            quality_status = "measured"
+            if profile.thresholds:
+                quality_status = "qualified" if all(key in metrics and metrics[key] >= value
+                                                    for key, value in profile.thresholds.items()) else "below_threshold"
         if not simulation and predictions.is_file() and profile.kind != "pipeline" and validation_sha:
             data = json.loads(predictions.read_text())
             if data.get("validation_sha256") != validation_sha:
@@ -196,6 +211,7 @@ class Factory:
                                 if isinstance(v, (int, float)) and k in {"train_loss", "eval_loss", "train_runtime"}})
         evaluator.summarize_metrics(metrics)
         return metrics, {"simulation": simulation, "metrics": metrics, "quality_status": quality_status,
+                         "training_stage": config.training_stage,
                          "training_success": True, "approval": "pending",
                          "note": "No task quality measured without actual model predictions and supplied criteria."}
 
@@ -204,7 +220,7 @@ class Factory:
         hashes = json.loads((directory / "artifacts.json").read_text())
         for name, expected in hashes.items():
             path = (directory / name).resolve()
-            if not path.is_relative_to(directory) or digest(path.read_bytes()) != expected:
+            if not path.is_relative_to(directory) or file_digest(path) != expected:
                 raise ValueError("artifact hash mismatch")
         return hashes
 

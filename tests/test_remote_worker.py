@@ -30,6 +30,7 @@ def test_worker_checks_integrity_and_publishes_real_completion_contract(tmp_path
             (directory / "output" / "adapter_model.safetensors").write_bytes(b"unit-test fixture; not weights")
 
     monkeypatch.setattr(worker, "LlamaFactoryBackend", FixtureBackend)
+    monkeypatch.setattr(worker, "runtime_preflight", lambda _: {"simulation_fixture": True})
     monkeypatch.setattr(worker.importlib.metadata, "version", lambda _: "0.9.5")
     monkeypatch.setenv("FACTORY_GPU_LOCK_FILE", str(Path("containers/gpu-requirements.lock").resolve()))
     monkeypatch.setattr("sys.argv", ["worker", str(directory), "5"])
