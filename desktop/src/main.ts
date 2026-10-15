@@ -177,7 +177,7 @@ function training() {
   ${configSelect("평가 방식", "evaluation_profile.kind", [["pipeline", "학습 완료 확인"], ["json", "JSON 형식"], ["classification", "분류"], ["extraction", "정보 추출"], ["kbf_extraction", "KBF 추출"]])}
   </div></section><section class="card"><h3>모델과 학습</h3><div class="grid">
   ${configSelect("기반 모델", "base_model", ["Qwen/Qwen2.5-0.5B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-7B-Instruct", "meta-llama/Llama-3.1-8B-Instruct", "meta-llama/Llama-3.2-3B-Instruct"].map(x => [x, x]))}
-  ${configSelect("학습 방법", "training_method", [["lora", "LoRA"], ["qlora", "QLoRA · 실제 GPU 검증 대기"]])}
+  ${configSelect("학습 방법", "training_method", [["lora", "LoRA"], ["qlora", "QLoRA · 4-bit"]])}
   ${configField("학습 횟수 (epoch)", "hyperparameters.num_train_epochs", "number")}
   ${configField("학습률", "hyperparameters.learning_rate", "number")}
   ${configField("배치 크기", "hyperparameters.per_device_train_batch_size", "number")}
@@ -266,8 +266,14 @@ function settingsFromForm(form: HTMLFormElement) {
 async function execute(job: Obj) {
   state.active = job.id; state.page = "jobs"; await refresh(); render();
   // Deliberately do not block navigation: a separate bridge process owns this attempt.
-  api("execute", { job_id: job.id, approved: true }).then(async () => {
-    await refresh(); state.notice = "학습 처리가 끝났습니다. 상태와 평가 결과를 확인하세요."; render();
+  api("execute", { job_id: job.id, approved: true }).then(async result => {
+    await refresh();
+    const current = state.jobs.find((j: Obj) => j.id === job.id);
+    state.notice = result ? "학습 처리가 끝났습니다. 상태와 평가 결과를 확인하세요." :
+      ["PENDING", "QUEUED", "RETRYING"].includes(current?.status) ?
+        "GPU를 사용할 수 없어 작업은 대기 중입니다. 다른 작업이 끝나면 ‘대기 작업 실행’을 눌러 주세요." :
+        "새로 실행된 작업이 없습니다. 현재 작업 상태를 확인하세요.";
+    render();
   }).catch(async error => { state.error = String(error); await refresh(); render(); });
 }
 function bind() {

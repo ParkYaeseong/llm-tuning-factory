@@ -52,6 +52,30 @@ test("plan is offline and execution requires separate explicit confirmation", as
   await page.getByRole("button", { name: "돌아가기", exact: true }).click();
   expect(await page.evaluate(() => (window as any).__testCalls.some((c: any) => c.args?.action === "submit"))).toBe(false);
 });
+
+test("busy GPU keeps a submitted job queued without announcing completion", async ({ page }) => {
+  await page.evaluate(config => {
+    const bridge = (window as any).__TAURI_INTERNALS__;
+    const original = bridge.invoke;
+    let submitted = false;
+    bridge.invoke = async (command: string, args: any) => {
+      if (command === "factory_action") {
+        if (args.action === "submit") submitted = true;
+        if (args.action === "execute") return null;
+        if (args.action === "jobs" && submitted) return [{ id: "c".repeat(32), status: "QUEUED",
+          attempts: 0, manifest: { config, simulation: false } }];
+      }
+      return original(command, args);
+    };
+  }, config);
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("작업은 대기 중입니다");
+  await expect(page.getByText("학습 처리가 끝났습니다.", { exact: false })).toHaveCount(0);
+  await expect(page.locator(".badge").first()).toHaveText("대기");
+});
 test("changed settings invalidate an already displayed execution plan", async ({ page }) => {
   await page.locator('nav [data-action="nav:training"]').click();
   await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
