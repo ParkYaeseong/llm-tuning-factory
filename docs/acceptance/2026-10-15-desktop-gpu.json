@@ -1,0 +1,283 @@
+{
+  "date": "2026-10-15",
+  "scope": "Windows development PC + real H100; synthetic Qwen2.5-0.5B SFT only",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "model_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+  "installer": {
+    "version": "0.2.3",
+    "file": "LLM Tuning Factory_0.2.3_x64-setup.exe",
+    "bytes": 44917847,
+    "sha256": "35c9995db4d720506a3814f9e142ebe94ef776e0de0aae447d486fd56a464af5",
+    "install_exit_code": 0,
+    "visible_version": "Windows · 내부 검토 0.2.3",
+    "sidecar_sha256": "712646be6488ed9bd3f6e4c9151f6d1f35e5d4946916a4d1e83d5062e585d9ac",
+    "installed_sidecar_matches_build": true,
+    "installed_native_sha256": "747921d8952cfa957e385cfa608d2c0ee123f6f4e786de70fdeed14efcd3a0da",
+    "native_bundle_marker": "NSIS patches TYPE_VAR_UNK to TYPE_VAR_NSS (three bytes)",
+    "python_source_sha256": "c5b040822868981c064ebb183c9a741424ea03d096f11b45c9ae1c361a2228ee",
+    "frozen_python_source_commit": "7fca6a441dfa875c6d0f40b7ce979c2fdefe772e"
+  },
+  "accepted_runs": [
+    {
+      "job_id": "bc4eaf26daea4f339fa5937e15f89d5f",
+      "run_id": "6a12982b12344b1a8aabd4e8aaeb3957",
+      "status": "COMPLETED",
+      "method": "lora",
+      "source_sha256": "8f91704981fadb47694fbb0c8fc4a1683427bbbc4c70cade72936285083f9298",
+      "local_files_verified": 44,
+      "remote_files_verified": 40,
+      "mlflow_output_files_verified": 23,
+      "mlflow_output_files_roundtrip_verified": 23,
+      "mlflow_adapter_roundtrip_sha256": "1c509c187103a7d5c6a7ada5030a3450321ddbf0d759c2488985b5eee82f3661",
+      "weights": {
+        "tensors": 96,
+        "finite": true,
+        "lora_B_nonzero": 196608,
+        "lora_B_values": 196608
+      },
+      "global_step": 12,
+      "training_health": {
+        "finite_statistics_checked": 25,
+        "global_step": 12
+      },
+      "native_predictions": 3,
+      "validation_sha256": "0311023ee70a84001f32906bbece791e6785f9d3e0401f72238465d71ec4f5d6",
+      "train_sha256": "2a727064e4743b3e237a9818ac72177f94651c730681e1947e9a413135dd1f6c",
+      "quality_status": "synthetic_only",
+      "simulation": false,
+      "synthetic_data": true,
+      "url": "https://mlflow.kbiofoundry.kr/#/experiments/16/runs/6a12982b12344b1a8aabd4e8aaeb3957"
+    },
+    {
+      "job_id": "069ba78280a84b07a17741aaebff6cfd",
+      "run_id": "a43fd2727a5441b58fb5d920f746ab59",
+      "status": "COMPLETED",
+      "method": "lora",
+      "source_sha256": "8f91704981fadb47694fbb0c8fc4a1683427bbbc4c70cade72936285083f9298",
+      "local_files_verified": 84,
+      "remote_files_verified": 58,
+      "mlflow_output_files_verified": 56,
+      "mlflow_output_files_roundtrip_verified": 56,
+      "mlflow_adapter_roundtrip_sha256": "e0958fe2ac95365f61c4b3015884a42dee9ca9a279a53e9c0b426a7b18879f97",
+      "weights": {
+        "tensors": 96,
+        "finite": true,
+        "lora_B_nonzero": 196608,
+        "lora_B_values": 196608
+      },
+      "global_step": 100,
+      "training_health": {
+        "finite_statistics_checked": 201,
+        "global_step": 100
+      },
+      "native_predictions": 3,
+      "validation_sha256": "0311023ee70a84001f32906bbece791e6785f9d3e0401f72238465d71ec4f5d6",
+      "train_sha256": "2a727064e4743b3e237a9818ac72177f94651c730681e1947e9a413135dd1f6c",
+      "quality_status": "synthetic_only",
+      "simulation": false,
+      "synthetic_data": true,
+      "url": "https://mlflow.kbiofoundry.kr/#/experiments/16/runs/a43fd2727a5441b58fb5d920f746ab59"
+    },
+    {
+      "job_id": "7f4d3983916b4e8cbe9c7e64802e5dac",
+      "run_id": "df6c2cc533204533aa1b7fd76c3dcb0d",
+      "status": "COMPLETED",
+      "method": "lora",
+      "source_sha256": "8f91704981fadb47694fbb0c8fc4a1683427bbbc4c70cade72936285083f9298",
+      "local_files_verified": 44,
+      "remote_files_verified": 40,
+      "mlflow_output_files_verified": 23,
+      "mlflow_output_files_roundtrip_verified": 23,
+      "mlflow_adapter_roundtrip_sha256": "5d1ed9a8bf7b8cd999fdda3bd7bc9df647ed6dabf89afdd576583f658acdc9d7",
+      "weights": {
+        "tensors": 96,
+        "finite": true,
+        "lora_B_nonzero": 196608,
+        "lora_B_values": 196608
+      },
+      "global_step": 2,
+      "training_health": {
+        "finite_statistics_checked": 5,
+        "global_step": 2
+      },
+      "native_predictions": 3,
+      "validation_sha256": "0311023ee70a84001f32906bbece791e6785f9d3e0401f72238465d71ec4f5d6",
+      "train_sha256": "2a727064e4743b3e237a9818ac72177f94651c730681e1947e9a413135dd1f6c",
+      "quality_status": "synthetic_only",
+      "simulation": false,
+      "synthetic_data": true,
+      "quantization": null,
+      "url": "https://mlflow.kbiofoundry.kr/#/experiments/16/runs/df6c2cc533204533aa1b7fd76c3dcb0d"
+    },
+    {
+      "job_id": "b03bddf3286d4c6fa12174a846eee3be",
+      "run_id": "ddc1585a277e4e5091c13f52a6a5873d",
+      "status": "COMPLETED",
+      "method": "qlora",
+      "source_sha256": "c5b040822868981c064ebb183c9a741424ea03d096f11b45c9ae1c361a2228ee",
+      "local_files_verified": 44,
+      "remote_files_verified": 40,
+      "mlflow_output_files_verified": 23,
+      "mlflow_output_files_roundtrip_verified": 23,
+      "mlflow_adapter_roundtrip_sha256": "5d6a6ac3549316f716af3fc021d89a39751e7f9b949bf3049ff27f91540b6571",
+      "weights": {
+        "tensors": 96,
+        "finite": true,
+        "lora_B_nonzero": 196608,
+        "lora_B_values": 196608
+      },
+      "global_step": 30,
+      "training_health": {
+        "finite_statistics_checked": 61,
+        "global_step": 30,
+        "quantization_confirmed_bits": 4
+      },
+      "native_predictions": 3,
+      "validation_sha256": "0311023ee70a84001f32906bbece791e6785f9d3e0401f72238465d71ec4f5d6",
+      "train_sha256": "2a727064e4743b3e237a9818ac72177f94651c730681e1947e9a413135dd1f6c",
+      "quality_status": "synthetic_only",
+      "simulation": false,
+      "synthetic_data": true,
+      "quantization": {
+        "train_bits": 4,
+        "predict_bits": 4,
+        "engine_method": "bnb",
+        "library": "bitsandbytes",
+        "engine_log": [
+          "[INFO|2026-10-15 01:37:49] llamafactory.model.model_utils.quantization:144 >> Quantizing model to 4 bit with bitsandbytes."
+        ]
+      },
+      "url": "https://mlflow.kbiofoundry.kr/#/experiments/16/runs/ddc1585a277e4e5091c13f52a6a5873d"
+    }
+  ],
+  "checkpoint_resume": {
+    "job_id": "069ba78280a84b07a17741aaebff6cfd",
+    "canceled_run_id": "1b9247d89f414dfbae43aeea52bea0bd",
+    "resumed_run_id": "a43fd2727a5441b58fb5d920f746ab59",
+    "first_status": "CANCELED",
+    "resumed_status": "COMPLETED",
+    "checkpoint": "checkpoint-10",
+    "checkpoint_step": 10,
+    "final_step": 100,
+    "history_prefix_records": 10,
+    "checkpoint_history_preserved": true,
+    "native_resume_argument": "output/checkpoint-10",
+    "native_resume_log_lines": [
+      "[INFO|trainer.py:3343] 2026-10-15 01:01:19,007 >> Loading model from output/checkpoint-10."
+    ],
+    "synthetic_data": true,
+    "simulation": false
+  },
+  "controller_loss_reconciliation": {
+    "job_id": "b03bddf3286d4c6fa12174a846eee3be",
+    "run_id": "ddc1585a277e4e5091c13f52a6a5873d",
+    "status": "COMPLETED",
+    "mlflow_status": "FINISHED",
+    "attempts": 1,
+    "same_run_reconciled": true,
+    "gpu_lease_released": true,
+    "controller_loss": {
+      "job_id": "b03bddf3286d4c6fa12174a846eee3be",
+      "controller_pid": 33360,
+      "worker_before_disconnect": {
+        "worker_pids": [
+          9341
+        ],
+        "complete": false,
+        "current_step": 1
+      },
+      "remote_after_disconnect": {
+        "result": null,
+        "current_step": 4,
+        "worker_log_exists": true
+      },
+      "gpu_lease_retained": true,
+      "disconnected_at": 1792028290.6728544
+    },
+    "early_recovery": {
+      "job_id": "b03bddf3286d4c6fa12174a846eee3be",
+      "status": "RUNNING",
+      "heartbeat_age_seconds": 27,
+      "gpu_lease_retained": true,
+      "recover_before_expiry": {
+        "recovered": 0
+      }
+    },
+    "stale_recovery": {
+      "job_id": "b03bddf3286d4c6fa12174a846eee3be",
+      "status": "FAILED",
+      "gpu_lease_retained": true,
+      "recover": {
+        "recovered": 1
+      }
+    }
+  },
+  "actual_quantization_probe": {
+    "is_loaded_in_4bit": true,
+    "linear4bit_layers": 168,
+    "packed_weight_container_dtypes": [
+      "torch.bfloat16"
+    ],
+    "storage_bits_per_original_weight": 4.0,
+    "packed_weights_on_cuda": true,
+    "quantization_types": [
+      "nf4"
+    ],
+    "finite_cuda_forward": true,
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "engine": "0.9.5",
+    "bitsandbytes": "0.48.1",
+    "job_id": "b03bddf3286d4c6fa12174a846eee3be",
+    "prediction_plan_sha256": "5a90e65d058bef32b863f70fc46ed715a192fd8d8a62f62e7fd0a84110745a31",
+    "adapter_sha256": "5d6a6ac3549316f716af3fc021d89a39751e7f9b949bf3049ff27f91540b6571"
+  },
+  "queued_without_remote_attempt": {
+    "job_id": "12cd97d5e73940c0b67c82365cf9cd55",
+    "status_before_cancellation": "QUEUED",
+    "attempts": 0,
+    "mlflow_run_id": null,
+    "remote_attempt_created": false,
+    "native_notice": "GPU를 사용할 수 없어 작업은 대기 중입니다. 다른 작업이 끝나면 ‘대기 작업 실행’을 눌러 주세요.",
+    "notice_captured_at": 1792027079.5110395,
+    "active_job_completed_at": 1792027113.1950257,
+    "waiting_confirmed_before_active_job_completed": true,
+    "final_installer_source_commit": "2203c19ccc576350cfc8631b46d316c3fd776a79"
+  },
+  "rejected_unquantized_run": {
+    "job_id": "c00b5facfbdb40429e3ab19437f8f242",
+    "run_id": "42397455771d4c2ca8e6066ea6fcba33",
+    "acceptance": "rejected_not_quantized",
+    "mlflow_status": "FAILED",
+    "reason": "Unsupported quantizer alias silently skipped 4-bit loading",
+    "source_sha256": "8f91704981fadb47694fbb0c8fc4a1683427bbbc4c70cade72936285083f9298"
+  },
+  "temporary_resource_teardown": {
+    "temporary_pod_id": "d3d2hcmct00tak",
+    "stop_confirmed": "EXITED",
+    "delete_confirmed_http_status": 404,
+    "network_volume_preserved": true,
+    "original_pod_status": "EXITED",
+    "elapsed_seconds_upper_estimate": 4941.7,
+    "gpu_cost_usd_upper_estimate_excluding_storage": 5.48,
+    "authorized_maximum_seconds": 5400,
+    "hourly_cost_usd": 3.99
+  },
+  "verification": {
+    "python": "78 passed, 1 opt-in GPU pytest skipped; manual GPU acceptance above",
+    "ruff": "passed",
+    "ui": "10 passed",
+    "frozen_package": "passed",
+    "hosted_cpu_run": 38667226882,
+    "hosted_windows_package_run": 38667226909,
+    "hosted_source_commit": "1222d626ed44a4143b18f1bcc3d4ce22c21636cf"
+  },
+  "limitations": [
+    "No direct S3 dataset integration",
+    "SFT LoRA/QLoRA only; fixed model catalog",
+    "No automatic full model/method capability matrix",
+    "Other catalog models not GPU-tested",
+    "No clean second-PC acceptance or code signing",
+    "No streaming or multi-PC scheduler",
+    "Synthetic outputs do not establish business quality"
+  ]
+}

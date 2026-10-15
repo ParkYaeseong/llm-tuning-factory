@@ -1,10 +1,43 @@
-# GPU desktop acceptance in progress — 2026-10-15
+# Current Windows GPU acceptance — 2026-10-15, app 0.2.3
 
-Explicitly approved temporary H100 in EU-FR-1 after the existing stopped H200 returned a host GPU-capacity error.
-Synthetic data only; 90-minute maximum with an owned-Pod watchdog. The installed 0.2.1 UI completed clean
-runtime preparation with matching source/lock/CUDA. Its first real training exposed a missing C compiler
-in the minimal test container during Triton initialization. Added a prerequisite check before installation
-and CUDA readiness, plus regression tests. This is not yet a completed desktop GPU acceptance.
+This section supersedes outstanding GPU statements in the dated historical entries below.
+Installed Windows UI + real H100 + Qwen2.5-0.5B synthetic SFT passed LoRA, genuine NF4 4-bit QLoRA,
+native generation, cancellation, checkpoint-10 → step-100 resume with preserved history, controller-loss
+reconciliation into the original MLflow run, GPU-busy queue behavior, and complete artifact hash recovery.
+Every output file uploaded to MLflow in the accepted audits was downloaded again and hash-verified.
+See [report](GPU_ACCEPTANCE_2026-10-15.md) and [safe receipt](acceptance/2026-10-15-desktop-gpu.json).
+
+Fixed missing C-compiler preflight, a misleading queue completion notice, and the quantizer alias:
+LLaMA-Factory 0.9.5 requires `bnb`, not `bitsandbytes`. The old unquantized QLoRA run was rejected and
+marked FAILED in shared MLflow. Final QLoRA has 168 actual CUDA Linear4bit layers, NF4 quantization,
+4.0 storage bits per original linear weight and a finite CUDA forward pass. Train and prediction logs
+both confirm actual 4-bit loading; the worker rejects a silent fallback.
+
+Final Python source SHA256: c5b040822868981c064ebb183c9a741424ea03d096f11b45c9ae1c361a2228ee
+(frozen source commit 7fca6a441dfa875c6d0f40b7ce979c2fdefe772e).
+Earlier LoRA/resume/queue receipts use source 8f91704981fadb47694fbb0c8fc4a1683427bbbc4c70cade72936285083f9298;
+they are not represented as rerun on the final source. Final-source genuine QLoRA and controller recovery passed.
+Final UI source 1222d626ed44a4143b18f1bcc3d4ce22c21636cf displays package version 0.2.3.
+
+Fresh locked Python 3.12 sync passes; pytest **78 passed, 1 skipped** (opt-in GPU pytest; paid manual evidence
+is separate); Ruff passes. UI **10 passed**, TypeScript/Vite build and frozen-package/wheel integrity pass.
+Rust allowlist test passed; Rust source unchanged during final quantizer/footer fixes, final NSIS build passed.
+GitHub CPU run 38667226882 and Windows package run 38667226909 both succeeded for 1222d62.
+Installer SHA256: 35c9995db4d720506a3814f9e142ebe94ef776e0de0aae447d486fd56a464af5.
+Installed sidecar equals build bytes; installed UI footer reports 0.2.3. NSIS changes only the native bundle
+marker UNK→NSS (three bytes). Test credentials were deleted and original public settings restored afterward.
+
+Temporary owned H100 stopped to EXITED, then deleted (GET 404). Existing H200 stayed EXITED and the
+existing network volume was preserved. Upper estimate 82.36 minutes / $5.48 GPU, storage excluded,
+within approved 90 minutes / $5.99. No institution data was transferred.
+
+Remaining scope: only SFT LoRA/QLoRA and a fixed model catalog; no complete automatic model/method
+capability matrix, direct S3 dataset connector, large-data streaming, multi-PC scheduler, or serving.
+Other catalog models, gated-model authentication, a clean second PC and signing remain unverified.
+Training-adapter Model Registry registration and a standalone GPU image build were not accepted here.
+Synthetic data establishes pipeline behavior, not business quality or numeric reproducibility.
+
+---
 
 # Progress and acceptance status — 2026-10-14
 
