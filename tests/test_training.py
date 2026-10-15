@@ -21,11 +21,11 @@ def test_yaml_translation_and_real_subprocess(tmp_path):
 
 
 def test_failures_and_timeouts(tmp_path):
-    for command, exception in [([sys.executable, "-c", "raise SystemExit(2)"], RuntimeError),
-                               ([sys.executable, "-c", "import time;time.sleep(10)"], TimeoutError)]:
+    for command, exception, timeout in [([sys.executable, "-c", "raise SystemExit(2)"], RuntimeError, 10),
+                                        ([sys.executable, "-c", "import time;time.sleep(10)"], TimeoutError, 1)]:
         backend = LlamaFactoryBackend(command=command)
         with pytest.raises(exception):
-            backend.train(tmp_path, 1)
+            backend.train(tmp_path, timeout)
 
 
 def test_checkpoint_compatibility_and_collection(tmp_path):
@@ -55,7 +55,8 @@ def test_qlora_config(tmp_path):
     LlamaFactoryBackend().prepare(config, tmp_path, b'[{"instruction":"test","output":"fixture"}]')
     plan = yaml.safe_load((tmp_path / "train.yaml").read_text())
     assert plan["quantization_bit"] == 4
-    assert plan["quantization_method"] == "bitsandbytes"
+    # LLaMA-Factory 0.9.5 QuantizationMethod.BNB is "bnb"; "bitsandbytes" silently falls through.
+    assert plan["quantization_method"] == "bnb"
 
 
 def test_active_subprocess_cancellation(tmp_path):
@@ -64,6 +65,20 @@ def test_active_subprocess_cancellation(tmp_path):
     with pytest.raises(CanceledError):
         backend.train(tmp_path, 30, canceled=lambda: time.monotonic() - start > 0.2)
     assert time.monotonic() - start < 10
+
+
+def test_qlora_health_rejects_silent_full_precision_fallback(tmp_path):
+    config = load_config("configs/ai/paper_extraction.yaml")
+    config = type(config).model_validate(config.model_dump() | {"training_method": "qlora"})
+    (tmp_path / "output").mkdir()
+    (tmp_path / "output/trainer_state.json").write_text('{"global_step":1,"log_history":[{"loss":0.7}]}')
+    (tmp_path / "train.log").write_text("quantized training requested, but no quantizer loaded")
+    backend = LlamaFactoryBackend()
+    with pytest.raises(ValueError, match="4-bit quantization"):
+        backend.validate_training_result(tmp_path, config)
+    (tmp_path / "train.log").write_text("Quantizing model to 4 bit with bitsandbytes.\n")
+    backend.validate_training_result(tmp_path, config)
+    assert json.loads((tmp_path / "training-health.json").read_text())["quantization_confirmed_bits"] == 4
 
 
 def test_bf16_translation_for_supported_gpu():

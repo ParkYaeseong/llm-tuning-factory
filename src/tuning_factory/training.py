@@ -77,7 +77,7 @@ class LlamaFactoryBackend(TrainingBackend):
                 "bf16": config.hyperparameters.precision == "bf16",
                 **config.hyperparameters.model_dump(exclude={"precision"})}
         if config.training_method == "qlora":
-            plan.update(quantization_bit=4, quantization_method="bitsandbytes")
+            plan.update(quantization_bit=4, quantization_method="bnb")
         return plan
 
     def train(self, directory, timeout, canceled=lambda: False):
@@ -136,9 +136,11 @@ class LlamaFactoryBackend(TrainingBackend):
                 "report_to": "none", "fp16": config.hyperparameters.precision == "fp16",
                 "bf16": config.hyperparameters.precision == "bf16"}
         if config.training_method == "qlora":
-            plan.update(quantization_bit=4, quantization_method="bitsandbytes")
+            plan.update(quantization_bit=4, quantization_method="bnb")
         (directory / "predict.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
         self.run_config(directory, timeout, canceled, "predict.yaml", "predict.log")
+        if config.training_method == "qlora":
+            self.confirm_quantization(directory / "predict.log")
         source = directory / "prediction" / "generated_predictions.jsonl"
         rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
         if not rows or len(rows) > profile.max_samples:
@@ -173,7 +175,17 @@ class LlamaFactoryBackend(TrainingBackend):
                   and p.name not in {"artifacts.json", "tracking-error.txt"}
                   and p != directory / "cancel"}
 
-    def validate_training_result(self, directory):
+    @staticmethod
+    def confirm_quantization(log_path):
+        if not log_path.is_file() or "Quantizing model to 4 bit with bitsandbytes." not in log_path.read_text(
+            encoding="utf-8", errors="replace"
+        ):
+            raise ValueError("4-bit quantization was not confirmed by LLaMA-Factory; refusing full-precision fallback")
+
+    def validate_training_result(self, directory, config=None):
+        quantized = config is not None and config.training_method == "qlora"
+        if quantized:
+            self.confirm_quantization(Path(directory) / "train.log")
         state_path = Path(directory) / "output" / "trainer_state.json"
         if not state_path.is_file():
             return
@@ -185,8 +197,10 @@ class LlamaFactoryBackend(TrainingBackend):
                     checked += 1
                     if not math.isfinite(float(item[key])):
                         raise ValueError(f"non-finite {key} in training state; review precision and optimizer configuration")
-        (Path(directory) / "training-health.json").write_text(json.dumps({"finite_statistics_checked": checked,
-                                                                         "global_step": state.get("global_step")}))
+        health = {"finite_statistics_checked": checked, "global_step": state.get("global_step")}
+        if quantized:
+            health["quantization_confirmed_bits"] = 4
+        (Path(directory) / "training-health.json").write_text(json.dumps(health), encoding="utf-8")
 
     def cleanup(self, directory):
         # Retain all evidence; lifecycle ownership is the executor's responsibility.

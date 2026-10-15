@@ -1,4 +1,106 @@
+# Current Windows GPU acceptance — 2026-10-15, app 0.2.3
+
+This section supersedes outstanding GPU statements in the dated historical entries below.
+Installed Windows UI + real H100 + Qwen2.5-0.5B synthetic SFT passed LoRA, genuine NF4 4-bit QLoRA,
+native generation, cancellation, checkpoint-10 → step-100 resume with preserved history, controller-loss
+reconciliation into the original MLflow run, GPU-busy queue behavior, and complete artifact hash recovery.
+Every output file uploaded to MLflow in the accepted audits was downloaded again and hash-verified.
+See [report](GPU_ACCEPTANCE_2026-10-15.md) and [safe receipt](acceptance/2026-10-15-desktop-gpu.json).
+
+Fixed missing C-compiler preflight, a misleading queue completion notice, and the quantizer alias:
+LLaMA-Factory 0.9.5 requires `bnb`, not `bitsandbytes`. The old unquantized QLoRA run was rejected and
+marked FAILED in shared MLflow. Final QLoRA has 168 actual CUDA Linear4bit layers, NF4 quantization,
+4.0 storage bits per original linear weight and a finite CUDA forward pass. Train and prediction logs
+both confirm actual 4-bit loading; the worker rejects a silent fallback.
+
+Final Python source SHA256: c5b040822868981c064ebb183c9a741424ea03d096f11b45c9ae1c361a2228ee
+(frozen source commit 7fca6a441dfa875c6d0f40b7ce979c2fdefe772e).
+Earlier LoRA/resume/queue receipts use source 8f91704981fadb47694fbb0c8fc4a1683427bbbc4c70cade72936285083f9298;
+they are not represented as rerun on the final source. Final-source genuine QLoRA and controller recovery passed.
+Final UI source 1222d626ed44a4143b18f1bcc3d4ce22c21636cf displays package version 0.2.3.
+
+Fresh locked Python 3.12 sync passes; pytest **78 passed, 1 skipped** (opt-in GPU pytest; paid manual evidence
+is separate); Ruff passes. UI **10 passed**, TypeScript/Vite build and frozen-package/wheel integrity pass.
+Rust allowlist test passed; Rust source unchanged during final quantizer/footer fixes, final NSIS build passed.
+GitHub CPU run 38667226882 and Windows package run 38667226909 both succeeded for 1222d62.
+Installer SHA256: 35c9995db4d720506a3814f9e142ebe94ef776e0de0aae447d486fd56a464af5.
+Installed sidecar equals build bytes; installed UI footer reports 0.2.3. NSIS changes only the native bundle
+marker UNK→NSS (three bytes). Test credentials were deleted and original public settings restored afterward.
+
+Temporary owned H100 stopped to EXITED, then deleted (GET 404). Existing H200 stayed EXITED and the
+existing network volume was preserved. Upper estimate 82.36 minutes / $5.48 GPU, storage excluded,
+within approved 90 minutes / $5.99. No institution data was transferred.
+
+Remaining scope: only SFT LoRA/QLoRA and a fixed model catalog; no complete automatic model/method
+capability matrix, direct S3 dataset connector, large-data streaming, multi-PC scheduler, or serving.
+Other catalog models, gated-model authentication, a clean second PC and signing remain unverified.
+Training-adapter Model Registry registration and a standalone GPU image build were not accepted here.
+Synthetic data establishes pipeline behavior, not business quality or numeric reproducibility.
+
+---
+
 # Progress and acceptance status — 2026-10-14
+
+## Windows workbench refinement — 0.2.1
+
+User selected the light Linear/Vercel direction after requesting getdesign.md references and similar open-source
+research. DESIGN.md records original product rules; docs/OPEN_SOURCE_REVIEW.md records upstream links, fit and limits.
+Removed the marketing hero/numbered sidebar; added compact workspace navigation, actual recent-run summary,
+bundled Pretendard font, local sample inspection, same-snapshot validation guard, fetched-history filters,
+nested parameter differences, reuse-as-new-plan and actual native progress visualization.
+
+Current source checks: **74 passed, 1 skipped**; Ruff passes; UI workflows **8 passed**; TypeScript/Vite and Rust
+allowlist test pass. Actual previously recovered GPU trainer_log.jsonl parsed as step 12/12 with finite loss
+0.4167558252811432. This is a read of existing evidence, not a new training run.
+The added tests cover duplicate/sample bounds, invalid samples, partial/nonfinite trainer records, downsampling,
+missing/nested parameter differences, validation leakage, keyboard navigation, search and progress empty states.
+
+0.2.1 NSIS installer build completed (~42.83 MiB), installed with exit code 0, and the installed app passed:
+local synthetic registration, source/lock-bearing offline plan, actual Windows vault save/masked read/delete,
+Ctrl+K navigation and actual-file sample inspection through the UI. The frozen engine and worker wheel
+have identical Python source bytes and the GPU dependency-lock hash matches.
+Packaged source commit: 7bc7171b63ddab2752a4f930ecb67d2c3d902437.
+Source SHA256: 3ff133ebb8d5e507b6cf512c8a2f6c3feefe849d50b787aebe5788906a40897a.
+Bundled authenticated read-only checks again read 12 MLflow runs and provider EXITED.
+No GPU was started or dataset transferred. Installer removal is tested on the development Windows host;
+clean second-PC acceptance and code signing are not covered.
+New desktop GPU bootstrap/training/cancellation/recovery acceptance and the other limits below remain outstanding.
+
+## Windows desktop pilot — current work
+
+Approved Windows-only design and implementation plan are in docs/plans/2026-10-14-windows-desktop*.
+Rust/Tauri UI wraps the existing Python controller. Windows Credential Manager retains API/OIDC secrets;
+the sidecar receives them only through stdin. UI profiles, datasets, queue and logs stay in per-user app data.
+No paid infrastructure was started and no dataset was transferred during desktop development.
+
+Current source checks: **68 passed, 1 skipped**; Ruff src/tests passes; TypeScript/Vite production build passes;
+four Playwright UI workflows pass; Rust command-allowlist test passes. A preexisting 1-second subprocess
+failure assertion was flaky under simultaneous compiler load; its nonzero-exit case now allows 10 seconds
+while the actual timeout case retains its 1-second deadline.
+
+First native build produced an unsigned Windows x64 NSIS installer (~41 MiB). Native WebView2 smoke checks
+verified bundled catalog, local synthetic dataset registration, offline plan with dependency lock, and actual
+Credential Manager save/masked read/delete using a synthetic value (then restored prior non-secret settings).
+The bundled engine authenticated to the existing MLflow server and read 12 experiment-16 runs; RunPod read-only
+status confirmed EXITED. Public Hugging Face revision lookup also returned a valid immutable 40-character commit.
+These were reads; no MLflow runs were created by the probes.
+
+Final source commit **251d63e0cf3d075e819010596ac104768d0a5145** was packaged and verified:
+the frozen engine's source hash equals the local package and all worker-wheel Python sources match.
+Source SHA256: 7a3e8dff7b1ff5bfbb356899f73465f962c71c2e96b5d45e9da360f76150f128.
+The frozen plan carries the exact GPU dependency lock. Final catalog has three epoch-based task templates.
+The final NSIS installer installed into a test folder with exit code 0; the installed native app passed
+catalog, synthetic local registration, offline plan and real vault masked-read checks. No system Python
+was used by the installed app. This remains a test on the development Windows PC, not a clean second PC.
+Final bundled read-only probes again read 12 MLflow runs and provider EXITED. Hosted CPU verification
+38534264783 passed on both Windows and Ubuntu. Desktop packaging CI is tracked separately.
+
+**Outstanding paid verification:** the new desktop runtime bootstrap and complete UI-triggered GPU
+training/generation/cancel/reconcile/resume flow have not been GPU-executed. Historical CLI H200 evidence below
+must not be presented as desktop acceptance. QLoRA, gated-model authentication, a clean second-PC installation,
+Windows signing, large-data streaming and multi-PC scheduling remain unverified or outside this release.
+The UI's existing-Pod flow has no automatic start/stop/delete controls. Assigned Pods and operator shutdown
+remain required. See docs/WINDOWS_APP.md for limits and exact setup.
 
 ## Latest live verification (supersedes the earlier baseline below)
 
