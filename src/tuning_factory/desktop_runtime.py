@@ -79,7 +79,16 @@ def runtime_path():
     return REMOTE + "/runtime/" + source_hash()[:16]
 
 
+def prerequisites(client):
+    # Triton's CUDA driver helper compiles C even when torch reports CUDA available.
+    command(client, ["sh", "-c", 'compiler="${CC:-cc}"; '
+                    'command -v "$compiler" >/dev/null && "$compiler" --version >/dev/null || '
+                    '{ printf "%s\\n" "C compiler required for Triton; use a CUDA devel Pod image "'
+                    '"or ask its administrator to install a C toolchain before preparing training." >&2; exit 1; }'])
+
+
 def check(client):
+    prerequisites(client)
     root = runtime_path()
     probe = (
         "import json,torch,importlib.metadata;"
@@ -101,6 +110,7 @@ def check(client):
 def runtime(settings, state_root, prepare=False):
     with connection(settings) as (pod, client):
         if prepare:
+            prerequisites(client)
             from .desktop import assets_root
             assets = assets_root()
             wheels = list((assets / "dist").glob("llm_tuning_factory-*.whl"))

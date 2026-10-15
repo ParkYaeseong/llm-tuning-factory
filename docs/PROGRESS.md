@@ -1,3 +1,11 @@
+# GPU desktop acceptance in progress — 2026-10-15
+
+Explicitly approved temporary H100 in EU-FR-1 after the existing stopped H200 returned a host GPU-capacity error.
+Synthetic data only; 90-minute maximum with an owned-Pod watchdog. The installed 0.2.1 UI completed clean
+runtime preparation with matching source/lock/CUDA. Its first real training exposed a missing C compiler
+in the minimal test container during Triton initialization. Added a prerequisite check before installation
+and CUDA readiness, plus regression tests. This is not yet a completed desktop GPU acceptance.
+
 # Progress and acceptance status — 2026-10-14
 
 ## Windows workbench refinement — 0.2.1
