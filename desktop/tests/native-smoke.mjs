@@ -6,6 +6,7 @@ const browser = await chromium.connectOverCDP("http://127.0.0.1:9223");
 try {
   const page = browser.contexts()[0].pages().find(p => /tauri|localhost/.test(p.url()));
   if (!page) throw new Error("Native application WebView not found");
+  page.setDefaultTimeout(60_000);
   await page.waitForFunction(() => !!window.__TAURI_INTERNALS__);
   await page.getByRole("heading", { name: "작업 공간", exact: true }).waitFor();
   await page.waitForFunction(() => !document.body.textContent.includes("작업 공간 불러오는 중"));

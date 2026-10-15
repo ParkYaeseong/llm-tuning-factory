@@ -46,7 +46,19 @@ In an isolated Transformers5.6.0 environment, actual AutoConfig loaded Qwen3.5-0
 Qwen3_5Config; Gemma4 config registration was checked. No weights were downloaded and no latest-model
 GPU training was performed. See [config-only CPU receipt](acceptance/2026-10-15-modern-config-cpu.json).
 
-Windows package/installer verification and publication receipts will be appended after the final build.
+Final frozen bridge passed all six offline stage plans, both dependency locks, every worker Python source byte,
+and dynamic S3 SDK data loading. Frozen backend commit 36e479d0b5b4192b1552352b786474f2d91db07d,
+source SHA256 b8cbf0d8c8eb4ff5aedd1fcfa854b512dd186dc44153ee4c3d7b0c6669ec8595. All 23 UI tests pass. Actual public Qwen revision/config metadata lookup
+passes without downloading model weights.
+
+Final unsigned Windows 0.3.0 NSIS installed successfully on the development Windows PC. Actual installed native
+smoke verified catalog, synthetic local registration/preview, immutable dry-run, PPO prerequisite guard,
+actual HF Qwen3.5 inspection/import/pinned dry-run, and Windows vault save/masked read/delete for RunPod,
+all three S3 credential fields and HF_TOKEN. Prior public settings
+were preserved and test credentials removed. No live S3/GPU work was performed.
+Installer SHA256 b7be610ed6c10ec98b89f3b8a3fb2459435306d1d67283354707a94fd3f4e49b; 47043962 bytes.
+See [final safe receipt](acceptance/2026-10-15-desktop-030.json). Installer prepared for private prerelease v0.3.0;
+review PR #2 is separate from the original Windows PR #1. Latest hosted reruns are reported separately from local checks.
 
 ---
 
