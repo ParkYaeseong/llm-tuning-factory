@@ -326,3 +326,25 @@ test("jobs explain and disable unsupported checkpoint resume using capabilities"
   await expect(page.getByRole("button", { name: "체크포인트에서 재개", exact: true })).toBeDisabled();
   await expect(page.getByText("이 학습 단계·방식은 체크포인트 재개를 지원하지 않습니다. 회수 가능한 결과는 재연결로 확인하세요.", { exact: true })).toBeVisible();
 });
+
+
+test("model revision metadata stays outside strict training config and clears on model change", async ({ page }) => {
+  await page.evaluate(() => {
+    const original = (window as any).__TAURI_INTERNALS__.invoke;
+    (window as any).__TAURI_INTERNALS__.invoke = async (command: string, args: any) => {
+      if (command === "factory_action" && args.action === "model_revision") return { model_revision: "b".repeat(40), tokenizer_revision: "b".repeat(40), template: "qwen", architecture: "qwen2", max_length: 32768, recommended_precision: "bf16", hidden_layers: 24, metadata_verified: true };
+      return original(command, args);
+    };
+  });
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByRole("button", { name: "선택한 모델 버전 확인·고정", exact: true }).click();
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  const data = await page.evaluate(() => (window as any).__testCalls.findLast((c: any) => c.args?.action === "plan").args.data.config);
+  expect(data.model_revision).toBe("b".repeat(40)); expect(data.template).toBe("qwen");
+  for (const key of ["architecture", "max_length", "recommended_precision", "hidden_layers", "metadata_verified"]) expect(data).not.toHaveProperty(key);
+  await expect(page.getByText("고정 버전 메타데이터 · 확인됨", { exact: true })).toBeVisible();
+  await expect(page.getByText("모델 최대 길이 32,768 토큰 · 현재 설정을 자동으로 변경하지 않습니다.", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("최대 토큰 길이", { exact: true })).toHaveValue("1024");
+  await page.getByLabel("기반 모델", { exact: true }).selectOption("example/ServerCatalogModel");
+  await expect(page.getByText("고정 버전 메타데이터 · 확인됨", { exact: true })).toHaveCount(0);
+});

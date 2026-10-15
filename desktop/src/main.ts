@@ -10,7 +10,7 @@ const state: Obj = {
   config: null, jobs: [], plan: null, logs: "", experiments: [], runs: [], nextToken: null,
   selected: [], experiment: "16", busy: "", notice: "", error: "", active: "", comparison: null,
   preview: null, datasetDraft: {}, historyQuery: "", historyStatus: "", progress: null,
-  jobCapabilities: null, connectionReport: null, runtimeReport: null, settingsDraft: null, s3SettingsDraft: null,
+  jobCapabilities: null, modelMetadata: null, connectionReport: null, runtimeReport: null, settingsDraft: null, s3SettingsDraft: null,
   capabilities: null, capabilityPending: false, s3Draft: { bucket: "", prefix: "", key: "", version_id: "", dataset_id: "s3_dataset", version: "1", kind: "instruction" }, s3Listing: null, s3Object: null,
 };
 const pages: Record<string, string> = {
@@ -107,6 +107,12 @@ function configField(label: string, path: string, type = "text", help = "") {
 function configSelect(label: string, path: string, options: [string, string][]) {
   let v = state.config; for (const p of path.split(".")) v = v?.[p];
   return select(label, path, v, options).replace("data-key=", "data-config=");
+}
+function modelMetadataView() {
+  const metadata = state.modelMetadata;
+  const c = state.config;
+  if (!metadata || metadata.model !== c.base_model || metadata.model_revision !== c.model_revision || metadata.tokenizer_revision !== c.tokenizer_revision) return "";
+  return `<div class="model-metadata compatibility"><h3>고정 버전 메타데이터 · ${metadata.metadata_verified ? "확인됨" : "확인 필요"}</h3><p>아키텍처 ${esc(metadata.architecture || "확인 필요")} · 레이어 ${num(metadata.hidden_layers)} · 권장 정밀도 ${esc(metadata.recommended_precision || "확인 필요")}</p>${typeof metadata.max_length === "number" ? `<p>모델 최대 길이 ${num(metadata.max_length)} 토큰 · 현재 설정을 자동으로 변경하지 않습니다.</p>` : ""}<small>설정은 직접 조정하고 호환성 검사 결과를 확인하세요.</small></div>`;
 }
 function methodSelect() {
   const methods = [["lora", "LoRA"], ["qlora", "QLoRA · 양자화 LoRA"], ["full", "Full · 전체 갱신"], ["freeze", "Freeze · 일부 레이어"], ["oft", "OFT"]];
@@ -301,7 +307,7 @@ function training() {
   ${configField("학습률", "hyperparameters.learning_rate", "number")}
   ${configField("배치 크기", "hyperparameters.per_device_train_batch_size", "number")}
   ${configField("최대 토큰 길이", "hyperparameters.cutoff_len", "number")}
-  </div><div class="actions">${button("선택한 모델 버전 확인·고정", "model_revision")}</div><p class="muted">모델을 변경하면 버전 확인을 눌러 주세요. 최초에는 공개 Qwen 모델을 권장합니다. Llama 모델은 이용 승인과 GPU의 사전 다운로드가 필요합니다.</p><details><summary>고급 설정</summary><div class="grid">
+  </div><div class="actions">${button("선택한 모델 버전 확인·고정", "model_revision")}</div>${modelMetadataView()}<p class="muted">모델을 변경하면 버전 확인을 눌러 주세요. 최초에는 공개 Qwen 모델을 권장합니다. Llama 모델은 이용 승인과 GPU의 사전 다운로드가 필요합니다.</p><details><summary>고급 설정</summary><div class="grid">
   ${configField("모델 revision · 40자리 commit", "model_revision")}
   ${configField("토크나이저 revision · 모델과 일치", "tokenizer_revision")}
   ${configField("모델 템플릿 · 모델에서 자동 적용", "template")}
@@ -424,6 +430,7 @@ function bind() {
     el.addEventListener("input", () => { captureConfig(); invalidatePlan(); });
     el.addEventListener("change", () => {
       captureConfig();
+      if (["base_model", "model_revision", "tokenizer_revision", "template"].includes(el.dataset.config || "")) state.modelMetadata = null;
       if (el.dataset.config === "base_model") {
         state.config.model_revision = ""; state.config.tokenizer_revision = "";
         const model = state.catalog.models.find((item: Obj) => item.id === state.config.base_model);
@@ -564,7 +571,11 @@ async function action(name: string) {
       state.plan = null; await checkCapabilities(); state.notice = "실제 GPU 종류·수·현재 요금을 학습 설정에 적용했습니다.";
     }
     else if (name === "model_revision") {
-      Object.assign(state.config, await api("model_revision", { model: state.config.base_model }));
+      const model = state.config.base_model;
+      const resolved = await api("model_revision", { model });
+      if (state.config.base_model !== model) throw new Error("조회 중 모델이 변경되었습니다. 현재 모델의 버전을 다시 확인하세요.");
+      for (const field of ["model_revision", "tokenizer_revision", "template"]) state.config[field] = resolved[field];
+      state.modelMetadata = { ...resolved, model };
       state.plan = null; await checkCapabilities(); state.notice = "선택한 모델과 토크나이저 버전을 고정했습니다.";
     }
     else if (name === "save-profile") { await api("save_profile", { config: state.config }); await catalog(); state.notice = "업무 AI 설정을 저장했습니다."; }

@@ -9,8 +9,10 @@ try {
   await page.waitForFunction(() => !!window.__TAURI_INTERNALS__);
   await page.getByRole("heading", { name: "작업 공간", exact: true }).waitFor();
   await page.waitForFunction(() => !document.body.textContent.includes("작업 공간 불러오는 중"));
+  await page.getByText('Windows · 내부 검토 0.3.0', { exact: true }).waitFor();
   const catalog = await page.evaluate(() => window.__TAURI_INTERNALS__.invoke("factory_action", { action: "catalog", data: {} }));
   if (catalog.templates.length < 3) throw new Error("Bundled profiles missing");
+  if (catalog.training_stages.length !== 6 || catalog.models.length < 15) throw new Error("Stage/model catalog missing");
   const config = catalog.templates.find(t => t.name === "paper_extraction").config;
   mkdirSync("test-results", { recursive: true });
   const source = resolve("test-results/native-dummy.json");
@@ -21,6 +23,10 @@ try {
     data: { path: source, dataset_id: "desktop_smoke", version: suffix, synthetic: true, export_allowed: false } }), { source, suffix });
   const plan = await page.evaluate(config => window.__TAURI_INTERNALS__.invoke("factory_action", { action: "plan", data: { config } }), config);
   if (!plan.dry_run || !plan.manifest.dependency_file_hashes["containers/gpu-requirements.lock"]) throw new Error("Packaged dry-run lacks worker lock");
+  const blockedPpo = await page.evaluate(config => window.__TAURI_INTERNALS__.invoke("factory_action", {
+    action: "capabilities", data: { config: { ...config, training_stage: "ppo" } }
+  }), config);
+  if (blockedPpo.valid || !blockedPpo.errors.some(x => x.includes("reward_model"))) throw new Error("PPO prerequisite guard missing");
   const preview = await page.evaluate(source => window.__TAURI_INTERNALS__.invoke("factory_action",
     { action: "dataset_preview", data: { path: source } }), source);
   if (preview.rows !== 1 || preview.samples.length !== 1) throw new Error("Native dataset inspection failed");
@@ -39,9 +45,13 @@ try {
     const fake = "desktop-synthetic-vault-" + suffix;
     try {
       await page.evaluate(({ fake, initial }) => window.__TAURI_INTERNALS__.invoke("settings_save",
-        { values: { ...initial, RUNPOD_API_KEY: fake } }), { fake, initial });
+        { values: { ...initial, RUNPOD_API_KEY: fake, S3_ACCESS_KEY_ID: fake,
+          S3_SECRET_ACCESS_KEY: fake, S3_SESSION_TOKEN: fake } }), { fake, initial });
       const masked = await page.evaluate(() => window.__TAURI_INTERNALS__.invoke("settings_get"));
       if (!masked.RUNPOD_API_KEY_saved || masked.RUNPOD_API_KEY) throw new Error("Vault response leaked secret");
+      for (const key of ["S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN"]) {
+        if (!masked[key + "_saved"] || masked[key]) throw new Error("S3 vault value missing or leaked");
+      }
       vaultVerified = true;
     } finally {
       await page.evaluate(() => window.__TAURI_INTERNALS__.invoke("forget_credentials"));
@@ -53,6 +63,7 @@ try {
   await page.screenshot({ path: "test-results/native-workspace.png", fullPage: true });
   console.log(JSON.stringify({ native_ui: true, bundled_catalog: catalog.templates.length,
     dataset_registered_locally: true, dry_run: plan.dry_run, worker_lock_present: true, native_vault_masked: vaultVerified,
+    native_s3_vault_masked: vaultVerified, training_stage_catalog: catalog.training_stages.length, ppo_guard: true,
     native_dataset_preview: true, command_navigation: true,
     gpu_started: false, dataset_transferred: false }));
 } finally { await browser.close(); }
