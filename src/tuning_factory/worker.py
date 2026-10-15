@@ -72,7 +72,7 @@ def main():
         required = ["adapter_config.json", "adapter_model.safetensors"]
         if not all((directory / "output" / name).is_file() for name in required):
             raise RuntimeError("training exited without final LoRA adapter")
-        backend.validate_training_result(directory)
+        backend.validate_training_result(directory, config)
         if validation:
             remaining = args.timeout - (time.monotonic() - started)
             if remaining <= 0:

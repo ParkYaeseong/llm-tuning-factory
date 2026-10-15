@@ -10,7 +10,8 @@ from tuning_factory.runner import Factory
 from tuning_factory.training import LlamaFactoryBackend
 
 
-def test_registered_validation_native_prediction_yaml_and_output(tmp_path):
+@pytest.mark.parametrize("method", ["lora", "qlora"])
+def test_registered_validation_native_prediction_yaml_and_output(tmp_path, method):
     raw = b'[{"instruction":"Synthetic classify","input":"fixture","output":"record"}]'
     source = tmp_path / "val.json"
     source.write_bytes(raw)
@@ -18,6 +19,7 @@ def test_registered_validation_native_prediction_yaml_and_output(tmp_path):
     registry.register_dataset("dummy", "1", "examples/dummy.json")
     registry.register_dataset("validation", "1", source)
     data = load_config("configs/ai/paper_extraction.yaml").model_dump()
+    data["training_method"] = method
     data["evaluation_profile"] = {"kind": "classification", "dataset_id": "validation", "dataset_version": "1", "max_samples": 1}
     config = AIConfig.model_validate(data)
     manifest = resolve(config, registry)
@@ -29,6 +31,9 @@ def test_registered_validation_native_prediction_yaml_and_output(tmp_path):
             assert plan["do_predict"] and not plan["do_train"]
             assert plan["adapter_name_or_path"] == "./output"
             assert plan["max_samples"] == 1
+            if method == "qlora":
+                assert plan["quantization_bit"] == 4 and plan["quantization_method"] == "bnb"
+                (directory / log_name).write_text("Quantizing model to 4 bit with bitsandbytes.\n")
             (directory / "prediction").mkdir()
             (directory / "prediction" / "generated_predictions.jsonl").write_text(
                 json.dumps({"predict": "record", "label": "record", "prompt": "fixture"}) + "\n")
