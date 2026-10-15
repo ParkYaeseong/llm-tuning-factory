@@ -5,6 +5,8 @@ Keep these rules independent of credentials and infrastructure discovery.
 """
 from copy import deepcopy
 
+from .model_hub import ModelProfile, imported_model
+
 STAGES = {
     "pt": ("Pre-training", "text"), "sft": ("Supervised fine-tuning", "instruction"),
     "rm": ("Reward modeling", "preference"), "ppo": ("PPO", "prompt"),
@@ -53,6 +55,14 @@ def compatibility(config):
         config = config.model_dump()
     errors, warnings = [], []
     model = next((m for m in model_catalog() if m["id"] == config.get("base_model")), None)
+    if config.get("model_profile"):
+        try:
+            profile = ModelProfile.model_validate(config["model_profile"])
+            if profile.repo_id != config.get("base_model") or profile.revision != config.get("model_revision"):
+                errors.append("registered model identity/revision differs; inspect the model again")
+            model = imported_model(profile)
+        except ValueError:
+            errors.append("registered model profile is invalid; inspect the model again")
     stage, method = config.get("training_stage", "sft"), config.get("training_method", "lora")
     options, stage_options = config.get("finetuning_options") or {}, config.get("stage_options") or {}
     evaluation = config.get("evaluation_profile") or {}
@@ -100,6 +110,12 @@ def compatibility(config):
         if method == "oft":
             errors.append("OFT generation evaluation is blocked by the pinned engine adapter parser")
     if model:
+        if stage not in model.get("supported_stages", STAGES):
+            errors.append(f"{stage} is unavailable for this architecture/runtime profile; choose a supported stage")
+        if method not in model.get("methods", METHODS):
+            errors.append(f"{method} is unavailable for this architecture profile")
+        if model.get("source") == "huggingface":
+            warnings.append("Imported HF model: metadata verified, actual GPU validation pending; text data only")
         if model["gated"]:
             warnings.append("Gated model requires prior access and a pre-provisioned model cache on the GPU")
         cutoff = (config.get("hyperparameters") or {}).get("cutoff_len", 1024)
@@ -109,7 +125,9 @@ def compatibility(config):
             warnings.append("Full/freeze training retains full model weights and requires substantially more memory/storage")
         warnings.append("Available configuration is not GPU verification of this stage/method/model combination")
     return {"valid": not errors, "errors": errors, "warnings": warnings,
-            "supported_stages": list(STAGES), "methods": [m for m in METHODS if not (stage == "ppo" and m == "oft")],
+            "supported_stages": list(model.get("supported_stages", STAGES)) if model else list(STAGES),
+            "methods": [m for m in (model.get("methods", METHODS) if model else METHODS)
+                        if not (stage == "ppo" and m == "oft")],
             "quantization_bits": [4, 8], "model": deepcopy(model),
             "dataset_kind": STAGES.get(stage, ("", "instruction"))[1],
             "engine_version": "0.9.3" if stage == "ppo" else "0.9.5",

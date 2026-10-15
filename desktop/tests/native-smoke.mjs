@@ -27,6 +27,19 @@ try {
     action: "capabilities", data: { config: { ...config, training_stage: "ppo" } }
   }), config);
   if (blockedPpo.valid || !blockedPpo.errors.some(x => x.includes("reward_model"))) throw new Error("PPO prerequisite guard missing");
+  const modern = await page.evaluate(() => window.__TAURI_INTERNALS__.invoke('factory_action', {
+    action: 'model_inspect', data: {model: 'Qwen/Qwen3.5-0.8B'}
+  }));
+  if (!modern.supported || modern.architecture !== 'qwen3_5') throw new Error('Modern HF inspection unavailable');
+  const registered = await page.evaluate(modern => window.__TAURI_INTERNALS__.invoke('factory_action', {
+    action: 'model_import', data: {model: modern.repo_id, revision: modern.revision, config_sha256: modern.profile.config_sha256}
+  }), modern);
+  const modernConfig = {...config, base_model: registered.profile.repo_id, template: registered.profile.template,
+    model_revision: registered.profile.revision, tokenizer_revision: registered.profile.revision, model_profile: registered.profile};
+  const modernPlan = await page.evaluate(config => window.__TAURI_INTERNALS__.invoke('factory_action', {
+    action:'plan', data:{config}
+  }), modernConfig);
+  if (!modernPlan.dry_run || modernPlan.manifest.config.model_profile.repo_id !== modern.repo_id) throw new Error('Modern HF plan failed');
   const preview = await page.evaluate(source => window.__TAURI_INTERNALS__.invoke("factory_action",
     { action: "dataset_preview", data: { path: source } }), source);
   if (preview.rows !== 1 || preview.samples.length !== 1) throw new Error("Native dataset inspection failed");
@@ -46,10 +59,10 @@ try {
     try {
       await page.evaluate(({ fake, initial }) => window.__TAURI_INTERNALS__.invoke("settings_save",
         { values: { ...initial, RUNPOD_API_KEY: fake, S3_ACCESS_KEY_ID: fake,
-          S3_SECRET_ACCESS_KEY: fake, S3_SESSION_TOKEN: fake } }), { fake, initial });
+          S3_SECRET_ACCESS_KEY: fake, S3_SESSION_TOKEN: fake, HF_TOKEN: fake } }), { fake, initial });
       const masked = await page.evaluate(() => window.__TAURI_INTERNALS__.invoke("settings_get"));
       if (!masked.RUNPOD_API_KEY_saved || masked.RUNPOD_API_KEY) throw new Error("Vault response leaked secret");
-      for (const key of ["S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN"]) {
+      for (const key of ["S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN", "HF_TOKEN"]) {
         if (!masked[key + "_saved"] || masked[key]) throw new Error("S3 vault value missing or leaked");
       }
       vaultVerified = true;
@@ -64,6 +77,11 @@ try {
   console.log(JSON.stringify({ native_ui: true, bundled_catalog: catalog.templates.length,
     dataset_registered_locally: true, dry_run: plan.dry_run, worker_lock_present: true, native_vault_masked: vaultVerified,
     native_s3_vault_masked: vaultVerified, training_stage_catalog: catalog.training_stages.length, ppo_guard: true,
+    modern_hf_model_registered: modern.repo_id, modern_hf_revision: modern.revision, native_hf_vault_masked: vaultVerified,
     native_dataset_preview: true, command_navigation: true,
     gpu_started: false, dataset_transferred: false }));
+} catch (error) {
+  const page = browser.contexts()[0]?.pages().find(p => /tauri|localhost/.test(p.url()));
+  if (page) console.error(JSON.stringify({ native_error_view: await page.locator('main').innerText() }));
+  throw error;
 } finally { await browser.close(); }

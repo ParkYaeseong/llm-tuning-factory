@@ -66,6 +66,8 @@ def parse_dataset(raw: bytes, kind=None):
                 and (expected_role is None or message.get(role_key) == expected_role))
 
     for row in rows:
+        if any(row.get(column) for column in ("images", "videos", "audios")):
+            raise ValueError("media datasets are unsupported; this application currently trains on text records only")
         if kind == "text":
             if not nonempty(row.get("text")):
                 raise ValueError("pretraining records require nonempty text")

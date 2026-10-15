@@ -4,8 +4,15 @@ Approved training-capability/S3 design implemented on codex/training-capabilitie
 the feature-limit statements in older dated entries; it does not expand their real GPU evidence.
 
 Implemented PT/SFT/RM/PPO/DPO/KTO, DPO/IPO/ORPO/SimPO/KTO-pair losses, Full/Freeze/LoRA/QLoRA/OFT,
-typed method options and shared UI/config/worker compatibility rules. Fifteen reviewed text model profiles
-cover Qwen2.5/Llama/Mistral/Gemma2; actual immutable HF metadata and worker GPU/BF16/architecture facts are checked.
+typed method options and shared UI/config/worker compatibility rules. Fifteen initial text model profiles
+cover Qwen2.5/Llama/Mistral/Gemma2. HF search/latest-update sort and exact repository-ID inspection/import now
+persist immutable model profiles with config hashes, revisions and architecture/template-bound capabilities.
+Qwen3.5/3.6 and Gemma4 structures can be imported for the app's initial text-SFT scope; this conservative
+app limit is not a claim that upstream forbids other stages. Unknown structures, custom remote code,
+pre-quantized inference weights and multimodal datasets are rejected with reasons. Qwen3 PPO is disabled
+because its selected template is absent in the separate legacy PPO runtime. Phi uses the actual `phi` template.
+HF tokens are vault-held metadata credentials only; gated GPU weights still require separately prepared access/cache.
+Actual immutable HF metadata and worker GPU/BF16/architecture facts are checked.
 Stage-specific datasets/descriptors, full model shards, adapters, value heads, generation and native RM evaluation
 are handled. Cross-stage metric deltas are refused. Large artifact transfer/hash checks use streaming file hashes.
 
@@ -14,8 +21,8 @@ S3 connection uses explicit vault-held credentials, SigV4, list pagination/exact
 HEAD checksum fields survive the UI import. Native settings reject secret-bearing/presigned endpoints before any
 vault or plaintext settings write. S3 import and subsequent GPU export approvals remain separate; no S3 keys go to GPU.
 
-Verification: Python 3.12 locked sync succeeds; **201 passed, 1 skipped**, Ruff passes. The skip is the opt-in
-GPU test. UI **21 passed**, TypeScript/Vite build passes. Full native Rust **3 tests passed** on version 0.3.0.
+Verification: Python 3.12 locked sync succeeds; **214 passed, 1 skipped**, Ruff passes. The skip is the opt-in
+GPU test. UI **23 passed**, TypeScript/Vite build passes. Full native Rust **4 tests passed** on version 0.3.0.
 S3 tests include actual boto3 SigV4 requests with independently verified signing to a local synthetic S3 endpoint;
 this is not an AWS/NCP/MinIO account acceptance. New regression failures were observed before fixes.
 
@@ -31,8 +38,13 @@ institution data was accessed. Historical 0.2.3 H100 evidence below is SFT/Qwen0
 Full/Freeze RM resume and OFT standalone prediction/reward evaluation are blocked by upstream limits.
 PPO prompts currently require Alpaca; incompatible odd-length ShareGPT prompts are rejected before launch.
 PPO reward models must be pre-provisioned with a complete inventory hash; LoRA base model and Full tokenizer
-identity are checked. Multimodal/unknown architectures, alternate optimizers/quantizers/plugins, unbounded streaming,
+identity are checked. Multimodal data/unknown architectures, alternate optimizers/quantizers/plugins, unbounded streaming,
 cross-PC scheduling, serving, clean second-PC install and signing are not accepted here.
+
+Real public HF searches found Qwen3.5, Qwen3.6 and Gemma4. Qwen3.5-0.8B immutable metadata inspection passed.
+In an isolated Transformers5.6.0 environment, actual AutoConfig loaded Qwen3.5-0.8B and Qwen3.6-27B as
+Qwen3_5Config; Gemma4 config registration was checked. No weights were downloaded and no latest-model
+GPU training was performed. See [config-only CPU receipt](acceptance/2026-10-15-modern-config-cpu.json).
 
 Windows package/installer verification and publication receipts will be appended after the final build.
 

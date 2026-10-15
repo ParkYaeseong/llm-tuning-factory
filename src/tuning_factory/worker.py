@@ -14,7 +14,7 @@ import yaml
 from .capabilities import compatibility
 from .config import AIConfig
 from .manifest import source_hash, verify_manifest
-from .registry import canonical, digest
+from .registry import canonical, digest, file_digest
 from .runtime_profiles import engine_profile
 from .training import CanceledError, LlamaFactoryBackend
 
@@ -37,9 +37,17 @@ def runtime_preflight(config):
     import torch
     from transformers import AutoConfig
     observed = AutoConfig.from_pretrained(config.base_model, revision=config.model_revision, trust_remote_code=False)
+    text = getattr(observed, "text_config", observed)
     facts = {"cuda_available": torch.cuda.is_available(), "gpu_count": torch.cuda.device_count(),
              "bf16_supported": torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False,
-             "model_type": observed.model_type, "num_hidden_layers": getattr(observed, "num_hidden_layers", None)}
+             "model_type": observed.model_type, "num_hidden_layers": getattr(text, "num_hidden_layers", None)}
+    if config.model_profile:
+        from huggingface_hub import hf_hub_download
+        cached = hf_hub_download(repo_id=config.base_model, filename="config.json", revision=config.model_revision)
+        if file_digest(cached) != config.model_profile.config_sha256:
+            raise ValueError("pinned model metadata hash differs from the inspected Hugging Face profile")
+        if config.hyperparameters.cutoff_len > getattr(text, "max_position_embeddings", config.model_profile.max_length):
+            raise ValueError("cutoff length exceeds the pinned model context length")
     validate_runtime_facts(config, facts)
     if config.training_stage == "ppo" and config.stage_options.reward_model_type == "full":
         from transformers import AutoTokenizer

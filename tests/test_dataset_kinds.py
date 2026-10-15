@@ -45,6 +45,11 @@ def test_wrong_kind_rejects_before_registration(kind, row):
         parse_dataset(json.dumps([row]).encode(), kind)
 
 
+def test_multimodal_media_is_not_silently_ignored_in_text_training():
+    with pytest.raises(ValueError, match='media'):
+        parse_dataset(b'[{"instruction":"describe image","output":"answer","images":["image.png"]}]')
+
+
 def test_preference_sharegpt_descriptor_preserves_real_columns():
     raw = json.dumps([{'conversations': [{'from': 'human', 'value': 'q'}],
                        'chosen': {'from': 'gpt', 'value': 'yes'},

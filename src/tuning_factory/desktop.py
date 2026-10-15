@@ -17,6 +17,7 @@ from .connections import ENV_SETTINGS
 from .desktop_inspection import inspect_dataset, parameter_changes, parse_progress
 from .execution import Policy, RunPodController
 from .manifest import resolve
+from .model_hub import ModelHub, register_model, registered_models
 from .registry import canonical, safe_name
 from .runner import Factory
 
@@ -86,8 +87,24 @@ class DesktopService:
             profiles = [json.loads(p.read_bytes()) for p in sorted((self.root / "profiles").glob("*.json"))]
             datasets = [json.loads(p.read_bytes()) for p in sorted(
                 (self.factory.registry.root / "datasets").glob("*/*.json"))]
+            models = {model["id"]: model for model in model_catalog()}
+            models.update({model["id"]: model for model in registered_models(self.root)})
             return {"templates": templates, "profiles": profiles, "datasets": datasets,
-                    "models": model_catalog(), "training_stages": training_stages()}
+                    "models": list(models.values()), "training_stages": training_stages()}
+        if action == "model_search":
+            with self.hub() as hub:
+                return hub.search(data["query"], data.get("sort", "downloads"))
+        if action in {"model_inspect", "model_import"}:
+            with self.hub() as hub:
+                result = hub.inspect(data["model"], data.get("revision"))
+            if action == "model_inspect":
+                return result
+            if not result["supported"]:
+                raise ValueError("; ".join(result["reasons"]))
+            if (data.get("config_sha256") != result["profile"]["config_sha256"] or
+                    data.get("revision") != result["revision"]):
+                raise ValueError("model metadata changed since inspection; inspect it again")
+            return register_model(self.root, result["profile"])
         if action == "capabilities":
             result = compatibility(data["config"])
             try:
@@ -108,6 +125,14 @@ class DesktopService:
         if action == "model_revision":
             import httpx
             model = data["model"]
+            custom = next((m for m in registered_models(self.root) if m["id"] == model), None)
+            if custom:
+                with self.hub() as hub:
+                    result = hub.inspect(model)
+                if not result["supported"]:
+                    raise ValueError("; ".join(result["reasons"]))
+                register_model(self.root, result["profile"])
+                return {**result, "model_profile": result["profile"]}
             profile = next((m for m in model_catalog() if m["id"] == model), None)
             if not profile:
                 raise ValueError("supported model required")
@@ -257,6 +282,9 @@ class DesktopService:
     def storage(self):
         from .storage import S3Storage
         return S3Storage(self.settings)
+
+    def hub(self):
+        return ModelHub(token=self.settings.get("HF_TOKEN"))
 
     def history(self, data):
         from mlflow import MlflowClient

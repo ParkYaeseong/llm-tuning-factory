@@ -44,6 +44,42 @@ test.beforeEach(async ({ page }) => {
   await page.goto("/");
   await expect(page.getByText("작업 공간 불러오는 중")).toHaveCount(0);
 });
+
+test('HF model search imports an immutable modern profile and disables unsupported stages', async ({ page }) => {
+  await page.evaluate(() => {
+    const native = (window as any).__TAURI_INTERNALS__;
+    const original = native.invoke;
+    let registered: any = null;
+    const profile = { repo_id: 'Qwen/Qwen3.5-0.8B', revision: 'c'.repeat(40), config_sha256: 'd'.repeat(64),
+      architecture: 'qwen3_5', template: 'qwen3_5_nothink', max_length: 32768, context_length: 262144,
+      hidden_layers: 24, recommended_precision: 'bfloat16', gated: false };
+    native.invoke = async (command: string, args: any) => {
+      if (command === 'factory_action') {
+        if (args.action === 'model_search') return { models: [{ id: profile.repo_id, downloads: 100, pipeline_tag: 'image-text-to-text' }] };
+        if (args.action === 'model_inspect') return { repo_id: profile.repo_id, revision: profile.revision,
+          architecture: profile.architecture, supported: true, reasons: [], profile, supported_stages: ['sft'] };
+        if (args.action === 'model_import') { registered = { id: profile.repo_id, template: profile.template,
+          registration: profile, gpu_verified: false }; return { model: registered, profile }; }
+        if (args.action === 'catalog') { const result = await original(command, args); if (registered) result.models.push(registered); return result; }
+        if (args.action === 'capabilities' && args.data.config.model_profile) return { valid: true, errors: [], warnings: ['GPU validation pending'],
+          supported_stages: ['sft'], methods: ['lora', 'qlora', 'full', 'freeze'], dataset_kind: 'instruction', engine_version: '0.9.5' };
+      }
+      return original(command, args);
+    };
+  });
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByLabel('HF 모델 검색').fill('Qwen3.5');
+  await page.locator('[data-action="hub-search"]').click();
+  await page.locator('[data-action="hub-inspect:0"]').click();
+  await page.locator('[data-action="hub-import"]').click();
+  await expect(page.getByLabel('기반 모델', {exact:true})).toHaveValue('Qwen/Qwen3.5-0.8B');
+  await expect(page.getByLabel('학습 단계', {exact:true}).locator('option[value="ppo"]')).toHaveJSProperty('disabled', true);
+  await page.locator('#training-form').getByRole('button', { name: '실행 계획 확인', exact:true }).click();
+  const data = await page.evaluate(() => (window as any).__testCalls.filter((x:any) => x.args?.action === 'plan').at(-1).args.data.config);
+  expect(data.model_profile.repo_id).toBe('Qwen/Qwen3.5-0.8B');
+  expect(data.model_revision).toBe('c'.repeat(40));
+  expect(data.architecture).toBeUndefined();
+});
 test("connection wizard masks secrets and persists via native command", async ({ page }) => {
   await page.locator('nav [data-action="nav:connections"]').click();
   await page.getByLabel("RunPod API 키").fill("synthetic-secret");

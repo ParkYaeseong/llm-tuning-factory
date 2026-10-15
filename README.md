@@ -20,7 +20,8 @@ Windows 앱은 Python을 포함하며 키는 연결 화면에서 입력하고 Wi
 더미 결과는 업무 AI 품질을 의미하지 않습니다.
 
 **새 기능:** PT·SFT·RM·PPO·DPO·KTO, Full·Freeze·LoRA·QLoRA·OFT와 단계별 옵션을 제공합니다.
-검토한 텍스트 모델 15개 프로필에서 호환 조건을 검사하고, 모델 변경 시 템플릿과 revision을 관리합니다.
+기본 모델 15개와 Hugging Face 검색·모델 ID 추가를 제공하고, 구조별 호환 조건과 고정 revision을 관리합니다.
+Qwen3.5/3.6·Gemma4 등은 지원 구조를 검사해 추가하며, GPU 검증 여부와 실행 제한을 따로 표시합니다.
 S3 버킷·파일 조회와 버전/해시를 고정한 PC 가져오기(파일당 32 MiB)를 지원합니다.
 [학습 방식·S3 사용 안내](docs/TRAINING_AND_STORAGE.md)를 확인하세요.
 

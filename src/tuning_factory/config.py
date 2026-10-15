@@ -5,6 +5,8 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .model_hub import ModelProfile
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
@@ -100,6 +102,7 @@ class AIConfig(StrictModel):
     dataset_id: str = Field(pattern=r"^[a-zA-Z0-9_-]+$")
     dataset_version: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$")
     base_model: str
+    model_profile: ModelProfile | None = None
     model_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     tokenizer_revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     training_backend: Literal["llamafactory"] = "llamafactory"
@@ -122,6 +125,9 @@ class AIConfig(StrictModel):
             raise ValueError("; ".join(result["errors"]))
         if self.model_revision != self.tokenizer_revision:
             raise ValueError("this backend requires tokenizer_revision == model_revision")
+        if self.model_profile and (self.model_profile.repo_id != self.base_model or
+                                   self.model_profile.revision != self.model_revision):
+            raise ValueError("registered model identity/revision differs from the pinned configuration; inspect it again")
         if self.dataset_version in {".", ".."}:
             raise ValueError("invalid dataset version")
         return self

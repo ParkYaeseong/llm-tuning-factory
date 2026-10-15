@@ -4,13 +4,13 @@ use serde_json::{json, Map, Value};
 use std::{fs, io::Write, path::PathBuf, process::{Command, Stdio}, sync::Mutex};
 use tauri::Manager;
 
-const SECRETS: [&str; 6] = ["RUNPOD_API_KEY", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLOW_TRACKING_TOKEN",
-    "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN"];
-const FIELDS: [&str; 18] = [
+const SECRETS: [&str; 7] = ["RUNPOD_API_KEY", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLOW_TRACKING_TOKEN",
+    "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN", "HF_TOKEN"];
+const FIELDS: [&str; 19] = [
     "MLFLOW_TRACKING_URI", "FACTORY_MLFLOW_ARTIFACT_LOCATION", "FACTORY_OPERATOR",
     "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "pod_id", "ssh_key_file",
     "ssh_fingerprint", "RUNPOD_API_KEY", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLOW_TRACKING_TOKEN", "auth_mode",
-    "S3_ENDPOINT_URL", "S3_REGION", "S3_ADDRESSING_STYLE", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN",
+    "S3_ENDPOINT_URL", "S3_REGION", "S3_ADDRESSING_STYLE", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN", "HF_TOKEN",
 ];
 struct SaveLock(Mutex<()>);
 
@@ -138,7 +138,8 @@ fn allowed(action: &str) -> bool {
     matches!(action, "catalog" | "save_profile" | "dataset" | "plan" | "submit" | "execute" |
         "jobs" | "logs" | "cancel" | "recover" | "reconcile" | "resume" | "connection" |
         "pod" | "runtime_check" | "runtime_prepare" | "live_logs" | "history" | "compare" | "model_revision" |
-        "dataset_preview" | "job_progress" | "capabilities" | "s3_list" | "s3_head" | "s3_import")
+        "dataset_preview" | "job_progress" | "capabilities" | "s3_list" | "s3_head" | "s3_import" |
+        "model_search" | "model_inspect" | "model_import")
 }
 
 #[tauri::command]
@@ -221,5 +222,14 @@ mod tests {
         assert!(!allowed("shell"));
         assert!(!allowed("pod-start"));
         assert!(!allowed("pod-stop"));
+    }
+    #[test]
+    fn hf_metadata_actions_are_explicit_and_token_is_never_public() {
+        for action in ["model_search", "model_inspect", "model_import"] { assert!(allowed(action)); }
+        let result = merge_public_settings(json!({"pod_id":"assigned"}),
+            json!({"HF_TOKEN":"synthetic-token"}).as_object().unwrap()).unwrap();
+        assert!(!result.contains_key("HF_TOKEN"));
+        assert_eq!(result.get("pod_id"), Some(&json!("assigned")));
+        assert!(SECRETS.contains(&"HF_TOKEN"));
     }
 }
