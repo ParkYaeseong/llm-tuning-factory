@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { version } from "../package.json";
 import { filterRuns, formatDate, icon, progressView } from "./workbench";
 import "./style.css";
 
@@ -244,7 +245,7 @@ function render() {
   root.innerHTML = `<aside><div class="brand"><span class="brand-mark"><svg width="22" height="24" viewBox="0 0 22 24" fill="none"><path d="M3 5h16M3 12h11M3 19h6" stroke="currentColor" stroke-width="3.2" stroke-linecap="square"/><circle cx="18" cy="19" r="2" fill="currentColor"/></svg></span><div>Tuning Factory<small>개인 워크스페이스</small></div>${icon("chevron", 12)}</div>
   <button class="command-trigger" data-action="search">${icon("search")}<span>바로 가기</span><kbd>Ctrl K</kbd></button><div class="nav-label">워크스페이스</div><nav>${Object.entries(pages).filter(([id]) => id !== "connections").map(([id, name]) => `<button aria-label="${name}" data-action="nav:${id}" class="${state.page === id ? "selected" : ""}">${icon(id)}<span>${name}</span>${id === "jobs" && state.jobs.filter((j: Obj) => j.status === "RUNNING").length ? '<i class="activity-marker"></i>' : ""}</button>`).join("")}</nav>
   <div class="nav-label settings-label">설정</div><nav><button aria-label="연결 설정" data-action="nav:connections" class="${state.page === "connections" ? "selected" : ""}">${icon("connections")}<span>연결 설정</span></button></nav>
-  <div class="sidebar-foot"><span class="avatar">${esc((state.settings.FACTORY_OPERATOR || "U").slice(0, 1).toUpperCase())}</span><div><b>${esc(state.settings.FACTORY_OPERATOR || "사용자 미설정")}</b><small>Windows · 내부 검토 0.2.1</small></div></div></aside>
+  <div class="sidebar-foot"><span class="avatar">${esc((state.settings.FACTORY_OPERATOR || "U").slice(0, 1).toUpperCase())}</span><div><b>${esc(state.settings.FACTORY_OPERATOR || "사용자 미설정")}</b><small>Windows · 내부 검토 ${esc(version)}</small></div></div></aside>
   <main><div class="appbar"><span class="breadcrumb">내 워크스페이스 <span>/</span> <b>${esc(pages[state.page])}</b></span><span class="local-context">${icon("folder", 13)} 내 PC에서 작업 관리</span></div><div class="content"><header class="page-heading"><div><h1>${esc(pages[state.page])}</h1><p>${esc(descriptions[state.page])}</p></div>${state.page === "overview" ? button(icon("plus") + " 새 학습", "nav:training", "primary") : ""}</header>
   <div aria-live="polite">${state.busy ? `<div class="notice busy"><span class="spinner"></span>${esc(state.busy)}<small>다른 화면에서도 작업 상태를 확인할 수 있습니다.</small></div>` : ""}${state.notice ? `<div class="notice">${esc(state.notice)}</div>` : ""}${state.error ? `<div class="notice error" role="alert">${esc(state.error)}</div>` : ""}</div>
   ${views[state.page]()}</div></main>`;

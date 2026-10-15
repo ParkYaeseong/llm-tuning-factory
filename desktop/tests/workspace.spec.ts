@@ -1,6 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { readFileSync } from "node:fs";
 const config = JSON.parse(readFileSync(new URL("./config.json", import.meta.url), "utf8"));
+const packageVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(({ config }) => {
     const calls: any[] = [];
@@ -41,6 +42,10 @@ test("connection wizard masks secrets and persists via native command", async ({
   await expect(page.getByLabel("RunPod API 키")).toHaveValue("");
   await expect(page.getByText("보안 저장됨 · 변경할 때만 입력")).toBeVisible();
   expect(await page.evaluate(() => localStorage.length)).toBe(0);
+});
+
+test("workbench displays the distributed package version", async ({ page }) => {
+  await expect(page.locator(".sidebar-foot small")).toHaveText(`Windows · 내부 검토 ${packageVersion}`);
 });
 test("plan is offline and execution requires separate explicit confirmation", async ({ page }) => {
   await page.locator('nav [data-action="nav:training"]').click();
