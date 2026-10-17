@@ -8,9 +8,13 @@ Pod, and insufficient evaluation fingerprints for automatic selection. Checked p
 adapter/reference/merge contracts. Proposed immutable model handoff, whole-Pod parallelism, attempt fencing,
 tracking outbox, deterministic compatible LoRA cat merge and same-benchmark reevaluation with best-original fallback.
 
-Status: **design only; product code and 0.3.0 installer unchanged**. Implementation plan/product work awaits written
-design review under the brainstorming workflow. No tests rerun for this documentation-only change; older acceptance
-below remains dated evidence. No paid resources, external datasets or institution data were accessed or transferred.
+User approved the written spec on 2026-10-17 (“진행해”). Prepared and self-reviewed the
+[implementation plan](superpowers/plans/2026-10-17-general-training-workflows.md), including task interfaces,
+failure tests, model numerical acceptance and native credential/controller lifecycle. Plan review and execution-method
+selection were approved on 2026-10-17: task implementers with independent task reviews. Product implementation is
+starting on codex/general-training-workflows; the released 0.3.0 installer remains unchanged until new acceptance.
+Baseline Python 3.12 suite rerun: **214 passed, 1 skipped** (opt-in live GPU), Ruff passes. No paid resources,
+external datasets or institution data were accessed or transferred.
 Actual serial handoff, multi-Pod concurrency and merged-model GPU evaluation are outstanding future acceptance work
 and require explicit resource/data authorization before any live execution.
 
