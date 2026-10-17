@@ -1,3 +1,21 @@
+# General-purpose workflow design — 2026-10-17
+
+User requested arbitrary-purpose projects/data, reusable training recipes, serial/parallel learning and automated
+post-training consolidation. User selected common evaluation/best-model selection plus compatible adapter merging.
+Prepared [written design](superpowers/specs/2026-10-17-general-training-workflows-design.md) for review.
+Repository audits confirmed example-driven UI startup, no typed parent-model input or DAG/controller, one configured
+Pod, and insufficient evaluation fingerprints for automatic selection. Checked pinned upstream LF0.9.5/PEFT0.18.1
+adapter/reference/merge contracts. Proposed immutable model handoff, whole-Pod parallelism, attempt fencing,
+tracking outbox, deterministic compatible LoRA cat merge and same-benchmark reevaluation with best-original fallback.
+
+Status: **design only; product code and 0.3.0 installer unchanged**. Implementation plan/product work awaits written
+design review under the brainstorming workflow. No tests rerun for this documentation-only change; older acceptance
+below remains dated evidence. No paid resources, external datasets or institution data were accessed or transferred.
+Actual serial handoff, multi-Pod concurrency and merged-model GPU evaluation are outstanding future acceptance work
+and require explicit resource/data authorization before any live execution.
+
+---
+
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
 
 Approved training-capability/S3 design implemented on codex/training-capabilities-s3. This section supersedes
