@@ -19,6 +19,9 @@ def source_hash():
 
 
 def resolve(config, registry, simulation=True):
+    from .config import GraphTrainingConfig
+    if isinstance(config, GraphTrainingConfig):
+        raise ValueError("graph training requires resolve_operation and verified model bindings")
     from .capabilities import STAGES
     from .runtime_profiles import engine_profile
     from .training import LlamaFactoryBackend
@@ -55,3 +58,26 @@ def verify_manifest(manifest):
     expected = manifest.get("sha256")
     if digest(canonical({k: v for k, v in manifest.items() if k != "sha256"})) != expected:
         raise ValueError("manifest hash mismatch")
+
+
+def resolve_operation(operation, registry):
+    """Hash a path-free v2 operation; preserve v1's body and hashing contract."""
+    from pydantic import TypeAdapter
+
+    from .graph_planner import snapshot_dataset, validate_sample_ids
+    from .operations import EvaluateOperation, OperationSpec, TrainOperation
+
+    value = operation.model_dump(mode="json") if hasattr(operation, "model_dump") else operation
+    operation = TypeAdapter(OperationSpec).validate_python(value)
+    datasets = []
+    if isinstance(operation, TrainOperation):
+        datasets.append(snapshot_dataset(registry, operation.dataset))
+    elif isinstance(operation, EvaluateOperation):
+        snapshot = snapshot_dataset(registry, operation.benchmark.dataset)
+        validate_sample_ids(operation.benchmark, snapshot)
+        datasets.append(snapshot)
+    body = {"schema_version": 2, "operation": operation.model_dump(mode="json"),
+            "datasets": [item.model_dump(mode="json") for item in datasets],
+            "code_commit": code_revision(), "source_sha256": source_hash()}
+    body["sha256"] = digest(canonical(body))
+    return body

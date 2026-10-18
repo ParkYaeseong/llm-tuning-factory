@@ -12,12 +12,17 @@ regression fallback. Review fixes cover complete adapter-loader metadata, operat
 historical descriptor hashes, dataset parser/fingerprint agreement, derived-output format drift, and explicit
 partial-success permission separated from normal quality filtering. All four task review gates passed.
 
-Actual frozen-source verification: Python 3.12.12 locked development/tracking sync; **474 passed, 1 skipped**
-in 129.59s; `uv run ruff check src tests` passes. The skip is the existing opt-in real GPU test.
-Separate CPU dependency/export preparation is in progress; it does not yet qualify the unimplemented public
+Task 5 implementation adds typed operation/graph schemas, immutable destination/resource snapshots,
+conditional model handoff checks, explicit whole-plan cost approval, and ready-time compilation. A separate
+path-free graph config preserves legacy SFT/PPO manifest behavior. Its independent review is pending.
+
+Actual frozen-source verification after Task 5: Python 3.12.12 locked development/tracking sync;
+**507 passed, 1 skipped** in 169.18s; `uv run ruff check src tests` passes. The skip is the existing opt-in
+real GPU test. Legacy SFT/PPO canonical bytes match the base resolver under the same current true provenance.
+Separate CPU dependency/export preparation passed; it does not yet qualify the unimplemented public
 model-operation numerical path. No GPU, institution data, model weights or external dataset transfer was used.
 
-Remaining Tasks 5–11: graph validation/planning, fenced atomic execution, model-operation CPU acceptance,
+Remaining Tasks 6–11, plus Task 5 review: fenced atomic execution, model-operation CPU acceptance,
 persistent multi-Pod controller/tracking repair, secure desktop API/broker, Windows UI/installer and Git sharing.
 These foundations are not end-to-end workflow, Windows 0.4.0 or live GPU acceptance. Actual serial handoff,
 multi-Pod concurrency and merge/reevaluation on GPU require separate concrete resource/data authorization.

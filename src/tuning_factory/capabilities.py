@@ -49,7 +49,7 @@ def training_stages():
             for stage, (label, kind) in STAGES.items()]
 
 
-def compatibility(config):
+def compatibility(config, *, graph_reward_binding=False):
     """Inspect partial UI mappings without running pydantic recursively."""
     if hasattr(config, "model_dump"):
         config = config.model_dump()
@@ -93,11 +93,11 @@ def compatibility(config):
     if stage == "dpo" and loss != "sigmoid" and stage_options.get("dpo_label_smoothing", 0) > 0:
         errors.append("DPO label smoothing is only supported with sigmoid loss")
     if stage == "ppo":
-        if not stage_options.get("reward_model"):
+        if not graph_reward_binding and not stage_options.get("reward_model"):
             errors.append("reward_model is required for PPO")
-        if not stage_options.get("reward_model_sha256"):
+        if not graph_reward_binding and not stage_options.get("reward_model_sha256"):
             errors.append("reward_model_sha256 inventory hash is required for reproducible PPO")
-        if stage_options.get("reward_model_type", "lora") == "lora" and not lora:
+        if not graph_reward_binding and stage_options.get("reward_model_type", "lora") == "lora" and not lora:
             errors.append("LoRA reward models require a LoRA/QLoRA PPO policy")
         if method == "oft":
             errors.append("OFT is unavailable in the dedicated LLaMA-Factory 0.9.3 PPO runtime")

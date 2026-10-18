@@ -119,8 +119,11 @@ class AIConfig(StrictModel):
 
     @model_validator(mode="after")
     def supported(self):
+        return self._supported()
+
+    def _supported(self, *, graph_reward_binding=False):
         from .capabilities import compatibility
-        result = compatibility(self.model_dump())
+        result = compatibility(self.model_dump(), graph_reward_binding=graph_reward_binding)
         if not result["valid"]:
             raise ValueError("; ".join(result["errors"]))
         if self.model_revision != self.tokenizer_revision:
@@ -131,6 +134,22 @@ class AIConfig(StrictModel):
         if self.dataset_version in {".", ".."}:
             raise ValueError("invalid dataset version")
         return self
+
+
+class GraphTrainingConfig(AIConfig):
+    """V2 options; only TrainOperation's typed ModelInput supplies reward identity.
+
+    This is not a legacy executable config. The worker must resolve its verified
+    model roles to local paths and validate a new AIConfig before legacy execution.
+    """
+
+    @model_validator(mode="after")
+    def supported(self):
+        if self.stage_options.reward_model is not None or self.stage_options.reward_model_sha256 is not None:
+            raise ValueError("graph training config must be path-free")
+        if self.evaluation_profile.dataset_id is not None:
+            raise ValueError("graph evaluations require separate EvaluateOperation nodes")
+        return self._supported(graph_reward_binding=True)
 
 
 def load_config(path: str | Path) -> AIConfig:
