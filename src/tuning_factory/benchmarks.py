@@ -130,7 +130,8 @@ def _key(model):
     return model.artifact_id, model.inventory_sha256
 
 
-def _excluded_reasons(record, selection):
+def _evaluation_failure_reasons(record, selection):
+    """Identify missing/unsuccessful real evaluation evidence before quality filtering."""
     reasons = []
     if record.status != "completed":
         reasons.append(record.status)
@@ -148,22 +149,28 @@ def _excluded_reasons(record, selection):
             reasons.append("invalid_metric")
         elif type(value) is float and not math.isfinite(value):
             reasons.append("nonfinite_metric")
-    if not reasons:
-        for threshold in selection.thresholds:
-            value = record.metrics[threshold.metric]
-            if (threshold.direction == "max" and value < threshold.value
-                    or threshold.direction == "min" and value > threshold.value):
-                reasons.append(f"threshold_failed:{threshold.metric}")
+    return tuple(dict.fromkeys(reasons))
+
+
+def _threshold_reasons(record, selection):
+    reasons = []
+    for threshold in selection.thresholds:
+        value = record.metrics[threshold.metric]
+        if (threshold.direction == "max" and value < threshold.value
+                or threshold.direction == "min" and value > threshold.value):
+            reasons.append(f"threshold_failed:{threshold.metric}")
     return tuple(dict.fromkeys(reasons))
 
 
 def select_best(records, selection: SelectionSpec, *, requested_models=None) -> SelectionResult:
     """Wait for the complete set by default; compare only real, finite evidence.
 
-    Terminal failures finish waiting but cannot win. Explicit partial selection
-    needs ``min_success`` eligible evaluations when any requested candidate is
-    missing, active, or excluded. A complete successful one-model set can select.
-    Duplicate evidence and mixed benchmarks are plan errors, never ranked.
+    Missing or unsuccessful real evaluations require explicit partial permission
+    and ``min_success`` quality-eligible candidates. Terminal failures end waiting
+    without granting that permission. A complete successful evaluation set uses
+    ordinary threshold filtering under either partial flag; it can leave one
+    winner, as can a complete successful one-model request. Duplicate evidence
+    and mixed benchmarks are plan errors, never ranked.
     """
     records = tuple(EvaluationRecord.model_validate(record) for record in records)
     selection = SelectionSpec.model_validate(selection)
@@ -181,10 +188,13 @@ def select_best(records, selection: SelectionSpec, *, requested_models=None) -> 
         raise ValueError("candidates must use the same benchmark")
     by_model = {_key(record.model): record for record in records}
     eligible, excluded = [], []
-    active = False
+    active = incomplete = False
     for model in requested:
         record = by_model.get(_key(model))
-        reasons = ("missing_record",) if record is None else _excluded_reasons(record, selection)
+        evaluation_reasons = (("missing_record",) if record is None
+                              else _evaluation_failure_reasons(record, selection))
+        incomplete |= bool(evaluation_reasons)
+        reasons = evaluation_reasons or _threshold_reasons(record, selection)
         active |= record is None or record.status in {"pending", "running"}
         if reasons:
             excluded.append(CandidateExclusion(model=model, record=record, reasons=reasons))
@@ -194,7 +204,9 @@ def select_best(records, selection: SelectionSpec, *, requested_models=None) -> 
     status = "no_winner"
     if active and not selection.allow_partial:
         status, reasons = "waiting", ("awaiting_requested_candidates",)
-    elif selection.allow_partial and excluded and len(eligible) < selection.min_success:
+    elif incomplete and not selection.allow_partial:
+        reasons = ("partial_selection_not_allowed",)
+    elif incomplete and len(eligible) < selection.min_success:
         status = "waiting" if active else "no_winner"
         reasons = ("insufficient_partial_success",)
     elif eligible:
@@ -203,7 +215,7 @@ def select_best(records, selection: SelectionSpec, *, requested_models=None) -> 
             *_key(record.model))).model
         status = "selected"
         if excluded:
-            reasons = ("partial_selection",) if selection.allow_partial else ("terminal_candidates_excluded",)
+            reasons = ("partial_selection",) if incomplete else ("quality_candidates_excluded",)
     else:
         reasons = ("no_eligible_candidates",)
     return SelectionResult(winner=winner, eligible=tuple(eligible), excluded=tuple(excluded), reasons=reasons,

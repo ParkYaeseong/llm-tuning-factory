@@ -163,8 +163,75 @@ def test_default_waits_for_all_requested_candidates_but_terminal_failure_finishe
     assert waiting.excluded[0].reasons == ("missing_record",)
     assert select([record("a"), record("b", status="pending")]).status == "waiting"
     assert select([record("a"), record("b", status="running")]).status == "waiting"
-    assert select([record("a"), record("b", status="failed")]).winner == model("a")
+    terminal = select([record("a"), record("b", status="failed")])
+    assert terminal.status == "no_winner"
+    assert terminal.winner is None
+    assert terminal.reasons == ("partial_selection_not_allowed",)
     assert select([record("a")]).winner == model("a")
+
+
+@pytest.mark.parametrize("direction", ["max", "min"])
+@pytest.mark.parametrize("outcome", ["failed", "cancelled", "skipped", "unevaluated"])
+@pytest.mark.parametrize("allow_partial", [False, True])
+@pytest.mark.parametrize("success_count", [1, 2])
+def test_terminal_evaluation_outcomes_require_explicit_partial_and_minimum_successes(
+        direction, outcome, allow_partial, success_count):
+    from tuning_factory.benchmarks import SelectionSpec, select_best
+
+    records = [record("a", 0.9), record("b", 0.7)][:success_count]
+    records.append(record("c", status=outcome))
+    result = select_best(records, SelectionSpec(metric="exact_match", direction=direction,
+                                               allow_partial=allow_partial))
+    assert result.status != "waiting"
+    if allow_partial and success_count == 2:
+        assert result.status == "selected"
+        assert result.winner == model("a" if direction == "max" else "b")
+        assert result.reasons == ("partial_selection",)
+    else:
+        assert result.status == "no_winner"
+        assert result.winner is None
+        assert result.reasons == (("insufficient_partial_success",) if allow_partial
+                                  else ("partial_selection_not_allowed",))
+    assert result.excluded[-1].reasons == (outcome,)
+
+
+@pytest.mark.parametrize("direction", ["max", "min"])
+@pytest.mark.parametrize("allow_partial", [False, True])
+def test_complete_evaluation_set_applies_quality_thresholds_independently_of_partial_permission(
+        direction, allow_partial):
+    from tuning_factory.benchmarks import MetricThreshold, SelectionSpec, select_best
+
+    selection = SelectionSpec(metric="exact_match", direction=direction, allow_partial=allow_partial,
+                              thresholds=(MetricThreshold(metric="exact_match", direction=direction, value=0.8),))
+    result = select_best([record("a", 0.9), record("b", 0.7)], selection)
+    assert result.status == "selected"
+    assert result.winner == model("a" if direction == "max" else "b")
+    assert result.excluded[0].reasons == ("threshold_failed:exact_match",)
+    assert "partial_selection" not in result.reasons
+    assert "insufficient_partial_success" not in result.reasons
+
+
+@pytest.mark.parametrize("direction", ["max", "min"])
+def test_actual_partial_join_still_requires_two_quality_eligible_candidates(direction):
+    from tuning_factory.benchmarks import MetricThreshold, SelectionSpec, select_best
+
+    selection = SelectionSpec(metric="exact_match", direction=direction, allow_partial=True,
+                              thresholds=(MetricThreshold(metric="exact_match", direction=direction, value=0.8),))
+    result = select_best([record("a", 0.9), record("b", 0.7), record("c", status="failed")], selection)
+    assert result.status == "no_winner"
+    assert result.winner is None
+    assert result.reasons == ("insufficient_partial_success",)
+
+
+@pytest.mark.parametrize("direction", ["max", "min"])
+@pytest.mark.parametrize("allow_partial", [False, True])
+def test_complete_successful_single_candidate_ignores_partial_minimum(direction, allow_partial):
+    from tuning_factory.benchmarks import SelectionSpec, select_best
+
+    result = select_best([record("a")], SelectionSpec(metric="exact_match", direction=direction,
+                                                     allow_partial=allow_partial))
+    assert result.status == "selected"
+    assert result.winner == model("a")
 
 
 def test_partial_selection_requires_explicit_opt_in_and_two_successes():
