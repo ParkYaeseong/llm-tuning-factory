@@ -195,6 +195,67 @@ class Registry:
             raise ValueError("invalid dataset hash")
         return self.root / "blobs" / f"{sha}.json"
 
+    def register_derived_dataset(self, dataset_id, version, source, provenance, *,
+                                 synthetic=False, export_allowed=False, kind="instruction"):
+        """Add checked origin evidence without changing legacy metadata/blob bytes.
+
+        The immutable provenance pointer is an intent written before registration;
+        retries finish a failed registration with the exact same identity and data.
+        """
+        dataset_id, version = safe_name(dataset_id), safe_name(version)
+        raw = Path(source).read_bytes()
+        rows, _, _ = parse_dataset(raw, kind)
+        if len(raw) > 32 * 1024 * 1024:
+            raise ValueError("dataset exceeds 32 MiB limit")
+        if (not isinstance(provenance, dict) or not isinstance(provenance.get("source_records"), list)
+                or len(provenance["source_records"]) != len(rows)
+                or not all(isinstance(row, dict) for row in provenance["source_records"])
+                or len(provenance.get("source_ordinals", [])) != len(rows)):
+            raise ValueError("invalid dataset provenance")
+        evidence = {"dataset_id": dataset_id, "version": version, "sha256": digest(raw),
+                    "kind": kind, "synthetic": bool(synthetic), "export_allowed": bool(export_allowed),
+                    "provenance": provenance}
+        body = canonical(evidence)
+        pointer = self.root / "dataset_provenance" / dataset_id / f"{version}.json"
+        metadata = self.root / "datasets" / dataset_id / f"{version}.json"
+        if metadata.exists() and not pointer.exists():
+            raise ValueError("immutable dataset version already registered without this provenance")
+        immutable_write(self.root / "provenance_blobs" / f"{digest(body)}.json", body)
+        immutable_write(pointer, canonical({"sha256": digest(body)}))
+        return self.register_dataset(dataset_id, version, source, synthetic=synthetic,
+                                     export_allowed=export_allowed, kind=kind)
+
+    def dataset_provenance(self, record):
+        """Return hash-checked additive provenance, or None for legacy datasets."""
+        current = self.get_dataset(record["dataset_id"], record["version"])
+        if current["sha256"] != record["sha256"]:
+            raise ValueError("dataset reference hash mismatch")
+        pointer = self.root / "dataset_provenance" / safe_name(record["dataset_id"]) / f"{safe_name(record['version'])}.json"
+        if not pointer.exists():
+            return None
+        sha = json.loads(pointer.read_bytes())["sha256"]
+        if not isinstance(sha, str) or not re.fullmatch("[0-9a-f]{64}", sha):
+            raise ValueError("invalid dataset provenance hash")
+        body = (self.root / "provenance_blobs" / f"{sha}.json").read_bytes()
+        if digest(body) != sha:
+            raise ValueError("dataset provenance hash mismatch")
+        evidence = json.loads(body)
+        for key in ("dataset_id", "version", "sha256", "synthetic", "export_allowed"):
+            if evidence[key] != current[key]:
+                raise ValueError("dataset provenance identity mismatch")
+        if evidence["kind"] != current.get("kind", "instruction"):
+            raise ValueError("dataset provenance kind mismatch")
+        provenance = evidence["provenance"]
+        if len(provenance["source_records"]) != current["rows"]:
+            raise ValueError("dataset provenance row count mismatch")
+        return provenance
+
+    def dataset_origins(self, record):
+        provenance = self.dataset_provenance(record)
+        if provenance is not None:
+            return provenance["source_records"]
+        return parse_dataset(self.dataset_path(record).read_bytes(), record.get("kind", "instruction"))[0]
+
     def register_ai(self, config):
         body = canonical(config.model_dump())
         revision = digest(body)
