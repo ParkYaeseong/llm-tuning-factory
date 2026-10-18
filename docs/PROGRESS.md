@@ -12,9 +12,23 @@ User approved the written spec on 2026-10-17 (“진행해”). Prepared and sel
 [implementation plan](superpowers/plans/2026-10-17-general-training-workflows.md), including task interfaces,
 failure tests, model numerical acceptance and native credential/controller lifecycle. Plan review and execution-method
 selection were approved on 2026-10-17: task implementers with independent task reviews. Product implementation is
-starting on codex/general-training-workflows; the released 0.3.0 installer remains unchanged until new acceptance.
+in progress on codex/general-training-workflows; the released 0.3.0 installer remains unchanged until new acceptance.
 Baseline Python 3.12 suite rerun: **214 passed, 1 skipped** (opt-in live GPU), Ruff passes. No paid resources,
 external datasets or institution data were accessed or transferred.
+2026-10-17 foundation milestone (not complete acceptance): general project and reusable recipe revisions plus immutable
+effective model artifact/input contracts are implemented. A frozen-source
+Python integration run passed **312 tests, 1 skipped** (the existing opt-in live GPU test); repository-wide Ruff passes.
+No new model training, data transfer or paid resource action was performed.
+2026-10-18 continuation: mapped CSV/JSON/JSONL imports, original/canonical provenance and reproducible
+input/group connected-component splits are implemented. Independent review found a parser-format/fingerprint
+disagreement that could bypass overlap detection; its scoped fix is in progress. Model artifact review
+identified incomplete loader metadata and repeated ancestor hashing; a scoped fix adds strict option guards,
+operation-local verification deduplication and historical descriptor-hash compatibility. Both findings passed scoped re-review.
+Fresh frozen-source full suite: **371 passed, 1 skipped** (existing opt-in GPU), repository-wide Ruff passes.
+Latest foundation integration adds common benchmark fingerprints, explicit objectives/thresholds, pending/partial
+candidate handling, text-answer agreement metrics and merge regression fallback. The data-format leakage fix
+and these evaluation changes passed **432 tests, 1 skipped** (existing opt-in GPU), with repository-wide Ruff passing.
+Both are now in independent task review. This is foundation verification, not end-to-end graph, Windows 0.4.0 or GPU acceptance.
 Actual serial handoff, multi-Pod concurrency and merged-model GPU evaluation are outstanding future acceptance work
 and require explicit resource/data authorization before any live execution.
 
