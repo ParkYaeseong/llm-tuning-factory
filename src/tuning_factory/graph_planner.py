@@ -213,6 +213,7 @@ class InputContract(StrictModel):
 class NodePlan(StrictModel):
     node: Node
     inputs: tuple[InputContract, ...]
+    permitted_model_roots: tuple[HFRootRef, ...]
     allowed_resources: tuple[OperationResources, ...]
     max_estimated_cost_usd: float = Field(ge=0)
     max_duration_seconds: int = Field(ge=0)
@@ -287,6 +288,13 @@ def _recipe(node, recipes):
     return RecipeSpec.model_validate(values)
 
 
+def _requires_materialization(parent: RecipeSpec, child: RecipeSpec):
+    """Only adapter weights need conversion before a changed training contract."""
+    return parent.training_method in {"lora", "qlora", "oft"} and (
+        parent.training_stage == "sft" and child.training_stage in {"dpo", "kto"}
+        or parent.training_method != child.training_method)
+
+
 def _definition_issues(project, graph, recipes, datasets):
     issues = graph_issues(graph)
     by_recipe = {item.revision_sha256: item for item in recipes}
@@ -335,8 +343,7 @@ def _definition_issues(project, graph, recipes, datasets):
                     raise ValueError("OFT artifact handoff/evaluation/merge/materialize is unsupported")
                 if isinstance(node, TrainNode):
                     child = _recipe(node, by_recipe)
-                    if (parent_recipe.training_stage == "sft" and child.training_stage in {"dpo", "kto"}
-                            or parent_recipe.training_method != child.training_method):
+                    if _requires_materialization(parent_recipe, child):
                         raise ValueError("parent transition requires explicit materialize")
                     if (parent_recipe.training_stage == "ppo") != (child.training_stage == "ppo"):
                         raise ValueError("unsupported primary/legacy PPO artifact route")
@@ -351,20 +358,28 @@ def _runtime(profile):
     return RuntimeProfile(profile=profile, engine_version=details["engine_version"], dependency_sha256=digest(lock.read_bytes()))
 
 
-def _root_for(node, nodes, recipes, artifacts, seen=None):
+def _roots_for(node, nodes, artifacts, cache=None, seen=None):
+    """Collect every permitted root, including all conditional selection winners."""
+    cache = {} if cache is None else cache
     seen = set() if seen is None else seen
     if node.id in seen:
         raise ValueError("cyclic model lineage")
+    if node.id in cache:
+        return cache[node.id]
     seen = seen | {node.id}
-    value = (node.model_input if isinstance(node, TrainNode) else node.models[0] if isinstance(node, MergeNode)
-             else node.evaluations[0] if isinstance(node, SelectNode) else node.model)
-    if isinstance(value, NodeOutputRef):
-        return _root_for(nodes[value.node_id], nodes, recipes, artifacts, seen)
-    if isinstance(value, ModelInput):
-        value = value.policy.base
-    if isinstance(value, HFRootRef):
-        return value
-    return artifacts[_artifact_key(value)].descriptor.root
+    values = ((node.model_input,) if isinstance(node, TrainNode) else node.models if isinstance(node, MergeNode)
+              else node.evaluations if isinstance(node, SelectNode) else (node.model,))
+    roots = {}
+    for value in values:
+        if isinstance(value, NodeOutputRef):
+            candidates = _roots_for(nodes[value.node_id], nodes, artifacts, cache, seen)
+        else:
+            if isinstance(value, ModelInput):
+                value = value.policy.base
+            candidates = (value if isinstance(value, HFRootRef) else artifacts[_artifact_key(value)].descriptor.root,)
+        roots.update((root.model_dump_json(), root) for root in candidates)
+    cache[node.id] = tuple(roots[key] for key in sorted(roots))
+    return cache[node.id]
 
 
 def _config(project, node, recipe, root, context, dataset, resources):
@@ -404,7 +419,9 @@ def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: Execu
     bindings = {item.binding_id: item for item in project_revision.spec.datasets}
     roles = {_dataset_key(item.dataset): item.role for item in project_revision.spec.datasets}
     planned = []
+    root_cache = {}
     for node in graph.nodes:
+        permitted_roots = _roots_for(node, nodes, artifacts, root_cache)
         allowed = []
         if not isinstance(node, SelectNode):
             if len(set(node.executor_profile_ids)) != len(node.executor_profile_ids):
@@ -421,14 +438,14 @@ def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: Execu
                                                  timeout_seconds=choice.timeout_seconds, runtime=runtime))
         if isinstance(node, TrainNode):
             recipe = _recipe(node, recipes)
-            root = _root_for(node, nodes, recipes, artifacts)
-            context = models.get(root.model_dump_json())
-            if context is None:
-                raise ValueError("verified root/tokenizer model context is not ready")
             expected = "ppo" if recipe.training_stage == "ppo" else "primary"
             if any(resource.runtime.profile != expected for resource in allowed):
                 raise ValueError("recipe runtime differs from chosen runtime")
-            _config(project_revision.spec, node, recipe, root, context, bindings[node.dataset_binding].dataset, allowed[0])
+            for root in permitted_roots:
+                context = models.get(root.model_dump_json())
+                if context is None:
+                    raise ValueError("verified root/tokenizer model context is not ready")
+                _config(project_revision.spec, node, recipe, root, context, bindings[node.dataset_binding].dataset, allowed[0])
         if isinstance(node, EvaluateNode):
             if node.benchmark_revision not in benchmarks:
                 raise ValueError("missing pinned benchmark revision")
@@ -436,7 +453,7 @@ def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: Execu
             if roles.get(_dataset_key(benchmark.dataset)) not in {"validation", "test"}:
                 raise ValueError("evaluation requires a held-out project dataset")
             validate_sample_ids(benchmark, datasets[_dataset_key(benchmark.dataset)])
-            if benchmark.tokenizer_fingerprint != _root_for(node, nodes, recipes, artifacts).tokenizer_fingerprint:
+            if any(benchmark.tokenizer_fingerprint != root.tokenizer_fingerprint for root in permitted_roots):
                 raise ValueError("benchmark tokenizer differs from model context")
         if isinstance(node, SelectNode):
             evaluation_nodes = [nodes[ref.node_id] for ref in node.evaluations]
@@ -449,7 +466,7 @@ def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: Execu
         _static_routes(node, nodes, recipes, artifacts, allowed)
         attempts = graph.retry_policy.max_attempts
         planned.append(NodePlan(node=node, inputs=tuple(InputContract(source=ref, required_port=port)
-            for ref, port in node_refs(node)), allowed_resources=tuple(allowed),
+            for ref, port in node_refs(node)), permitted_model_roots=permitted_roots, allowed_resources=tuple(allowed),
             max_estimated_cost_usd=max((r.facts.cost(r.timeout_seconds) for r in allowed), default=0) * attempts,
             max_duration_seconds=max((r.timeout_seconds for r in allowed), default=0) * attempts))
     total = sum(item.max_estimated_cost_usd for item in planned)
@@ -502,8 +519,7 @@ def _static_routes(node, nodes, recipes, artifacts, resources):
                     raise ValueError("OFT artifact handoff/evaluation/merge/materialize is unsupported")
                 if isinstance(node, TrainNode):
                     child_recipe = _recipe(node, recipes)
-                    if (parent_recipe.training_stage == "sft" and child_recipe.training_stage in {"dpo", "kto"}
-                            or parent_recipe.training_method != child_recipe.training_method):
+                    if _requires_materialization(parent_recipe, child_recipe):
                         raise ValueError("parent transition requires an explicit materialize node")
                 if isinstance(node, MergeNode) and (parent_recipe.training_method not in {"lora", "qlora"}
                         or parent_recipe.training_stage in {"rm", "ppo"}):
@@ -712,9 +728,7 @@ def compile_node(plan: GraphPlan, node_id: str, verified_bindings: VerifiedBindi
         contexts = [item for item in choices.models if item.root == root]
         if len(contexts) != 1:
             raise ValueError("actual model root differs from pinned model context")
-        nodes = {item.id: item for item in plan.graph.nodes}
-        expected_root = _root_for(node, nodes, recipes, {_artifact_key(a.model): a for a in choices.artifacts})
-        if root != expected_root:
+        if root not in entry.permitted_model_roots:
             raise ValueError("actual model root differs from planned input lineage")
         dataset_binding = next(item for item in plan.project_revision.spec.datasets if item.binding_id == node.dataset_binding)
         actual = snapshot_dataset(bindings.registry, dataset_binding.dataset)

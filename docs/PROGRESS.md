@@ -14,10 +14,12 @@ partial-success permission separated from normal quality filtering. All four tas
 
 Task 5 implementation adds typed operation/graph schemas, immutable destination/resource snapshots,
 conditional model handoff checks, explicit whole-plan cost approval, and ready-time compilation. A separate
-path-free graph config preserves legacy SFT/PPO manifest behavior. Its independent review is pending.
+path-free graph config preserves legacy SFT/PPO manifest behavior. Initial independent review found two
+handoff errors; fixes now allow full-weight parents to initialize new adapters and bind selected winners
+from all approved model roots. Scoped re-review is pending.
 
 Actual frozen-source verification after Task 5: Python 3.12.12 locked development/tracking sync;
-**507 passed, 1 skipped** in 169.18s; `uv run ruff check src tests` passes. The skip is the existing opt-in
+**518 passed, 1 skipped** in 191.30s; `uv run ruff check src tests` passes. The skip is the existing opt-in
 real GPU test. Legacy SFT/PPO canonical bytes match the base resolver under the same current true provenance.
 Separate CPU dependency/export preparation passed; it does not yet qualify the unimplemented public
 model-operation numerical path. No GPU, institution data, model weights or external dataset transfer was used.

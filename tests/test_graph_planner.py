@@ -582,3 +582,136 @@ def test_catalog_root_uses_its_reviewed_template(tmp_path):
     operation = compile_node(plan_graph(revise(project, graph), choices, (facts,)), "train.1", VerifiedBindings(
         registry, ModelArtifactStore(tmp_path / "models"), choices.executors[0]))
     assert operation.config.template == "llama3"
+
+
+@pytest.mark.parametrize("parent_method", ["full", "freeze"])
+@pytest.mark.parametrize("child_stage,kind,row", [
+    ("sft", "instruction", {"instruction": "child", "output": "answer"}),
+    ("dpo", "preference", {"instruction": "child", "chosen": "yes", "rejected": "no"}),
+    ("kto", "kto", {"instruction": "child", "output": "answer", "kto_tag": True}),
+])
+def test_full_weight_symbolic_parent_initializes_new_adapter_without_materialize(
+        tmp_path, parent_method, child_stage, kind, row):
+    from test_model_artifacts import fixture_model
+
+    from tuning_factory.graph_planner import (
+        ModelContext,
+        NodeModelBinding,
+        ProducerEvidence,
+        VerifiedBindings,
+    )
+    from tuning_factory.graph_schema import validate_graph
+    from tuning_factory.model_artifacts import ModelArtifactStore
+    from tuning_factory.model_hub import ModelProfile
+
+    registry, project, choices, facts = fixture(tmp_path)
+    directory, descriptor = fixture_model(tmp_path)
+    store = ModelArtifactStore(tmp_path / "models")
+    ref = store.freeze(directory, descriptor)
+    profile = ModelProfile(repo_id=descriptor.root.repo_id, revision=descriptor.root.revision,
+        config_sha256=descriptor.root.config_sha256, architecture="qwen2", template="qwen")
+    recipes = tuple(Revision(spec=recipe, revision_sha256=digest(canonical(recipe.model_dump(mode="json"))))
+        for recipe in (RecipeSpec(recipe_id="parent", name="Parent", training_method=parent_method),
+                       RecipeSpec(recipe_id="child", name="Child", training_stage=child_stage, input_kind=kind)))
+    path = tmp_path / "child.json"
+    path.write_bytes(canonical([row]))
+    record = registry.register_dataset("child", "1", path, kind=kind)
+    data = DatasetRef(dataset_id="child", version="1", sha256=record["sha256"])
+    graph = {"nodes": [{"kind": "train", "id": "parent", "label": "Parent",
+        "recipe_revision": recipes[0].revision_sha256, "dataset_binding": "data", "executor_profile_ids": ["p"],
+        "model_input": ModelInput(policy=ModelLoadRef(base=descriptor.root), initialization="full_weights").model_dump(mode="json")},
+        {"kind": "train", "id": "child", "label": "Child", "recipe_revision": recipes[1].revision_sha256,
+         "dataset_binding": "child", "executor_profile_ids": ["p"],
+         "model_input": {"node_id": "parent", "output_name": "model"}}]}
+    project = revise(project, graph, [*project.spec.datasets, DatasetBinding(binding_id="child", role="train", dataset=data)])
+    choices = choices.model_copy(update={"recipes": recipes, "models": (ModelContext(root=descriptor.root, profile=profile),),
+        "datasets": (*choices.datasets, snapshot_dataset(registry, data)), "node_resources": (
+            NodeResources(node_id="parent", timeout_seconds=900), NodeResources(node_id="child", timeout_seconds=900))})
+    assert validate_graph(project.spec, choices.recipes, registry) == []
+    plan = plan_graph(project, choices, (facts,))
+    producer = ProducerEvidence(model=ref, job_id=descriptor.producer_job_id, attempt_id=descriptor.producer_attempt_id,
+        manifest_sha256=descriptor.producer_manifest_sha256, runtime_profile="primary", training_stage="sft",
+        status="completed", tracking_acknowledged=True, plan_sha256=plan.sha256, node_id="parent")
+    operation = compile_node(plan, "child", VerifiedBindings(registry, store, choices.executors[0],
+        outputs=(NodeModelBinding(node_id="parent", model=ref),), producers=(producer,)))
+    assert operation.model_input.initialization == "new_adapter"
+    assert operation.model_input.policy == ModelLoadRef(base=ref)
+    assert operation.model_input.frozen_reference == (ModelLoadRef(base=ref) if child_stage in {"dpo", "kto"} else None)
+
+
+def selected_roots_fixture(tmp_path):
+    from test_model_artifacts import fixture_model
+
+    from tuning_factory.graph_planner import ModelContext, snapshot_artifact
+    from tuning_factory.model_artifacts import ModelDescriptor
+    from tuning_factory.model_hub import ModelProfile
+
+    registry, project, choices, facts, store, first, producer, benchmark = evaluation_fixture(tmp_path)
+    directory, descriptor = fixture_model(tmp_path, marker="second")
+    second_root = descriptor.root.model_copy(update={"revision": "b" * 40})
+    descriptor = ModelDescriptor.model_validate({**descriptor.model_dump(), "root": second_root,
+        "effective_base": second_root, "producer_job_id": "second-job", "producer_attempt_id": "second-attempt"})
+    second = store.freeze(directory, descriptor)
+    second_producer = producer.model_copy(update={"model": second, "job_id": "second-job", "attempt_id": "second-attempt"})
+    model_contexts = tuple(ModelContext(root=root, profile=ModelProfile(repo_id=root.repo_id, revision=root.revision,
+        config_sha256=root.config_sha256, architecture="qwen2", template="qwen"))
+        for root in (choices.models[0].root, second_root))
+    record = registry.get_dataset("data", "1")
+    data = DatasetRef(dataset_id="data", version="1", sha256=record["sha256"])
+    recipe = RecipeSpec(recipe_id="child", name="Child")
+    recipe_revision = Revision(spec=recipe, revision_sha256=digest(canonical(recipe.model_dump(mode="json"))))
+    graph = dict(project.spec.graph)
+    graph["nodes"] = [graph["nodes"][0], {**graph["nodes"][0], "id": "second-eval", "model": second.model_dump()},
+        {**graph["nodes"][1], "evaluations": [{"node_id": node, "output_name": "evaluation"}
+                                               for node in ("eval", "second-eval")]},
+        {"kind": "train", "id": "child", "label": "Child", "recipe_revision": recipe_revision.revision_sha256,
+         "dataset_binding": "data", "executor_profile_ids": ["p"],
+         "model_input": {"node_id": "select", "output_name": "model"}}]
+    project = revise(project, graph, [*project.spec.datasets, DatasetBinding(binding_id="data", role="train", dataset=data)])
+    choices = choices.model_copy(update={"recipes": (recipe_revision,), "models": model_contexts,
+        "datasets": (*choices.datasets, snapshot_dataset(registry, data)),
+        "artifacts": (*choices.artifacts, snapshot_artifact(store, second, second_producer)),
+        "node_resources": (*choices.node_resources, NodeResources(node_id="second-eval", timeout_seconds=900),
+                           NodeResources(node_id="child", timeout_seconds=900))})
+    return registry, project, choices, facts, store, (first, second), (producer, second_producer), benchmark
+
+
+@pytest.mark.parametrize("reverse_candidates", [False, True])
+def test_second_selected_root_binds_child_to_actual_winner(tmp_path, reverse_candidates):
+    from tuning_factory.benchmarks import EvaluationRecord, select_best
+    from tuning_factory.graph_planner import (
+        NodeEvaluationBinding,
+        NodeExecutionEvidence,
+        NodeModelBinding,
+        VerifiedBindings,
+    )
+
+    registry, project, choices, facts, store, refs, producers, benchmark = selected_roots_fixture(tmp_path)
+    if reverse_candidates:
+        graph = dict(project.spec.graph)
+        graph["nodes"][2]["evaluations"].reverse()
+        project = revise(project, graph)
+    plan = plan_graph(project, choices, (facts,))
+    records = tuple(EvaluationRecord(model=ref, benchmark_sha256=benchmark.fingerprint(), metrics={"accuracy": score},
+        status="completed", synthetic=False, simulation=False, producer_attempt_id=node + "-attempt")
+        for node, ref, score in zip(("eval", "second-eval"), refs, (.1, .9)))
+    selected = select_best(records, plan.graph.nodes[2].selection)
+    evaluations = tuple(NodeEvaluationBinding(node_id=node, evaluation=record, tracking_acknowledged=True,
+        producer=NodeExecutionEvidence(node_id=node, plan_sha256=plan.sha256, job_id=node + "-job",
+            attempt_id=record.producer_attempt_id, manifest_sha256="d" * 64,
+            status="completed", tracking_acknowledged=True)) for node, record in zip(("eval", "second-eval"), records))
+    operation = compile_node(plan, "child", VerifiedBindings(registry, store, choices.executors[0],
+        outputs=(NodeModelBinding(node_id="select", model=refs[1], selection=selected),),
+        producers=producers, evaluations=evaluations))
+    assert operation.model_input.policy.base == refs[1]
+    assert operation.config.model_revision == "b" * 40
+    assert set(root.revision for root in plan.nodes[-1].permitted_model_roots) == {"a" * 40, "b" * 40}
+
+
+@pytest.mark.parametrize("invalid_context", ["missing", "incompatible"])
+def test_every_selected_root_must_have_a_compatible_child_context(tmp_path, invalid_context):
+    _, project, choices, facts, *_ = selected_roots_fixture(tmp_path)
+    contexts = choices.models[:1] if invalid_context == "missing" else (choices.models[0],
+        choices.models[1].model_copy(update={"profile": choices.models[1].profile.model_copy(update={"max_length": 64})}))
+    with pytest.raises(ValueError, match="context|cutoff_len"):
+        plan_graph(project, choices.model_copy(update={"models": contexts}), (facts,))

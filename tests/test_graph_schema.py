@@ -34,3 +34,26 @@ def test_graph_limits_cover_explicit_and_implicit_edges():
     graph = GraphSpec(nodes=[materialize(str(i), str((i+1) % 64)) for i in range(64)],
                       depends_on=[{"node_id": str(i // 64), "depends_on": str(i % 64)} for i in range(257)])
     assert "edge_limit" in {issue.code for issue in graph_issues(graph)}
+
+
+def test_adapter_method_change_still_requires_materialization(tmp_path):
+    from test_graph_planner import fixture, revise
+
+    from tuning_factory.graph_planner import NodeResources, plan_graph
+    from tuning_factory.graph_schema import validate_graph
+    from tuning_factory.projects import Revision
+    from tuning_factory.recipes import RecipeSpec
+    from tuning_factory.registry import canonical, digest
+
+    registry, project, choices, facts = fixture(tmp_path)
+    child = RecipeSpec(recipe_id="child", name="Child", training_method="qlora")
+    revision = Revision(spec=child, revision_sha256=digest(canonical(child.model_dump(mode="json"))))
+    graph = dict(project.spec.graph)
+    graph["nodes"] = [*graph["nodes"], {**graph["nodes"][0], "id": "child", "recipe_revision": revision.revision_sha256,
+        "model_input": {"node_id": "train.1", "output_name": "model"}}]
+    project = revise(project, graph)
+    choices = choices.model_copy(update={"recipes": (*choices.recipes, revision), "node_resources": (
+        *choices.node_resources, NodeResources(node_id="child", timeout_seconds=900))})
+    assert any("materialize" in issue.message for issue in validate_graph(project.spec, choices.recipes, registry))
+    with pytest.raises(ValueError, match="materialize"):
+        plan_graph(project, choices, (facts,))
