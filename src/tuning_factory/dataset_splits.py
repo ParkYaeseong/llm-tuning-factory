@@ -58,15 +58,26 @@ def _normalize(value):
     return value
 
 
-def input_fingerprint(row, kind):
-    """text-input-v1: input-only NFC and whitespace-normalized canonical hash."""
+def input_fingerprint(row, kind, *, formatting=None, message_key=None):
+    """text-input-v1 input hash; dataset callers must pin the parsed input schema.
+
+    Without schema keywords this pure single-record helper infers that record's
+    format. Split/overlap boundaries always pass the dataset-wide parser choice.
+    """
     if kind not in DATASET_KINDS or not isinstance(row, dict):
         raise ValueError("unsupported input fingerprint record")
+    if formatting is None:
+        formatting = "sharegpt" if kind != "text" and ("messages" in row or "conversations" in row) else "alpaca"
+    if formatting not in {"alpaca", "sharegpt"}:
+        raise ValueError("unsupported input fingerprint formatting")
+    if message_key is not None and (formatting != "sharegpt" or message_key not in {"messages", "conversations"}):
+        raise ValueError("invalid input fingerprint message key")
     if kind == "text":
         value = {"text": row.get("text", "")}
-    elif "messages" in row or "conversations" in row:
-        modern = "messages" in row
-        messages = row["messages" if modern else "conversations"]
+    elif formatting == "sharegpt":
+        message_key = message_key or ("messages" if "messages" in row else "conversations")
+        modern = message_key == "messages"
+        messages = row[message_key]
         role_key, content_key = ("role", "content") if modern else ("from", "value")
         roles = {"human": "user", "gpt": "assistant"} if not modern else {}
         history = [{"role": roles.get(message[role_key], message[role_key]), "content": message[content_key]}
@@ -79,13 +90,21 @@ def input_fingerprint(row, kind):
     return digest(canonical({"version": "text-input-v1", "input": _normalize(value)}))
 
 
+def _input_schema(rows, formatting):
+    # parse_dataset and dataset_descriptor choose this key once from the first
+    # record, even when a later record contains another conversation-like field.
+    return {"formatting": formatting,
+            "message_key": ("messages" if "messages" in rows[0] else "conversations")
+            if formatting == "sharegpt" else None}
+
+
 def _dataset(registry, ref):
     ref = DatasetRef.model_validate(ref.model_dump() if isinstance(ref, DatasetRef) else ref)
     record = registry.get_dataset(ref.dataset_id, ref.version)
     if record["sha256"] != ref.sha256:
         raise ValueError("dataset reference hash mismatch")
-    rows, _, _ = parse_dataset(registry.dataset_path(record).read_bytes(), record.get("kind", "instruction"))
-    return record, rows
+    rows, formatting, _ = parse_dataset(registry.dataset_path(record).read_bytes(), record.get("kind", "instruction"))
+    return record, rows, _input_schema(rows, formatting)
 
 
 def assert_no_input_overlap(train_refs, heldout_refs, *, registry=None):
@@ -100,13 +119,14 @@ def assert_no_input_overlap(train_refs, heldout_refs, *, registry=None):
             if (registry is None and isinstance(ref, dict) and "rows" in ref
                     and set(ref) <= {"kind", "rows"} and isinstance(ref["rows"], list)):
                 kind, rows = ref.get("kind", "instruction"), ref["rows"]
-                parse_dataset(canonical(rows), kind)
+                _, formatting, _ = parse_dataset(canonical(rows), kind)
+                schema = _input_schema(rows, formatting)
             else:
                 if registry is None:
                     raise ValueError("registry required for dataset references")
-                record, rows = _dataset(registry, ref)
+                record, rows, schema = _dataset(registry, ref)
                 kind = record.get("kind", "instruction")
-            found.update(input_fingerprint(row, kind) for row in rows)
+            found.update(input_fingerprint(row, kind, **schema) for row in rows)
         return found
 
     train = fingerprints(train_refs)
@@ -117,7 +137,7 @@ def assert_no_input_overlap(train_refs, heldout_refs, *, registry=None):
 
 def _preview(registry, plan):
     plan = SplitPlan.model_validate(plan.model_dump() if isinstance(plan, SplitPlan) else plan)
-    record, rows = _dataset(registry, plan.dataset)
+    record, rows, schema = _dataset(registry, plan.dataset)
     origins = registry.dataset_origins(record)
     parent_provenance = registry.dataset_provenance(record)
     source_ordinals = parent_provenance["source_ordinals"] if parent_provenance else list(range(len(rows)))
@@ -130,7 +150,7 @@ def _preview(registry, plan):
         return index
 
     seen_inputs, seen_groups = {}, {}
-    fingerprints = [input_fingerprint(row, record.get("kind", "instruction")) for row in rows]
+    fingerprints = [input_fingerprint(row, record.get("kind", "instruction"), **schema) for row in rows]
     for ordinal, fingerprint in enumerate(fingerprints):
         keys = [(seen_inputs, fingerprint)]
         if plan.group_field is not None:
@@ -174,7 +194,9 @@ def _preview(registry, plan):
     bodies, output_refs = {}, {}
     for role in roles:
         body = canonical([row for ordinal, row in enumerate(rows) if assigned[ordinal] == role])
-        parse_dataset(body, record.get("kind", "instruction"))
+        output_rows, output_formatting, _ = parse_dataset(body, record.get("kind", "instruction"))
+        if _input_schema(output_rows, output_formatting) != schema:
+            raise ValueError("split output changes the dataset input format; remove ambiguous unused metadata")
         bodies[role] = body
         output_refs[role] = {**plan.outputs[role].model_dump(), "sha256": digest(body)}
     manifest = {"schema_version": 1, "fingerprint_version": "text-input-v1", "plan": plan.model_dump(mode="json"),

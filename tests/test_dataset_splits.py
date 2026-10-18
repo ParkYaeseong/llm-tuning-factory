@@ -159,3 +159,80 @@ def test_split_preview_tampering_and_missing_groups_fail_before_commit(tmp_path)
     with pytest.raises(ValueError, match="preview hash"):
         commit_split(registry, preview["plan_sha256"])
     assert not (registry.root / "datasets/train").exists()
+
+
+def legacy_mixed_rows(formatting, actual_key, metadata_key):
+    def conversation(prompt, key):
+        if key == "messages":
+            return [{"role": "user", "content": prompt}, {"role": "assistant", "content": "answer"}]
+        return [{"from": "human", "value": prompt}, {"from": "gpt", "value": "answer"}]
+
+    def row(prompt):
+        return ({"instruction": prompt, "output": "answer"} if formatting == "alpaca"
+                else {actual_key: conversation(prompt, actual_key)})
+
+    rows = [row("shared prompt"), row("shared prompt"), row("independent one"), row("independent two")]
+    rows[1][metadata_key] = conversation("unused metadata prompt", metadata_key)
+    return rows
+
+
+@pytest.mark.parametrize("formatting,actual_key,metadata_key", [
+    ("alpaca", None, "messages"),
+    ("alpaca", None, "conversations"),
+    ("sharegpt", "conversations", "messages"),
+    ("sharegpt", "messages", "conversations"),
+])
+def test_registered_overlap_uses_dataset_format_despite_unused_later_metadata(
+        tmp_path, formatting, actual_key, metadata_key):
+    rows = legacy_mixed_rows(formatting, actual_key, metadata_key)
+    # Only the later row overlaps; its extra conversation-shaped field is unused.
+    rows[0] = ({"instruction": "different", "output": "answer"} if formatting == "alpaca"
+               else {actual_key: rows[2][actual_key]})
+    registry, train = registered(tmp_path, rows)
+    heldout_path = tmp_path / "heldout.json"
+    heldout_path.write_text(json.dumps([legacy_mixed_rows(formatting, actual_key, metadata_key)[0]]))
+    heldout_record = registry.register_dataset("heldout", "1", heldout_path)
+    heldout = DatasetRef(**{key: heldout_record[key] for key in ("dataset_id", "version", "sha256")})
+    before_metadata = (registry.root / "datasets/source/1.json").read_bytes()
+    before_blob = registry.dataset_path(registry.get_dataset("source", "1")).read_bytes()
+    with pytest.raises(ValueError, match="overlap"):
+        assert_no_input_overlap([train], [heldout], registry=registry)
+    with pytest.raises(ValueError, match="overlap"):
+        assert_no_input_overlap([{"rows": rows}], [{"rows": json.loads(heldout_path.read_text())}])
+    assert (registry.root / "datasets/source/1.json").read_bytes() == before_metadata
+    assert registry.dataset_path(registry.get_dataset("source", "1")).read_bytes() == before_blob
+
+
+@pytest.mark.parametrize("formatting,actual_key,metadata_key", [
+    ("alpaca", None, "messages"),
+    ("alpaca", None, "conversations"),
+    ("sharegpt", "conversations", "messages"),
+    ("sharegpt", "messages", "conversations"),
+])
+def test_split_groups_actual_prompts_despite_unused_later_metadata(tmp_path, formatting, actual_key, metadata_key):
+    rows = legacy_mixed_rows(formatting, actual_key, metadata_key)
+    registry, ref = registered(tmp_path, rows)
+    preview = preview_split(registry, plan(ref))
+    first, later = preview["assignments"][:2]
+    assert first["input_sha256"] == later["input_sha256"]
+    assert first["component_sha256"] == later["component_sha256"]
+    assert first["split"] == later["split"]
+    committed = commit_split(registry, preview["plan_sha256"])
+    output = committed["outputs"][first["split"]]
+    record = registry.get_dataset(output["dataset_id"], output["version"])
+    assert json.loads(registry.dataset_path(record).read_bytes()) == rows[:2]
+
+
+@pytest.mark.parametrize("formatting,actual_key,metadata_key", [
+    ("alpaca", None, "messages"),
+    ("alpaca", None, "conversations"),
+    ("sharegpt", "conversations", "messages"),
+])
+def test_split_rejects_output_that_would_select_unused_metadata_as_input(tmp_path, formatting, actual_key, metadata_key):
+    rows = legacy_mixed_rows(formatting, actual_key, metadata_key)
+    rows[0] = rows.pop()  # Three distinct prompts force one row into each split.
+    registry, ref = registered(tmp_path, rows)
+    with pytest.raises(ValueError, match="dataset input format"):
+        preview_split(registry, plan(ref))
+    assert not (registry.root / "split_previews").exists()
+    assert not (registry.root / "datasets/train").exists()
