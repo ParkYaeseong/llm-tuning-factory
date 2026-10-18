@@ -1,36 +1,26 @@
-# General-purpose workflow design — 2026-10-17
+# General-purpose workflows — implementation in progress, 2026-10-18
 
-User requested arbitrary-purpose projects/data, reusable training recipes, serial/parallel learning and automated
-post-training consolidation. User selected common evaluation/best-model selection plus compatible adapter merging.
-Prepared [written design](superpowers/specs/2026-10-17-general-training-workflows-design.md) for review.
-Repository audits confirmed example-driven UI startup, no typed parent-model input or DAG/controller, one configured
-Pod, and insufficient evaluation fingerprints for automatic selection. Checked pinned upstream LF0.9.5/PEFT0.18.1
-adapter/reference/merge contracts. Proposed immutable model handoff, whole-Pod parallelism, attempt fencing,
-tracking outbox, deterministic compatible LoRA cat merge and same-benchmark reevaluation with best-original fallback.
+User approved the [design](superpowers/specs/2026-10-17-general-training-workflows-design.md) and
+[implementation plan](superpowers/plans/2026-10-17-general-training-workflows.md), including task implementers
+and independent reviews. Work continues on codex/general-training-workflows; the released Windows 0.3.0
+installer remains unchanged until new acceptance.
 
-User approved the written spec on 2026-10-17 (“진행해”). Prepared and self-reviewed the
-[implementation plan](superpowers/plans/2026-10-17-general-training-workflows.md), including task interfaces,
-failure tests, model numerical acceptance and native credential/controller lifecycle. Plan review and execution-method
-selection were approved on 2026-10-17: task implementers with independent task reviews. Product implementation is
-in progress on codex/general-training-workflows; the released 0.3.0 installer remains unchanged until new acceptance.
-Baseline Python 3.12 suite rerun: **214 passed, 1 skipped** (opt-in live GPU), Ruff passes. No paid resources,
-external datasets or institution data were accessed or transferred.
-2026-10-17 foundation milestone (not complete acceptance): general project and reusable recipe revisions plus immutable
-effective model artifact/input contracts are implemented. A frozen-source
-Python integration run passed **312 tests, 1 skipped** (the existing opt-in live GPU test); repository-wide Ruff passes.
-No new model training, data transfer or paid resource action was performed.
-2026-10-18 continuation: mapped CSV/JSON/JSONL imports, original/canonical provenance and reproducible
-input/group connected-component splits are implemented. Independent review found a parser-format/fingerprint
-disagreement that could bypass overlap detection; its scoped fix is in progress. Model artifact review
-identified incomplete loader metadata and repeated ancestor hashing; a scoped fix adds strict option guards,
-operation-local verification deduplication and historical descriptor-hash compatibility. Both findings passed scoped re-review.
-Fresh frozen-source full suite: **371 passed, 1 skipped** (existing opt-in GPU), repository-wide Ruff passes.
-Latest foundation integration adds common benchmark fingerprints, explicit objectives/thresholds, pending/partial
-candidate handling, text-answer agreement metrics and merge regression fallback. The data-format leakage fix
-and these evaluation changes passed **432 tests, 1 skipped** (existing opt-in GPU), with repository-wide Ruff passing.
-Both are now in independent task review. This is foundation verification, not end-to-end graph, Windows 0.4.0 or GPU acceptance.
-Actual serial handoff, multi-Pod concurrency and merged-model GPU evaluation are outstanding future acceptance work
-and require explicit resource/data authorization before any live execution.
+Reviewed foundations (Tasks 1–4): blank projects and immutable reusable recipes; mapped CSV/JSON/JSONL import
+with original/canonical provenance and input-OR-group component splits; immutable effective-model artifacts;
+common benchmark fingerprints, text-answer agreement metrics, explicit objective/threshold selection and merge
+regression fallback. Review fixes cover complete adapter-loader metadata, operation-local ancestor verification,
+historical descriptor hashes, dataset parser/fingerprint agreement, derived-output format drift, and explicit
+partial-success permission separated from normal quality filtering. All four task review gates passed.
+
+Actual frozen-source verification: Python 3.12.12 locked development/tracking sync; **474 passed, 1 skipped**
+in 129.59s; `uv run ruff check src tests` passes. The skip is the existing opt-in real GPU test.
+Separate CPU dependency/export preparation is in progress; it does not yet qualify the unimplemented public
+model-operation numerical path. No GPU, institution data, model weights or external dataset transfer was used.
+
+Remaining Tasks 5–11: graph validation/planning, fenced atomic execution, model-operation CPU acceptance,
+persistent multi-Pod controller/tracking repair, secure desktop API/broker, Windows UI/installer and Git sharing.
+These foundations are not end-to-end workflow, Windows 0.4.0 or live GPU acceptance. Actual serial handoff,
+multi-Pod concurrency and merge/reevaluation on GPU require separate concrete resource/data authorization.
 
 ---
 
