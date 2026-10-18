@@ -409,3 +409,192 @@ def test_synthetic_parent_provenance_cannot_be_removed(tmp_path):
     child_directory, child_descriptor = fixture_model(tmp_path, adapter=True, marker='child')
     with pytest.raises(ValueError, match='synthetic'):
         store.freeze(child_directory, updated(child_descriptor, effective_base=parent, parents=(parent,)))
+
+
+@pytest.mark.parametrize('field,value', [('fan_in_fan_out', True), ('inference_mode', True),
+                                        ('task_type', 'CAUSAL_LM')])
+def test_loader_option_requires_matching_effective_metadata(tmp_path, field, value):
+    module = api()
+    directory, descriptor = fixture_model(tmp_path, adapter=True)
+    store = module.ModelArtifactStore(tmp_path / 'store')
+    before = store.freeze(directory, descriptor)
+    config = json.loads((directory / 'adapter_config.json').read_text())
+    config[field] = value
+    (directory / 'adapter_config.json').write_bytes(canonical(config))
+    with pytest.raises(ValueError, match='adapter'):
+        store.freeze(directory, descriptor)
+    changed = updated(descriptor, adapter=updated(descriptor.adapter, **{field: value}))
+    after = store.freeze(directory, changed)
+    assert before.artifact_id != after.artifact_id
+    assert store.get(after).adapter.model_dump()[field] == value
+    assert store.verify(before) == descriptor
+
+
+@pytest.mark.parametrize('field,value', [
+    ('unknown_loader_option', True), ('unknown_loader_option', None), ('lora_bias', True),
+    ('exclude_modules', ['v_proj']), ('layers_to_transform', [1]), ('layers_pattern', 'layers'),
+    ('megatron_config', {'tensor_model_parallel_size': 2}), ('megatron_core', 'custom.core'),
+    ('trainable_token_indices', [1]), ('loftq_config', {'loftq_bits': 4}),
+    ('eva_config', {'rho': 2}), ('corda_config', {'corda_method': 'ipm'}),
+    ('alora_invocation_tokens', [1]), ('use_qalora', True), ('qalora_group_size', 32),
+    ('arrow_config', {'top_k': 1}), ('ensure_weight_tying', True),
+    ('auto_mapping', {'base_model_class': 'UnreviewedModel'}),
+    ('runtime_config', {'ephemeral_gpu_offload': True}), ('fan_in_fan_out', 0),
+])
+def test_unrepresented_loader_variants_are_rejected(tmp_path, field, value):
+    module = api()
+    directory, descriptor = fixture_model(tmp_path, adapter=True)
+    config = json.loads((directory / 'adapter_config.json').read_text())
+    config[field] = value
+    (directory / 'adapter_config.json').write_bytes(canonical(config))
+    with pytest.raises(ValueError, match='adapter'):
+        module.ModelArtifactStore(tmp_path / 'store').freeze(directory, descriptor)
+
+
+def test_default_export_fields_and_provenance_do_not_change_effective_metadata(tmp_path):
+    module = api()
+    directory, descriptor = fixture_model(tmp_path, adapter=True)
+    config = json.loads((directory / 'adapter_config.json').read_text())
+    config.update(fan_in_fan_out=False, task_type=None, inference_mode=False,
+                  peft_version='0.18.1', revision='a' * 40, base_model_name_or_path='/old/output',
+                  auto_mapping=None, exclude_modules=None, layers_to_transform=None, layers_pattern=None,
+                  megatron_config=None, megatron_core='megatron.core', trainable_token_indices=None,
+                  loftq_config={}, eva_config=None, corda_config=None, alora_invocation_tokens=None,
+                  use_qalora=False, qalora_group_size=16, lora_bias=False, arrow_config=None,
+                  ensure_weight_tying=False)
+    (directory / 'adapter_config.json').write_bytes(canonical(config))
+    store = module.ModelArtifactStore(tmp_path / 'store')
+    ref = store.freeze(directory, descriptor)
+    assert store.get(ref).adapter == descriptor.adapter
+    assert store.get(ref).effective_base == descriptor.root
+
+
+def make_shared_lineage(tmp_path, count=6):
+    module = api()
+    directory, descriptor = fixture_model(tmp_path)
+    store = module.ModelArtifactStore(tmp_path / 'store')
+    refs = []
+    for index in range(count):
+        parents = tuple(refs[-2:])
+        ref = store.freeze(directory, updated(descriptor, producer_job_id=f'job-{index}',
+                                              parents=parents, effective_base=parents[-1] if parents
+                                              else descriptor.root))
+        refs.append(ref)
+    return store, directory, descriptor, refs
+
+
+@pytest.mark.parametrize('operation', ['verify', 'get', 'path', 'freeze', 'validate_input'])
+def test_shared_ancestors_are_hashed_once_per_public_operation(tmp_path, monkeypatch, operation):
+    module = api()
+    store, directory, descriptor, refs = make_shared_lineage(tmp_path)
+    original_inventory = module._inventory
+    scans = []
+
+    def inventory_spy(path):
+        scans.append(path)
+        return original_inventory(path)
+
+    monkeypatch.setattr(module, '_inventory', inventory_spy)
+    if operation == 'freeze':
+        store.freeze(directory, updated(descriptor, producer_job_id='child',
+                                         parents=tuple(refs[-2:]), effective_base=refs[-1]))
+        # One new snapshot plus each distinct parent: no path is hashed twice.
+        assert len(scans) == len(refs) + 1
+    elif operation == 'validate_input':
+        load = module.ModelLoadRef(base=refs[-1])
+        store.validate_input(module.ModelInput(policy=load, initialization='full_weights', frozen_reference=load))
+        assert len(scans) == len(refs)
+    else:
+        getattr(store, operation)(refs[-1])
+        assert len(scans) == len(refs)
+    assert len(set(scans)) == len(scans)
+
+
+def test_completed_verification_cache_does_not_survive_public_calls(tmp_path):
+    store, _, _, refs = make_shared_lineage(tmp_path)
+    root_payload = store.path(refs[0])
+    store.verify(refs[-1])
+    (root_payload / 'model.safetensors').write_bytes(b'tampered after earlier successful verification')
+    for read in (store.verify, store.get, store.path):
+        with pytest.raises(ValueError, match='hash|inventory'):
+            read(refs[-1])
+
+
+def test_shared_verification_cache_never_skips_active_cycle_check(tmp_path):
+    store, _, _, refs = make_shared_lineage(tmp_path, count=2)
+    identity = (refs[0].artifact_id, refs[0].inventory_sha256)
+    completed = {identity: store.get(refs[0])}
+    # A completed node cannot legitimize a reference back into the active path.
+    with pytest.raises(ValueError, match='cyclic'):
+        store._verify(refs[0], {identity}, completed)
+
+
+def test_historical_descriptor_identity_survives_added_effective_option_defaults(tmp_path):
+    module = api()
+    directory, descriptor = fixture_model(tmp_path, adapter=True)
+    store = module.ModelArtifactStore(tmp_path / 'store')
+    current = store.freeze(directory, descriptor)
+    location = store.path(current).parent
+    historical = descriptor.model_dump(mode='json')
+    for field in ('fan_in_fan_out', 'task_type', 'inference_mode'):
+        historical['adapter'].pop(field)
+    body = canonical(historical)
+    prior = module.ModelArtifactRef(artifact_id=sha(body), inventory_sha256=current.inventory_sha256)
+    (location / 'descriptor.json').write_bytes(body)
+    historical_location = store.root / prior.artifact_id / prior.inventory_sha256
+    historical_location.parent.mkdir()
+    location.rename(historical_location)
+    assert store.get(prior) == descriptor
+    assert store.path(prior).parent == historical_location
+    assert store.get(prior).adapter.fan_in_fan_out is False
+
+
+def test_historical_descriptor_defaults_do_not_accept_unrecorded_loader_changes(tmp_path):
+    module = api()
+    directory, descriptor = fixture_model(tmp_path, adapter=True)
+    config = json.loads((directory / 'adapter_config.json').read_text())
+    config['fan_in_fan_out'] = True
+    (directory / 'adapter_config.json').write_bytes(canonical(config))
+    # Construct the exact legacy serialized artifact directly: the prior release
+    # accepted this unrepresented option. A valid historical hash is insufficient.
+    historical = descriptor.model_dump(mode='json')
+    for field in ('fan_in_fan_out', 'task_type', 'inference_mode'):
+        historical['adapter'].pop(field)
+    inventory = [{'path': file.name, 'size': file.stat().st_size, 'sha256': sha(file.read_bytes())}
+                 for file in sorted(directory.iterdir())]
+    ref = module.ModelArtifactRef(artifact_id=sha(canonical(historical)),
+                                   inventory_sha256=sha(canonical(inventory)))
+    store = module.ModelArtifactStore(tmp_path / 'store')
+    location = store.root / ref.artifact_id / ref.inventory_sha256
+    location.mkdir(parents=True)
+    directory.rename(location / 'files')
+    (location / 'descriptor.json').write_bytes(canonical(historical))
+    (location / 'inventory.json').write_bytes(canonical(inventory))
+    with pytest.raises(ValueError, match='adapter.*fan_in_fan_out'):
+        store.verify(ref)
+
+
+def test_verification_cache_distinguishes_both_parts_of_artifact_identity(tmp_path, monkeypatch):
+    module = api()
+    directory, descriptor = fixture_model(tmp_path)
+    store = module.ModelArtifactStore(tmp_path / 'store')
+    first = store.freeze(directory, descriptor)
+    with (directory / 'model.safetensors').open('r+b') as stream:
+        stream.seek(-1, 2)
+        stream.write(b'\x01')
+    second = store.freeze(directory, descriptor)
+    assert first.artifact_id == second.artifact_id
+    assert first.inventory_sha256 != second.inventory_sha256
+    child = store.freeze(directory, updated(descriptor, producer_job_id='child',
+                                             parents=(first, second), effective_base=second))
+    scans = []
+    original_inventory = module._inventory
+
+    def inventory_spy(path):
+        scans.append(path)
+        return original_inventory(path)
+
+    monkeypatch.setattr(module, '_inventory', inventory_spy)
+    store.verify(child)
+    assert len(scans) == 3
+    assert len(set(scans)) == 3

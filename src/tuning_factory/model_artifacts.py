@@ -103,6 +103,9 @@ class AdapterMetadata(ArtifactModel):
     alpha: float = Field(gt=0)
     target_modules: tuple[ModuleName, ...] = Field(min_length=1)
     dropout: float = Field(default=0, ge=0, lt=1)
+    fan_in_fan_out: bool = Field(default=False, strict=True)
+    task_type: Literal["CAUSAL_LM"] | None = None
+    inference_mode: bool = Field(default=False, strict=True)
     use_rslora: bool = Field(default=False, strict=True)
     use_dora: bool = Field(default=False, strict=True)
     pissa_init: bool = Field(default=False, strict=True)
@@ -354,10 +357,18 @@ def _validate_adapter(directory: Path, adapter: AdapterMetadata):
     if not isinstance(actual, dict):
         raise ValueError("invalid adapter configuration")
     expected = {"peft_type": "OFT" if adapter.method == "oft" else "LORA", "r": adapter.rank,
-                "target_modules": sorted(adapter.target_modules), "modules_to_save": sorted(adapter.modules_to_save)}
+                "target_modules": sorted(adapter.target_modules), "modules_to_save": sorted(adapter.modules_to_save),
+                "fan_in_fan_out": adapter.fan_in_fan_out, "task_type": adapter.task_type,
+                "inference_mode": adapter.inference_mode, "bias": adapter.bias}
     defaults = {"modules_to_save": [], "bias": "none", "use_rslora": False, "use_dora": False,
                 "lora_dropout": 0, "rank_pattern": {}, "alpha_pattern": {}, "target_parameters": [],
-                "layer_replication": [], "init_lora_weights": True}
+                "layer_replication": [], "init_lora_weights": True, "fan_in_fan_out": False,
+                "task_type": None, "inference_mode": False}
+    # Reviewed PEFT 0.18.1 export defaults. Features without typed effective
+    # metadata must remain at these defaults; unknown options fail closed even
+    # when their value is None/False. Do not silently inherit new loader variants.
+    unsupported_defaults = {"auto_mapping": None, "exclude_modules": None,
+                            "layers_to_transform": None, "layers_pattern": None}
     if adapter.method != "oft":
         expected.update(lora_alpha=adapter.alpha, lora_dropout=adapter.dropout, bias=adapter.bias,
                         use_rslora=adapter.use_rslora, use_dora=adapter.use_dora,
@@ -368,8 +379,28 @@ def _validate_adapter(directory: Path, adapter: AdapterMetadata):
                         init_lora_weights=("pissa" if adapter.pissa_iter == -1
                                            else f"pissa_niter_{adapter.pissa_iter}")
                         if adapter.pissa_init else True)
+        unsupported_defaults.update(
+            megatron_config=None, megatron_core="megatron.core", trainable_token_indices=None,
+            loftq_config={}, eva_config=None, corda_config=None, alora_invocation_tokens=None,
+            use_qalora=False, qalora_group_size=16, lora_bias=False, arrow_config=None,
+            ensure_weight_tying=False,
+        )
     else:
         expected.update(oft_block_size=adapter.oft_block_size, module_dropout=adapter.module_dropout)
+        unsupported_defaults.update(init_weights=True, coft=False, eps=6e-5, block_share=False,
+                                    use_cayley_neumann=True, num_cayley_neumann_terms=5)
+    # These strings are export provenance, never instructions for locating or
+    # loading the base. ModelDescriptor.effective_base is authoritative.
+    provenance = {"base_model_name_or_path", "revision", "peft_version"}
+    unknown = set(actual) - set(expected) - set(unsupported_defaults) - provenance
+    if unknown:
+        raise ValueError(f"unsupported adapter configuration fields: {', '.join(sorted(unknown))}")
+    for key in provenance & set(actual):
+        if actual[key] is not None and not isinstance(actual[key], str):
+            raise ValueError(f"invalid adapter provenance: {key}")
+    for key, default in unsupported_defaults.items():
+        if key in actual and canonical(actual[key]) != canonical(default):
+            raise ValueError(f"unsupported nondefault adapter configuration: {key}")
     for key, wanted in expected.items():
         value = actual.get(key, defaults.get(key))
         if key in {"modules_to_save", "target_parameters", "layer_replication"} and value is None:
@@ -451,6 +482,7 @@ class ModelArtifactStore:
         if self.root == source or self.root.is_relative_to(source):
             raise ValueError("artifact store must not be inside source directory")
         _check_ancestors(self.root)
+        completed = {}
         temporary = Path(tempfile.mkdtemp(prefix=".freeze-", dir=self.root))
         try:
             payload = temporary / "files"
@@ -464,7 +496,7 @@ class ModelArtifactStore:
                     os.fsync(writer.fileno())
             inventory = _inventory(payload)
             _validate_payload(payload, descriptor, inventory)
-            self._validate_lineage(descriptor, set())
+            self._validate_lineage(descriptor, set(), completed)
             body = canonical(descriptor.model_dump(mode="json"))
             inventory_body = _inventory_bytes(inventory)
             ref = ModelArtifactRef(artifact_id=digest(body), inventory_sha256=digest(inventory_body))
@@ -481,17 +513,19 @@ class ModelArtifactStore:
             except OSError:
                 if not destination.exists():
                     raise
-                self.verify(ref)
+                self._verify(ref, set(), completed)
             return ref
         finally:
             if temporary.exists():
                 shutil.rmtree(temporary)
 
-    def _verify(self, ref: ModelArtifactRef, seen: set) -> ModelDescriptor:
+    def _verify(self, ref: ModelArtifactRef, active: set, completed: dict) -> ModelDescriptor:
         ref = ModelArtifactRef.model_validate(ref)
         identity = (ref.artifact_id, ref.inventory_sha256)
-        if identity in seen:
+        if identity in active:
             raise ValueError("cyclic model artifact lineage")
+        if identity in completed:
+            return completed[identity]
         location = self._location(ref)
         try:
             _check_ancestors(location)
@@ -500,7 +534,10 @@ class ModelArtifactStore:
             descriptor_raw = _read_json(location / "descriptor.json")
             inventory_raw = _read_json(location / "inventory.json")
             descriptor = ModelDescriptor.model_validate(descriptor_raw)
-            if digest(canonical(descriptor.model_dump(mode="json"))) != ref.artifact_id:
+            # Identity belongs to the canonical content originally stored, not
+            # to defaults added by a newer metadata validator. The normalized
+            # descriptor must still pass all current loader/payload checks below.
+            if digest(canonical(descriptor_raw)) != ref.artifact_id:
                 raise ValueError("model descriptor hash mismatch")
             if not isinstance(inventory_raw, list):
                 raise ValueError("invalid model artifact inventory")
@@ -510,13 +547,15 @@ class ModelArtifactStore:
             if _inventory(location / "files") != inventory:
                 raise ValueError("model inventory files/hash mismatch")
             _validate_payload(location / "files", descriptor, inventory)
-            self._validate_lineage(descriptor, seen | {identity})
+            self._validate_lineage(descriptor, active | {identity}, completed)
+            # Cache only fully verified evidence, and only in this operation.
+            completed[identity] = descriptor
             return descriptor
         except OSError as exc:
             raise ValueError("model artifact is missing or inaccessible") from exc
 
-    def _validate_lineage(self, descriptor, seen):
-        parents = {ref: self._verify(ref, seen) for ref in descriptor.parents}
+    def _validate_lineage(self, descriptor, active, completed):
+        parents = {ref: self._verify(ref, active, completed) for ref in descriptor.parents}
         if any(parent.synthetic and not descriptor.synthetic or parent.simulation and not descriptor.simulation
                for parent in parents.values()):
             raise ValueError("synthetic/simulation provenance must be preserved from all parents")
@@ -538,20 +577,20 @@ class ModelArtifactStore:
         return self.verify(ref)
 
     def verify(self, ref: ModelArtifactRef) -> ModelDescriptor:
-        return self._verify(ref, set())
+        return self._verify(ref, set(), {})
 
     def path(self, ref: ModelArtifactRef) -> Path:
         ref = ModelArtifactRef.model_validate(ref)
         self.verify(ref)
         return self._location(ref) / "files"
 
-    def _validate_load(self, load: ModelLoadRef, kind: str, require_real: bool):
-        base = self.verify(load.base) if isinstance(load.base, ModelArtifactRef) else load.base
+    def _validate_load(self, load: ModelLoadRef, kind: str, require_real: bool, completed: dict):
+        base = self._verify(load.base, set(), completed) if isinstance(load.base, ModelArtifactRef) else load.base
         if isinstance(base, ModelDescriptor) and base.storage_kind != "full_model":
             raise ValueError("model input base must be a full model")
         effective = base
         if load.adapter is not None:
-            effective = self.verify(load.adapter)
+            effective = self._verify(load.adapter, set(), completed)
             if effective.storage_kind != "adapter":
                 raise ValueError("model input adapter must have adapter storage")
             if effective.effective_base != load.base:
@@ -572,11 +611,12 @@ class ModelArtifactStore:
         model_input = ModelInput.model_validate(model_input)
         if model_input.frozen_reference is not None and model_input.frozen_reference != model_input.policy:
             raise ValueError("frozen reference must bind the exact policy parent")
-        policy = self._validate_load(model_input.policy, "causal_lm", require_real)
+        completed = {}
+        policy = self._validate_load(model_input.policy, "causal_lm", require_real, completed)
         for load, kind in ((model_input.frozen_reference, "causal_lm"),
                            (model_input.reward_model, "reward_model")):
             if load is not None:
-                other = self._validate_load(load, kind, require_real)
+                other = self._validate_load(load, kind, require_real, completed)
                 if other.tokenizer_fingerprint != policy.tokenizer_fingerprint:
                     raise ValueError("reference/reward tokenizer differs from policy")
                 root = other.root if isinstance(other, ModelDescriptor) else other
