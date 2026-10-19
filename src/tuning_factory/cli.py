@@ -157,6 +157,9 @@ def work(ctx: typer.Context, drain: bool = False, pod_id: str | None = None,
          host: str | None = None, port: int = 22, username: str = "root", key_file: Path | None = None,
          approve_execution_and_transfer: bool = False, server_profile: Path | None = None):
     factory = ctx.obj
+    # Refuse an insecure tracking setup before any job is claimed, so no attempt is consumed.
+    from .auth import require_secure_tracking
+    require_secure_tracking(getattr(factory.tracker, "uri", None))
     factory.store.recover()
     server = server_connection(ctx, server_profile)
     if server is not None:

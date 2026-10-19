@@ -64,19 +64,20 @@ def test_secret_references_support_existing_colon_and_export_formats(tmp_path, m
         ConnectionProfile(tracking_uri="http://public.example", oidc_token_url="https://sso.example/token")
 
 
-@pytest.mark.parametrize("environment,mode", [
-    ({}, "none"), ({"MLFLOW_TRACKING_TOKEN": "fixture-token"}, "token"),
-    ({"MLFLOW_OIDC_TOKEN_URL": "https://sso.example/token"}, "oidc"),
-    ({"MLFLOW_OIDC_TOKEN_URL": "https://sso.example/token", "MLFLOW_TRACKING_TOKEN": "refreshed"}, "oidc"),
+@pytest.mark.parametrize("environment,mode,uri", [
+    ({}, "none", "http://127.0.0.1:5000"), ({"MLFLOW_TRACKING_TOKEN": "fixture-token"}, "token", "https://127.0.0.1:5000"),
+    ({"MLFLOW_OIDC_TOKEN_URL": "https://sso.example/token"}, "oidc", "https://127.0.0.1:5000"),
+    ({"MLFLOW_OIDC_TOKEN_URL": "https://sso.example/token", "MLFLOW_TRACKING_TOKEN": "refreshed"}, "oidc",
+     "https://127.0.0.1:5000"),
 ])
-def test_connection_report_names_the_mlflow_authentication_mode(tmp_path, monkeypatch, environment, mode):
+def test_connection_report_names_the_mlflow_authentication_mode(tmp_path, monkeypatch, environment, mode, uri):
     from tuning_factory import auth
     from tuning_factory.connections import ENV_SETTINGS
     from tuning_factory.diagnostics import check_connections
 
     class Client:
         def __init__(self, tracking_uri):
-            assert tracking_uri == "https://127.0.0.1:5000"
+            assert tracking_uri == uri
 
         def search_experiments(self, max_results):
             return []
@@ -86,7 +87,7 @@ def test_connection_report_names_the_mlflow_authentication_mode(tmp_path, monkey
 
     for key in ENV_SETTINGS:
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://127.0.0.1:5000")
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", uri)
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr("mlflow.MlflowClient", Client)

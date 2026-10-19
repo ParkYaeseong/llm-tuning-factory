@@ -9,15 +9,18 @@ class MLflowTracker:
     def __init__(self, uri, experiment="llm-tuning-factory", client=None, artifact_location=None):
         # MLflow's terminal URL output breaks machine-readable JSON and legacy Windows consoles.
         os.environ["MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT"] = "true"
-        from .auth import configure_oidc, require_secure_tracking
+        from .auth import configure_oidc, require_secure_artifacts, require_secure_tracking
         require_secure_tracking(uri)
+        artifact_location = artifact_location or os.environ.get("FACTORY_MLFLOW_ARTIFACT_LOCATION")
+        require_secure_artifacts(artifact_location)
         self.auth_refresher = configure_oidc()
         if client is None:
             from mlflow import MlflowClient
             client = MlflowClient(tracking_uri=uri)
         self.client = client
         found = client.get_experiment_by_name(experiment)
-        artifact_location = artifact_location or os.environ.get("FACTORY_MLFLOW_ARTIFACT_LOCATION")
+        if found is not None:
+            require_secure_artifacts(getattr(found, "artifact_location", None))
         self.experiment_id = found.experiment_id if found else client.create_experiment(experiment, artifact_location=artifact_location)
 
     def start(self, job_id, manifest):

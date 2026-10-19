@@ -56,14 +56,21 @@ INSECURE_TRACKING = ("인증값을 사용하는 MLflow 서버 주소는 HTTPS여
                      "토큰과 OIDC 값을 비우거나 앱에서 ‘인증 없음’을 선택하세요.")
 
 
+def credentials_configured():
+    return any(os.environ.get(key) for key in
+               ("MLFLOW_TRACKING_TOKEN", "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_SECRET"))
+
+
 def require_secure_tracking(uri):
     """Bearer tokens and OIDC secrets never travel over plain HTTP; unauthenticated servers are unaffected."""
-    if not uri:
-        return
-    if any(os.environ.get(key) for key in
-           ("MLFLOW_TRACKING_TOKEN", "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_SECRET")):
-        if urlsplit(str(uri)).scheme != "https":
-            raise ValueError(INSECURE_TRACKING)
+    if uri and credentials_configured() and urlsplit(str(uri)).scheme != "https":
+        raise ValueError(INSECURE_TRACKING)
+
+
+def require_secure_artifacts(uri):
+    """MLflow's HTTP artifact repository sends the tracking token; mlflow-artifacts:, s3:, file: do not."""
+    if uri and credentials_configured() and urlsplit(str(uri)).scheme == "http":
+        raise ValueError(INSECURE_TRACKING)
 
 
 def configure_oidc():

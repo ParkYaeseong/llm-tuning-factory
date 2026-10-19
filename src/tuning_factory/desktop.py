@@ -8,7 +8,6 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import yaml
 
@@ -102,16 +101,14 @@ class DesktopService:
         if self.settings.get("auth_mode") == "none":
             # Defense in depth: native settings also stop sending these for unauthenticated servers.
             self.settings = {key: value for key, value in self.settings.items() if key not in MLFLOW_AUTH_SETTINGS}
-        uri = self.settings.get("MLFLOW_TRACKING_URI")
-        if uri and any(self.settings.get(k) for k in ("MLFLOW_TRACKING_TOKEN", "MLFLOW_OIDC_CLIENT_SECRET")):
-            if urlsplit(uri).scheme != "https":
-                raise ValueError("authenticated MLflow requires HTTPS")
         for key in ENV_SETTINGS:
             os.environ.pop(key, None)
             if self.settings.get(key):
                 os.environ[key] = str(self.settings[key])
+        from .auth import require_secure_tracking
         from .tracking import LazyMLflowTracker
         uri = self.settings.get("MLFLOW_TRACKING_URI")
+        require_secure_tracking(uri)
         self.factory = Factory(self.root, policy=Policy(),
                                tracker=LazyMLflowTracker(uri) if uri else None)
 
