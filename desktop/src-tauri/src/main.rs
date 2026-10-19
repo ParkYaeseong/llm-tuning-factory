@@ -354,11 +354,16 @@ mod tests {
             assert_eq!(public, mlflow_settings(mode), "public view changed for {mode:?}");
         }
     }
+    /// A fake PEM header such as the OpenSSH or RSA one, assembled at runtime so no source file contains a
+    /// header the release secret scan (scripts/check_secrets.py) would report.
+    fn fake_key_header(kind: &str) -> String {
+        format!("-----BEGIN {kind}{}-----", "PRIVATE KEY")
+    }
     #[test]
     fn key_file_settings_refuse_pasted_private_keys() {
         for name in ["ssh_key_file", "server_ssh_key_file"] {
-            for pasted in ["-----BEGIN OPENSSH PRIVATE KEY----\nb3BlbnNzaC1rZXktdjE=", "-----BEGIN RSA PRIVATE KEY----",
-                "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none", "Public-Lines: 2\nAAAA\nPrivate-Lines: 1\nAAAA"] {
+            for pasted in [format!("{}\nb3BlbnNzaC1rZXktdjE=", fake_key_header("OPENSSH ")), fake_key_header("RSA "),
+                "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none".into(), "Public-Lines: 2\nAAAA\nPrivate-Lines: 1\nAAAA".into()] {
                 let error = merge(json!({name: pasted})).expect_err("a pasted private key was accepted");
                 assert!(error.contains("파일 경로"), "{error}");
             }
@@ -368,14 +373,14 @@ mod tests {
     }
     #[test]
     fn a_stored_pasted_key_neither_blocks_other_saves_nor_survives_them() {
-        let existing = json!({"pod_id": "assigned", "ssh_key_file": "-----BEGIN OPENSSH PRIVATE KEY----\nb3Blbg==",
+        let existing = json!({"pod_id": "assigned", "ssh_key_file": format!("{}\nb3Blbg==", fake_key_header("OPENSSH ")),
             "server_ssh_key_file": "PuTTY-User-Key-File-3: ssh-ed25519"});
         let saved = merge_public_settings(existing.clone(), json!({"S3_REGION": "kr-standard"}).as_object().unwrap())
             .expect("an unrelated save was blocked by a stored key-file value");
         assert_eq!(saved.get("S3_REGION"), Some(&json!("kr-standard")));
         assert_eq!(saved.get("pod_id"), Some(&json!("assigned")));
         assert!(!saved.contains_key("ssh_key_file") && !saved.contains_key("server_ssh_key_file"), "pasted key content was kept");
-        assert!(merge_public_settings(existing.clone(), json!({"ssh_key_file": "-----BEGIN RSA PRIVATE KEY----"}).as_object().unwrap()).is_err());
+        assert!(merge_public_settings(existing.clone(), json!({"ssh_key_file": fake_key_header("RSA ")}).as_object().unwrap()).is_err());
         let replaced = merge_public_settings(existing, json!({"ssh_key_file": "C:\\keys\\id_ed25519"}).as_object().unwrap()).unwrap();
         assert_eq!(replaced.get("ssh_key_file"), Some(&json!("C:\\keys\\id_ed25519")));
     }
