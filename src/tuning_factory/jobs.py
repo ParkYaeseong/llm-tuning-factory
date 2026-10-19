@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ACTIVE = {'PROVISIONING', 'RUNNING', 'EVALUATING'}
+RECEIPT_CHUNK = 500  # Stay far below SQLite's variable limit.
 TERMINAL = {'FAILED', 'CANCELED', 'COMPLETED'}
 TRANSITIONS = {
     'PENDING': {'QUEUED', 'CANCELED'}, 'QUEUED': {'PROVISIONING', 'CANCELED'},
@@ -165,10 +166,12 @@ class JobStore:
     def raw_server_receipts(self, job_ids):
         """Stored receipt text of the given jobs; callers parse each row and fail closed."""
         job_ids = list(job_ids)
+        if not job_ids:
+            return {}
         receipts = {}
         with self.connection() as db:
-            for start in range(0, len(job_ids), 500):  # Stay far below SQLite's variable limit.
-                chunk = job_ids[start:start + 500]
+            for start in range(0, len(job_ids), RECEIPT_CHUNK):
+                chunk = job_ids[start:start + RECEIPT_CHUNK]
                 rows = db.execute('SELECT job_id,receipt FROM job_destinations WHERE job_id IN (%s)'
                                   % ','.join('?' * len(chunk)), chunk)
                 receipts.update({row['job_id']: row['receipt'] for row in rows})

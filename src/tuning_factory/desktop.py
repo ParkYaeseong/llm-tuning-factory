@@ -54,8 +54,8 @@ def tutorial_sample_path():
 
 
 def reserved_tutorial_id(data):
-    # Windows registry folders are case-insensitive, so spelling variants share the reserved name.
-    return str(data.get("dataset_id", "")).casefold() == TUTORIAL_DATASET_ID
+    # Windows folders ignore case and trailing dots, so those spelling variants share the reserved name.
+    return str(data.get("dataset_id", "")).casefold().rstrip(".") == TUTORIAL_DATASET_ID
 
 
 def check_tutorial_registration(data):
@@ -256,18 +256,30 @@ class DesktopService:
             copy = self.root / "tutorial" / "tutorial_sample.json"
             if not copy.is_file() or copy.read_bytes() != raw:
                 copy.parent.mkdir(parents=True, exist_ok=True)
-                temporary = copy.with_suffix(".tmp")
-                temporary.write_bytes(raw)
-                os.replace(temporary, copy)
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(dir=copy.parent, suffix=".tmp", delete=False) as handle:
+                        temporary = Path(handle.name)
+                        handle.write(raw)
+                    os.replace(temporary, copy)
+                except PermissionError:
+                    # A concurrent process may hold the target; success only if it already holds the bundle.
+                    if not copy.is_file() or copy.read_bytes() != raw:
+                        raise
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
             return {"dataset_id": TUTORIAL_DATASET_ID, "version": "1", "kind": "instruction",
                     "path": str(copy), "sha256": digest(raw), "rows": len(parse_dataset(raw, "instruction")[0])}
         if action == "dataset_preview":
             return inspect_dataset(data["path"], data.get("kind", "instruction"))
         if action == "dataset":
+            source = Path(data["path"])
             if reserved_tutorial_id(data):
                 check_tutorial_registration(data)
+                source = tutorial_sample_path()  # Read the verified bundle, not a path that could be swapped.
             return self.factory.registry.register_dataset(
-                data["dataset_id"], data["version"], Path(data["path"]),
+                data["dataset_id"], data["version"], source,
                 export_allowed=data.get("export_allowed") is True, synthetic=data.get("synthetic") is True,
                 kind=data.get("kind", "instruction"))
         if action == "s3_list":
