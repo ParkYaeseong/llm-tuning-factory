@@ -50,7 +50,7 @@ unlaunched attempt and frees its lock; started or taken-over attempts keep their
 usernames are accepted (no leading `-`, whitespace or control characters); bootstrap pip uses `--no-cache-dir`
 after a fixed `python3 -m pip --version` check that reports a missing pip before transfer; an unreadable
 /etc/machine-id reports an unsupported server instead of a traceback; `doctor` rejects `--pod-id` with a server
-profile. Scoped re-review of these fixes is pending.
+profile. The scoped re-review of these fixes passed.
 
 Native settings contract for Task 6B: `provider: "ssh_server"` with string values under `server_`-prefixed keys
 (`server_ssh_host`, `server_ssh_port`, `server_ssh_username`, `server_ssh_fingerprint`, `server_ssh_key_file`,
@@ -58,14 +58,15 @@ Native settings contract for Task 6B: `provider: "ssh_server"` with string value
 inactive Pod's `ssh_key_file`/`ssh_fingerprint` stay separate. An explicit operator hourly cost is required; 0 is
 allowed. Server identity is the SHA-256 of the lowercased /etc/machine-id; lock aliasing also treats any observed
 GPU UUID overlap as the same server, and an SSH lock without an observation blocks. The cross-provider lock policy
-is deliberate: while any SSH job or preparation reservation exists, RunPod claims/preparation are blocked and vice
-versa, matching the v1 default of one concurrent job (`Policy.max_concurrent=1`). Distinct-resource concurrency is
-Task 8.
+is deliberate: the cross-provider quarantine in `JobStore._resource_blocked` treats a RunPod Pod and an SSH server as
+possibly the same hardware. A held RunPod job lock blocks SSH claims and SSH preparation; an SSH job lock or SSH preparation
+reservation blocks RunPod claims and RunPod preparation. RunPod preparation records no reservation, so it does not block
+SSH. This is separate from the v1 concurrency default (`Policy.max_concurrent=1`). Distinct-resource concurrency is Task 8.
 
 Deferred: the key identity is a hash of the resolved local key-file path, so moving the key breaks recovery of old
 jobs and replacing it at the same path goes undetected (consider the public-key fingerprint later); the server
 worker binds an unbound real job to its server before claiming, approved by `--approve-execution-and-transfer`;
-graph ResourceFacts still allows a 0 RunPod price (Task 8); `JobStore.resource_blocked` is unused.
+graph ResourceFacts still allows a 0 RunPod price (Task 8). `JobStore.resource_blocked`, unused in 6A, is used by 6B-1.
 
 Actual verification after the Task 6A review fixes: Python 3.12.12 locked development/tracking sync;
 **652 passed, 1 skipped** in 49.56s (55 new cases; 114 in tests/test_gpu_servers.py); `uv run ruff check src tests`
@@ -121,27 +122,51 @@ passes. The UI is tested against a mocked bridge, so the real Tauri/WebView2 she
 
 Task 6B-3 (user documentation) updates README.md, docs/WINDOWS_APP.md, docs/CONFIGURATION.md, docs/OPERATIONS.md and
 .env.example for direct-SSH GPU servers (desktop steps, server prerequisites, profile JSON, CLI flow, reservation
-release, limits) and the unauthenticated MLflow mode (HTTP only without credentials, local `mlflow server` example,
-artifact-proxy note, trusted-network warning). **Task 6B is complete in software.** Task 6 commits: 6f3c70f, 570498d,
-16235c6, 15b118d, c0ee9a9, c8df219, 0b569dc, e67b90e (docs: guide SSH GPU servers and unauthenticated MLflow), 5447ce5 (test fixtures build fake key headers
-at runtime) and the follow-up docs commit `docs: state MLflow HTTPS enforcement exactly and record the secret-scan history finding`.
+release, limits) and the unauthenticated MLflow mode (HTTP only without credentials, local `mlflow server` example run from a
+full `mlflow` package, artifact-proxy note, trusted-network warning). **Task 6B is complete in software.**
 
-Latest actual verification (2026-10-19, Windows, on the docs commit's tree): `uv run pytest -q` **711 passed, 1 skipped**
-in 99.82s; `uv run ruff check src tests` passes; Playwright **47 passed**; `npm run build` (tsc + Vite) passes;
-`cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` **11 passed**.
+Commits of the SSH GPU server and MLflow work, in order:
+- Task 6A (adapters): 5f7baff (SSH server support), 2a11d4a (destination-bound jobs do not block other workers), 124b9f2
+  (collect after unrelated inventory drift), 2328474 (executor/receipt/CLI tests), f5335d2 (release an unlaunched attempt),
+  cdf717d (prerequisite/identity/input fixes), 85808a7 (6A review record), 06ceb65 (plan scope for local MLflow).
+- Task 6B-1: 6f3c70f (SSH-only recovery executors, refused pre-launch errors), 570498d (desktop actions routed to SSH servers,
+  unauthenticated MLflow).
+- Task 6B-2: 16235c6 (refuse misrouted server jobs early), 15b118d (robust job listing and preparation), c0ee9a9 (SSH
+  server connection screen), c8df219 (keep MLflow settings, isolate the connection module), 0b569dc (shared button actions,
+  port comparison, pasted key detection).
+- Task 6B-3 docs: e67b90e (guide), 5b5734f (HTTPS statement), and the correction commit `docs: correct SSH server and MLflow
+  guidance against the current code`.
+- Test hygiene: 5447ce5 (Rust fake key headers built at runtime).
+- Follow-ups since: 7c07f92 (protected synthetic sample for the desktop tutorial; the tutorial is a later task), a71049a
+  (`claim()` refuses non-fact observations, receipt lookups are chunked), 61fee6c (tutorial sample trailing-dot alias and race),
+  68021a2 (MLflow credentials refused over plain HTTP in every client path), 74d7df8 (release stuck preparations, one GPU per
+  job, `.ppk` keys refused), 20d6f30 (credentials kept off http artifact roots, fail fast before claiming), acaf393 (count only
+  policy-compliant GPU selections as configured), 24135cb (OIDC counts as configured only with a secret; run artifact roots checked).
+
+MLflow rule at HEAD (24135cb, treat OIDC as configured only with a secret and check run artifact roots): if `MLFLOW_TRACKING_TOKEN`
+is set, or both `MLFLOW_OIDC_TOKEN_URL` and `MLFLOW_OIDC_CLIENT_SECRET` are set, the tracking URI must be https (CLI and desktop;
+`work` and `run --mock` check before claiming), an http artifact location (including a run's server-assigned one) is refused, and even local `file:`/
+`sqlite:` URIs are refused with credentials set. No-auth http is allowed.
+
+Latest actual verification (2026-10-19, Windows, HEAD 24135cb): `uv run pytest -q` **743 passed, 1 skipped** in 81.22s;
+`uv run ruff check src tests` passes. Earlier in this session Playwright gave **50 passed** and `npm run build` (tsc + Vite)
+passed, but on a working tree that also held other people's uncommitted desktop edits, and the Rust run on that tree had 11
+passed, 1 failed (`key_file_settings_refuse_putty_ppk_paths`, from an uncommitted `main.rs`); these were not re-run on a
+clean HEAD, so treat the Playwright and Rust results at HEAD as unconfirmed here. (The prior committed state had Playwright 47,
+Rust 11 passed.)
 Secret scan: after 5447ce5 the current tree is clean (`git grep` finds no contiguous private-key header). However
 `scripts/check_secrets.py` walks all reachable history and still reports `desktop/src-tauri/src/main.rs: private key` from the
-unpushed local commits c0ee9a9, c8df219 and 0b569dc (fake header stubs in Rust tests, not key material). Pending: before any
-push those commits need a history rewrite, or another decision from the user.
+unpushed local commits c8df219 and 0b569dc (`git log -S "PRIVATE KEY-----"` also lists 5447ce5, which removed it; the stubs are fake
+header text in Rust tests, not key material). Pending: before any push those commits need a history rewrite, or another
+decision from the user.
 
 Still unverified: a real SSH/BOP server, real NVIDIA GPU execution, a real MLflow server (authenticated or not), the real
 Tauri/WebView2 shell and Windows Credential Manager, and installer acceptance (Task 11). All SSH behavior was tested with
 fake SSH responses.
 
-Deferred hardening: `claim()` should reject a `server_facts` that is not an `SSHServerFacts` (defence in depth); the
-`raw_server_receipts` IN-list needs a cap; some sidecar refusals are still in English; the key identity is derived from a
-hash of the local key path (moving the key breaks recovery, replacing it in place is undetected); the CLI does not refuse
-MLFLOW_TRACKING_TOKEN over plain HTTP.
+Deferred hardening: some sidecar refusals are still in English; the key identity is derived from a
+hash of the local key path (moving the key breaks recovery, replacing it in place is undetected). (`claim()` now rejects
+non-fact observations and receipt lookups are chunked, so those two earlier items are done.)
 
 Remaining Tasks 7–11 (Tasks 6A/6B are complete in software): model-operation CPU acceptance,
 persistent multi-Pod controller/tracking repair, secure desktop API/broker, Windows UI/installer and Git sharing.

@@ -96,7 +96,7 @@ is not in the released 0.3.0 installer. Secrets never belong here: use the deskt
 | `server_ssh_username` | SSH account. Root is not required. |
 | `server_ssh_key_file` | Local path of the private key file. A pasted `PRIVATE KEY` text is refused. The key stays where it is. |
 | `server_ssh_fingerprint` | Host key fingerprint `SHA256:...` supplied by the administrator. Observed keys are never trusted automatically. |
-| `server_remote_root` | Absolute work folder on the server, for example `/home/USER/factory`. Letters, digits, `_ . / -` only, no trailing slash, no `.` or `..` parts, no symlinks, writable. |
+| `server_remote_root` | Absolute work folder on the server, for example `/home/USER/factory`. Letters, digits, `_ . / -` only, no trailing slash, no `.` or `..` parts, writable. Neither the path nor any parent such as `/home` may be a symlink; enter the resolved real path. |
 | `server_total_hourly_cost_usd` | Whole-server hourly cost typed by the operator; `0` is allowed for internal servers. It is a user setting, not a cloud price. |
 | `server_selected_gpu_uuids` | A JSON string holding an array of at most 8 distinct GPU UUIDs, for example `["GPU-00000000-0000-0000-0000-000000000000"]`. |
 | `auth_mode` | MLflow authentication: `oidc`, `token` or `none`. An empty value is read as `oidc`; other values are refused. |
@@ -104,7 +104,10 @@ is not in the released 0.3.0 installer. Secrets never belong here: use the deskt
 The `server_` keys are separate from the Pod's `ssh_key_file` and `ssh_fingerprint`, so switching provider does not
 lose the other connection. With `auth_mode` set to `none` the OIDC address, client ID, client secret and token are not
 passed to the Python engine (the saved values are kept for a later switch back). Authenticated MLflow
-(token or OIDC secret) requires an HTTPS tracking URI in the desktop app (the CLI requires HTTPS for OIDC token URLs and connection profiles, but does not refuse a bare token over HTTP; use HTTPS anyway); `none` also allows HTTP such as `http://127.0.0.1:5000`.
+(a token, or both the OIDC token URL and the OIDC secret; the URL alone does not count) requires an HTTPS tracking URI, in the CLI
+and the desktop app alike (`work` and `run --mock` check before claiming), and an `http` artifact location, including a run's server-assigned one, is refused too. Even `file:` and `sqlite:` tracking URIs are refused while credentials are set,
+so clear them for a local store. `none` allows HTTP such as `http://127.0.0.1:5000`. The desktop saves only one GPU: the
+app limits a job to one GPU, so `server_selected_gpu_uuids` holds at most one UUID there, and `.ppk` key paths are refused (OpenSSH format, no passphrase).
 
 ### CLI server profile (JSON)
 
@@ -124,17 +127,19 @@ The CLI reads one local JSON file for `--server-profile` and for the `server-ins
 }
 ```
 
-- `ssh_port` defaults to 22 and must be an integer. `selected_gpu_uuids` may be empty for `server-inspect`, but
-  preparation, `plan --real`, submission and `work` need at least one observed UUID.
+- `ssh_port` defaults to 22 and must be an integer. `selected_gpu_uuids` may be empty for `server-inspect` only;
+  `server-runtime` (with or without `--prepare`), `plan --real`, submission and `work` need at least one observed UUID. The default
+  policy allows one GPU per job.
+- The key must be an OpenSSH-format private key without a passphrase; no agent is used.
 - A relative `ssh_key_file` is resolved next to the JSON file. The file contains a path only, never key content.
 - `total_hourly_cost_usd` is required (>= 0) and applies to the whole server.
-- A job's resource profile in the AI YAML must still match the selected GPU count and GPU name.
+- A job's resource profile in the AI YAML must have the selected GPU count and the exact GPU name, and its per-GPU price times the count must be at least `total_hourly_cost_usd`.
   Use `server-inspect` to read the exact name and UUIDs.
 
 ### Destination hash and receipt
 
 Public destination settings (address, port, user, host fingerprint, remote work folder, selected GPU UUIDs, a hash of the
-resolved key path and the operator cost) form a destination hash. The desktop shows it in the plan, and submission refuses a job
+resolved key path and the operator cost) form a destination hash. The plan carries it (it is not displayed), and submission refuses a job
 if the settings changed after the plan. On submission the app freezes an approval receipt from one read-only observation
 of the server: server identity, transport settings, selected GPUs and cost. The receipt is stored next to the job, not in
 the v1 manifest, and holds no credentials. Execution, logs, progress, cancel and result collection use that receipt:

@@ -50,23 +50,34 @@ with approval=pending and compatibility tags. Model registration is separate fro
 
 A local or internal-network server without authentication is supported. In the desktop app choose the authentication
 method "인증 없음 · 로컬·내부 서버" and enter the server address. In the CLI leave `MLFLOW_TRACKING_TOKEN` empty and
-clear the three `MLFLOW_OIDC_*` values (`.env.example` pre-fills the OIDC address and client ID). The connection check
+clear the three `MLFLOW_OIDC_*` values (`.env.example` pre-fills the OIDC token URL and client ID; the secret is empty). The connection check
 then reports `mlflow_auth: none`, shown in the desktop as "확인됨 · 인증 없음"; `mlflow_authenticated_read` is true only
 when real credentials were used.
 
+The project environment installs only `mlflow-skinny` (client), which cannot run a server. Run the full `mlflow` package
+separately, for example in a throwaway tool environment or its own venv, at the version this project pins (3.17.1 in `uv.lock`):
+
 ```powershell
-mlflow server --host 127.0.0.1 --port 5000
+uvx --from mlflow==3.17.1 mlflow server --host 127.0.0.1 --port 5000
 # .env: MLFLOW_TRACKING_URI=http://127.0.0.1:5000
 ```
 
-- The desktop app refuses authenticated MLflow (token or OIDC secret) over HTTP; HTTP works only without credentials. The CLI requires HTTPS for OIDC token URLs and connection profiles but does not refuse `MLFLOW_TRACKING_TOKEN` over plain HTTP, so use HTTPS whenever a token is used.
+- One rule applies to the CLI and the desktop app alike: credentials count as configured when `MLFLOW_TRACKING_TOKEN` is set, or when both
+  `MLFLOW_OIDC_TOKEN_URL` and `MLFLOW_OIDC_CLIENT_SECRET` are set; then the tracking URI must be `https`. The OIDC URL alone
+  (the desktop pre-fills it) does not count: the app starts, and only MLflow actions fail with the "OIDC 인증을 선택했지만
+  …" message above. The check runs in the tracker, `doctor`, the desktop history view and service start; `work` and
+  `run --mock` check the tracking URI and any configured artifact location before claiming. An `http` artifact location is
+  refused whether configured, taken from the existing experiment, or assigned by the server to a run. Without
+  credentials, plain HTTP is allowed. With credentials set, even local stores are refused: so a `file:` or `sqlite:` tracking URI is also refused while they are set; clear
+  them when using a local store.
 - If an OIDC address is set but the client ID or secret is missing, the app stops with
   "OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. 인증값을 입력하거나 ‘인증 없음’을 선택하세요." Fill the
   credentials or clear the OIDC address.
 - The default `FACTORY_MLFLOW_ARTIFACT_LOCATION=mlflow-artifacts:/llm-tuning-factory` stores artifacts through the
   tracking server's artifact proxy. MLflow 2 and later `mlflow server` normally serves that proxy by default, but confirm
-  with `mlflow server --help` for your installed version. With a file-based or proxy-less server, uploads of
-  logs and models fail; set an artifact location the server supports.
+  with `mlflow server --help` for your installed version (`--serve-artifacts` defaults to on in 3.17.1). The
+  `mlflow-artifacts:` location needs an http(s) tracking URI. With a proxy-less server, uploads of logs and models fail;
+  set an artifact location the server supports.
 - Anyone who can reach an unauthenticated server can read its records and artifacts. Bind it to `127.0.0.1` or use it
   only on a trusted internal network, and never expose it to the public internet. This project did not verify a real
   unauthenticated MLflow server yet; only mocked connections were tested.
@@ -140,22 +151,32 @@ written to manifests or profiles. Data transfer, execution and environment prepa
 
 ### Prerequisites
 
-- Linux, a readable `/etc/machine-id`, and NVIDIA GPUs visible to `nvidia-smi` (MIG partitions are rejected).
+- Linux, a readable `/etc/machine-id`, and NVIDIA GPUs visible to `nvidia-smi` (MIG partitions are rejected; one MIG-enabled GPU makes the whole inspection fail).
 - `python3` (3.8 or newer) with `python3 -m pip`, `flock` and a C compiler (`cc`). Missing tools are reported, never installed.
-- An absolute work folder, for example `/home/USER/factory`, that is writable and contains no symlinks.
-- SSH key authentication and the server's `SHA256:` host fingerprint obtained from the administrator by a trusted route.
-  Root is not required.
+- An absolute work folder, for example `/home/USER/factory`, that is writable and contains no symlinks. The probe rejects the folder if the path or any parent (such as `/home`) is a symlink; enter the
+  resolved real path. Only ASCII letters, digits and `_ . / -` are allowed in the path.
+- SSH key authentication with an OpenSSH-format private key without a passphrase (no agent, no PuTTY `.ppk`). Create the key
+  pair yourself and ask the administrator to register the public key; never ask for a private key.
+- The server's `SHA256:` host key fingerprint from the administrator by a trusted route. Ask for the ED25519 host key
+  fingerprint (paramiko prefers ED25519). Root is not required.
+- Outbound internet from the server for preparation (pip/uv, Python 3.12, packages) and for model downloads from Hugging Face,
+  unless the caches are pre-provisioned.
 - An operator-entered whole-server hourly cost (0 is allowed for internal servers; it is not a cloud price).
 
 Under the work folder the app keeps a private runtime for each app source version (`runtime/`), job files (`jobs/`), the model
-cache (`hf-cache/`) and a uv cache (`uv-cache/`). pip runs with no cache. The selected GPU UUIDs are bound with
+cache (`hf-cache/`), downloaded Python builds (`python/`) and a uv cache (`uv-cache/`). pip runs with no cache. The selected GPU UUIDs are bound with
 `CUDA_VISIBLE_DEVICES`. The first preparation downloads dependencies and can take a long time.
 
 ### Concurrency and locks
 
-One factory job runs per server. Registering the same server under another address or profile does not bypass the lock
-(identity is derived from the machine ID and shared GPU UUIDs). In this version the default concurrency is 1, so any SSH job
-or preparation reservation blocks RunPod claims and preparation, and the reverse also holds.
+One factory job runs per server, and the default policy allows one GPU per job (`Policy.max_gpus=1`; the desktop app
+fixes this at one, so select exactly one GPU there). Registering the same server under another address or profile does not
+bypass the lock (identity is derived from the machine ID and shared GPU UUIDs).
+
+Cross-provider quarantine: because a RunPod Pod and an SSH server cannot be proven distinct, any held RunPod job lock
+blocks SSH claims and SSH preparation, and any SSH job lock or SSH preparation reservation blocks RunPod claims and RunPod
+preparation. RunPod preparation records no reservation, so it does not block SSH. Locks live in the local state directory:
+another PC, or a different `--state-dir`, is not blocked, so coordinate with other users of the server.
 
 ### CLI flow
 
@@ -175,25 +196,29 @@ uv run factory doctor --server-profile server.json
 
 1. `server-inspect` is read-only. It prints the observed GPU UUIDs, names and memory; copy the UUIDs you may use into
    `selected_gpu_uuids`.
-2. `server-runtime` without `--prepare` checks the private runtime. `--prepare` installs it and requires
+2. `server-runtime` without `--prepare` checks the private runtime; like `--prepare`, it needs at least one selected GPU UUID
+   in the profile. `--prepare` installs it and requires
    `--approve-preparation`. `--training-stage` selects the stage environment (default `sft`).
-3. `plan --real --server-profile` makes one read-only observation and prints the destination receipt. The AI YAML's GPU type,
-   count and per-GPU price must match the selected GPUs and the declared cost. `run ... --submit --real --server-profile`
+3. `plan --real --server-profile` makes one read-only observation and prints the destination receipt. The AI YAML's GPU type and
+   count must equal the selected GPUs, and its per-GPU price times the count must be at least the declared whole-server cost. `run ... --submit --real --server-profile`
    freezes that receipt for the job. Without `--submit` the command only prints the plan.
-4. `work --server-profile` fails without `--approve-execution-and-transfer`. With it, the worker transfers the approved
+4. Preparation uses `--approve-preparation`; execution and data transfer share `--approve-execution-and-transfer`.
+   `work --server-profile` fails without it. With it, the worker transfers the approved
    data to the server and runs the job there. Only unbound jobs and jobs whose receipt matches the current
    destination are chosen; others wait without blocking it. `--drain` keeps working until the queue is empty.
    `--pod-id` cannot be combined with a server profile.
 5. `reconcile JOB_ID --server-profile` re-attaches to an existing attempt to collect results, logs and progress. It uses
    the job's original receipt and refuses a different server, key, work folder or GPU selection, but tolerates drift in
    unrelated GPUs and operator cost. It never launches work. `doctor --server-profile` runs the read-only connection
-   check; it cannot be combined with `--pod-id`. A connection profile (`--connection-file`) with `provider: ssh_server`
-   is also accepted in place of `--server-profile`.
+   check; it cannot be combined with `--pod-id`. `--connection-file` is a global option placed before the command
+   (`uv run factory --connection-file FILE doctor`); a connection profile with `provider: ssh_server` replaces
+   `--server-profile` for `doctor`, `plan`, `run`, `work` and `reconcile` only. `server-inspect`, `server-runtime` and
+   `server-runtime-release` always take the profile file as an argument.
 
 ### Uncertain preparation reservations
 
-A preparation that loses its connection leaves a reservation whose remote end is unknown. It keeps blocking the same
-server (and RunPod) until released. First confirm on the server that the preparation process has ended, then:
+A preparation that loses its connection leaves an UNCERTAIN reservation whose remote end is unknown, and a preparation
+whose app was killed can stay PREPARING. Both keep blocking the same server (and RunPod claims) until released. First confirm on the server that the preparation process has ended, then:
 
 ```powershell
 uv run factory server-runtime-status
