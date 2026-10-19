@@ -141,19 +141,20 @@ Commits of the SSH GPU server and MLflow work, in order:
   (`claim()` refuses non-fact observations, receipt lookups are chunked), 61fee6c (tutorial sample trailing-dot alias and race),
   68021a2 (MLflow credentials refused over plain HTTP in every client path), 74d7df8 (release stuck preparations, one GPU per
   job, `.ppk` keys refused), 20d6f30 (credentials kept off http artifact roots, fail fast before claiming), acaf393 (count only
-  policy-compliant GPU selections as configured), 24135cb (OIDC counts as configured only with a secret; run artifact roots checked).
+  policy-compliant GPU selections as configured), 24135cb (OIDC counts as configured only with a secret; run artifact roots checked), de2124f (over-limit plans cannot start,
+  `.ppk` trailing-dot check, clearer PREPARING warning), 2f08f67 (tutorial native allowlist and package asset), 65c5183 (tests pin
+  the code revision so concurrent commits cannot break manifests; tighter `run --mock` refusal test).
 
-MLflow rule at HEAD (24135cb, treat OIDC as configured only with a secret and check run artifact roots): if `MLFLOW_TRACKING_TOKEN`
+MLflow rule as of 24135cb ( treat OIDC as configured only with a secret and check run artifact roots): if `MLFLOW_TRACKING_TOKEN`
 is set, or both `MLFLOW_OIDC_TOKEN_URL` and `MLFLOW_OIDC_CLIENT_SECRET` are set, the tracking URI must be https (CLI and desktop;
 `work` and `run --mock` check before claiming), an http artifact location (including a run's server-assigned one) is refused, and even local `file:`/
 `sqlite:` URIs are refused with credentials set. No-auth http is allowed.
 
-Latest actual verification (2026-10-19, Windows, HEAD 24135cb): `uv run pytest -q` **743 passed, 1 skipped** in 81.22s;
-`uv run ruff check src tests` passes. Earlier in this session Playwright gave **50 passed** and `npm run build` (tsc + Vite)
-passed, but on a working tree that also held other people's uncommitted desktop edits, and the Rust run on that tree had 11
-passed, 1 failed (`key_file_settings_refuse_putty_ppk_paths`, from an uncommitted `main.rs`); these were not re-run on a
-clean HEAD, so treat the Playwright and Rust results at HEAD as unconfirmed here. (The prior committed state had Playwright 47,
-Rust 11 passed.)
+Latest actual verification (2026-10-19, Windows): Python at the code state of 24135cb and later, `uv run pytest -q` **743 passed, 1 skipped**
+in 81.22s and `uv run ruff check src tests` passes. Desktop numbers are the reviewer's clean-tree results from a `git archive`
+export of 343ff78 and of 65c5183: Playwright **53 passed** (connections 30 + workspace 23), `npm run build` (tsc + Vite) passes and
+`cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` **12 passed**. `scripts/check_secrets.py`
+reports only the historical `main.rs` finding below.
 Secret scan: after 5447ce5 the current tree is clean (`git grep` finds no contiguous private-key header). However
 `scripts/check_secrets.py` walks all reachable history and still reports `desktop/src-tauri/src/main.rs: private key` from the
 unpushed local commits c8df219 and 0b569dc (`git log -S "PRIVATE KEY-----"` also lists 5447ce5, which removed it; the stubs are fake

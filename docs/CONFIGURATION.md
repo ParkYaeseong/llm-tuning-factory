@@ -106,8 +106,8 @@ lose the other connection. With `auth_mode` set to `none` the OIDC address, clie
 passed to the Python engine (the saved values are kept for a later switch back). Authenticated MLflow
 (a token, or both the OIDC token URL and the OIDC secret; the URL alone does not count) requires an HTTPS tracking URI, in the CLI
 and the desktop app alike (`work` and `run --mock` check before claiming), and an `http` artifact location, including a run's server-assigned one, is refused too. Even `file:` and `sqlite:` tracking URIs are refused while credentials are set,
-so clear them for a local store. `none` allows HTTP such as `http://127.0.0.1:5000`. The desktop saves only one GPU: the
-app limits a job to one GPU, so `server_selected_gpu_uuids` holds at most one UUID there, and `.ppk` key paths are refused (OpenSSH format, no passphrase).
+so clear them for a local store. `none` allows HTTP such as `http://127.0.0.1:5000`. Native settings accept up to 8 selected UUIDs, but the
+workbench refuses to save more than one (one GPU per job); an older larger saved selection is flagged and blocks actions. `.ppk` key paths are refused (OpenSSH format, no passphrase).
 
 ### CLI server profile (JSON)
 
@@ -127,7 +127,7 @@ The CLI reads one local JSON file for `--server-profile` and for the `server-ins
 }
 ```
 
-- `ssh_port` defaults to 22 and must be an integer. `selected_gpu_uuids` may be empty for `server-inspect` only;
+- `ssh_port` defaults to 22 and must be an integer. `selected_gpu_uuids` may be empty for `server-inspect` and `doctor --server-profile` (inspection-only probe);
   `server-runtime` (with or without `--prepare`), `plan --real`, submission and `work` need at least one observed UUID. The default
   policy allows one GPU per job.
 - The key must be an OpenSSH-format private key without a passphrase; no agent is used.

@@ -65,12 +65,12 @@ uvx --from mlflow==3.17.1 mlflow server --host 127.0.0.1 --port 5000
 - One rule applies to the CLI and the desktop app alike: credentials count as configured when `MLFLOW_TRACKING_TOKEN` is set, or when both
   `MLFLOW_OIDC_TOKEN_URL` and `MLFLOW_OIDC_CLIENT_SECRET` are set; then the tracking URI must be `https`. The OIDC URL alone
   (the desktop pre-fills it) does not count: the app starts, and only MLflow actions fail with the "OIDC 인증을 선택했지만
-  …" message above. The check runs in the tracker, `doctor`, the desktop history view and service start; `work` and
+  …" message below. The check runs in the tracker, `doctor`, the desktop history view and service start; `work` and
   `run --mock` check the tracking URI and any configured artifact location before claiming. An `http` artifact location is
   refused whether configured, taken from the existing experiment, or assigned by the server to a run. Without
   credentials, plain HTTP is allowed. With credentials set, even local stores are refused: so a `file:` or `sqlite:` tracking URI is also refused while they are set; clear
   them when using a local store.
-- If an OIDC address is set but the client ID or secret is missing, the app stops with
+- If an OIDC address is set but the client ID or secret is missing, MLflow actions stop with
   "OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. 인증값을 입력하거나 ‘인증 없음’을 선택하세요." Fill the
   credentials or clear the OIDC address.
 - The default `FACTORY_MLFLOW_ARTIFACT_LOCATION=mlflow-artifacts:/llm-tuning-factory` stores artifacts through the
@@ -147,20 +147,21 @@ installer. Nothing below is authorization to connect, transfer data or spend: ea
 
 It never creates, starts, stops or deletes a server, and never touches Docker or Slurm. It does not use sudo or apt, does not
 change the system Python, and does not trust a host key it merely observed. Private keys stay on your PC. No credentials are
-written to manifests or profiles. Data transfer, execution and environment preparation each need their own explicit flag.
+written to manifests or profiles. Data transfer and execution share `--approve-execution-and-transfer`; environment preparation uses its own `--approve-preparation`.
 
 ### Prerequisites
 
 - Linux, a readable `/etc/machine-id`, and NVIDIA GPUs visible to `nvidia-smi` (MIG partitions are rejected; one MIG-enabled GPU makes the whole inspection fail).
 - `python3` (3.8 or newer) with `python3 -m pip`, `flock` and a C compiler (`cc`). Missing tools are reported, never installed.
-- An absolute work folder, for example `/home/USER/factory`, that is writable and contains no symlinks. The probe rejects the folder if the path or any parent (such as `/home`) is a symlink; enter the
+- An absolute work folder, for example `/home/USER/factory`, that is writable. The probe rejects the folder if the path or any parent (such as `/home`) is a symlink; enter the
   resolved real path. Only ASCII letters, digits and `_ . / -` are allowed in the path.
 - SSH key authentication with an OpenSSH-format private key without a passphrase (no agent, no PuTTY `.ppk`). Create the key
   pair yourself and ask the administrator to register the public key; never ask for a private key.
 - The server's `SHA256:` host key fingerprint from the administrator by a trusted route. Ask for the ED25519 host key
   fingerprint (paramiko prefers ED25519). Root is not required.
-- Outbound internet from the server for preparation (pip/uv, Python 3.12, packages) and for model downloads from Hugging Face,
-  unless the caches are pre-provisioned.
+- Preparation always needs PyPI, or a pip/uv index mirror configured on the server: it runs `pip install ... uv==0.11.23` and
+  `uv pip sync`. Python 3.12 is downloaded only if it is missing. Only the Hugging Face model download can be avoided, by
+  pre-filling `hf-cache/` under the work folder.
 - An operator-entered whole-server hourly cost (0 is allowed for internal servers; it is not a cloud price).
 
 Under the work folder the app keeps a private runtime for each app source version (`runtime/`), job files (`jobs/`), the model
@@ -218,7 +219,7 @@ uv run factory doctor --server-profile server.json
 ### Uncertain preparation reservations
 
 A preparation that loses its connection leaves an UNCERTAIN reservation whose remote end is unknown, and a preparation
-whose app was killed can stay PREPARING. Both keep blocking the same server (and RunPod claims) until released. First confirm on the server that the preparation process has ended, then:
+whose app was killed can stay PREPARING. Both keep blocking the same server (and RunPod claims and preparation) until released. First confirm on the server that the preparation process has ended, then:
 
 ```powershell
 uv run factory server-runtime-status
