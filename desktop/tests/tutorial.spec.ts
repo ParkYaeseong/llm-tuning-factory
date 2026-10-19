@@ -6,7 +6,7 @@ const config = JSON.parse(readFileSync(new URL("./config.json", import.meta.url)
 const forbidden = ["submit", "execute", "resume", "runtime_check", "runtime_prepare", "connection", "pod",
   "s3_list", "s3_head", "s3_import", "server_inspect", "server_facts", "runtime_reservations", "runtime_release",
   "save_profile", "model_import", "cancel", "recover", "reconcile"];
-type Boot = { registered?: boolean; withoutDummy?: boolean; seen?: boolean };
+type Boot = { registered?: boolean; withoutDummy?: boolean; seen?: boolean; noTemplates?: boolean };
 
 async function boot(page: Page, options: Boot = {}) {
   await page.addInitScript(({ config, options }) => {
@@ -23,7 +23,7 @@ async function boot(page: Page, options: Boot = {}) {
       if (command === "settings_get") return {};
       if (command !== "factory_action") return {};
       const { action, data } = args;
-      if (action === "catalog") return { templates: [{ name: "paper_extraction", config }], profiles: [], datasets: structuredClone(datasets),
+      if (action === "catalog") return { templates: options.noTemplates ? [] : [{ name: "paper_extraction", config }], profiles: [], datasets: structuredClone(datasets),
         models: [{ id: config.base_model, template: "qwen", architecture: "qwen2", gpu_verified: true }],
         training_stages: [{ id: "sft", label: "SFT · 지도 학습", dataset_kind: "instruction" }] };
       if (action === "jobs") return [];
@@ -55,16 +55,17 @@ async function expectStep(page: Page, id: string) {
   await expect(popover(page).locator("#tour-title")).toHaveText(tutorialSteps.find(s => s.id === id)!.title);
 }
 
-/** Holds the next request for `action` until the returned release function is called. */
-async function holdAction(page: Page, action: string) {
-  await page.evaluate(action => {
+/** Holds the next request for `action` until the returned release function is called, optionally answering `result`. */
+async function holdAction(page: Page, action: string, result?: unknown) {
+  await page.evaluate(({ action, result }) => {
     const native = (window as any).__TAURI_INTERNALS__;
     const original = native.invoke;
     native.invoke = async (command: string, args: any) => {
-      if (command === "factory_action" && args.action === action) await new Promise(resolve => (window as any).__release = resolve);
-      return original(command, args);
+      if (command !== "factory_action" || args.action !== action) return original(command, args);
+      await new Promise(resolve => (window as any).__release = resolve);
+      return result === undefined ? original(command, args) : result;
     };
-  }, action);
+  }, { action, result });
   return () => page.evaluate(() => (window as any).__release());
 }
 
@@ -202,7 +203,7 @@ test("one click navigates right after a training field edit re-renders the workb
 
 test("a press that never ends normally still lets the deferred render happen", async ({ page }) => {
   await boot(page, { seen: true });
-  for (const ending of ["pointercancel", "no release"]) {
+  for (const ending of ["pointercancel", "no release", "second press"]) {
     await page.getByRole("button", { name: "학습 설정", exact: true }).click();
     await page.getByLabel("업무 AI ID", { exact: true }).fill(`draft ${ending}`);
     await page.locator("h1").evaluate(el => el.setAttribute("data-before-press", ""));
@@ -211,9 +212,59 @@ test("a press that never ends normally still lets the deferred render happen", a
     if (ending === "pointercancel") {
       await page.evaluate(() => window.dispatchEvent(new PointerEvent("pointercancel")));
       await expect(page.locator("h1[data-before-press]")).toHaveCount(0, { timeout: 500 });
+    } else if (ending === "second press") {
+      // The first release schedules its render, but another press starts first and its release is never seen.
+      await page.evaluate(() => {
+        window.dispatchEvent(new PointerEvent("pointercancel"));
+        document.querySelector('#app [data-action="nav:datasets"]')!.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      });
+      await expect(page.locator("h1[data-before-press]")).toHaveCount(0);
     } else await expect(page.locator("h1[data-before-press]")).toHaveCount(0);
     await page.mouse.up();
   }
+});
+
+test("a click released after a task finished during the press keeps the task's result", async ({ page }) => {
+  await boot(page, { seen: true });
+  await page.getByRole("button", { name: "학습 설정", exact: true }).click();
+  const pinned = "f".repeat(40);
+  const release = await holdAction(page, "model_revision", { model_revision: pinned, tokenizer_revision: pinned, template: "qwen", model_profile: null });
+  await page.getByRole("button", { name: "선택한 모델 버전 확인·고정" }).click();
+  await expect(page.locator(".notice.busy")).toBeVisible();
+  await page.getByRole("button", { name: "데이터", exact: true }).hover();
+  await page.mouse.down();
+  await release();
+  // The pinning task has finished once its follow-up compatibility check went out with the new revision.
+  await expect.poll(() => page.evaluate(pinned => (window as any).__testCalls.some((c: any) =>
+    c.args?.action === "capabilities" && c.args.data.config.model_revision === pinned), pinned)).toBe(true);
+  await page.mouse.up();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("데이터");
+  await page.getByRole("button", { name: "학습 설정", exact: true }).click();
+  await expect(page.getByLabel("모델 revision · 40자리 commit", { exact: true })).toHaveValue(pinned);
+});
+
+test("ending the tutorial during a press focuses the tutorial button of the next render", async ({ page }) => {
+  await boot(page, { seen: true });
+  await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
+  await expectStep(page, "welcome");
+  await advanceTo(page, "data-preview");
+  await page.locator("#dataset-form label.check").first().hover();
+  await page.mouse.down();
+  await page.keyboard.press("Escape");
+  await expect(popover(page)).toHaveCount(0);
+  await page.locator("h1").evaluate(el => el.setAttribute("data-before-release", ""));
+  await page.evaluate(() => window.dispatchEvent(new PointerEvent("pointercancel")));
+  // Only the render deferred until the release replaces the sidebar; focus must be on its new button.
+  await expect(page.locator("h1[data-before-release]")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "튜토리얼", exact: true })).toBeFocused();
+  await page.mouse.up();
+});
+
+test("without an example setting the tutorial explains that it cannot start", async ({ page }) => {
+  await boot(page, { seen: true, noTemplates: true });
+  await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
+  await expect(page.getByText("예제 학습 설정을 찾을 수 없어 튜토리얼을 시작할 수 없습니다.")).toBeVisible();
+  await expect(popover(page)).toHaveCount(0);
 });
 
 test("ending while a plan request is pending waits for it and then restores the draft", async ({ page }) => {
@@ -381,6 +432,12 @@ test("restarting ignores a sample request from the previous run", async ({ page 
   await expect(page.getByLabel("데이터 ID", { exact: true })).toHaveValue("my_dataset");
   await expect(tourButton(page, "연습 샘플 채우기")).toBeEnabled();
   await expect(tourButton(page, "다음")).toBeDisabled();
+});
+
+test("a registered real dataset completes the data checklist item", async ({ page }) => {
+  await boot(page, { registered: true, seen: true });
+  const row = page.locator(".setup-row", { hasText: "데이터 버전 등록" });
+  await expect(row.locator(".setup-check")).toHaveClass(/done/);
 });
 
 test("the practice sample alone does not complete the data checklist item", async ({ page }) => {

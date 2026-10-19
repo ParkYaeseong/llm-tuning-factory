@@ -63,6 +63,7 @@ async function task(label: string, operation: () => Promise<void>) {
   finally { state.busy = ""; render(); }
 }
 function captureDrafts() {
+  flushDeferredRender();
   const hub = document.querySelector<HTMLFormElement>("#hub-form");
   if (hub) state.hubDraft = settingsFromForm(hub);
   const hf = document.querySelector<HTMLFormElement>("#hf-settings-form");
@@ -106,6 +107,7 @@ function commandSearch() {
   dialog.addEventListener("close", () => dialog.remove()); document.body.append(dialog); update(); dialog.showModal();
 }
 function captureConfig() {
+  flushDeferredRender();
   if (!state.config) return;
   document.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-config]").forEach(el => {
     const parts = el.dataset.config!.split(".");
@@ -449,7 +451,10 @@ function comparison() {
 // Pressing a control moves focus out of an edited field, whose change handler re-renders. Replacing the pressed
 // control before pointerup would make the browser drop the click, so renders wait until the press ends.
 const pressable = "button, summary, label.check, input[type=checkbox], input[type=radio]";
-let pressed = false, presses = 0, renderDeferred = false;
+let pressed = false, presses = 0, armed = 0, renderDeferred = false;
+/** Before form values are read back into state: a deferred render means the page still shows values that a
+ * finished task has since replaced. During the press itself the page is current and stays as it is. */
+function flushDeferredRender() { if (renderDeferred && !pressed) render(); }
 function releasePress() {
   if (!pressed) return;
   pressed = false;
@@ -465,8 +470,10 @@ window.addEventListener("pointermove", e => { if (!e.buttons) releasePress(); },
 window.addEventListener("blur", releasePress);
 function render() {
   if (pressed) {
-    if (!renderDeferred) { const press = presses; setTimeout(() => { if (pressed && presses === press) releasePress(); }, 1000); }
-    renderDeferred = true; return;
+    renderDeferred = true;
+    // One fallback per press, so a later press whose release is also lost cannot leave the page stale either.
+    if (armed !== presses) { const press = armed = presses; setTimeout(() => { if (pressed && presses === press) releasePress(); }, 1000); }
+    return;
   }
   renderDeferred = false;
   const views: Obj = { overview, connections, datasets, training, jobs, history };
@@ -481,7 +488,8 @@ function render() {
   tutorial.afterRender();
 }
 async function refresh() { state.jobs = await api("jobs"); }
-async function catalog() { state.catalog = await api("catalog"); }
+let catalogLoaded = false;
+async function catalog() { state.catalog = await api("catalog"); catalogLoaded = true; }
 async function saveSettings(values: Obj) {
   const before = state.settings;
   state.settings = await invoke("settings_save", { values });
@@ -653,7 +661,11 @@ async function action(name: string) {
   }
   if (name === "search") { commandSearch(); return; }
   if (name === "tutorial") {
-    if (state.busy || !state.config) { state.notice = "작업 공간을 불러오거나 진행 중인 작업이 끝난 뒤 튜토리얼을 시작하세요."; render(); return; }
+    if (state.busy || !state.config) {
+      state.notice = !state.busy && catalogLoaded ? "예제 학습 설정을 찾을 수 없어 튜토리얼을 시작할 수 없습니다."
+        : "작업 공간을 불러오거나 진행 중인 작업이 끝난 뒤 튜토리얼을 시작하세요.";
+      render(); return;
+    }
     captureConfig(); captureDrafts(); await tutorial.start(); return;
   }
   if (name === "tutorial-dismiss") { rememberTutorial("dismissed"); render(); return; }
@@ -665,6 +677,7 @@ async function action(name: string) {
   if (name.startsWith("pick:")) {
     const dataset = name.endsWith("dataset");
     const path = await invoke<string | null>("pick_file", { kind: dataset ? "dataset" : "key" });
+    flushDeferredRender();
     const input = document.querySelector<HTMLInputElement>(`[data-key="${dataset ? "path" : name === "pick:server-key" ? "server_ssh_key_file" : "ssh_key_file"}"]`);
     if (path && input) input.value = path;
     captureDrafts();

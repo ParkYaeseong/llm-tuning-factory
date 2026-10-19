@@ -38,6 +38,8 @@ export function createTutorial(host: TutorialHost, steps: TutorialStep[] = tutor
   let run = 0;
   let ctaRun = -1;
   let pendingEnd: Outcome | null = null;
+  // Applied by the next actual render: the host may defer a render, which would replace a button focused earlier.
+  let launcherFocus = false;
 
   const ctaPending = () => ctaRun === run;
   const waiting = () => Boolean(host.state.busy) || ctaPending();
@@ -89,7 +91,7 @@ export function createTutorial(host: TutorialHost, steps: TutorialStep[] = tutor
       const { config, plan, datasetDraft, preview } = host.state;
       snapshot = structuredClone({ config, plan, datasetDraft, preview });
     }
-    run++; pendingEnd = null;
+    run++; pendingEnd = null; launcherFocus = false;
     entered = new Set(); focused = -1; scrolled = -1; announced = -1;
     await go(0);
   }
@@ -104,8 +106,8 @@ export function createTutorial(host: TutorialHost, steps: TutorialStep[] = tutor
     layer?.remove(); layer = null;
     if (snapshot) Object.assign(host.state, snapshot, { capabilities: null });
     snapshot = null;
-    host.render(); focusLauncher();
-    if (host.state.config) { await guarded(() => host.checkCapabilities()); host.render(); focusLauncher(); }
+    launcherFocus = true; host.render();
+    if (host.state.config) { await guarded(() => host.checkCapabilities()); if (index < 0) launcherFocus = true; host.render(); }
   }
 
   async function runCta(step: TutorialStep) {
@@ -116,8 +118,8 @@ export function createTutorial(host: TutorialHost, steps: TutorialStep[] = tutor
       if (patch && current === run) Object.assign(host.state, patch);
     } catch (error) { if (current === run) host.state.error = String(error); }
     finally { if (ctaRun === current) ctaRun = -1; }
+    if (index < 0) launcherFocus = true;
     host.render();
-    if (index < 0) focusLauncher();
   }
 
   async function command(name: string) {
@@ -176,7 +178,10 @@ export function createTutorial(host: TutorialHost, steps: TutorialStep[] = tutor
   }
 
   function afterRender() {
-    if (index < 0) return;
+    if (index < 0) {
+      if (launcherFocus) { launcherFocus = false; focusLauncher(); }
+      return;
+    }
     const step = steps[index];
     const busy = waiting();
     if (pendingEnd && !busy) {
