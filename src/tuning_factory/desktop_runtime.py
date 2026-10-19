@@ -264,6 +264,9 @@ def runtime_reservations(state_root):
     return JobStore(Path(state_root) / "jobs.db").preparation_reservations()
 
 
+RESERVATION_SETTINGS_CHANGED = "다른 서버 설정(비용·키 파일 포함)으로 만든 예약입니다. 그 설정으로 바꾼 뒤 해제하세요."
+
+
 def release_runtime_reservation(settings, state_root, reservation_id, *, confirm_preparation_stopped=False):
     from .jobs import JobStore
     config = server_settings(settings)
@@ -273,8 +276,15 @@ def release_runtime_reservation(settings, state_root, reservation_id, *, confirm
     if reservation is None:
         raise ValueError("unknown preparation reservation")
     facts = SSHServerFacts.model_validate(reservation["facts"])
-    profile = config.profile(facts)
-    store.reconcile_preparation(reservation_id, profile, confirm_preparation_stopped=confirm_preparation_stopped)
+    try:
+        profile = config.profile(facts)
+        store.reconcile_preparation(reservation_id, profile, confirm_preparation_stopped=confirm_preparation_stopped)
+    except ValueError as exc:
+        # Never released on a mismatch; only the two destination-mismatch refusals get the fixed Korean text.
+        if str(exc) in {"SSH server profile differs from verified destination observation",
+                        "preparation destination differs from original reservation"}:
+            raise ValueError(RESERVATION_SETTINGS_CHANGED) from None
+        raise
     return {"released": reservation_id}
 
 

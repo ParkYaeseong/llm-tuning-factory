@@ -417,7 +417,7 @@ def test_runtime_prepare_refuses_while_this_server_an_alias_or_another_provider_
 
 def test_cross_provider_lock_message_explains_cause_and_remedy():
     assert desktop.CROSS_PROVIDER_LOCK == (
-        "다른 연결 대상(RunPod)의 끝나지 않은 작업 잠금이 남아 있어 GPU 서버를 사용할 수 없습니다. "
+        "다른 연결 대상(RunPod 등)의 끝나지 않은 작업 잠금이 남아 있어 GPU 서버를 사용할 수 없습니다. "
         "실행 관리에서 해당 작업을 재연결·결과 회수하거나, 원래 프로세스가 끝난 것을 확인한 뒤 "
         "CLI release-lock으로 해제하세요.")
 
@@ -495,6 +495,24 @@ def test_runtime_reservations_are_listed_and_released_only_with_both_confirmatio
                                             "reservation_id": lease.reservation_id}) == \
         {"released": lease.reservation_id}
     assert app.dispatch("runtime_reservations", {}) == []
+
+
+@pytest.mark.parametrize("changed", [{"server_total_hourly_cost_usd": "1.5"}, {"server_ssh_key_file": "other-key"}])
+def test_release_refuses_a_reservation_made_with_other_settings_in_korean(tmp_path, monkeypatch, changed):
+    from tuning_factory import desktop_runtime
+
+    monkeypatch.setattr(desktop_runtime, "local_key_file", lambda path: str(path))
+    app = desktop.DesktopService(tmp_path, native())
+    current = server_settings(native())
+    lease = app.factory.store.reserve_preparation(current.profile(a4000(current)), a4000(current))
+    app.factory.store.mark_preparation_uncertain(lease)
+    edited = desktop.DesktopService(tmp_path, native(**changed))
+    with pytest.raises(ValueError) as error:
+        edited.dispatch("runtime_release", {"approved": True, "confirm_preparation_stopped": True,
+                                            "reservation_id": lease.reservation_id})
+    assert str(error.value) == desktop_runtime.RESERVATION_SETTINGS_CHANGED == (
+        "다른 서버 설정(비용·키 파일 포함)으로 만든 예약입니다. 그 설정으로 바꾼 뒤 해제하세요.")
+    assert [item["reservation_id"] for item in app.dispatch("runtime_reservations", {})] == [lease.reservation_id]
 
 
 def test_server_inspect_and_facts_route_to_ssh_and_refuse_runpod(tmp_path, monkeypatch):

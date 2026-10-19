@@ -35,7 +35,7 @@ UNBOUND_SERVER_JOB = ("GPU 서버용 승인 기록이 없는 작업입니다. "
                       "GPU 서버 연결에서 실행 계획을 다시 확인하고 제출하세요.")
 SERVER_BOUND_JOB = "이 작업은 GPU 서버용으로 승인되었습니다. 연결 대상을 그 GPU 서버로 바꾼 뒤 실행하세요."
 UNREADABLE_RECEIPT = "GPU 서버 승인 기록을 읽을 수 없습니다. 작업을 다시 계획·제출하세요."
-CROSS_PROVIDER_LOCK = ("다른 연결 대상(RunPod)의 끝나지 않은 작업 잠금이 남아 있어 GPU 서버를 사용할 수 없습니다. "
+CROSS_PROVIDER_LOCK = ("다른 연결 대상(RunPod 등)의 끝나지 않은 작업 잠금이 남아 있어 GPU 서버를 사용할 수 없습니다. "
                        "실행 관리에서 해당 작업을 재연결·결과 회수하거나, 원래 프로세스가 끝난 것을 확인한 뒤 "
                        "CLI release-lock으로 해제하세요.")
 PRACTICE_SUBMIT_REFUSAL = "연습용 데이터(tutorial_sample)로는 실제 학습을 시작할 수 없습니다."
