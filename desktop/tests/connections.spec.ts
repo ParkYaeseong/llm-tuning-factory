@@ -589,22 +589,24 @@ test("reservation matching compares the hourly cost the way the sidecar parses i
   expect(result).toEqual([["0.11", true], ["0.110", true], ["1.1e-1", true], ["0.12", false], ["", false], [" ", false], ["abc", false], [null, false]]);
 });
 
-test("a release refused for other key settings is explained in Korean", async ({ page }) => {
+test("a release the sidecar refuses for other key settings shows its message unchanged", async ({ page }) => {
+  const refusal = "다른 서버 설정(비용·키 파일 포함)으로 만든 예약입니다. 그 설정으로 바꾼 뒤 해제하세요.";
   await open(page, server);
-  await page.evaluate(() => {
+  await page.evaluate(refusal => {
     const mock = (window as any).__mock;
     mock.reservations = [{ reservation_id: "a".repeat(32), resource_id: "ssh_server:" + "f".repeat(64), status: "UNCERTAIN",
       created: 1791960000, profile: { transport: mock.inspection.transport, total_hourly_cost_usd: 0.11 }, facts: {} }];
     const native = (window as any).__TAURI_INTERNALS__, original = native.invoke;
-    // The UI cannot compute the key reference hash, so only the sidecar notices a different key file.
+    // The UI cannot compute the key reference hash, so only the sidecar notices a different key file and refuses in Korean.
     native.invoke = async (command: string, args: any) => command === "factory_action" && args.action === "runtime_release"
-      ? Promise.reject("preparation destination differs from original reservation") : original(command, args);
-  });
+      ? Promise.reject(refusal) : original(command, args);
+  }, refusal);
   await connectionsPage(page);
   await page.getByRole("button", { name: "준비 예약 확인", exact: true }).click();
   await page.getByRole("button", { name: "원격 준비 종료 확인 · 예약 해제", exact: true }).click();
   await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
-  await expect(page.getByRole("alert")).toHaveText("다른 서버 설정(비용·키 파일 포함)으로 만든 예약입니다. 그 설정으로 바꾼 뒤 해제하세요.");
+  await expect(page.getByRole("alert")).toHaveText(refusal);
+  await expect(page.getByRole("button", { name: "원격 준비 종료 확인 · 예약 해제", exact: true })).toBeVisible();
 });
 
 test("a server job left waiting names the locks that can hold it", async ({ page }) => {
@@ -613,7 +615,7 @@ test("a server job left waiting names the locks that can hold it", async ({ page
   await page.getByRole("button", { name: "대기 작업 실행", exact: true }).click();
   await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
   await expect(page.locator(".notice")).toContainText("작업은 대기 중입니다");
-  await expect(page.locator(".notice")).toContainText("다른 작업이나 다른 연결 대상(RunPod)의 끝나지 않은 작업 잠금이 남아 있을 수 있습니다. 실행 관리에서 확인하세요.");
+  await expect(page.locator(".notice")).toContainText("다른 작업이나 다른 연결 대상(RunPod 등)의 끝나지 않은 작업 잠금이 남아 있을 수 있습니다. 실행 관리에서 확인하세요.");
 });
 
 test("connection controls are locked while a server preparation runs", async ({ page }) => {
