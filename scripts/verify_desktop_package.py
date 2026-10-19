@@ -60,11 +60,20 @@ with tempfile.TemporaryDirectory(prefix="factory-package-") as temporary:
         "S3_ACCESS_KEY_ID": "frozen-offline-access", "S3_SECRET_ACCESS_KEY": "frozen-offline-secret",
         "S3_ENDPOINT_URL": "https://s3.invalid", "S3_REGION": "us-east-1",
     }, expected_error="exact S3 bucket")
+    # The onefile asset folder is temporary; the returned practice copy must outlive this process.
+    tutorial = request("tutorial_sample")
+    bundled = (root / "examples/tutorial_sample.json").read_bytes()
+    assert tutorial["sha256"] == digest(bundled) and tutorial["rows"] == 8
+    assert Path(tutorial["path"]).read_bytes() == bundled
+    request("dataset", {"dataset_id": "tutorial_sample", "version": "1", "path": tutorial["path"],
+                        "synthetic": True, "export_allowed": True}, expected_error="tutorial_sample")
+    request("dataset", {"dataset_id": "tutorial_sample", "version": "1", "path": tutorial["path"], "synthetic": True})
     wheel = next((root / "build/desktop-assets/dist").glob("*.whl"))
     with zipfile.ZipFile(wheel) as archive:
         for source in (root / "src/tuning_factory").glob("*.py"):
             assert archive.read("tuning_factory/" + source.name) == source.read_bytes(), source.name
     print(json.dumps({"frozen_engine": True, "offline_dry_run": True, "source_and_worker_match": True,
                       "locked_dependencies": True, "all_stage_plans": True, "frozen_s3_sdk_loaded": True,
+                      "tutorial_sample_persisted": True,
                       "source_commit": plan["manifest"]["code_commit"],
                       "source_sha256": source_hash(), "gpu_started": False}))

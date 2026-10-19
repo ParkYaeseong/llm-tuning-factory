@@ -186,7 +186,7 @@ fn allowed(action: &str) -> bool {
         "pod" | "runtime_check" | "runtime_prepare" | "live_logs" | "history" | "compare" | "model_revision" |
         "dataset_preview" | "job_progress" | "capabilities" | "s3_list" | "s3_head" | "s3_import" |
         "model_search" | "model_inspect" | "model_import" |
-        "server_inspect" | "server_facts" | "runtime_reservations" | "runtime_release")
+        "server_inspect" | "server_facts" | "runtime_reservations" | "runtime_release" | "tutorial_sample")
 }
 
 #[tauri::command]
@@ -262,6 +262,7 @@ mod tests {
         assert!(allowed("s3_list"));
         assert!(allowed("s3_head"));
         assert!(allowed("s3_import"));
+        assert!(allowed("tutorial_sample"));
         assert!(SECRETS.contains(&"S3_ACCESS_KEY_ID"));
         assert!(SECRETS.contains(&"S3_SECRET_ACCESS_KEY"));
         assert!(SECRETS.contains(&"S3_SESSION_TOKEN"));

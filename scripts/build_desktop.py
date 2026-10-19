@@ -19,6 +19,8 @@ def main():
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / name, target)
     shutil.copytree(ROOT / "configs/ai", assets / "configs/ai", dirs_exist_ok=True)
+    (assets / "examples").mkdir(exist_ok=True)
+    shutil.copyfile(ROOT / "examples/tutorial_sample.json", assets / "examples/tutorial_sample.json")
     wheel_dir = assets / "dist"
     wheel_dir.mkdir(exist_ok=True)
     for old in wheel_dir.glob("*.whl"):
