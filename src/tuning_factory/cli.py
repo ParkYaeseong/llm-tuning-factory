@@ -175,7 +175,7 @@ def work(ctx: typer.Context, drain: bool = False, pod_id: str | None = None,
                 output({"waiting": True, "reason": "Pod not running; start separately with explicit approval"})
                 return
             # Refuse to silently exceed the declared price or resource budget.
-            queued = [j for j in factory.store.list() if j["status"] == "QUEUED" and not j["graph_run_id"] and not j["manifest"]["simulation"]]
+            queued = runpod_queue(factory.store)
             if not queued:
                 output({"idle": True})
                 return
@@ -208,7 +208,7 @@ def work(ctx: typer.Context, drain: bool = False, pod_id: str | None = None,
                                   target_job_id=selected["id"] if selected else None)
         finally:
             # Borrowed Pods have no ownership record and are never changed here.
-            remaining = any(j["status"] == "QUEUED" and not j["graph_run_id"] and not j["manifest"]["simulation"] for j in factory.store.list())
+            remaining = bool(runpod_queue(factory.store))
             if (pod_id and (not drain or not remaining) and
                     (factory.root / "managed-pods" / f"{pod_id}.json").is_file()):
                 ManagedPods(factory.root, controller, factory.policy).stop(pod_id)
@@ -217,12 +217,20 @@ def work(ctx: typer.Context, drain: bool = False, pod_id: str | None = None,
             break
 
 
+def runpod_queue(store):
+    """Real v1 jobs a RunPod worker may select: never one frozen to an SSH server destination."""
+    bound = store.server_bound_job_ids()
+    return [job for job in store.list() if job["status"] == "QUEUED" and not job["graph_run_id"]
+            and not job["manifest"]["simulation"] and job["id"] not in bound]
+
+
 def server_work(factory, settings, drain, approved):
     from .config import AIConfig
     from .desktop_runtime import connection, executor_for
-    from .gpu_servers import ServerApprovalReceipt
+    from .gpu_servers import ServerApprovalReceipt, server_settings
     if not approved:
         raise typer.BadParameter("--approve-execution-and-transfer is required for real jobs")
+    transport = server_settings(settings).transport
     while True:
         queued = sorted((job for job in factory.store.list() if job["status"] == "QUEUED"
                          and not job["graph_run_id"] and not job["manifest"]["simulation"]),
@@ -234,6 +242,11 @@ def server_work(factory, settings, drain, approved):
         with connection(settings) as (facts, _):
             selected = None
             for job in queued:
+                receipt = factory.store.server_receipt(job["id"])
+                # Only unbound jobs or jobs frozen to this exact destination; others never block.
+                if receipt is not None and not receipt.matches_destination(job["manifest"]["sha256"],
+                                                                           transport, facts):
+                    continue
                 config = AIConfig.model_validate(job["manifest"]["config"])
                 try:
                     facts.validate_config(config)
@@ -243,7 +256,8 @@ def server_work(factory, settings, drain, approved):
                     selected = job
                     break
             if selected is None:
-                output({"waiting": True, "reason": "no queued job fits observed server GPU selection and budget"})
+                output({"waiting": True, "reason": "no queued job fits this server destination, "
+                                                   "observed GPU selection and budget"})
                 return
         receipt = factory.store.server_receipt(selected['id'])
         stage = selected['manifest']['config']['training_stage']

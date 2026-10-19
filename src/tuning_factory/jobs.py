@@ -157,6 +157,11 @@ class JobStore:
                 raise ValueError('unknown job')
             self._bind_server_receipt(db, self.decode(row), receipt)
 
+    def server_bound_job_ids(self):
+        """Jobs frozen to an SSH server destination; RunPod workers never select them."""
+        with self.connection() as db:
+            return {row['job_id'] for row in db.execute('SELECT job_id FROM job_destinations')}
+
     def server_receipt(self, job_id):
         from .gpu_servers import ServerApprovalReceipt
         with self.connection() as db:
@@ -283,6 +288,11 @@ class JobStore:
               *, server_profile=None, server_facts=None):
         if max_concurrent < 1:
             raise ValueError('max_concurrent must be positive')
+        if server_profile is not None:
+            from .gpu_servers import validate_server_binding
+            validate_server_binding(server_profile, server_facts)
+            if gpu != server_facts.exclusivity_key:
+                raise ValueError('claim resource differs from verified destination')
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             active = db.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('PROVISIONING','RUNNING','EVALUATING')").fetchone()[0]
@@ -296,9 +306,12 @@ class JobStore:
                     continue
                 destination = db.execute('SELECT 1 FROM job_destinations WHERE job_id=?', (row['id'],)).fetchone()
                 if server_profile is not None:
-                    self._verify_server_destination(db, row, server_profile, server_facts)
-                    if gpu != server_facts.exclusivity_key:
-                        raise ValueError('claim resource differs from verified destination')
+                    try:
+                        self._verify_server_destination(db, row, server_profile, server_facts)
+                    except ValueError:
+                        if job_id is not None:
+                            raise  # An explicitly targeted job reports why it cannot run here.
+                        continue  # Unbound or bound elsewhere: never blocks other eligible jobs.
                 elif destination:
                     continue
                 if max_gpus is not None and used + self.gpu_count(row['manifest']) > max_gpus:

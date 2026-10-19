@@ -320,3 +320,11 @@ class ServerApprovalReceipt(StrictModel):
                 or self.facts.total_hourly_cost_usd != facts.total_hourly_cost_usd
                 or transport.sha256 != facts.transport_settings_sha256):
             raise ValueError("server receipt destination differs from approved job")
+
+    def matches_destination(self, manifest_sha256, transport, facts):
+        """Queue selection filter: a job bound elsewhere is skipped, never fatal to the worker."""
+        try:
+            self.validate_destination(manifest_sha256, transport, facts)
+        except ValueError:
+            return False
+        return True

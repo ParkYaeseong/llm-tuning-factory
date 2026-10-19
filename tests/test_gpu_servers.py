@@ -740,3 +740,140 @@ def test_cli_runtime_reservation_release_is_explicit_and_keeps_original_destinat
     result = runner.invoke(app, [*release, "--confirm-preparation-stopped"])
     assert result.exit_code == 0, result.output
     assert store.preparation_reservations() == []
+
+
+A4000 = "NVIDIA RTX A4000"
+
+
+def a4000(config=None, **updates):
+    """Facts whose GPU type matches configs/ai/paper_extraction.yaml."""
+    from tuning_factory.gpu_servers import GPUDevice
+
+    body = dict(inventory=(GPUDevice(uuid=UUID1, name=A4000, memory_mib=16376),
+                           GPUDevice(uuid=UUID2, name=A4000, memory_mib=16376)), gpu_type=A4000)
+    return observation(config, **(body | updates))
+
+
+def real_factory(root):
+    from tuning_factory.config import load_config
+    from tuning_factory.manifest import resolve
+    from tuning_factory.runner import Factory
+
+    factory = Factory(root)
+    factory.registry.register_dataset("dummy", "1", "examples/dummy.json", export_allowed=True)
+    config = load_config("configs/ai/paper_extraction.yaml")
+    return factory, config, resolve(config, factory.registry, simulation=False)
+
+
+@pytest.mark.parametrize("bound_elsewhere", ["other_server", "same_server_drifted_inventory"])
+def test_server_worker_skips_jobs_bound_to_another_destination(tmp_path, monkeypatch, bound_elsewhere):
+    from contextlib import contextmanager
+
+    from typer.testing import CliRunner
+
+    from tuning_factory import desktop_runtime
+    from tuning_factory.cli import app
+    from tuning_factory.connections import load_server_settings
+    from tuning_factory.execution import SSHExecutor
+    from tuning_factory.gpu_servers import GPUDevice, ServerApprovalReceipt
+
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    factory, config, manifest = real_factory(tmp_path / "state")
+    path = tmp_path / "server.json"
+    path.write_text(settings().model_dump_json())
+    current = load_server_settings(path)
+    facts = a4000(current, server_id="b" * 64)
+    if bound_elsewhere == "other_server":
+        other = settings().model_copy(update={"ssh_host": "gpu-a.example"})
+        old = a4000(other, server_id="a" * 64)
+        profile = other.profile(old)
+    else:
+        old = a4000(current, server_id="b" * 64, inventory=(
+            GPUDevice(uuid=UUID2, name=A4000, memory_mib=16376),))
+        profile = current.profile(old)
+    bound = factory.submit(config, request_key="bound", priority=5, simulation=False,
+                           server_receipt=ServerApprovalReceipt.create(manifest["sha256"], profile, old))
+    unbound = factory.submit(config, request_key="unbound", priority=0, simulation=False)
+
+    @contextmanager
+    def observed(_, **kwargs):
+        yield facts, object()
+
+    class SoftwareServer(SSHExecutor):
+        def run(self, backend, directory, timeout, canceled, checkpoint=None, *, launch_id=None):
+            assert launch_id
+
+    monkeypatch.setattr(desktop_runtime, "connection", observed)
+    monkeypatch.setattr(desktop_runtime, "check", lambda *a, **kw: {})
+    monkeypatch.setattr(desktop_runtime, "SSHExecutor", SoftwareServer)
+    result = CliRunner().invoke(app, ["--state-dir", str(factory.root), "work", "--server-profile", str(path),
+                                      "--approve-execution-and-transfer"])
+    assert result.exit_code == 0, result.output
+    assert factory.store.get(unbound["id"])["status"] == "COMPLETED"
+    assert factory.store.get(bound["id"])["status"] == "QUEUED"
+    assert factory.store.get(bound["id"])["attempts"] == 0
+
+
+def test_runpod_worker_ignores_jobs_bound_to_an_ssh_server(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from typer.testing import CliRunner
+
+    from tuning_factory.cli import app
+    from tuning_factory.execution import SSHExecutor
+    from tuning_factory.gpu_servers import ServerApprovalReceipt
+
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.setenv("RUNPOD_API_KEY", "software-fixture-only")
+    factory, config, manifest = real_factory(tmp_path / "state")
+    facts = a4000()
+    bound = factory.submit(config, request_key="bound", priority=5, simulation=False,
+                           server_receipt=ServerApprovalReceipt.create(manifest["sha256"],
+                                                                       settings().profile(facts), facts))
+    unbound = factory.submit(config, request_key="unbound", priority=0, simulation=False)
+    pod = {"id": "pod1", "desiredStatus": "RUNNING", "costPerHr": 0.4, "gpu": {"id": A4000, "count": 1},
+           "publicIp": "203.0.113.5", "portMappings": {"22": 22022}, "networkVolume": {"id": "volume"},
+           "volumeMountPath": "/workspace"}
+
+    class PodFixture(SSHExecutor):
+        def __init__(self, host, port, username, key_file, pod=None):
+            super().__init__(host, port, username, key_file, client=object(), pod=pod)
+
+        def run(self, backend, directory, timeout, canceled, checkpoint=None, *, launch_id=None):
+            assert launch_id
+
+    monkeypatch.setattr("tuning_factory.cli.RunPodController", lambda *a, **k: SimpleNamespace(status=lambda _: pod))
+    monkeypatch.setattr("tuning_factory.cli.SSHExecutor", PodFixture)
+    result = CliRunner().invoke(app, ["--state-dir", str(factory.root), "work", "--pod-id", "pod1",
+                                      "--host", "203.0.113.5", "--port", "22022", "--key-file",
+                                      str(tmp_path / "key"), "--approve-execution-and-transfer"])
+    assert result.exit_code == 0, result.output
+    assert factory.store.get(unbound["id"])["status"] == "COMPLETED"
+    assert factory.store.get(bound["id"])["status"] == "QUEUED"
+    assert factory.store.get(bound["id"])["attempts"] == 0
+
+
+def test_unfiltered_server_claim_skips_unbound_and_foreign_receipts(tmp_path):
+    from test_graph_store import queued
+
+    from tuning_factory.gpu_servers import ServerApprovalReceipt
+    from tuning_factory.jobs import JobStore
+
+    store = JobStore(tmp_path / "jobs.db")
+    facts = observation()
+    profile = settings().profile(facts)
+    queued(store, "unbound", priority=9)
+    receipts = {"foreign": (observation(server_id="b" * 64), 5), "drifted": (observation(inventory=(
+        observation().inventory[1],)), 3), "own": (facts, 0)}
+    jobs = {}
+    for index, (name, (observed, priority)) in enumerate(receipts.items()):
+        sha = str(index + 1) * 64
+        receipt = ServerApprovalReceipt.create(sha, settings().profile(observed), observed)
+        jobs[name] = store.submit({"sha256": sha, "simulation": False,
+                                   "config": {"resource_profile": {"gpu_count": 1}}}, name, priority,
+                                  server_receipt=receipt)
+        store.transition(jobs[name]["id"], "QUEUED")
+    claimed = store.claim(facts.exclusivity_key, server_profile=profile, server_facts=facts)
+    assert claimed and claimed["id"] == jobs["own"]["id"]
+    with pytest.raises(ValueError, match="resource"):
+        store.claim("ssh_server:" + "c" * 64, max_concurrent=4, server_profile=profile, server_facts=facts)
