@@ -12,6 +12,10 @@ export const SERVER_BOUND_JOB = "이 작업은 GPU 서버용으로 승인되었�
 export const UNBOUND_SERVER_JOB = "GPU 서버용 승인 기록이 없는 작업입니다. GPU 서버 연결에서 실행 계획을 다시 확인하고 제출하세요.";
 export const UNREADABLE_RECEIPT = "GPU 서버 승인 기록을 읽을 수 없습니다. 작업을 다시 계획·제출하세요.";
 const OTHER_SETTINGS_RESERVATION = "다른 서버 설정으로 만든 예약입니다. 그 서버 설정으로 바꾼 뒤 해제하세요.";
+// The desktop sidecar uses the default execution policy (one GPU per job); the plan refuses more.
+// Native settings still accept up to 8 UUIDs for a later multi-GPU policy. Keep the message in step.
+export const MAX_GPUS_PER_JOB = 1;
+export const GPU_POLICY_MESSAGE = "현재 앱 정책은 작업당 GPU 1개입니다. GPU를 하나만 선택하세요.";
 
 /* Native settings: string values; the GPU selection is a JSON-encoded UUID array. */
 
@@ -67,6 +71,11 @@ export function reservationMatches(reservation: Obj, settings: Obj) {
   return isServer(settings) && key(t.ssh_host, sshPort(t.ssh_port), t.ssh_username, t.ssh_fingerprint, t.remote_root, t.selected_gpu_uuids)
     === key(settings.server_ssh_host, sshPort(settings.server_ssh_port), settings.server_ssh_username,
       settings.server_ssh_fingerprint, settings.server_remote_root, selectedGpus(settings));
+}
+/** Why the saved GPU selection cannot be used under the app policy, or null. */
+export function selectionPolicyIssue(settings: Obj) {
+  const count = selectedGpus(settings).length;
+  return count > MAX_GPUS_PER_JOB ? `${GPU_POLICY_MESSAGE} (저장된 선택 GPU ${count}개)` : null;
 }
 /** Why a fresh inspection cannot be approved for runtime preparation, or null. */
 export function prepareIssue(inspection: Obj) {
@@ -128,8 +137,12 @@ export function prepareApproval(inspection: Obj, stage: string) {
     + `선택 GPU: ${gpus}\n사용자 데이터는 전송하지 않습니다. 앱은 서버를 켜거나 끄지 않습니다.`;
 }
 export function releaseApproval(reservation: Obj) {
-  const t = reservation.profile?.transport || {};
-  return `원래 GPU 서버(${sshAddress(t.ssh_username, t.ssh_host, t.ssh_port)})에서 학습 환경 준비 프로세스가 종료된 것을 직접 확인했습니다.\n`
+  const t = reservation.profile?.transport || {}, server = sshAddress(t.ssh_username, t.ssh_host, t.ssh_port);
+  // A PREPARING reservation outlives a killed app or sidecar, but it may also belong to a preparation still running.
+  const preparing = reservation.status !== "PREPARING" ? "" : "이 예약은 아직 ‘준비 중’으로 기록되어 있습니다. "
+    + "이 앱이나 다른 앱 창에서 환경 준비가 아직 실행 중일 수 있습니다. 앱 창을 모두 닫고 "
+    + `${server}의 프로세스 목록에서 준비 명령이 실행 중이지 않음을 확인한 경우에만 진행하세요.\n`;
+  return preparing + `원래 GPU 서버(${server})에서 학습 환경 준비 프로세스가 종료된 것을 직접 확인했습니다.\n`
     + `예약 ${reservation.reservation_id}을 해제하면 이 서버에서 다시 준비하거나 학습할 수 있습니다. `
     + "준비가 아직 실행 중이면 해제하지 마세요. 같은 서버에서 작업이 겹칠 수 있습니다.";
 }
@@ -180,15 +193,17 @@ export function inventoryTable(inspection: Obj, checked: string[], saved: string
   const row = (gpu: Obj) => `<tr><td><input type="checkbox" data-gpu="${esc(gpu.uuid)}" aria-label="${esc(gpu.uuid)} 학습에 사용"`
     + `${checked.includes(gpu.uuid) ? " checked" : ""}></td><td>${shortIdentifier(gpu.uuid)}</td><td>${esc(gpu.name)}</td><td>${esc(gibibytes(gpu.memory_mib))}</td></tr>`;
   return `<p class="muted">${esc(summary.join(" · "))}</p>`
+    + `<p class="muted">현재 앱 정책은 작업당 GPU ${MAX_GPUS_PER_JOB}개입니다. 학습에 사용할 GPU를 골라 저장하세요.</p>`
     + (missing ? `<p class="warning-text">저장된 선택 중 ${missing}개 GPU가 이번 조회에 없습니다. 선택을 다시 저장하세요.</p>` : "")
     + '<div class="table-scroll"><table><thead><tr><th>사용</th><th>GPU UUID</th><th>이름</th><th>메모리</th></tr></thead>'
     + `<tbody>${inventory.map(row).join("")}</tbody></table></div>`;
 }
-/** Preparation reservations; uncertain ones get a release button (data-action "release:<index>"). */
+/** Preparation reservations with a release button (data-action "release:<index>"). PREPARING ones are releasable
+ * too: a killed app or sidecar leaves them behind, and the approval text warns that one may still be running. */
 export function reservationTable(reservations: Obj[], settings: Obj, disabled: boolean) {
   if (!reservations.length) return '<p class="muted">진행 중이거나 확인이 필요한 환경 준비 예약이 없습니다.</p>';
   const release = (item: Obj, index: number) => {
-    if (item.status !== "UNCERTAIN") return "";
+    if (!["PREPARING", "UNCERTAIN"].includes(item.status)) return "";
     const releasable = reservationMatches(item, settings);
     return button("원격 준비 종료 확인 · 예약 해제", "release:" + index, "danger", disabled || !releasable)
       + (releasable ? "" : `<small>${OTHER_SETTINGS_RESERVATION}</small>`);
@@ -200,6 +215,7 @@ export function reservationTable(reservations: Obj[], settings: Obj, disabled: b
       + `<td>${esc(formatDate(item.created))}</td><td>${release(item, index)}</td></tr>`;
   };
   return '<h3 class="subheading">환경 준비 예약</h3><p class="muted">‘종료 확인 필요’는 준비 명령이 끝났는지 앱이 확인하지 못한 예약입니다. '
+    + "‘준비 중’이 계속 남아 있으면 앱이나 준비 과정이 중단되었을 수 있습니다. "
     + "원래 서버에서 준비 프로세스가 끝났는지 직접 확인한 뒤 해제하세요.</p>"
     + '<div class="table-scroll"><table><thead><tr><th>예약</th><th>서버</th><th>상태</th><th>시작 시각</th><th></th></tr></thead>'
     + `<tbody>${reservations.map(row).join("")}</tbody></table></div>`;

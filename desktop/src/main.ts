@@ -1,9 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { version } from "../package.json";
 import { button, filterRuns, formatDate, icon, progressView } from "./workbench";
-import { connectionResult, destinationChange, inventoryTable, isServer, jobDestination, jobDestinationIssue, prepareApproval, prepareIssue,
-  releaseApproval, reservationMatches, reservationTable, resourcesFromFacts, sameSelection, selectedGpus, serverAddress, serverBridge,
-  serverConfigured, settingsRoute, shortIdentifier, transferApproval } from "./server-connection";
+import { connectionResult, destinationChange, GPU_POLICY_MESSAGE, inventoryTable, isServer, jobDestination, jobDestinationIssue,
+  MAX_GPUS_PER_JOB, prepareApproval, prepareIssue, releaseApproval, reservationMatches, reservationTable, resourcesFromFacts, sameSelection,
+  selectedGpus, selectionPolicyIssue, serverAddress, serverBridge, serverConfigured, settingsRoute, shortIdentifier,
+  transferApproval } from "./server-connection";
 import "./style.css";
 
 type Obj = Record<string, any>;
@@ -286,7 +287,7 @@ function connections() {
   const runpod = `<section class="card" data-tour="connection-fields"><div class="section-title"><h3>RunPod 연결</h3><span class="badge">기존 Pod 사용</span></div><div class="grid">
   ${field("RunPod API 키", "RUNPOD_API_KEY", s.RUNPOD_API_KEY || "", "password", s.RUNPOD_API_KEY_saved ? "보안 저장됨 · 변경할 때만 입력" : "API 키는 Windows 자격 증명 저장소에 보관합니다.")}
   ${field("Pod ID", "pod_id", s.pod_id)}
-  ${field("SSH 개인키 파일", "ssh_key_file", s.ssh_key_file, "text", "개인키 내용을 입력하지 않고 파일 경로를 선택합니다.")}
+  ${field("SSH 개인키 파일", "ssh_key_file", s.ssh_key_file, "text", "OpenSSH 형식·암호 없는 개인키 파일 경로를 선택합니다. 키 내용은 입력하지 마세요.")}
   <div class="field"><span>키 파일 선택</span>${button("파일 찾기", "pick:key")}</div>
   ${field("SSH 서버 지문", "ssh_fingerprint", s.ssh_fingerprint, "text", "신뢰할 수 있는 경로로 확인한 SHA256:… 지문을 입력하세요.")}
   ${operator}
@@ -295,7 +296,7 @@ function connections() {
   ${field("서버 주소", "server_ssh_host", s.server_ssh_host, "text", "예: gpu.example.org 또는 IP 주소")}
   ${field("SSH 포트", "server_ssh_port", s.server_ssh_port || "22")}
   ${field("접속 계정", "server_ssh_username", s.server_ssh_username, "text", "root 계정이 아니어도 됩니다.")}
-  ${field("SSH 개인키 파일", "server_ssh_key_file", s.server_ssh_key_file, "text", "개인키 내용을 입력하지 않고 파일 경로를 선택합니다.")}
+  ${field("SSH 개인키 파일", "server_ssh_key_file", s.server_ssh_key_file, "text", "OpenSSH 형식·암호 없는 개인키 파일 경로를 선택합니다. 키 내용은 입력하지 마세요.")}
   <div class="field"><span>키 파일 선택</span>${button("파일 찾기", "pick:server-key")}</div>
   ${field("SSH 서버 지문", "server_ssh_fingerprint", s.server_ssh_fingerprint, "text", "관리자가 신뢰할 수 있는 경로로 전달한 SHA256:… 값만 입력하세요.")}
   ${field("작업 폴더 · 절대 경로", "server_remote_root", s.server_remote_root, "text", "예: /home/계정/factory. 앱의 학습 환경·캐시·작업 파일이 이 폴더 아래에 만들어지며 서버의 Python은 변경하지 않습니다.")}
@@ -328,11 +329,14 @@ function runtimeCard(server: boolean, pending: boolean) {
   <p>선택한 학습 단계에 맞는 학습 엔진을 Pod의 별도 폴더에 설치합니다. PPO는 별도 환경을 사용합니다. 첫 준비는 다운로드 용량에 따라 시간이 걸립니다.</p>${note}
   <div class="actions">${runtimeButton("환경 확인", "runtime_check")}${runtimeButton("학습 환경 준비", "runtime_prepare", "primary")}${runtimeButton("GPU 정보 → 학습 설정에 적용", "apply-pod")}</div></section>`;
   const saved = selectedGpus(state.settings), inspection = state.serverInspection;
+  // A saved selection over the app policy blocks every action that would use it until a valid one is saved.
+  const policy = selectionPolicyIssue(state.settings);
   const actions = [runtimeButton("GPU 목록 조회", "server-inspect"), runtimeButton("GPU 선택 저장", "server-select", "", !inspection),
-    runtimeButton("환경 확인", "runtime_check"), runtimeButton("학습 환경 준비", "runtime_prepare", "primary"),
-    runtimeButton("GPU 정보 → 학습 설정에 적용", "apply-pod"), runtimeButton("준비 예약 확인", "server-reservations")];
+    runtimeButton("환경 확인", "runtime_check", "", !!policy), runtimeButton("학습 환경 준비", "runtime_prepare", "primary", !!policy),
+    runtimeButton("GPU 정보 → 학습 설정에 적용", "apply-pod", "", !!policy), runtimeButton("준비 예약 확인", "server-reservations")];
   return `<section class="card" data-tour="connection-runtime"><h3>GPU 학습 환경</h3>
   <p>저장된 GPU 서버의 작업 폴더 아래 별도 환경에 학습 엔진을 설치합니다. 서버의 기본 Python과 시스템 패키지는 변경하지 않습니다. 학습에 사용할 GPU를 조회해 선택하세요. 첫 준비는 다운로드 용량에 따라 시간이 걸립니다.</p>${note}
+  ${policy ? `<p class="warning-text">${esc(policy)}</p>` : ""}
   <p class="muted">저장된 선택 GPU: ${saved.length ? saved.map(shortIdentifier).join(", ") : "없음 · GPU 목록을 조회해 선택하세요"}</p>
   ${inspection ? inventoryTable(inspection, state.gpuDraft || saved, saved) : ""}
   <div class="actions">${actions.join("")}</div>
@@ -657,6 +661,8 @@ async function action(name: string) {
     if (!await approve("S3에서 PC로 데이터 가져오기", `${state.s3Draft.bucket}/${state.s3Draft.key} (${dataSize(state.s3Object.size)})를 이 PC에 다운로드하고 검사한 사본으로 등록합니다. S3 다운로드 요금이 발생할 수 있습니다. RunPod로는 전송하지 않습니다. 학습 시작 시 별도 전송 동의가 필요합니다.`)) return;
   }
   if (name.startsWith("release:")) { await releaseReservation(state.reservations?.[Number(name.split(":")[1])]); return; }
+  const policy = isServer(state.settings) && ["runtime_check", "runtime_prepare", "apply-pod"].includes(name) && selectionPolicyIssue(state.settings);
+  if (policy) { state.error = policy; render(); return; }
   if (name === "runtime_prepare" && isServer(state.settings)) { await prepareServer(); return; }
   if (name === "runtime_prepare" && !await approve("GPU 학습 환경 준비", "저장된 연결의 현재 실행 중인 Pod에 앱 전용 학습 환경을 설치합니다. 의존성과 모델 실행 도구를 다운로드하며 GPU 요금은 계속 발생합니다. 사용자 데이터는 전송하지 않습니다.")) return;
   if (name === "resume" && state.jobCapabilities?.resume_supported === false) { state.error = "이 학습 단계·방식은 체크포인트 재개를 지원하지 않습니다."; render(); return; }
@@ -700,7 +706,7 @@ async function action(name: string) {
     else if (name === "server-inspect") { state.serverInspection = null; state.gpuDraft = null; state.serverInspection = await gpuServer.serverInspect(); }
     else if (name === "server-select") {
       const selected: string[] = state.gpuDraft ?? selectedGpus(state.settings);
-      if (selected.length > 8) throw new Error("GPU는 최대 8개까지 선택할 수 있습니다.");
+      if (selected.length > MAX_GPUS_PER_JOB) throw new Error(GPU_POLICY_MESSAGE);
       const change = await saveSettings({ server_selected_gpu_uuids: JSON.stringify(selected) });
       state.notice = change === "none" ? "GPU 선택이 바뀌지 않았습니다." : selected.length
         ? `학습에 사용할 GPU ${selected.length}개를 저장했습니다. 실행 계획을 다시 확인하세요.` : "GPU 선택을 비웠습니다. 학습 전에 GPU를 선택하세요.";

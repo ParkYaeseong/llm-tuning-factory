@@ -199,27 +199,26 @@ test("GPU inventory selection saves a JSON string and server facts fill exact tr
   await expect(runtime.getByText("<img src=x onerror=alert(1)>", { exact: true })).toBeVisible();
   await expect(page.locator("img")).toHaveCount(0);
   await page.screenshot({ path: "test-results/server-connection.png", fullPage: true });
+  await page.getByLabel(`${GPU_A} 학습에 사용`, { exact: true }).uncheck();
   await page.getByLabel(`${GPU_B} 학습에 사용`, { exact: true }).check();
   await page.getByRole("button", { name: "GPU 선택 저장", exact: true }).click();
-  expect((await saves(page)).at(-1)).toEqual({ server_selected_gpu_uuids: JSON.stringify([GPU_A, GPU_B]) });
-  await expect(page.locator(".notice")).toContainText("GPU 2개");
+  expect((await saves(page)).at(-1)).toEqual({ server_selected_gpu_uuids: JSON.stringify([GPU_B]) });
+  await expect(page.locator(".notice")).toContainText("GPU 1개");
   // A new selection on the same server keeps the inventory instead of forcing another SSH inspection.
   await expect(runtime.locator("tbody tr")).toHaveCount(2);
   await expect(page.getByLabel(`${GPU_B} 학습에 사용`, { exact: true })).toBeChecked();
   expect(await calls(page, "server_inspect")).toHaveLength(1);
 
-  // 0.11 / 5 rounds below 0.11 when multiplied back; the per-GPU price must never undercut the server total.
-  await page.evaluate(f => (window as any).__mock.facts = f, facts(5, 0.11));
+  // Multi-GPU price rounding is covered by the module test; the app policy allows one GPU per job.
+  await page.evaluate(f => (window as any).__mock.facts = f, facts(1, 0.11));
   await page.getByRole("button", { name: "GPU 정보 → 학습 설정에 적용", exact: true }).click();
   await expect(page.locator(".notice")).toContainText("학습 설정에 적용했습니다");
   await trainingPage(page);
   await expect(page.getByLabel("GPU 종류 · 연결 설정에서 가져오기", { exact: true })).toHaveValue("NVIDIA A100-SXM4-80GB");
-  await expect(page.getByLabel("GPU 수", { exact: true })).toHaveValue("5");
+  await expect(page.getByLabel("GPU 수", { exact: true })).toHaveValue("1");
   await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
   let resource = (await calls(page, "plan")).at(-1).config.resource_profile;
-  expect(resource.gpu_type).toBe("NVIDIA A100-SXM4-80GB"); expect(resource.gpu_count).toBe(5);
-  expect(resource.hourly_cost_usd * 5).toBeGreaterThanOrEqual(0.11);
-  expect(Math.abs(resource.hourly_cost_usd - 0.11 / 5)).toBeLessThan(1e-15);
+  expect(resource).toMatchObject({ gpu_type: "NVIDIA A100-SXM4-80GB", gpu_count: 1, hourly_cost_usd: 0.11 });
 
   await page.evaluate(f => (window as any).__mock.facts = f, facts(1, 0));
   await connectionsPage(page);
@@ -279,6 +278,7 @@ test("changing server settings after planning removes the plan", async ({ page }
   await expect(page.getByRole("heading", { name: "실행 전 확인" })).toBeVisible();
   await connectionsPage(page);
   await page.getByRole("button", { name: "GPU 목록 조회", exact: true }).click();
+  await page.getByLabel(`${GPU_A} 학습에 사용`, { exact: true }).uncheck();
   await page.getByLabel(`${GPU_B} 학습에 사용`, { exact: true }).check();
   await page.getByRole("button", { name: "GPU 선택 저장", exact: true }).click();
   await trainingPage(page);
@@ -345,7 +345,7 @@ test("server runtime preparation refuses an empty GPU selection before approval"
   expect(await calls(page, "runtime_prepare")).toEqual([]);
 });
 
-test("releasing an uncertain reservation requires confirming the remote preparation stopped", async ({ page }) => {
+test("releasing an uncertain or stuck reservation requires confirming the remote preparation stopped", async ({ page }) => {
   await open(page, server);
   await page.evaluate(() => {
     const mock = (window as any).__mock;
@@ -357,17 +357,33 @@ test("releasing an uncertain reservation requires confirming the remote preparat
   await page.getByRole("button", { name: "준비 예약 확인", exact: true }).click();
   const runtime = page.locator('[data-tour="connection-runtime"]');
   await expect(runtime.locator("tbody tr")).toHaveCount(2);
-  await expect(page.getByRole("button", { name: "원격 준비 종료 확인 · 예약 해제", exact: true })).toHaveCount(1);
+  const release = page.getByRole("button", { name: "원격 준비 종료 확인 · 예약 해제", exact: true });
+  await expect(release).toHaveCount(2);
   await runtime.screenshot({ path: "test-results/server-reservations.png" });
-  await page.getByRole("button", { name: "원격 준비 종료 확인 · 예약 해제", exact: true }).click();
-  await expect(page.getByRole("dialog")).toContainText("준비 프로세스가 종료된 것을 직접 확인했습니다");
-  await expect(page.getByRole("dialog")).toContainText("researcher@gpu.example.org");
+  await release.first().click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("준비 프로세스가 종료된 것을 직접 확인했습니다");
+  await expect(dialog).toContainText("researcher@gpu.example.org");
+  await expect(dialog).not.toContainText("다른 앱 창");
   await page.getByRole("button", { name: "돌아가기", exact: true }).click();
   expect(await calls(page, "runtime_release")).toEqual([]);
-  await page.getByRole("button", { name: "원격 준비 종료 확인 · 예약 해제", exact: true }).click();
+  await release.first().click();
   await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
   await expect(runtime.locator("tbody tr")).toHaveCount(1);
   expect(await calls(page, "runtime_release")).toEqual([{ approved: true, confirm_preparation_stopped: true, reservation_id: "a".repeat(32) }]);
+
+  // A PREPARING reservation outlives a killed app or sidecar; releasing it warns that preparation may still run.
+  await expect(release).toBeEnabled();
+  await release.click();
+  await expect(dialog).toContainText("이 앱이나 다른 앱 창에서 환경 준비가 아직 실행 중일 수 있습니다");
+  await expect(dialog).toContainText("프로세스 목록");
+  await expect(dialog).toContainText("준비 프로세스가 종료된 것을 직접 확인했습니다");
+  await page.getByRole("button", { name: "돌아가기", exact: true }).click();
+  expect(await calls(page, "runtime_release")).toHaveLength(1);
+  await release.click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(runtime.locator("tbody tr")).toHaveCount(0);
+  expect((await calls(page, "runtime_release")).at(-1)).toEqual({ approved: true, confirm_preparation_stopped: true, reservation_id: "b".repeat(32) });
 });
 
 test("tutorial anchors exist exactly once for both providers without remote calls", async ({ page }) => {
@@ -632,4 +648,37 @@ test("SSH ports compare the way the sidecar parses them", async ({ page }) => {
   // Python: an absent port is 22, a digit string becomes an integer ("022" is 22) and anything else is refused.
   expect(result).toEqual([[null, true, true, "22"], ["22", true, true, "22"], ["022", true, true, "22"], ["", false, false, "NaN"],
     ["22.0", false, false, "NaN"], ["0x16", false, false, "NaN"], [" 22", false, false, "NaN"], ["abc", false, false, "NaN"]]);
+});
+
+const GPU_POLICY = "현재 앱 정책은 작업당 GPU 1개입니다. GPU를 하나만 선택하세요.";
+test("the app policy allows one GPU per job in the server selection", async ({ page }) => {
+  await open(page, { ...server, server_selected_gpu_uuids: JSON.stringify([GPU_A, GPU_B]) });
+  await connectionsPage(page);
+  const runtime = page.locator('[data-tour="connection-runtime"]');
+  // A saved selection over the policy blocks the actions that would use it until it is fixed.
+  await expect(runtime.getByText(GPU_POLICY, { exact: false })).toBeVisible();
+  for (const name of ["GPU 정보 → 학습 설정에 적용", "학습 환경 준비", "환경 확인"])
+    await expect(page.getByRole("button", { name, exact: true }), name).toBeDisabled();
+  await page.getByRole("button", { name: "GPU 목록 조회", exact: true }).click();
+  await expect(runtime.getByText("작업당 GPU 1개", { exact: false }).first()).toBeVisible();
+  await page.getByRole("button", { name: "GPU 선택 저장", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText(GPU_POLICY);
+  expect(await saves(page)).toEqual([]);
+  await page.getByLabel(`${GPU_B} 학습에 사용`, { exact: true }).uncheck();
+  await page.getByRole("button", { name: "GPU 선택 저장", exact: true }).click();
+  expect((await saves(page)).at(-1)).toEqual({ server_selected_gpu_uuids: JSON.stringify([GPU_A]) });
+  await expect(runtime.getByText(GPU_POLICY, { exact: false })).toHaveCount(0);
+  for (const name of ["GPU 정보 → 학습 설정에 적용", "학습 환경 준비", "환경 확인"])
+    await expect(page.getByRole("button", { name, exact: true }), name).toBeEnabled();
+  expect(await calls(page, "server_facts")).toEqual([]);
+  expect(await calls(page, "runtime_check")).toEqual([]);
+});
+
+test("both key-file fields ask for an OpenSSH key without a passphrase", async ({ page }) => {
+  await open(page);
+  await connectionsPage(page);
+  const hint = "OpenSSH 형식·암호 없는 개인키 파일 경로";
+  await expect(page.locator('[data-tour="connection-fields"]')).toContainText(hint);
+  await page.getByLabel("연결 대상", { exact: true }).selectOption("ssh_server");
+  await expect(page.locator('[data-tour="connection-fields"]')).toContainText(hint);
 });

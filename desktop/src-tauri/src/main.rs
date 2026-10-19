@@ -70,9 +70,11 @@ fn settings_get(app: tauri::AppHandle) -> Result<Value, String> {
     read_settings(&app_root(&app)?, false)
 }
 
+const KEY_FILE_FIELDS: [&str; 2] = ["ssh_key_file", "server_ssh_key_file"];
+
 /// Pasted OpenSSH/PEM or PuTTY (.ppk) key content in a key-file path field.
 fn pasted_key(name: &str, value: &Value) -> bool {
-    ["ssh_key_file", "server_ssh_key_file"].contains(&name) && value.as_str().is_some_and(|text|
+    KEY_FILE_FIELDS.contains(&name) && value.as_str().is_some_and(|text|
         ["PRIVATE KEY", "PuTTY-User-Key-File-", "Private-Lines:"].iter().any(|marker| text.contains(marker)))
 }
 
@@ -88,6 +90,11 @@ fn merge_public_settings(existing: Value, input: &Map<String, Value>) -> Result<
     // before this check is dropped below instead of blocking unrelated saves (S3, HF, the other provider).
     if input.iter().any(|(name, value)| pasted_key(name, value)) {
         return Err("SSH 개인키 파일에는 키 내용이 아니라 키 파일 경로를 입력하세요.".into());
+    }
+    // The sidecar's SSH client reads OpenSSH keys without a passphrase or agent, never PuTTY files.
+    if input.iter().any(|(name, value)| KEY_FILE_FIELDS.contains(&name.as_str())
+        && value.as_str().is_some_and(|path| path.trim_end().to_ascii_lowercase().ends_with(".ppk"))) {
+        return Err("PuTTY .ppk 키는 지원하지 않습니다. OpenSSH 형식(암호 없는 키)으로 변환한 키 파일을 선택하세요.".into());
     }
     let previous = existing.as_object().ok_or("설정 파일이 손상되었습니다.")?;
     let mut public: Map<String, Value> = previous.iter()
@@ -368,8 +375,23 @@ mod tests {
                 assert!(error.contains("파일 경로"), "{error}");
             }
             assert!(merge(json!({name: "C:\\Users\\researcher\\.ssh\\id_ed25519"})).is_ok());
-            assert!(merge(json!({name: "C:\\Users\\researcher\\keys\\server.ppk"})).is_ok());
         }
+    }
+    #[test]
+    fn key_file_settings_refuse_putty_ppk_paths() {
+        // paramiko reads OpenSSH keys without a passphrase or agent; a .ppk path would only fail at connection time.
+        for name in ["ssh_key_file", "server_ssh_key_file"] {
+            for path in ["C:\\Users\\researcher\\keys\\server.ppk", "C:\\keys\\SERVER.PPK", "D:\\keys\\gpu.Ppk"] {
+                let error = merge(json!({name: path})).expect_err("a PuTTY .ppk path was accepted");
+                assert!(error.contains("PuTTY .ppk") && error.contains("OpenSSH"), "{error}");
+            }
+            for path in ["C:\\keys\\id_ed25519", "C:\\keys\\ppk\\id_rsa", "C:\\keys\\server.ppk.pem"] {
+                assert!(merge(json!({name: path})).is_ok(), "{path} was refused");
+            }
+        }
+        // Only submitted values are validated: a stored .ppk path does not block an unrelated save.
+        let stored = json!({"ssh_key_file": "C:\\keys\\old.ppk", "server_ssh_key_file": "C:\\keys\\gpu.ppk"});
+        assert!(merge_public_settings(stored, json!({"S3_REGION": "kr-standard"}).as_object().unwrap()).is_ok());
     }
     #[test]
     fn a_stored_pasted_key_neither_blocks_other_saves_nor_survives_them() {
