@@ -101,6 +101,7 @@ test("provider switch shows server fields and save/reopen persists them without 
   await page.getByRole("button", { name: "파일 찾기", exact: true }).click();
   await expect(page.getByLabel("SSH 개인키 파일", { exact: true })).toHaveValue("C:\\keys\\picked_ed25519");
   await page.getByLabel("SSH 서버 지문", { exact: true }).fill(FINGERPRINT);
+  await expect(page.getByText("예: /home/USERNAME/factory (영문·숫자·_ . / - 만 사용)", { exact: false })).toBeVisible();
   await page.getByLabel("작업 폴더 · 절대 경로", { exact: true }).fill("/home/researcher/factory");
   await page.getByLabel("시간당 비용 (USD) · 서버 전체", { exact: true }).fill("0");
   await page.getByLabel("기록에 표시할 이름", { exact: true }).fill("검토자");

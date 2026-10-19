@@ -308,7 +308,7 @@ function connections() {
   ${field("SSH 개인키 파일", "server_ssh_key_file", s.server_ssh_key_file, "text", keyHelp(s.server_ssh_key_file))}
   <div class="field"><span>키 파일 선택</span>${button("파일 찾기", "pick:server-key")}</div>
   ${field("SSH 서버 지문", "server_ssh_fingerprint", s.server_ssh_fingerprint, "text", "관리자가 신뢰할 수 있는 경로로 전달한 SHA256:… 값만 입력하세요.")}
-  ${field("작업 폴더 · 절대 경로", "server_remote_root", s.server_remote_root, "text", "예: /home/계정/factory. 앱의 학습 환경·캐시·작업 파일이 이 폴더 아래에 만들어지며 서버의 Python은 변경하지 않습니다.")}
+  ${field("작업 폴더 · 절대 경로", "server_remote_root", s.server_remote_root, "text", "예: /home/USERNAME/factory (영문·숫자·_ . / - 만 사용). 앱의 학습 환경·캐시·작업 파일이 이 폴더 아래에 만들어지며 서버의 Python은 변경하지 않습니다.")}
   ${field("시간당 비용 (USD) · 서버 전체", "server_total_hourly_cost_usd", s.server_total_hourly_cost_usd, "text", "내부 서버는 0을 입력하세요. 클라우드 요금 조회 결과가 아니라 직접 입력한 값입니다.")}
   ${operator}
   </div><p class="muted">RunPod API 키와 Pod ID는 필요하지 않습니다. 앱은 서버를 켜거나 끄지 않으며 서버의 시스템 패키지를 변경하지 않습니다.</p></section>`;
