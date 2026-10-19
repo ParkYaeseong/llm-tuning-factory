@@ -40,6 +40,9 @@ SHA256 지문으로 직접 접속해 학습할 수 있습니다(앱은 작업당
 CLI `.env`의 토큰과 OIDC 세 항목을 비워 연결합니다. 서버에 접근할 수 있는 누구나 기록을 볼 수 있으므로
 신뢰할 수 있는 망에서만 사용하세요. 토큰·OIDC 인증값을 쓰면 CLI와 앱 모두 HTTPS 주소만 허용합니다. 자세한 내용은 [운영 안내](docs/OPERATIONS.md)와 [Windows 사용 안내](docs/WINDOWS_APP.md)에 있습니다.
 
+처음 사용하는 Windows 앱 사용자는 작업 공간의 “튜토리얼 시작”으로 합성 예제만 쓰는 약 5분 실습을 해 볼 수 있습니다
+(연결 정보 불필요, GPU·전송 없음). [Windows 사용 안내](docs/WINDOWS_APP.md)를 확인하세요.
+
 ## 처음 설치하기
 
 Git과 [uv](https://docs.astral.sh/uv/getting-started/installation/)를 준비한 뒤 아래 순서로 실행합니다.

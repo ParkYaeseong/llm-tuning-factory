@@ -169,6 +169,29 @@ Deferred hardening: some sidecar refusals are still in English; the key identity
 hash of the local key path (moving the key breaks recovery, replacing it in place is undetected). (`claim()` now rejects
 non-fact observations and receipt lookups are chunked, so those two earlier items are done.)
 
+First-run tutorial (2026-10-19): an 11-step hands-on tour with non-blocking popovers and a highlight ring, started from the overview
+card "튜토리얼 시작", the sidebar "튜토리얼" button or Ctrl+K "튜토리얼" (pressing it during a tour restarts it). It fills,
+previews and registers the bundled synthetic `tutorial_sample` (8 rows), selects it in the training settings and runs the
+dry-run plan; the connection steps only explain RunPod and GPU servers. Esc or "그만하기" ends it (deferred while a request is in
+flight) and restores the pre-tour training draft, plan, dataset draft and preview; completion or dismissal is remembered in local
+storage. The sample stays registered, marked synthetic with GPU transfer blocked; the ID `tutorial_sample` is reserved (case and
+trailing-dot variants and S3 import are refused) and it is excluded from the "시작하기" data checklist. A clicked button is no
+longer lost when a field edit re-renders the screen. Commits: 7c07f92, a71049a, 61fee6c (backend sample, reserved ID, claim and
+receipt hardening), 2f08f67 (native allowlist and package asset), f0f33c3, 7104e11, c3891ba (engine and UI, deferred exit,
+on-screen popover, first-click fix), 6eebbe9, 32b9eeb (checklist exclusion, ASCII path hint), aacdd0f (package verifier checks the
+tutorial refusal and registration exactly) and the docs commit `docs: guide first-time users through the desktop tutorial`.
+
+Actual verification at HEAD aacdd0f (2026-10-19, Windows): `uv run pytest -q` **743 passed, 1 skipped** in 51.89s;
+`uv run ruff check src tests` passes; `npx playwright test` **72 passed** (1.6m); `npm run build` (tsc + Vite) passes;
+`cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` **12 passed**;
+`uv run python scripts/check_secrets.py` reports only the historical `main.rs` finding (`Checked 582 staged/historical file
+versions; 1 findings.`) and `git grep` for private-key headers finds nothing.
+
+Unverified for the tutorial: the real Tauri/WebView2 rendering and layout of the tour, the installed frozen package and
+`verify_desktop_package.py` (Task 11), and any real GPU, server or MLflow. Known minor limits: a deferred render can fire mid-press
+after a 1 s fallback; screen readers may not announce step 1 when the tour opens; the tour must be updated when Task 10
+redesigns screens (the `data-tour` contract tests catch this).
+
 Remaining Tasks 7–11 (Tasks 6A/6B are complete in software): model-operation CPU acceptance,
 persistent multi-Pod controller/tracking repair, secure desktop API/broker, Windows UI/installer and Git sharing.
 These foundations are not end-to-end workflow, Windows 0.4.0 or live GPU acceptance. Actual serial handoff,
