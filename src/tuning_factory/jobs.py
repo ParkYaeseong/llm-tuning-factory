@@ -148,7 +148,7 @@ class JobStore:
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
-            if row and row['active_attempt_id']:
+            if isinstance(subject, AttemptLease) or (row and (row['active_attempt_id'] or row['attempts'])):
                 self._validate_lease(db, subject)
             if row is not None and row['status'] == status:
                 return
@@ -269,7 +269,7 @@ class JobStore:
 
     def gpu_locked(self, gpu):
         with self.connection() as db:
-            return bool(db.execute('SELECT 1 FROM gpu_locks WHERE gpu=?', (gpu,)).fetchone())
+            return self._resource_blocked(db, gpu)
 
     def recover(self, stale_after_seconds=120):
         with self.connection() as db:

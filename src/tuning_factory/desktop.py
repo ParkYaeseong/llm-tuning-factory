@@ -208,7 +208,7 @@ class DesktopService:
             self.job_directory(job_id)
             stage = self.factory.store.get(job_id)["manifest"]["config"].get("training_stage", "sft")
             with executor_for(self.settings, self.root, training_stage=stage) as executor:
-                return self.factory.work(executor=executor, gpu=self.settings["pod_id"],
+                return self.factory.work(executor=executor, gpu="existing_runpod:" + self.settings["pod_id"],
                                          approved_transfer=True, select_mode=True, target_job_id=job_id)
         if action == "jobs":
             return self.factory.store.list()[-200:][::-1]
@@ -250,7 +250,7 @@ class DesktopService:
             from .desktop_runtime import runtime
             if action == "runtime_prepare" and data.get("approved") is not True:
                 raise ValueError("explicit runtime preparation approval required")
-            if action == "runtime_prepare" and self.factory.store.gpu_locked(self.settings.get("pod_id", "")):
+            if action == "runtime_prepare" and self.factory.store.gpu_locked("existing_runpod:" + self.settings.get("pod_id", "")):
                 raise ValueError("Pod is reserved by a job; reconcile and finish it before preparing runtime")
             return runtime(self.settings, self.root, prepare=action == "runtime_prepare",
                            training_stage=data.get("training_stage", "sft"))

@@ -85,3 +85,75 @@ def test_plan_rejects_identical_training_and_validation_snapshot(tmp_path):
     config["evaluation_profile"].update(kind="json", dataset_id="dummy", dataset_version="1")
     with pytest.raises(ValueError, match="identical"):
         app.dispatch("plan", {"config": config})
+
+
+@pytest.mark.parametrize('lock_key', ['existing_runpod:borrowed', 'unknown-old-profile'])
+def test_desktop_cannot_execute_past_uncertain_shared_resource_lock(tmp_path, monkeypatch, lock_key):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {'pod_id': 'borrowed'})
+    store = app.factory.store
+    old = store.submit({'sha256': 'old', 'simulation': False}, 'old')
+    store.transition(old['id'], 'QUEUED')
+    claimed = store.claim(lock_key)
+    store.transition(claimed['lease'], 'FAILED')
+    app.factory.policy = app.factory.policy.model_copy(update={'max_gpus': 2})
+    queued = store.submit({'sha256': 'next', 'simulation': False,
+                           'config': {'training_stage': 'sft'}}, 'next')
+    store.transition(queued['id'], 'QUEUED')
+
+    @contextmanager
+    def fake_executor(*args, **kwargs):
+        yield SimpleNamespace(remote=True)
+
+    monkeypatch.setattr(desktop_runtime, 'executor_for', fake_executor)
+    monkeypatch.setattr(app.factory, 'run_claimed', lambda *args: pytest.fail('reserved physical resource was claimed'))
+    assert app.dispatch('execute', {'approved': True, 'job_id': queued['id']}) is None
+    assert store.get(queued['id'])['attempts'] == 0
+    assert store.gpu_locked(lock_key)
+
+
+@pytest.mark.parametrize('lock_key', ['existing_runpod:borrowed', 'unknown-old-profile'])
+def test_desktop_runtime_prepare_observes_canonical_and_unknown_locks(tmp_path, monkeypatch, lock_key):
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {'pod_id': 'borrowed'})
+    store = app.factory.store
+    job = store.submit({'sha256': 'old', 'simulation': False}, 'old')
+    store.transition(job['id'], 'QUEUED')
+    claimed = store.claim(lock_key)
+    store.transition(claimed['lease'], 'FAILED')
+    monkeypatch.setattr(desktop_runtime, 'runtime', lambda *args, **kwargs: pytest.fail('reserved Pod runtime was prepared'))
+    with pytest.raises(ValueError, match='reserved'):
+        app.dispatch('runtime_prepare', {'approved': True})
+    assert store.gpu_locked(lock_key)
+
+
+def test_desktop_claim_is_visible_to_canonical_workers(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {'pod_id': 'borrowed'})
+    store = app.factory.store
+    job = store.submit({'sha256': 'desktop', 'simulation': False,
+                        'config': {'training_stage': 'sft'}}, 'desktop')
+    store.transition(job['id'], 'QUEUED')
+
+    @contextmanager
+    def fake_executor(*args, **kwargs):
+        yield SimpleNamespace(remote=True)
+
+    monkeypatch.setattr(desktop_runtime, 'executor_for', fake_executor)
+    monkeypatch.setattr(app.factory, 'run_claimed', lambda claimed, *args: claimed)
+    claimed = app.dispatch('execute', {'approved': True, 'job_id': job['id']})
+    assert claimed['lease'].resource_id == 'existing_runpod:borrowed'
+    store.transition(claimed['lease'], 'FAILED')
+    other = store.submit({'sha256': 'canonical'}, 'canonical')
+    store.transition(other['id'], 'QUEUED')
+    assert store.gpu_locked('existing_runpod:borrowed')
+    assert store.claim('existing_runpod:borrowed') is None
+    # Ambiguous old strings remain unmapped; their uncertainty quarantines real claims.
+    with store.connection() as db:
+        assert db.execute('SELECT gpu FROM gpu_locks').fetchone()[0] == 'existing_runpod:borrowed'

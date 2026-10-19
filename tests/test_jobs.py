@@ -57,3 +57,17 @@ def test_gpu_budget_separate_from_concurrent_job_count(tmp_path):
         store.transition(job["id"], "QUEUED")
     assert store.claim("pod-a", max_concurrent=4, max_gpus=2)
     assert store.claim("pod-b", max_concurrent=4, max_gpus=2) is None
+
+
+def test_retired_lease_rejected_before_resumed_job_is_claimed(tmp_path):
+    store = JobStore(tmp_path / 'jobs.db')
+    job = store.submit({'sha256': 'one'}, 'one')
+    store.transition(job['id'], 'QUEUED')
+    first = store.claim('mock-cpu')
+    store.transition(first['lease'], 'FAILED')
+    store.release_gpu(first['lease'], execution_stopped=True)
+    store.reset_for_resume(job['id'])
+    for status in ('QUEUED', 'CANCELED'):
+        with pytest.raises(ValueError, match='lease'):
+            store.transition(first['lease'], status)
+        assert store.get(job['id'])['status'] == 'QUEUED'

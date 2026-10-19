@@ -20,9 +20,11 @@ from all approved model roots. Both findings passed scoped re-review; Task 5 is 
 
 Task 6 implementation adds atomic graph/job storage, replayable evidence, fenced attempt ownership,
 stable launch identities, controller leases, conservative legacy-lock migration and typed output/tracking
-ledger hooks. Its independent review is pending. v2 worker dispatch and the persistent controller are later tasks.
+ledger hooks. Initial review found a retired-lease queue mutation and inconsistent desktop resource keys.
+Both fixes passed 60 scoped regression tests; amended full-suite and scoped re-review are pending.
+v2 worker dispatch and the persistent controller are later tasks.
 
-Actual frozen-source verification after Task 6: Python 3.12.12 locked development/tracking sync;
+Actual frozen-source verification before the Task 6 review fixes: Python 3.12.12 locked development/tracking sync;
 **532 passed, 1 skipped** in 260.91s; `uv run ruff check src tests` passes. The skip is the existing opt-in
 real GPU test. Legacy SFT/PPO canonical bytes match the base resolver under the same current true provenance.
 Separate CPU dependency/export preparation passed; it does not yet qualify the unimplemented public
