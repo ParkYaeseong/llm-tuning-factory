@@ -32,7 +32,45 @@ model-operation numerical path. No GPU, institution data, model weights or exter
 
 User scope update on 2026-10-19 adds [general Linux/NVIDIA SSH servers](superpowers/specs/2026-10-19-ssh-gpu-servers-extension.md),
 including BOP-style servers with direct SSH execution. Tasks 6A/6B will add provider-neutral adapters and Windows
-connection settings. Task 6A core is implemented and undergoing final software regression; independent review remains pending. It includes typed SSH observations/receipts, exact UUID selection, operator-declared zero cost, alias-aware local resource exclusion and durable runtime-preparation reservations. This support is not tested against a real server yet.
+connection settings. Task 6A core adds typed SSH observations/receipts, exact UUID selection, operator-declared
+zero cost, alias-aware local resource exclusion and durable runtime-preparation reservations.
+
+Task 6A independent review found Important and Minor issues; all assigned fixes were made test-first. A queued job
+bound to another destination no longer blocks workers: the SSH worker selects only unbound jobs or jobs whose
+receipt matches the current destination, the RunPod worker ignores SSH-bound jobs, and an untargeted server claim
+skips unbound or mismatched rows. Collect, reconcile, live logs and progress of an existing attempt now use an
+explicit recovery path: same machine-id server ID, exact transport (host, port, user, pin, remote root, selected
+UUIDs, key reference) and the original attempt record, while GPU inventory drift, including a missing selected GPU,
+is tolerated; operator cost edits do not block recovery. The recovery executor carries the original approval facts
+and can never claim or launch. Launch and preparation keep exact inventory, selection, count and type checks.
+Paramiko-shaped fakes now cover the SSH `executor_for` branch, `plan_server_destination`, `validate_server_receipt`,
+CLI `plan --real`, `run --submit --real` and `reconcile` with `--server-profile`, GPU type mismatches and
+`PinnedHostKey` pinning; these tests exposed no further production bug. A refused pre-launch check now fails the
+unlaunched attempt and frees its lock; started or taken-over attempts keep theirs. Minor fixes: LDAP-style
+usernames are accepted (no leading `-`, whitespace or control characters); bootstrap pip uses `--no-cache-dir`
+after a fixed `python3 -m pip --version` check that reports a missing pip before transfer; an unreadable
+/etc/machine-id reports an unsupported server instead of a traceback; `doctor` rejects `--pod-id` with a server
+profile. Scoped re-review of these fixes is pending.
+
+Native settings contract for Task 6B: `provider: "ssh_server"` with string values under `server_`-prefixed keys
+(`server_ssh_host`, `server_ssh_port`, `server_ssh_username`, `server_ssh_fingerprint`, `server_ssh_key_file`,
+`server_remote_root`, `server_selected_gpu_uuids` as a JSON-encoded array, `server_total_hourly_cost_usd`), so the
+inactive Pod's `ssh_key_file`/`ssh_fingerprint` stay separate. An explicit operator hourly cost is required; 0 is
+allowed. Server identity is the SHA-256 of the lowercased /etc/machine-id; lock aliasing also treats any observed
+GPU UUID overlap as the same server, and an SSH lock without an observation blocks. The cross-provider lock policy
+is deliberate: while any SSH job or preparation reservation exists, RunPod claims/preparation are blocked and vice
+versa, matching the v1 default of one concurrent job (`Policy.max_concurrent=1`). Distinct-resource concurrency is
+Task 8.
+
+Deferred: the key identity is a hash of the resolved local key-file path, so moving the key breaks recovery of old
+jobs and replacing it at the same path goes undetected (consider the public-key fingerprint later); the server
+worker binds an unbound real job to its server before claiming, approved by `--approve-execution-and-transfer`;
+graph ResourceFacts still allows a 0 RunPod price (Task 8); `JobStore.resource_blocked` is unused.
+
+Actual verification after the Task 6A review fixes: Python 3.12.12 locked development/tracking sync;
+**652 passed, 1 skipped** in 49.56s (55 new cases; 114 in tests/test_gpu_servers.py); `uv run ruff check src tests`
+passes. The skip is the existing opt-in real GPU test. Unverified: no real SSH/BOP server and no GPU were used;
+SSH connections, probes and SFTP are software fixtures only.
 
 Remaining Tasks 6A/6B and 7–11: general SSH GPU servers, model-operation CPU acceptance,
 persistent multi-Pod controller/tracking repair, secure desktop API/broker, Windows UI/installer and Git sharing.
