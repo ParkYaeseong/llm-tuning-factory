@@ -143,7 +143,9 @@ class SSHExecutor(ExecutionBackend):
 
     def __init__(self, host, port, username, key_file, remote_root="/workspace/factory", client=None, pod=None,
                  remote_python="python", worker_lock_file=None, hf_home=None,
-                 server_profile=None, server_facts=None):
+                 server_profile=None, server_facts=None, recovery_only=False):
+        if recovery_only and server_profile is None:
+            raise ValueError("recovery-only execution requires the original server destination")
         if server_profile is not None or server_facts is not None:
             if client is None:
                 raise ValueError("inspected SSH connection required for server execution")
@@ -169,6 +171,8 @@ class SSHExecutor(ExecutionBackend):
         self.pod = pod
         self.server_profile = server_profile
         self.server_facts = server_facts
+        # Recovery carries the original approval facts, not a fresh launch observation.
+        self.recovery_only = recovery_only
         self.remote_python = remote_python
         self.worker_lock_file = worker_lock_file
         self.hf_home = hf_home
@@ -249,6 +253,8 @@ class SSHExecutor(ExecutionBackend):
                     temporary.unlink(missing_ok=True)
 
     def run(self, backend, directory, timeout, canceled, checkpoint=None, *, launch_id=None):
+        if self.recovery_only:
+            raise ValueError("recovery-only executor cannot launch training")
         directory = Path(directory).resolve()
         if not re.fullmatch(r"[0-9a-f]{32}", directory.name):
             raise ValueError("invalid remote job directory")

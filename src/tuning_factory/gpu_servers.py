@@ -167,6 +167,14 @@ class SSHServerInspection(StrictModel):
             raise ValueError("inspection destination differs from current settings")
 
 
+class SSHServerIdentity(StrictModel):
+    """Recovery-only observation of a physical server. It never authorizes preparation or launch."""
+    provider: Literal["ssh_server"] = "ssh_server"
+    server_id: Sha256
+    transport: SSHTransport
+    observed_at: datetime
+
+
 class SSHServerFacts(StrictModel):
     provider: Literal["ssh_server"] = "ssh_server"
     server_id: Sha256
@@ -237,6 +245,18 @@ def validate_server_binding(profile, facts):
         raise ValueError("SSH server profile differs from verified destination observation")
 
 
+def validate_recovery_identity(profile, transport, identity=None):
+    """Existing-attempt recovery requires the original physical server and exact transport
+    (host, port, user, pin, remote root, GPU selection, key reference). GPU inventory may drift."""
+    profile = SSHServerProfile.model_validate(profile.model_dump() if hasattr(profile, "model_dump") else profile)
+    if profile.transport != SSHTransport.model_validate(transport.model_dump()):
+        raise ValueError("recovery destination differs from original execution")
+    if identity is not None:
+        identity = SSHServerIdentity.model_validate(identity.model_dump())
+        if identity.transport != profile.transport or identity.server_id != profile.server_id:
+            raise ValueError("recovery server differs from original execution destination")
+
+
 # This source is fixed. The sole user-derived argument is a separately quoted,
 # validated path. Inspection never creates files, installs tools, or loads data.
 _LINUX_PROBE = """import json,os,platform,shutil,sys
@@ -250,13 +270,28 @@ print(json.dumps(dict(system=platform.system(),machine_id=Path('/etc/machine-id'
 """
 
 
-def probe_server(client, settings: SSHServerSettings, run_command, *, inspection_only=False):
-    """Read Linux identity, tool/workspace facts and full NVIDIA UUID inventory."""
-    settings = SSHServerSettings.model_validate(settings.model_dump())
+def _observe_linux(client, settings, run_command):
     system = json.loads(run_command(client, ["python3", "-c", _LINUX_PROBE, settings.remote_root]))
     if system.get("system") != "Linux" or not re.fullmatch(r"[0-9a-fA-F]{32}", system.get("machine_id", "")):
         raise ValueError("supported Linux server with stable machine identity required")
-    if not system.get("workspace_safe") or not system.get("workspace_writable"):
+    if not system.get("workspace_safe"):
+        raise ValueError("remote workspace must be writable and free of symlinks")
+    return system, digest(system["machine_id"].lower().encode())
+
+
+def probe_server_identity(client, settings: SSHServerSettings, run_command):
+    """Recovery probe: the same fixed identity read, without inventory, tool or selection checks."""
+    settings = SSHServerSettings.model_validate(settings.model_dump())
+    _, server_id = _observe_linux(client, settings, run_command)
+    return SSHServerIdentity(server_id=server_id, transport=settings.transport,
+                             observed_at=datetime.now(timezone.utc))
+
+
+def probe_server(client, settings: SSHServerSettings, run_command, *, inspection_only=False):
+    """Read Linux identity, tool/workspace facts and full NVIDIA UUID inventory."""
+    settings = SSHServerSettings.model_validate(settings.model_dump())
+    system, server_id = _observe_linux(client, settings, run_command)
+    if not system.get("workspace_writable"):
         raise ValueError("remote workspace must be writable and free of symlinks")
     if not all(system.get("tools", {}).get(name) for name in ("flock", "cc")):
         raise ValueError("server requires flock and a C compiler; ask its administrator")
@@ -274,7 +309,6 @@ def probe_server(client, settings: SSHServerSettings, run_command, *, inspection
         raise ValueError("duplicate GPU UUID in observed inventory")
     if any(uuid not in inventory for uuid in settings.selected_gpu_uuids):
         raise ValueError("selected GPU UUID is absent from observed inventory")
-    server_id = digest(system["machine_id"].lower().encode())
     if inspection_only:
         return SSHServerInspection(server_id=server_id, transport=settings.transport, inventory=tuple(devices),
                                    total_hourly_cost_usd=settings.total_hourly_cost_usd,
@@ -320,6 +354,11 @@ class ServerApprovalReceipt(StrictModel):
                 or self.facts.total_hourly_cost_usd != facts.total_hourly_cost_usd
                 or transport.sha256 != facts.transport_settings_sha256):
             raise ValueError("server receipt destination differs from approved job")
+
+    def validate_recovery(self, transport, identity=None):
+        """Collect/reconcile only; launch and preparation keep validate_destination."""
+        type(self).model_validate(self.model_dump())
+        validate_recovery_identity(self.profile, transport, identity)
 
     def matches_destination(self, manifest_sha256, transport, facts):
         """Queue selection filter: a job bound elsewhere is skipped, never fatal to the worker."""

@@ -877,3 +877,196 @@ def test_unfiltered_server_claim_skips_unbound_and_foreign_receipts(tmp_path):
     assert claimed and claimed["id"] == jobs["own"]["id"]
     with pytest.raises(ValueError, match="resource"):
         store.claim("ssh_server:" + "c" * 64, max_concurrent=4, server_profile=profile, server_facts=facts)
+
+
+class StatFile:
+    """Local file with the paramiko SFTPFile.stat() used by remote log tails."""
+
+    def __init__(self, handle):
+        self.handle = handle
+
+    def stat(self):
+        import os
+        return os.fstat(self.handle.fileno())
+
+    def __getattr__(self, name):
+        return getattr(self.handle, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.handle.close()
+
+
+class FakeServer:
+    """Paramiko-shaped software fixture: fixed probe replies and a local SFTP tree; never a network."""
+
+    def __init__(self, root, machine_id="b" * 32,
+                 inventory=((UUID1, A4000, 16376), (UUID2, A4000, 16376))):
+        from test_remote_worker import FakeSFTP
+
+        class SFTP(FakeSFTP):
+            def open(self, path, mode="r"):
+                return StatFile(super().open(path, mode))
+
+        root.mkdir(parents=True, exist_ok=True)
+        self.sftp = SFTP(root)
+        self.machine_id = machine_id
+        self.inventory = inventory
+        self.policies, self.connects, self.commands = [], [], []
+
+    def install(self, monkeypatch):
+        from tuning_factory import desktop_runtime
+
+        server = self
+
+        class Client:
+            def set_missing_host_key_policy(self, policy):
+                server.policies.append(policy)
+
+            def connect(self, host, **kwargs):
+                server.connects.append((host, kwargs))
+
+            def open_sftp(self):
+                return server.sftp
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(desktop_runtime.paramiko, "SSHClient", Client)
+        monkeypatch.setattr(desktop_runtime, "command", self.command)
+        return self
+
+    def command(self, client, argv, timeout=60, **kwargs):
+        self.commands.append(argv)
+        if argv[0] == "nvidia-smi":
+            return "".join(f"{uuid}, {name}, {memory}, Disabled\n" for uuid, name, memory in self.inventory)
+        if argv[:2] == ["python3", "-c"]:
+            return json.dumps(dict(system="Linux", machine_id=self.machine_id, python=[3, 12, 9],
+                                   tools={"flock": True, "cc": True}, workspace_safe=True,
+                                   workspace_writable=True))
+        raise AssertionError("unexpected remote command " + repr(argv))
+
+    def facts(self, config):
+        from tuning_factory.gpu_servers import probe_server
+
+        return probe_server(None, config, self.command)
+
+
+def launched_server_attempt(tmp_path, server, config):
+    """A real job whose original server attempt finished after the controller lost contact."""
+    from tuning_factory.gpu_servers import ServerApprovalReceipt
+
+    factory, ai_config, manifest = real_factory(tmp_path / "state")
+    facts = server.facts(config)
+    receipt = ServerApprovalReceipt.create(manifest["sha256"], config.profile(facts), facts)
+    job = factory.submit(ai_config, simulation=False, server_receipt=receipt)
+    claimed = factory.store.claim(facts.exclusivity_key, server_profile=receipt.profile, server_facts=facts,
+                                  job_id=job["id"])
+    launch_id = factory.store.begin_launch(claimed["lease"])
+    directory = factory.directory(job["id"])
+    remote = config.remote_root + "/jobs/" + job["id"] + "/" + launch_id
+    (directory / "remote-attempt.json").write_text(json.dumps(
+        {"remote_path": remote, "created": 0, "destination": receipt.profile.model_dump(mode="json")}))
+    attempt = server.sftp.path(remote)
+    attempt.mkdir(parents=True)
+    (attempt / "manifest.json").write_bytes((directory / "manifest.json").read_bytes())
+    (attempt / "artifacts.json").write_text("{}")
+    (attempt / "result.json").write_text('{"status": "COMPLETED"}')
+    (attempt / "train.log").write_text("software fixture step 2/2")
+    factory.store.transition(claimed["lease"], "FAILED", "controller lost contact")
+    return factory, job, receipt
+
+
+DRIFT = {"unselected_removed": ((UUID2, A4000, 16376),),
+         "gpu_added": ((UUID1, A4000, 16376), (UUID2, A4000, 16376),
+                       ("GPU-33333333-3333-3333-3333-333333333333", "NVIDIA H100", 81559)),
+         "memory_changed": ((UUID1, A4000, 16376), (UUID2, A4000, 15000)),
+         "selected_missing": ((UUID1, A4000, 16376),)}
+
+
+@pytest.mark.parametrize("drift", sorted(DRIFT))
+def test_recovery_collects_original_attempt_after_unrelated_inventory_drift(tmp_path, monkeypatch, drift):
+    from tuning_factory import desktop_runtime
+
+    server = FakeServer(tmp_path / "remote").install(monkeypatch)
+    config = settings()
+    factory, job, receipt = launched_server_attempt(tmp_path, server, config)
+    server.inventory = DRIFT[drift]
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    monkeypatch.setattr(desktop_runtime, "check", lambda *a, **kw: pytest.fail("recovery never preflights"))
+    directory = factory.directory(job["id"])
+    assert "software fixture" in desktop_runtime.live_logs(native, factory.root, directory)["text"]
+    assert desktop_runtime.read_progress(native, directory) is not None
+    with desktop_runtime.executor_for(native, factory.root, preflight=False, server_receipt=receipt,
+                                      recovery=True) as executor:
+        assert executor.recovery_only
+        result = factory.reconcile(job["id"], executor)
+    assert result["status"] == "COMPLETED"
+    assert not factory.store.gpu_locked(receipt.facts.exclusivity_key)
+
+
+@pytest.mark.parametrize("change", [dict(machine_id="c" * 32), dict(ssh_fingerprint="SHA256:" + "B" * 43),
+                                    dict(remote_root="/home/researcher/other"),
+                                    dict(selected_gpu_uuids=(UUID1,)), dict(ssh_key_file="other-key")])
+def test_recovery_refuses_another_server_or_edited_transport(tmp_path, monkeypatch, change):
+    from tuning_factory import desktop_runtime
+
+    server = FakeServer(tmp_path / "remote").install(monkeypatch)
+    config = settings()
+    factory, job, receipt = launched_server_attempt(tmp_path, server, config)
+    if "machine_id" in change:
+        server.machine_id = change["machine_id"]
+    else:
+        config = config.model_copy(update=change)
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    directory = factory.directory(job["id"])
+    connects = len(server.connects)
+    for action in (lambda: desktop_runtime.live_logs(native, factory.root, directory),
+                   lambda: desktop_runtime.read_progress(native, directory)):
+        with pytest.raises(ValueError, match="destination|server"):
+            action()
+    with pytest.raises(ValueError, match="destination|server"):
+        with desktop_runtime.executor_for(native, factory.root, preflight=False, server_receipt=receipt,
+                                          recovery=True) as executor:
+            factory.reconcile(job["id"], executor)
+    if "machine_id" not in change:
+        assert len(server.connects) == connects  # Edited settings are refused before SSH.
+    assert factory.store.get(job["id"])["status"] == "FAILED"
+    assert factory.store.gpu_locked(receipt.facts.exclusivity_key)
+
+
+@pytest.mark.parametrize("drift", sorted(DRIFT))
+def test_launch_still_requires_exact_approved_inventory(tmp_path, monkeypatch, drift):
+    from tuning_factory import desktop_runtime
+    from tuning_factory.gpu_servers import ServerApprovalReceipt
+
+    server = FakeServer(tmp_path / "remote").install(monkeypatch)
+    config = settings()
+    facts = server.facts(config)
+    receipt = ServerApprovalReceipt.create("1" * 64, config.profile(facts), facts)
+    server.inventory = DRIFT[drift]
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    monkeypatch.setattr(desktop_runtime, "check", lambda *a, **kw: pytest.fail("preflight after mismatch"))
+    with pytest.raises(ValueError, match="destination|selected GPU"):
+        with desktop_runtime.executor_for(native, tmp_path, server_receipt=receipt):
+            pytest.fail("drifted hardware reached launch")
+
+
+def test_recovery_executor_can_never_claim_or_launch(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+
+    server = FakeServer(tmp_path / "remote").install(monkeypatch)
+    config = settings()
+    factory, job, receipt = launched_server_attempt(tmp_path, server, config)
+    factory.store.reconcile_result(factory.store.current_lease(job["id"]), "FAILED", "fixture")
+    factory.store.reset_for_resume(job["id"])
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    with desktop_runtime.executor_for(native, factory.root, server_receipt=receipt, recovery=True) as executor:
+        with pytest.raises(ValueError, match="recovery"):
+            factory.work(executor=executor, gpu=receipt.facts.exclusivity_key, approved_transfer=True,
+                         target_job_id=job["id"])
+        with pytest.raises(ValueError, match="recovery"):
+            executor.run(None, factory.directory(job["id"]), 5, lambda: False, launch_id="d" * 32)
+    assert factory.store.get(job["id"])["status"] == "QUEUED"

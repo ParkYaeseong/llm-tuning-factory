@@ -15,9 +15,12 @@ from .execution import ExecutionUncertain, RunPodController, SSHExecutor
 from .gpu_servers import (
     ServerApprovalReceipt,
     SSHServerFacts,
+    SSHServerIdentity,
     SSHServerInspection,
     probe_server,
+    probe_server_identity,
     server_settings,
+    validate_recovery_identity,
 )
 from .manifest import source_hash
 from .runtime_profiles import engine_profile
@@ -49,7 +52,8 @@ def validate_pod(pod):
 
 
 @contextmanager
-def connection(settings, *, inspection_only=False):
+def connection(settings, *, inspection_only=False, recovery=False):
+    """SSH server modes: launch facts (default), read-only inspection, or recovery identity only."""
     if settings.get("provider", "existing_runpod") == "ssh_server":
         config = server_settings(settings)
         client = paramiko.SSHClient()
@@ -58,8 +62,12 @@ def connection(settings, *, inspection_only=False):
             client.connect(config.ssh_host, port=config.ssh_port, username=config.ssh_username,
                            key_filename=str(config.ssh_key_file), allow_agent=False, look_for_keys=False,
                            timeout=20, banner_timeout=20, auth_timeout=20)
-            facts = (probe_server(client, config, command, inspection_only=True) if inspection_only
-                     else probe_server(client, config, command))
+            if recovery:
+                facts = probe_server_identity(client, config, command)
+            elif inspection_only:
+                facts = probe_server(client, config, command, inspection_only=True)
+            else:
+                facts = probe_server(client, config, command)
             yield facts, client
         finally:
             client.close()
@@ -249,7 +257,13 @@ def release_runtime_reservation(settings, state_root, reservation_id, *, confirm
 
 
 @contextmanager
-def executor_for(settings, state_root, preflight=True, training_stage="sft", *, server_receipt=None):
+def executor_for(settings, state_root, preflight=True, training_stage="sft", *, server_receipt=None,
+                 recovery=False):
+    if recovery and settings.get("provider", "existing_runpod") == "ssh_server":
+        with recovery_executor(settings, server_receipt) as executor:
+            yield executor
+        return
+    preflight = preflight and not recovery
     if server_receipt is not None:
         server_receipt = validate_server_receipt(settings, server_receipt)
     with connection(settings) as (pod, client):
@@ -278,6 +292,24 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
         yield executor
 
 
+@contextmanager
+def recovery_executor(settings, server_receipt):
+    """Collect an existing attempt after unrelated GPU inventory drift. It requires the original
+    physical server, exact transport and (in collect_result) the original attempt record. It never
+    preflights, claims or launches; launch and preparation keep the exact inventory checks."""
+    if server_receipt is None:
+        raise ValueError("original SSH server destination receipt required for recovery")
+    receipt = ServerApprovalReceipt.model_validate(server_receipt.model_dump()
+        if hasattr(server_receipt, "model_dump") else server_receipt)
+    config = server_settings(settings)
+    receipt.validate_recovery(config.transport)  # Edited settings never open SSH.
+    with connection(settings, recovery=True) as (identity, client):
+        receipt.validate_recovery(config.transport, identity)
+        yield SSHExecutor("", 22, config.ssh_username, "", client=client, server_profile=receipt.profile,
+                          server_facts=receipt.facts, remote_root=config.remote_root + "/jobs",
+                          recovery_only=True)
+
+
 def live_logs(settings, state_root, directory):
     record = json.loads((Path(directory) / "remote-attempt.json").read_bytes())
     remote_root = validate_original_destination(settings, record)
@@ -285,7 +317,7 @@ def live_logs(settings, state_root, directory):
     expected = remote_root + "/jobs/" + Path(directory).name + "/"
     if not remote.startswith(expected) or not re.fullmatch("[0-9a-f]{32}", remote[len(expected):]):
         raise ValueError("remote attempt outside desktop namespace")
-    with connection(settings) as (facts, client):
+    with connection(settings, recovery=True) as (facts, client):
         validate_original_observation(record, facts)
         with client.open_sftp() as sftp:
             chunks = []
@@ -308,7 +340,7 @@ def read_progress(settings, directory):
     if (not remote.startswith(expected)
             or not re.fullmatch("[0-9a-f]{32}", remote[len(expected):])):
         raise ValueError("progress request differs from original Pod or job namespace")
-    with connection(settings) as (facts, client):
+    with connection(settings, recovery=True) as (facts, client):
         validate_original_observation(record, facts)
         with client.open_sftp() as sftp:
             try:
@@ -334,8 +366,10 @@ def validate_original_destination(settings, record):
 
 
 def validate_original_observation(record, facts):
-    if isinstance(facts, SSHServerFacts):
-        from .gpu_servers import SSHServerProfile, validate_server_binding
+    from .gpu_servers import SSHServerProfile, validate_server_binding
+    if isinstance(facts, SSHServerIdentity):
+        validate_recovery_identity(SSHServerProfile.model_validate(record.get("destination")), facts.transport, facts)
+    elif isinstance(facts, SSHServerFacts):
         validate_server_binding(SSHServerProfile.model_validate(record.get("destination")), facts)
 
 

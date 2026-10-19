@@ -315,7 +315,9 @@ def reconcile(ctx: typer.Context, job_id: str,
         receipt = ctx.obj.store.server_receipt(job_id)
         if receipt is None:
             raise typer.BadParameter("job has no original SSH server destination receipt")
-        with executor_for(server, ctx.obj.root, preflight=False, server_receipt=receipt) as executor:
+        # Recovery binds the original server, transport and attempt record, not current inventory.
+        with executor_for(server, ctx.obj.root, preflight=False, server_receipt=receipt,
+                          recovery=True) as executor:
             output(ctx.obj.reconcile(job_id, executor))
         return
     if not pod_id or not host or not key_file:

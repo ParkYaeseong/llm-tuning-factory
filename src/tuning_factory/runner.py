@@ -61,6 +61,8 @@ class Factory:
 
     def work(self, executor=None, backend=None, gpu="mock-cpu", approved_transfer=False, select_mode=False, target_job_id=None):
         executor = executor or LocalExecutor()
+        if getattr(executor, "recovery_only", False):
+            raise ValueError("recovery-only executor cannot claim or launch a job")
         job = self.store.claim(gpu, self.policy.max_concurrent, self.policy.max_gpus,
                                simulation=not executor.remote if select_mode else None, job_id=target_job_id,
                                server_profile=getattr(executor, "server_profile", None),
@@ -77,6 +79,8 @@ class Factory:
             raise NotImplementedError("v2 graph execution requires the operation worker adapter")
         executor = executor or LocalExecutor()
         server_facts = getattr(executor, "server_facts", None)
+        if getattr(executor, "recovery_only", False):
+            raise ValueError("recovery-only executor cannot launch a job")
         if server_facts is not None:
             self.store.verify_server_destination(job['id'], executor.server_profile, server_facts)
             if lease.resource_id != server_facts.exclusivity_key:
