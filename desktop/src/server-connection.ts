@@ -12,6 +12,9 @@ export const SERVER_BOUND_JOB = "이 작업은 GPU 서버용으로 승인되었�
 export const UNBOUND_SERVER_JOB = "GPU 서버용 승인 기록이 없는 작업입니다. GPU 서버 연결에서 실행 계획을 다시 확인하고 제출하세요.";
 export const UNREADABLE_RECEIPT = "GPU 서버 승인 기록을 읽을 수 없습니다. 작업을 다시 계획·제출하세요.";
 const OTHER_SETTINGS_RESERVATION = "다른 서버 설정으로 만든 예약입니다. 그 서버 설정으로 바꾼 뒤 해제하세요.";
+// Release compares the whole stored profile, including the key file's reference hash the screen cannot compute.
+const RELEASE_DESTINATION_REFUSAL = "preparation destination differs from original reservation";
+const OTHER_SETTINGS_RELEASE = "다른 서버 설정(비용·키 파일 포함)으로 만든 예약입니다. 그 설정으로 바꾼 뒤 해제하세요.";
 // The desktop sidecar uses the default execution policy (one GPU per job); the plan refuses more.
 // Native settings still accept up to 8 UUIDs for a later multi-GPU policy. Keep the message in step.
 export const MAX_GPUS_PER_JOB = 1;
@@ -67,13 +70,17 @@ export function jobDestinationIssue(job: Obj, settings: Obj) {
   if (!route) return UNBOUND_SERVER_JOB;
   return routeKey(route) === routeKey(saved) ? null : SERVER_BOUND_JOB;
 }
-/** Release rebuilds the reservation profile from saved settings, so only matching reservations can be released. */
+/** An hourly cost as the sidecar reads it: a number or a non-blank numeric string; anything else never matches. */
+const hourlyCost = (value: unknown) => typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+/** Release rebuilds the reservation profile from saved settings, so only matching reservations can be released.
+ * The key file is compared by the sidecar alone; its refusal is translated by serverBridge().runtimeRelease. */
 export function reservationMatches(reservation: Obj, settings: Obj) {
   const t = reservation.profile?.transport || {};
   const key = (...values: unknown[]) => JSON.stringify(values);
   return isServer(settings) && key(t.ssh_host, sshPort(t.ssh_port), t.ssh_username, t.ssh_fingerprint, t.remote_root, t.selected_gpu_uuids)
     === key(settings.server_ssh_host, sshPort(settings.server_ssh_port), settings.server_ssh_username,
-      settings.server_ssh_fingerprint, settings.server_remote_root, selectedGpus(settings));
+      settings.server_ssh_fingerprint, settings.server_remote_root, selectedGpus(settings))
+    && hourlyCost(reservation.profile?.total_hourly_cost_usd) === hourlyCost(settings.server_total_hourly_cost_usd);
 }
 /** Why the saved GPU selection cannot be used under the app policy, or null. */
 export function selectionPolicyIssue(settings: Obj) {
@@ -100,7 +107,9 @@ export function serverBridge(api: Bridge) {
       api("runtime_prepare", { approved: true, inspection, training_stage: stage }),
     runtimeReservations: (): Promise<Obj[]> => api("runtime_reservations"),
     runtimeRelease: (reservationId: string): Promise<Obj> =>
-      api("runtime_release", { approved: true, confirm_preparation_stopped: true, reservation_id: reservationId }),
+      api("runtime_release", { approved: true, confirm_preparation_stopped: true, reservation_id: reservationId }).catch(error => {
+        throw String(error).includes(RELEASE_DESTINATION_REFUSAL) ? OTHER_SETTINGS_RELEASE : error;
+      }),
   };
 }
 

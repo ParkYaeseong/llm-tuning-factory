@@ -518,10 +518,11 @@ async function execute(job: Obj) {
   api("execute", { job_id: job.id, approved: true }).then(async result => {
     await refresh();
     const current = state.jobs.find((j: Obj) => j.id === job.id);
+    const waiting = "GPU를 사용할 수 없어 작업은 대기 중입니다. 다른 작업이 끝나면 ‘대기 작업 실행’을 눌러 주세요."
+      // A GPU server job can also wait on a lock another job or an unfinished RunPod job left behind.
+      + ((current ?? job).server_destination ? " 다른 작업이나 다른 연결 대상(RunPod)의 끝나지 않은 작업 잠금이 남아 있을 수 있습니다. 실행 관리에서 확인하세요." : "");
     state.notice = result ? "학습 처리가 끝났습니다. 상태와 평가 결과를 확인하세요." :
-      ["PENDING", "QUEUED", "RETRYING"].includes(current?.status) ?
-        "GPU를 사용할 수 없어 작업은 대기 중입니다. 다른 작업이 끝나면 ‘대기 작업 실행’을 눌러 주세요." :
-        "새로 실행된 작업이 없습니다. 현재 작업 상태를 확인하세요.";
+      ["PENDING", "QUEUED", "RETRYING"].includes(current?.status) ? waiting : "새로 실행된 작업이 없습니다. 현재 작업 상태를 확인하세요.";
     render();
   }).catch(async error => { state.error = String(error); await refresh(); render(); });
 }

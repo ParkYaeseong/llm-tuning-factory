@@ -351,8 +351,8 @@ test("releasing an uncertain or stuck reservation requires confirming the remote
   await page.evaluate(() => {
     const mock = (window as any).__mock;
     mock.reservations = [
-      { reservation_id: "a".repeat(32), resource_id: "ssh_server:" + "f".repeat(64), status: "UNCERTAIN", created: 1791960000, profile: { transport: mock.inspection.transport }, facts: {} },
-      { reservation_id: "b".repeat(32), resource_id: "ssh_server:" + "9".repeat(64), status: "PREPARING", created: 1791960100, profile: { transport: mock.inspection.transport }, facts: {} }];
+      { reservation_id: "a".repeat(32), resource_id: "ssh_server:" + "f".repeat(64), status: "UNCERTAIN", created: 1791960000, profile: { transport: mock.inspection.transport, total_hourly_cost_usd: 0.11 }, facts: {} },
+      { reservation_id: "b".repeat(32), resource_id: "ssh_server:" + "9".repeat(64), status: "PREPARING", created: 1791960100, profile: { transport: mock.inspection.transport, total_hourly_cost_usd: 0.11 }, facts: {} }];
   });
   await connectionsPage(page);
   await page.getByRole("button", { name: "준비 예약 확인", exact: true }).click();
@@ -558,6 +558,64 @@ test("reservations made with other server settings cannot be released here", asy
   expect(await calls(page, "runtime_release")).toEqual([]);
 });
 
+test("reservations made with another hourly cost cannot be released here", async ({ page }) => {
+  await open(page, server);
+  await page.evaluate(() => {
+    const mock = (window as any).__mock;
+    mock.reservations = [{ reservation_id: "a".repeat(32), resource_id: "ssh_server:" + "f".repeat(64), status: "UNCERTAIN",
+      created: 1791960000, profile: { transport: mock.inspection.transport, total_hourly_cost_usd: 0.5 }, facts: {} }];
+  });
+  await connectionsPage(page);
+  await page.getByRole("button", { name: "준비 예약 확인", exact: true }).click();
+  await expect(page.getByRole("button", { name: "원격 준비 종료 확인 · 예약 해제", exact: true })).toBeDisabled();
+  await expect(page.getByText("다른 서버 설정으로 만든 예약입니다. 그 서버 설정으로 바꾼 뒤 해제하세요.", { exact: true })).toBeVisible();
+  expect(await calls(page, "runtime_release")).toEqual([]);
+});
+
+test("reservation matching compares the hourly cost the way the sidecar parses it", async ({ page }) => {
+  await open(page);
+  await page.addScriptTag({ type: "module", content: 'import * as m from "/src/server-connection.ts"; window.__serverConnection = m;' });
+  await page.waitForFunction(() => (window as any).__serverConnection);
+  const result = await page.evaluate(() => {
+    const m = (window as any).__serverConnection;
+    const transport = { ssh_host: "h", ssh_port: 22, ssh_username: "u", ssh_fingerprint: "SHA256:x", remote_root: "/r", selected_gpu_uuids: [] };
+    return ["0.11", "0.110", "1.1e-1", "0.12", "", " ", "abc", null].map(cost => {
+      const settings: Record<string, unknown> = { provider: "ssh_server", server_ssh_host: "h", server_ssh_username: "u",
+        server_ssh_fingerprint: "SHA256:x", server_remote_root: "/r", server_selected_gpu_uuids: "[]" };
+      if (cost !== null) settings.server_total_hourly_cost_usd = cost;
+      return [cost, m.reservationMatches({ profile: { transport, total_hourly_cost_usd: 0.11 } }, settings)];
+    });
+  });
+  expect(result).toEqual([["0.11", true], ["0.110", true], ["1.1e-1", true], ["0.12", false], ["", false], [" ", false], ["abc", false], [null, false]]);
+});
+
+test("a release refused for other key settings is explained in Korean", async ({ page }) => {
+  await open(page, server);
+  await page.evaluate(() => {
+    const mock = (window as any).__mock;
+    mock.reservations = [{ reservation_id: "a".repeat(32), resource_id: "ssh_server:" + "f".repeat(64), status: "UNCERTAIN",
+      created: 1791960000, profile: { transport: mock.inspection.transport, total_hourly_cost_usd: 0.11 }, facts: {} }];
+    const native = (window as any).__TAURI_INTERNALS__, original = native.invoke;
+    // The UI cannot compute the key reference hash, so only the sidecar notices a different key file.
+    native.invoke = async (command: string, args: any) => command === "factory_action" && args.action === "runtime_release"
+      ? Promise.reject("preparation destination differs from original reservation") : original(command, args);
+  });
+  await connectionsPage(page);
+  await page.getByRole("button", { name: "준비 예약 확인", exact: true }).click();
+  await page.getByRole("button", { name: "원격 준비 종료 확인 · 예약 해제", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.getByRole("alert")).toHaveText("다른 서버 설정(비용·키 파일 포함)으로 만든 예약입니다. 그 설정으로 바꾼 뒤 해제하세요.");
+});
+
+test("a server job left waiting names the locks that can hold it", async ({ page }) => {
+  await open(page, server);
+  await selectJob(page, route);
+  await page.getByRole("button", { name: "대기 작업 실행", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("작업은 대기 중입니다");
+  await expect(page.locator(".notice")).toContainText("다른 작업이나 다른 연결 대상(RunPod)의 끝나지 않은 작업 잠금이 남아 있을 수 있습니다. 실행 관리에서 확인하세요.");
+});
+
 test("connection controls are locked while a server preparation runs", async ({ page }) => {
   await open(page, server);
   await page.evaluate(() => { const mock = (window as any).__mock; mock.gate = new Promise(resolve => mock.open = resolve); });
@@ -651,9 +709,9 @@ test("SSH ports compare the way the sidecar parses them", async ({ page }) => {
     const job = { server_destination: { ssh_host: "h", ssh_port: 22, ssh_username: "u", remote_root: "/r", selected_gpu_uuids: [] } };
     return [null, "22", "022", "", "22.0", "0x16", " 22", "abc"].map(port => {
       const settings: Record<string, unknown> = { provider: "ssh_server", server_ssh_host: "h", server_ssh_username: "u",
-        server_ssh_fingerprint: "SHA256:x", server_remote_root: "/r", server_selected_gpu_uuids: "[]" };
+        server_ssh_fingerprint: "SHA256:x", server_remote_root: "/r", server_selected_gpu_uuids: "[]", server_total_hourly_cost_usd: "0" };
       if (port !== null) settings.server_ssh_port = port;
-      return [port, m.reservationMatches({ profile: { transport } }, settings), m.jobDestinationIssue(job, settings) === null, String(m.sshPort(port ?? undefined))];
+      return [port, m.reservationMatches({ profile: { transport, total_hourly_cost_usd: 0 } }, settings), m.jobDestinationIssue(job, settings) === null, String(m.sshPort(port ?? undefined))];
     });
   });
   // Python: an absent port is 22, a digit string becomes an integer ("022" is 22) and anything else is refused.

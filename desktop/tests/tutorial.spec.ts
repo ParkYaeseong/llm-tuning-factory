@@ -21,6 +21,7 @@ async function boot(page: Page, options: Boot = {}) {
     (window as any).__TAURI_INTERNALS__ = { invoke: async (command: string, args: any) => {
       calls.push({ command, args });
       if (command === "settings_get") return {};
+      if (command === "settings_save") return { ...args.values };
       if (command !== "factory_action") return {};
       const { action, data } = args;
       if (action === "catalog") return { templates: options.noTemplates ? [] : [{ name: "paper_extraction", config }], profiles: [], datasets: structuredClone(datasets),
@@ -432,6 +433,34 @@ test("restarting ignores a sample request from the previous run", async ({ page 
   await expect(page.getByLabel("데이터 ID", { exact: true })).toHaveValue("my_dataset");
   await expect(tourButton(page, "연습 샘플 채우기")).toBeEnabled();
   await expect(tourButton(page, "다음")).toBeDisabled();
+});
+
+test("ending the tutorial drops a plan made for a connection saved differently during the tour", async ({ page }) => {
+  await boot(page, { seen: true });
+  await page.getByRole("button", { name: "학습 설정", exact: true }).click();
+  await page.getByRole("button", { name: "실행 계획 확인" }).click();
+  const planCard = page.getByRole("heading", { name: "실행 전 확인" });
+  await expect(planCard).toBeVisible();
+  // An unchanged connection keeps the plan from before the tour.
+  await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
+  await expectStep(page, "welcome");
+  await page.keyboard.press("Escape");
+  await expect(popover(page)).toHaveCount(0);
+  await page.getByRole("button", { name: "학습 설정", exact: true }).click();
+  await expect(planCard).toBeVisible();
+  // Saving another destination during the tour invalidates it for good.
+  await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
+  await expectStep(page, "welcome");
+  await tourButton(page, "다음").click();
+  await expectStep(page, "connection-provider");
+  await page.getByLabel("연결 대상", { exact: true }).selectOption("ssh_server");
+  await page.getByRole("button", { name: "연결 정보 저장", exact: true }).click();
+  await expect(page.getByText("연결 정보를 저장했습니다.", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(popover(page)).toHaveCount(0);
+  await page.getByRole("button", { name: "학습 설정", exact: true }).click();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("학습 설정");
+  await expect(planCard).toHaveCount(0);
 });
 
 test("a registered real dataset completes the data checklist item", async ({ page }) => {

@@ -1,3 +1,4 @@
+import { destinationChange } from "./server-connection";
 import { escapeHtml as esc } from "./workbench";
 import { tutorialSteps, type TutorialContext, type TutorialStep } from "./tutorial-steps";
 
@@ -27,6 +28,7 @@ export function rememberTutorial(outcome: Outcome) {
 export function createTutorial(host: TutorialHost, steps: TutorialStep[] = tutorialSteps) {
   let index = -1;
   let snapshot: Obj | null = null;
+  let startSettings: Obj = {};
   let sample: Obj | null = null;
   let entered = new Set<string>();
   let focused = -1;
@@ -90,6 +92,7 @@ export function createTutorial(host: TutorialHost, steps: TutorialStep[] = tutor
     if (index < 0) {
       const { config, plan, datasetDraft, preview } = host.state;
       snapshot = structuredClone({ config, plan, datasetDraft, preview });
+      startSettings = structuredClone(host.state.settings ?? {});
     }
     run++; pendingEnd = null; launcherFocus = false;
     entered = new Set(); focused = -1; scrolled = -1; announced = -1;
@@ -104,7 +107,12 @@ export function createTutorial(host: TutorialHost, steps: TutorialStep[] = tutor
     rememberTutorial(outcome);
     index = -1; run++;
     layer?.remove(); layer = null;
-    if (snapshot) Object.assign(host.state, snapshot, { capabilities: null });
+    if (snapshot) {
+      // Saving another destination or GPU selection during the tour invalidated the plan, as it does outside it;
+      // bringing it back would offer a start the sidecar refuses for its old destination.
+      if (destinationChange(startSettings, host.state.settings ?? {}) !== "none") snapshot.plan = null;
+      Object.assign(host.state, snapshot, { capabilities: null });
+    }
     snapshot = null;
     launcherFocus = true; host.render();
     if (host.state.config) { await guarded(() => host.checkCapabilities()); if (index < 0) launcherFocus = true; host.render(); }
