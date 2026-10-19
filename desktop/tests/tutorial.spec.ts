@@ -136,8 +136,6 @@ test("ending the tutorial restores the previous training draft", async ({ page }
   await boot(page);
   await page.getByRole("button", { name: "학습 설정", exact: true }).click();
   await page.getByLabel("업무 AI ID", { exact: true }).fill("my_draft");
-  // Committing the edit first: its change event re-renders the page, which would swallow a click already pressed.
-  await page.getByLabel("업무 AI ID", { exact: true }).blur();
   await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
   await expectStep(page, "welcome");
   await advanceTo(page, "training-dataset");
@@ -190,6 +188,32 @@ test("Ctrl+K starts the tutorial and each step moves focus to its title", async 
   await expectStep(page, "connection-provider");
   await expect(page.locator("#tour-title")).toBeFocused();
   await expect(page.getByRole("dialog", { name: "GPU 연결 방식 고르기" })).toBeVisible();
+});
+
+test("one click navigates right after a training field edit re-renders the workbench", async ({ page }) => {
+  await boot(page, { seen: true });
+  await page.getByRole("button", { name: "학습 설정", exact: true }).click();
+  await page.getByLabel("업무 AI ID", { exact: true }).fill("edited_draft");
+  await page.getByRole("button", { name: "데이터", exact: true }).click();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("데이터");
+  await page.getByRole("button", { name: "학습 설정", exact: true }).click();
+  await expect(page.getByLabel("업무 AI ID", { exact: true })).toHaveValue("edited_draft");
+});
+
+test("a press that never ends normally still lets the deferred render happen", async ({ page }) => {
+  await boot(page, { seen: true });
+  for (const ending of ["pointercancel", "no release"]) {
+    await page.getByRole("button", { name: "학습 설정", exact: true }).click();
+    await page.getByLabel("업무 AI ID", { exact: true }).fill(`draft ${ending}`);
+    await page.locator("h1").evaluate(el => el.setAttribute("data-before-press", ""));
+    await page.getByRole("button", { name: "데이터", exact: true }).hover();
+    await page.mouse.down();
+    if (ending === "pointercancel") {
+      await page.evaluate(() => window.dispatchEvent(new PointerEvent("pointercancel")));
+      await expect(page.locator("h1[data-before-press]")).toHaveCount(0, { timeout: 500 });
+    } else await expect(page.locator("h1[data-before-press]")).toHaveCount(0);
+    await page.mouse.up();
+  }
 });
 
 test("ending while a plan request is pending waits for it and then restores the draft", async ({ page }) => {
@@ -326,7 +350,6 @@ test("the tutorial button restarts an active tour and the end still restores the
   await boot(page, { registered: true });
   await page.getByRole("button", { name: "학습 설정", exact: true }).click();
   await page.getByLabel("업무 AI ID", { exact: true }).fill("my_draft");
-  await page.getByLabel("업무 AI ID", { exact: true }).blur();
   await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
   await expectStep(page, "welcome");
   await advanceTo(page, "training-plan");

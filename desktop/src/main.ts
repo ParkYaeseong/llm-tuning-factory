@@ -445,7 +445,29 @@ function comparison() {
   ${state.comparison.parameter_changes?.length ? `<table class="parameter-diff"><thead><tr><th>설정</th><th>첫 번째</th><th>두 번째</th></tr></thead><tbody>${state.comparison.parameter_changes.map((p: Obj) => `<tr><td class="mono">${esc(p.parameter)}</td><td class="diff-before">${esc(p.base_missing ? "없음" : JSON.stringify(p.base))}</td><td class="diff-after">${esc(p.candidate_missing ? "없음" : JSON.stringify(p.candidate))}</td></tr>`).join("")}</tbody></table>` : '<p class="muted">기록된 설정이 동일합니다.</p>'}
   <div class="grid"><div><details><summary>첫 번째 실행의 전체 설정</summary><pre>${esc(JSON.stringify(a.config, null, 2))}</pre></details>${button("이 설정으로 새 실험", "reuse:" + a.id)}</div><div><details><summary>두 번째 실행의 전체 설정</summary><pre>${esc(JSON.stringify(b.config, null, 2))}</pre></details>${button("이 설정으로 새 실험", "reuse:" + b.id)}</div></div></section>`;
 }
+// Pressing a control moves focus out of an edited field, whose change handler re-renders. Replacing the pressed
+// control before pointerup would make the browser drop the click, so renders wait until the press ends.
+const pressable = "button, summary, label.check, input[type=checkbox], input[type=radio]";
+let pressed = false, presses = 0, renderDeferred = false;
+function releasePress() {
+  if (!pressed) return;
+  pressed = false;
+  // Runs after the click this release produces, unless that click has rendered already.
+  if (renderDeferred) setTimeout(() => { if (renderDeferred) render(); }, 0);
+}
+window.addEventListener("pointerdown", e => {
+  if ((e.target as Element | null)?.closest?.(pressable)) { pressed = true; presses++; }
+}, true);
+for (const type of ["pointerup", "pointercancel"]) window.addEventListener(type, releasePress, true);
+// A release the page never saw (outside the window, on a control disabled meanwhile) must not leave it stale.
+window.addEventListener("pointermove", e => { if (!e.buttons) releasePress(); }, true);
+window.addEventListener("blur", releasePress);
 function render() {
+  if (pressed) {
+    if (!renderDeferred) { const press = presses; setTimeout(() => { if (pressed && presses === press) releasePress(); }, 1000); }
+    renderDeferred = true; return;
+  }
+  renderDeferred = false;
   const views: Obj = { overview, connections, datasets, training, jobs, history };
   root.innerHTML = `<aside><div class="brand"><span class="brand-mark"><svg width="22" height="24" viewBox="0 0 22 24" fill="none"><path d="M3 5h16M3 12h11M3 19h6" stroke="currentColor" stroke-width="3.2" stroke-linecap="square"/><circle cx="18" cy="19" r="2" fill="currentColor"/></svg></span><div>Tuning Factory<small>개인 워크스페이스</small></div>${icon("chevron", 12)}</div>
   <button class="command-trigger" data-action="search">${icon("search")}<span>바로 가기</span><kbd>Ctrl K</kbd></button><div class="nav-label">워크스페이스</div><nav>${Object.entries(pages).filter(([id]) => id !== "connections").map(([id, name]) => `<button aria-label="${name}" data-action="nav:${id}" class="${state.page === id ? "selected" : ""}">${icon(id)}<span>${name}</span>${id === "jobs" && state.jobs.filter((j: Obj) => j.status === "RUNNING").length ? '<i class="activity-marker"></i>' : ""}</button>`).join("")}</nav>
