@@ -1,4 +1,4 @@
-"""Build a self-contained Windows sidecar. No credentials, state or data are bundled."""
+"""Build a self-contained Windows sidecar. Only the fictional synthetic tutorial sample (examples/tutorial_sample.json) is bundled; no credentials, user state or user data are."""
 import importlib.metadata
 import shutil
 import subprocess

@@ -5,6 +5,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from tuning_factory.desktop import TUTORIAL_REFUSAL
 from tuning_factory.manifest import source_hash
 from tuning_factory.registry import digest
 
@@ -17,6 +18,8 @@ with tempfile.TemporaryDirectory(prefix="factory-package-") as temporary:
         result = json.loads(run.stdout)
         if expected_error:
             assert not result["ok"] and expected_error in result["error"], result
+            if expected_error == TUTORIAL_REFUSAL:
+                assert result["error"] == TUTORIAL_REFUSAL, result
             return result
         if not result["ok"]:
             raise RuntimeError(result.get("error"))
@@ -66,8 +69,10 @@ with tempfile.TemporaryDirectory(prefix="factory-package-") as temporary:
     assert tutorial["sha256"] == digest(bundled) and tutorial["rows"] == 8
     assert Path(tutorial["path"]).read_bytes() == bundled
     request("dataset", {"dataset_id": "tutorial_sample", "version": "1", "path": tutorial["path"],
-                        "synthetic": True, "export_allowed": True}, expected_error="tutorial_sample")
-    request("dataset", {"dataset_id": "tutorial_sample", "version": "1", "path": tutorial["path"], "synthetic": True})
+                        "synthetic": True, "export_allowed": True}, expected_error=TUTORIAL_REFUSAL)
+    registered = request("dataset", {"dataset_id": "tutorial_sample", "version": "1", "path": tutorial["path"],
+                                     "synthetic": True})
+    assert registered["export_allowed"] is False and registered["synthetic"] is True and registered["rows"] == 8
     wheel = next((root / "build/desktop-assets/dist").glob("*.whl"))
     with zipfile.ZipFile(wheel) as archive:
         for source in (root / "src/tuning_factory").glob("*.py"):
