@@ -20,7 +20,7 @@ export function icon(name: string, size = 16) {
   return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.file}</svg>`;
 }
 export const button = (label: string, action: string, cls = "", disabled = false) =>
-  `<button type="button" class="${cls}" data-action="${action}"${disabled ? " disabled" : ""}>${label}</button>`;
+  `<button type="button" class="${cls}" data-action="${escapeHtml(action)}"${disabled ? " disabled" : ""}>${label}</button>`;
 export function formatDate(seconds: unknown) {
   return typeof seconds === "number" ? new Date(seconds * 1000).toLocaleString("ko-KR", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
 }

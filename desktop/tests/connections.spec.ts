@@ -66,6 +66,7 @@ async function open(page: Page, settings: Record<string, unknown> = {}) {
       if (action === "execute") return null;
       if (action === "runtime_prepare") { if (mock.gate) await mock.gate; if (mock.prepareError) throw mock.prepareError; return { prepared: true }; }
       if (action === "runtime_reservations") return structuredClone(mock.reservations);
+      if (action === "history") return data.experiment_id ? { runs: structuredClone(mock.runs || []), next_page_token: null } : { experiments: [] };
       if (action === "runtime_release") { mock.reservations = mock.reservations.filter((r: any) => r.reservation_id !== data.reservation_id); return { released: data.reservation_id }; }
       return {};
     } };
@@ -594,4 +595,41 @@ test("the server connection module refuses invalid prices and escapes rendered v
   expect(result.resources.hourly_cost_usd * 3).toBeGreaterThanOrEqual(0.21);
   expect(result.html).not.toContain("<script>"); expect(result.html).not.toContain("<img"); expect(result.html).not.toContain("<b>");
   expect(result.html).toContain("&lt;script&gt;");
+});
+
+test("server-supplied run IDs cannot inject markup through shared action buttons", async ({ page }) => {
+  const evil = 'run" data-injected="1"><img src=x>';
+  await open(page);
+  await page.evaluate(({ config, evil }) => (window as any).__mock.runs = [{ id: evil, ai_id: "paper", status: "FINISHED", operator: "tester",
+    metrics: {}, config: { ...config, ai_id: "paper" }, simulation: false }], { config, evil });
+  await page.locator('nav [data-action="nav:history"]').click();
+  await page.getByRole("button", { name: "기록 불러오기", exact: true }).click();
+  await expect(page.getByRole("button", { name: "설정 불러오기", exact: true })).toBeVisible();
+  await expect(page.locator("[data-injected]")).toHaveCount(0);
+  await expect(page.locator("img")).toHaveCount(0);
+  // dataset decodes the escaped attribute, so the dispatcher still receives the original ID.
+  expect(await page.getByRole("button", { name: "설정 불러오기", exact: true }).evaluate(el => (el as HTMLElement).dataset.action)).toBe("reuse:" + evil);
+  await page.getByRole("button", { name: "설정 불러오기", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "학습 설정", exact: true })).toBeVisible();
+  await expect(page.locator(".notice")).toContainText("설정을 불러왔습니다.");
+});
+
+test("SSH ports compare the way the sidecar parses them", async ({ page }) => {
+  await open(page);
+  await page.addScriptTag({ type: "module", content: 'import * as m from "/src/server-connection.ts"; window.__serverConnection = m;' });
+  await page.waitForFunction(() => (window as any).__serverConnection);
+  const result = await page.evaluate(() => {
+    const m = (window as any).__serverConnection;
+    const transport = { ssh_host: "h", ssh_port: 22, ssh_username: "u", ssh_fingerprint: "SHA256:x", remote_root: "/r", selected_gpu_uuids: [] };
+    const job = { server_destination: { ssh_host: "h", ssh_port: 22, ssh_username: "u", remote_root: "/r", selected_gpu_uuids: [] } };
+    return [null, "22", "022", "", "22.0", "0x16", " 22", "abc"].map(port => {
+      const settings: Record<string, unknown> = { provider: "ssh_server", server_ssh_host: "h", server_ssh_username: "u",
+        server_ssh_fingerprint: "SHA256:x", server_remote_root: "/r", server_selected_gpu_uuids: "[]" };
+      if (port !== null) settings.server_ssh_port = port;
+      return [port, m.reservationMatches({ profile: { transport } }, settings), m.jobDestinationIssue(job, settings) === null, String(m.sshPort(port ?? undefined))];
+    });
+  });
+  // Python: an absent port is 22, a digit string becomes an integer ("022" is 22) and anything else is refused.
+  expect(result).toEqual([[null, true, true, "22"], ["22", true, true, "22"], ["022", true, true, "22"], ["", false, false, "NaN"],
+    ["22.0", false, false, "NaN"], ["0x16", false, false, "NaN"], [" 22", false, false, "NaN"], ["abc", false, false, "NaN"]]);
 });

@@ -38,13 +38,20 @@ export function destinationChange(before: Obj, after: Obj): "none" | "selection"
   if (route(before) !== route(after)) return "destination";
   return (before.server_selected_gpu_uuids ?? "") === (after.server_selected_gpu_uuids ?? "") ? "none" : "selection";
 }
+/** The SSH port as the sidecar parses it: absent is 22, a digit string is an integer ("022" is 22), anything else NaN. */
+export function sshPort(value: unknown) {
+  if (value === undefined || value === null) return 22;
+  if (typeof value === "number") return Number.isInteger(value) ? value : NaN;
+  return typeof value === "string" && /^[0-9]+$/.test(value) ? Number(value) : NaN;
+}
 /** The saved server shaped like jobs[].server_destination; null for RunPod. */
 export function settingsRoute(settings: Obj): Obj | null {
   if (!isServer(settings)) return null;
-  return { ssh_host: settings.server_ssh_host, ssh_port: Number(settings.server_ssh_port || 22), ssh_username: settings.server_ssh_username,
+  return { ssh_host: settings.server_ssh_host, ssh_port: sshPort(settings.server_ssh_port), ssh_username: settings.server_ssh_username,
     remote_root: settings.server_remote_root, selected_gpu_uuids: selectedGpus(settings) };
 }
-const routeKey = (route: Obj) => JSON.stringify([route.ssh_host, String(route.ssh_port), route.ssh_username, route.remote_root, route.selected_gpu_uuids]);
+// NaN serializes as null and never equals an observed integer port.
+const routeKey = (route: Obj) => JSON.stringify([route.ssh_host, sshPort(route.ssh_port), route.ssh_username, route.remote_root, route.selected_gpu_uuids]);
 /** The sidecar's refusal for running this job with the saved connection, or null when they agree. */
 export function jobDestinationIssue(job: Obj, settings: Obj) {
   const route = job.server_destination, saved = settingsRoute(settings);
@@ -57,8 +64,8 @@ export function jobDestinationIssue(job: Obj, settings: Obj) {
 export function reservationMatches(reservation: Obj, settings: Obj) {
   const t = reservation.profile?.transport || {};
   const key = (...values: unknown[]) => JSON.stringify(values);
-  return isServer(settings) && key(t.ssh_host, String(t.ssh_port), t.ssh_username, t.ssh_fingerprint, t.remote_root, t.selected_gpu_uuids)
-    === key(settings.server_ssh_host, String(settings.server_ssh_port || 22), settings.server_ssh_username,
+  return isServer(settings) && key(t.ssh_host, sshPort(t.ssh_port), t.ssh_username, t.ssh_fingerprint, t.remote_root, t.selected_gpu_uuids)
+    === key(settings.server_ssh_host, sshPort(settings.server_ssh_port), settings.server_ssh_username,
       settings.server_ssh_fingerprint, settings.server_remote_root, selectedGpus(settings));
 }
 /** Why a fresh inspection cannot be approved for runtime preparation, or null. */

@@ -70,6 +70,12 @@ fn settings_get(app: tauri::AppHandle) -> Result<Value, String> {
     read_settings(&app_root(&app)?, false)
 }
 
+/// Pasted OpenSSH/PEM or PuTTY (.ppk) key content in a key-file path field.
+fn pasted_key(name: &str, value: &Value) -> bool {
+    ["ssh_key_file", "server_ssh_key_file"].contains(&name) && value.as_str().is_some_and(|text|
+        ["PRIVATE KEY", "PuTTY-User-Key-File-", "Private-Lines:"].iter().any(|marker| text.contains(marker)))
+}
+
 fn merge_public_settings(existing: Value, input: &Map<String, Value>) -> Result<Map<String, Value>, String> {
     if input.keys().any(|key| !FIELDS.contains(&key.as_str())) {
         return Err("허용하지 않은 설정 항목".into());
@@ -78,9 +84,15 @@ fn merge_public_settings(existing: Value, input: &Map<String, Value>) -> Result<
         let text = value.as_str().ok_or("설정은 문자열이어야 합니다.")?;
         if text.len() > 2048 { return Err("설정값이 너무 깁니다.".into()); }
     }
+    // settings.json is plaintext: refuse submitted key content where only a path belongs. A value stored
+    // before this check is dropped below instead of blocking unrelated saves (S3, HF, the other provider).
+    if input.iter().any(|(name, value)| pasted_key(name, value)) {
+        return Err("SSH 개인키 파일에는 키 내용이 아니라 키 파일 경로를 입력하세요.".into());
+    }
     let previous = existing.as_object().ok_or("설정 파일이 손상되었습니다.")?;
     let mut public: Map<String, Value> = previous.iter()
-        .filter(|(name, value)| FIELDS.contains(&name.as_str()) && !SECRETS.contains(&name.as_str()) && value.is_string())
+        .filter(|(name, value)| FIELDS.contains(&name.as_str()) && !SECRETS.contains(&name.as_str()) && value.is_string()
+            && !pasted_key(name, value))
         .map(|(name, value)| (name.clone(), value.clone())).collect();
     for (name, value) in input {
         if !SECRETS.contains(&name.as_str()) { public.insert(name.clone(), value.clone()); }
@@ -97,10 +109,6 @@ fn merge_public_settings(existing: Value, input: &Map<String, Value>) -> Result<
         Ok(Value::Array(items)) if items.len() <= 8 && items.iter().all(Value::is_string));
     if !valid_selection {
         return Err("선택한 GPU 목록은 GPU UUID 문자열 최대 8개의 JSON 배열이어야 합니다.".into());
-    }
-    // settings.json is plaintext: a pasted key must never be stored where only a path belongs.
-    if ["ssh_key_file", "server_ssh_key_file"].iter().any(|name| text(name).contains("PRIVATE KEY")) {
-        return Err("SSH 개인키 파일에는 키 내용이 아니라 키 파일 경로를 입력하세요.".into());
     }
     if let Some(endpoint) = public.get("S3_ENDPOINT_URL").and_then(Value::as_str) {
         if !endpoint.is_empty() {
@@ -349,12 +357,27 @@ mod tests {
     #[test]
     fn key_file_settings_refuse_pasted_private_keys() {
         for name in ["ssh_key_file", "server_ssh_key_file"] {
-            for pasted in ["-----BEGIN OPENSSH PRIVATE KEY----\nb3BlbnNzaC1rZXktdjE=", "-----BEGIN RSA PRIVATE KEY----"] {
+            for pasted in ["-----BEGIN OPENSSH PRIVATE KEY----\nb3BlbnNzaC1rZXktdjE=", "-----BEGIN RSA PRIVATE KEY----",
+                "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none", "Public-Lines: 2\nAAAA\nPrivate-Lines: 1\nAAAA"] {
                 let error = merge(json!({name: pasted})).expect_err("a pasted private key was accepted");
                 assert!(error.contains("파일 경로"), "{error}");
             }
             assert!(merge(json!({name: "C:\\Users\\researcher\\.ssh\\id_ed25519"})).is_ok());
+            assert!(merge(json!({name: "C:\\Users\\researcher\\keys\\server.ppk"})).is_ok());
         }
+    }
+    #[test]
+    fn a_stored_pasted_key_neither_blocks_other_saves_nor_survives_them() {
+        let existing = json!({"pod_id": "assigned", "ssh_key_file": "-----BEGIN OPENSSH PRIVATE KEY----\nb3Blbg==",
+            "server_ssh_key_file": "PuTTY-User-Key-File-3: ssh-ed25519"});
+        let saved = merge_public_settings(existing.clone(), json!({"S3_REGION": "kr-standard"}).as_object().unwrap())
+            .expect("an unrelated save was blocked by a stored key-file value");
+        assert_eq!(saved.get("S3_REGION"), Some(&json!("kr-standard")));
+        assert_eq!(saved.get("pod_id"), Some(&json!("assigned")));
+        assert!(!saved.contains_key("ssh_key_file") && !saved.contains_key("server_ssh_key_file"), "pasted key content was kept");
+        assert!(merge_public_settings(existing.clone(), json!({"ssh_key_file": "-----BEGIN RSA PRIVATE KEY----"}).as_object().unwrap()).is_err());
+        let replaced = merge_public_settings(existing, json!({"ssh_key_file": "C:\\keys\\id_ed25519"}).as_object().unwrap()).unwrap();
+        assert_eq!(replaced.get("ssh_key_file"), Some(&json!("C:\\keys\\id_ed25519")));
     }
     #[test]
     fn server_sidecar_actions_are_named_operations() {
