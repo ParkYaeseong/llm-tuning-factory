@@ -15,7 +15,10 @@ const OTHER_SETTINGS_RESERVATION = "다른 서버 설정으로 만든 예약입�
 // The desktop sidecar uses the default execution policy (one GPU per job); the plan refuses more.
 // Native settings still accept up to 8 UUIDs for a later multi-GPU policy. Keep the message in step.
 export const MAX_GPUS_PER_JOB = 1;
-export const GPU_POLICY_MESSAGE = "현재 앱 정책은 작업당 GPU 1개입니다. GPU를 하나만 선택하세요.";
+export const GPU_POLICY_MESSAGE = `현재 앱 정책은 작업당 GPU ${MAX_GPUS_PER_JOB}개입니다. `
+  + `GPU를 ${MAX_GPUS_PER_JOB === 1 ? "하나만" : `${MAX_GPUS_PER_JOB}개 이하로`} 선택하세요.`;
+/** A PuTTY key path; Windows drops trailing dots and spaces, so "key.ppk." is one too (native refuses saving it). */
+export const puttyKeyPath = (path: unknown) => /\.ppk[.\s]*$/i.test(String(path ?? ""));
 
 /* Native settings: string values; the GPU selection is a JSON-encoded UUID array. */
 
@@ -140,8 +143,10 @@ export function releaseApproval(reservation: Obj) {
   const t = reservation.profile?.transport || {}, server = sshAddress(t.ssh_username, t.ssh_host, t.ssh_port);
   // A PREPARING reservation outlives a killed app or sidecar, but it may also belong to a preparation still running.
   const preparing = reservation.status !== "PREPARING" ? "" : "이 예약은 아직 ‘준비 중’으로 기록되어 있습니다. "
-    + "이 앱이나 다른 앱 창에서 환경 준비가 아직 실행 중일 수 있습니다. 앱 창을 모두 닫고 "
-    + `${server}의 프로세스 목록에서 준비 명령이 실행 중이지 않음을 확인한 경우에만 진행하세요.\n`;
+    + "이 앱이나 다른 앱 창에서 환경 준비가 아직 실행 중일 수 있습니다. 다른 앱 창을 모두 닫고 "
+    + `${server}의 프로세스 목록에서 준비 명령이 실행 중이지 않음을 확인한 경우에만 진행하세요.\n`
+    // A killed window can leave its sidecar running with the preparation lease.
+    + "작업 관리자에서 factory-bridge.exe가 실행 중이 아닌지 확인하세요.\n";
   return preparing + `원래 GPU 서버(${server})에서 학습 환경 준비 프로세스가 종료된 것을 직접 확인했습니다.\n`
     + `예약 ${reservation.reservation_id}을 해제하면 이 서버에서 다시 준비하거나 학습할 수 있습니다. `
     + "준비가 아직 실행 중이면 해제하지 마세요. 같은 서버에서 작업이 겹칠 수 있습니다.";

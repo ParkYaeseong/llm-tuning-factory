@@ -93,7 +93,9 @@ fn merge_public_settings(existing: Value, input: &Map<String, Value>) -> Result<
     }
     // The sidecar's SSH client reads OpenSSH keys without a passphrase or agent, never PuTTY files.
     if input.iter().any(|(name, value)| KEY_FILE_FIELDS.contains(&name.as_str())
-        && value.as_str().is_some_and(|path| path.trim_end().to_ascii_lowercase().ends_with(".ppk"))) {
+        // Windows drops trailing dots and spaces from file names, so "key.ppk." names the same .ppk file.
+        && value.as_str().is_some_and(|path| path.trim_end_matches(|c: char| c == '.' || c.is_whitespace())
+            .to_ascii_lowercase().ends_with(".ppk"))) {
         return Err("PuTTY .ppk 키는 지원하지 않습니다. OpenSSH 형식(암호 없는 키)으로 변환한 키 파일을 선택하세요.".into());
     }
     let previous = existing.as_object().ok_or("설정 파일이 손상되었습니다.")?;
@@ -381,7 +383,9 @@ mod tests {
     fn key_file_settings_refuse_putty_ppk_paths() {
         // paramiko reads OpenSSH keys without a passphrase or agent; a .ppk path would only fail at connection time.
         for name in ["ssh_key_file", "server_ssh_key_file"] {
-            for path in ["C:\\Users\\researcher\\keys\\server.ppk", "C:\\keys\\SERVER.PPK", "D:\\keys\\gpu.Ppk"] {
+            // Windows drops trailing dots and spaces from file names, so "server.ppk." opens server.ppk.
+            for path in ["C:\\Users\\researcher\\keys\\server.ppk", "C:\\keys\\SERVER.PPK", "D:\\keys\\gpu.Ppk",
+                "C:\\keys\\server.ppk.", "C:\\keys\\server.ppk. .", "C:\\keys\\server.PPK.. "] {
                 let error = merge(json!({name: path})).expect_err("a PuTTY .ppk path was accepted");
                 assert!(error.contains("PuTTY .ppk") && error.contains("OpenSSH"), "{error}");
             }

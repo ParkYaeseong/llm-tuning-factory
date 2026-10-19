@@ -376,7 +376,10 @@ test("releasing an uncertain or stuck reservation requires confirming the remote
   await expect(release).toBeEnabled();
   await release.click();
   await expect(dialog).toContainText("이 앱이나 다른 앱 창에서 환경 준비가 아직 실행 중일 수 있습니다");
+  await expect(dialog).toContainText("다른 앱 창을 모두 닫고");
   await expect(dialog).toContainText("프로세스 목록");
+  // A killed window can leave its sidecar running with the preparation lease.
+  await expect(dialog).toContainText("작업 관리자에서 factory-bridge.exe가 실행 중이 아닌지 확인하세요.");
   await expect(dialog).toContainText("준비 프로세스가 종료된 것을 직접 확인했습니다");
   await page.getByRole("button", { name: "돌아가기", exact: true }).click();
   expect(await calls(page, "runtime_release")).toHaveLength(1);
@@ -688,4 +691,45 @@ test("both key-file fields ask for an OpenSSH key without a passphrase", async (
   await expect(page.locator('[data-tour="connection-fields"]')).toContainText(hint);
   await page.getByLabel("연결 대상", { exact: true }).selectOption("ssh_server");
   await expect(page.locator('[data-tour="connection-fields"]')).toContainText(hint);
+});
+
+test("a stored PuTTY key path is flagged under its field so saves are not refused without explanation", async ({ page }) => {
+  const warning = "OpenSSH 형식(암호 없는 키)으로 변환한 키 파일로 바꿔야 연결 정보를 저장할 수 있습니다";
+  await open(page, { ...server, ssh_key_file: "C:\\keys\\pod.PPK.", server_ssh_key_file: "C:\\keys\\gpu.ppk" });
+  await connectionsPage(page);
+  const fields = page.locator('[data-tour="connection-fields"]');
+  await expect(fields).toContainText(warning);
+  await page.getByLabel("SSH 개인키 파일", { exact: true }).fill("C:\\keys\\id_ed25519");
+  await page.getByLabel("연결 대상", { exact: true }).selectOption("existing_runpod");
+  await expect(fields).toContainText(warning);
+  await page.getByLabel("SSH 개인키 파일", { exact: true }).fill("C:\\keys\\pod_ed25519");
+  await page.getByLabel("연결 대상", { exact: true }).selectOption("ssh_server");
+  await expect(fields).not.toContainText(warning);
+});
+
+test("an over-limit GPU selection blocks starting a planned job and says why", async ({ page }) => {
+  await open(page, { ...server, server_selected_gpu_uuids: JSON.stringify([GPU_A, GPU_B]) });
+  await trainingPage(page);
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  await expect(page.locator(".plan")).toContainText(GPU_POLICY);
+  await expect(page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" })).toBeDisabled();
+  await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).evaluate(el => el.removeAttribute("disabled"));
+  await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).click();
+  await expect(page.getByRole("alert")).toContainText(GPU_POLICY);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calls(page, "submit")).toEqual([]);
+});
+
+test("the dispatcher refuses guarded runtime actions even when a disabled button is re-enabled", async ({ page }) => {
+  await open(page, { ...server, server_selected_gpu_uuids: JSON.stringify([GPU_A, GPU_B]) });
+  await connectionsPage(page);
+  for (const name of ["GPU 정보 → 학습 설정에 적용", "학습 환경 준비", "환경 확인"]) {
+    const control = page.getByRole("button", { name, exact: true });
+    await expect(control).toBeDisabled();
+    await control.evaluate(el => el.removeAttribute("disabled"));
+    await control.click();
+    await expect(page.getByRole("alert"), name).toContainText(GPU_POLICY);
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+  }
+  for (const action of ["server_facts", "server_inspect", "runtime_check", "runtime_prepare"]) expect(await calls(page, action), action).toEqual([]);
 });

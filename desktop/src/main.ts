@@ -2,8 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { version } from "../package.json";
 import { button, filterRuns, formatDate, icon, progressView } from "./workbench";
 import { connectionResult, destinationChange, GPU_POLICY_MESSAGE, inventoryTable, isServer, jobDestination, jobDestinationIssue,
-  MAX_GPUS_PER_JOB, prepareApproval, prepareIssue, releaseApproval, reservationMatches, reservationTable, resourcesFromFacts, sameSelection,
-  selectedGpus, selectionPolicyIssue, serverAddress, serverBridge, serverConfigured, settingsRoute, shortIdentifier,
+  MAX_GPUS_PER_JOB, prepareApproval, prepareIssue, puttyKeyPath, releaseApproval, reservationMatches, reservationTable, resourcesFromFacts,
+  sameSelection, selectedGpus, selectionPolicyIssue, serverAddress, serverBridge, serverConfigured, settingsRoute, shortIdentifier,
   transferApproval } from "./server-connection";
 import "./style.css";
 
@@ -284,10 +284,13 @@ function connections() {
   // Remote checks use saved settings; an unsaved provider switch would target the other destination.
   const pending = server !== isServer(state.settings);
   const operator = field("기록에 표시할 이름", "FACTORY_OPERATOR", s.FACTORY_OPERATOR);
+  // Native settings refuse a submitted .ppk path, so a stored one would block every save of this form.
+  const keyHelp = (path: unknown) => "OpenSSH 형식·암호 없는 개인키 파일 경로를 선택합니다. 키 내용은 입력하지 마세요." + (puttyKeyPath(path)
+    ? '<br><span class="warning-text">PuTTY .ppk 키는 지원하지 않습니다. OpenSSH 형식(암호 없는 키)으로 변환한 키 파일로 바꿔야 연결 정보를 저장할 수 있습니다.</span>' : "");
   const runpod = `<section class="card" data-tour="connection-fields"><div class="section-title"><h3>RunPod 연결</h3><span class="badge">기존 Pod 사용</span></div><div class="grid">
   ${field("RunPod API 키", "RUNPOD_API_KEY", s.RUNPOD_API_KEY || "", "password", s.RUNPOD_API_KEY_saved ? "보안 저장됨 · 변경할 때만 입력" : "API 키는 Windows 자격 증명 저장소에 보관합니다.")}
   ${field("Pod ID", "pod_id", s.pod_id)}
-  ${field("SSH 개인키 파일", "ssh_key_file", s.ssh_key_file, "text", "OpenSSH 형식·암호 없는 개인키 파일 경로를 선택합니다. 키 내용은 입력하지 마세요.")}
+  ${field("SSH 개인키 파일", "ssh_key_file", s.ssh_key_file, "text", keyHelp(s.ssh_key_file))}
   <div class="field"><span>키 파일 선택</span>${button("파일 찾기", "pick:key")}</div>
   ${field("SSH 서버 지문", "ssh_fingerprint", s.ssh_fingerprint, "text", "신뢰할 수 있는 경로로 확인한 SHA256:… 지문을 입력하세요.")}
   ${operator}
@@ -296,7 +299,7 @@ function connections() {
   ${field("서버 주소", "server_ssh_host", s.server_ssh_host, "text", "예: gpu.example.org 또는 IP 주소")}
   ${field("SSH 포트", "server_ssh_port", s.server_ssh_port || "22")}
   ${field("접속 계정", "server_ssh_username", s.server_ssh_username, "text", "root 계정이 아니어도 됩니다.")}
-  ${field("SSH 개인키 파일", "server_ssh_key_file", s.server_ssh_key_file, "text", "OpenSSH 형식·암호 없는 개인키 파일 경로를 선택합니다. 키 내용은 입력하지 마세요.")}
+  ${field("SSH 개인키 파일", "server_ssh_key_file", s.server_ssh_key_file, "text", keyHelp(s.server_ssh_key_file))}
   <div class="field"><span>키 파일 선택</span>${button("파일 찾기", "pick:server-key")}</div>
   ${field("SSH 서버 지문", "server_ssh_fingerprint", s.server_ssh_fingerprint, "text", "관리자가 신뢰할 수 있는 경로로 전달한 SHA256:… 값만 입력하세요.")}
   ${field("작업 폴더 · 절대 경로", "server_remote_root", s.server_remote_root, "text", "예: /home/계정/factory. 앱의 학습 환경·캐시·작업 파일이 이 폴더 아래에 만들어지며 서버의 Python은 변경하지 않습니다.")}
@@ -395,12 +398,17 @@ function training() {
   ${compatibilityView()}<div class="actions"><button class="primary" type="submit" ${!state.capabilities?.valid || state.capabilityPending ? "disabled" : ""}>실행 계획 확인</button>${button("설정 저장", "save-profile")}</div></section></form>
   ${state.plan ? `<section class="card plan"><h3>실행 전 확인</h3><div class="stats"><article><small>업무 AI</small><b>${esc(state.plan.manifest.config.ai_id)}</b></article><article><small>학습 데이터</small><b>${esc(state.plan.manifest.dataset.dataset_id)} · ${num(state.plan.manifest.dataset.rows)}건</b></article><article><small>최대 시간 기준 예상 GPU 비용</small><b>$${num(state.plan.estimated_cost_usd)}</b></article></div>
   <p>${esc(state.plan.note)}</p><p class="muted">${isServer(state.settings) ? `GPU 서버: ${esc(serverAddress(state.settings))} · 선택 GPU ${selectedGpus(state.settings).length}개` : `Pod: ${esc(state.settings.pod_id || "미설정")}`} · GPU: ${esc(state.plan.manifest.config.resource_profile.gpu_type)}</p>
-  ${planBlocked() ? `<p class="warning-text">${esc(state.plan.destination_issue || "GPU 서버 연결 설정을 확인하고 실행 계획을 다시 확인하세요.")}</p>` : ""}
-  ${button("데이터 전송에 동의하고 학습 시작", "start", "primary", planBlocked())}
+  ${planIssues().map(issue => `<p class="warning-text">${esc(issue)}</p>`).join("")}
+  ${button("데이터 전송에 동의하고 학습 시작", "start", "primary", planIssues().length > 0)}
   <details><summary>확정된 설정 보기</summary><pre>${esc(JSON.stringify(state.plan.manifest.config, null, 2))}</pre></details></section>` : ""}`;
 }
-// The offline plan reports no destination hash when the saved server settings cannot be approved.
-const planBlocked = () => Boolean(state.plan && isServer(state.settings) && !state.plan.destination_sha256);
+/** Why a displayed server plan cannot start: no destination hash for the saved settings (the offline plan's
+ * issue) or a saved GPU selection over the app policy, which the submitted facts would not match. */
+function planIssues(): string[] {
+  if (!state.plan || !isServer(state.settings)) return [];
+  const destination = state.plan.destination_sha256 ? null : state.plan.destination_issue || "GPU 서버 연결 설정을 확인하고 실행 계획을 다시 확인하세요.";
+  return [destination, selectionPolicyIssue(state.settings)].filter((issue): issue is string => Boolean(issue));
+}
 function jobs() {
   const active = state.jobs.find((j: Obj) => j.id === state.active);
   const resumeSupported = state.jobCapabilities && state.jobCapabilities.resume_supported !== false;
@@ -669,7 +677,7 @@ async function action(name: string) {
   if (["start", "execute", "resume"].includes(name)) {
     captureConfig();
     if (name === "start" && !state.plan) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
-    if (name === "start" && planBlocked()) { state.error = state.plan.destination_issue || "GPU 서버 연결 설정을 확인하고 실행 계획을 다시 확인하세요."; render(); return; }
+    if (name === "start" && planIssues().length) { state.error = planIssues().join("\n"); render(); return; }
     // Execute and resume run where the job was approved; resume resets the job before the sidecar could refuse.
     const job = name === "start" ? null : state.jobs.find((j: Obj) => j.id === state.active);
     const issue = job ? jobDestinationIssue(job, state.settings) : null;
