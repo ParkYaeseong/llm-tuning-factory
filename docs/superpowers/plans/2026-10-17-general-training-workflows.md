@@ -182,6 +182,10 @@ RunPod 키/Pod ID는 일반 서버에서 요구하지 않는다. 연결 검사, 
 튜토리얼 연결 단계용으로 연결 대상(RunPod/GPU 서버) 선택 필드 묶음에 `data-tour="connection-provider"`,
 선택한 제공자의 연결 필드 묶음에 `data-tour="connection-fields"`, GPU 학습 환경(환경 확인/준비·GPU 선택) 카드에
 `data-tour="connection-runtime"`을 각각 정확히 하나씩 렌더링한다.
+같은 연결 화면에 [MLflow 인증 없음](../specs/2026-10-19-ssh-gpu-servers-extension.md#mlflow-인증-없음-2026-10-19-추가)을 구현한다:
+`auth_mode=none`, native 인증값 미전달, OIDC 시크릿 누락 시 명확한 ValueError, `mlflow_read`/`mlflow_auth` 연결 검사 표시와 문서.
+추가 시험: none 저장/재열기와 OIDC·토큰 입력란 숨김, Python에 인증값 미전달(Rust), 잘못된 auth_mode 거부,
+OIDC 주소만 있고 시크릿 없음 → 명확한 오류, 인증 없는 HTTP URI 허용과 인증 있는 HTTP 거부 유지.
 
 - [ ] **1. RED:** 일반 서버 필드 표시와 save/reopen; 키/인증값 masking 유지;
   일반 서버 GPU 조회/선택/0 비용 실행 계획; 프로필/선택 GPU 변경 시 기존 계획 차단;

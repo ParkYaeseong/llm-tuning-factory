@@ -45,6 +45,25 @@ Docker/Slurm 제출, Windows GPU 원격 실행, 서버 생성/전원 제어는 �
 과거 RunPod 설정은 제공자 필드가 없어도 RunPod로 읽으며 기존 v1 manifest/모델/데이터/MLflow 기록을 보존한다.
 이후 영속 컨트롤러와 새 그래프 UI도 같은 제공자 중립 계약을 사용한다.
 
+## MLflow 인증 없음 (2026-10-19 추가)
+
+사용자 질문 “mlflow 연동할때 로컬서버나 인증 없는경우는 어떻게 돼?”에 이어 Task 6B에 포함하기로 선택했다.
+현재는 ‘발급받은 토큰’ + 빈 토큰으로만 인증 없는 서버를 쓸 수 있고, 기본값 OIDC에서 시크릿만 비우면
+`'MLFLOW_OIDC_CLIENT_SECRET'` KeyError로 실패하며, 연결 검사는 인증 없이 조회해도 “인증·조회 확인됨”으로 표시한다.
+
+- 인증 방식 `auth_mode`에 `none`(화면: “인증 없음 · 로컬·내부 서버”)을 추가한다. 허용 값은 `oidc`/`token`/`none`이며
+  native 저장 시 다른 값은 거부한다. 빈 값은 과거 설정과 같이 `oidc`로 읽는다.
+- `none`이면 native가 OIDC 주소·클라이언트 ID·시크릿과 토큰을 Python에 전달하지 않는다.
+  저장된 인증값은 삭제하지 않으므로 다른 방식으로 되돌리면 다시 쓴다. 화면에서는 OIDC·토큰 입력란을 숨긴다.
+- OIDC 주소가 있는데 클라이언트 ID나 시크릿이 없으면 KeyError 대신 “OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다.
+  인증값을 입력하거나 ‘인증 없음’을 선택하세요.” ValueError로 거부한다. CLI `.env`에도 같은 규칙이 적용된다.
+- HTTPS 규칙은 유지한다: 토큰/OIDC 인증값이 있으면 HTTPS만 허용하고, 인증 없음은 `http://127.0.0.1:5000` 같은 HTTP를 허용한다.
+- 연결 검사 결과에 `mlflow_read: true`와 `mlflow_auth`(`oidc`/`token`/`none`)를 추가하고,
+  기존 `mlflow_authenticated_read`는 실제 인증을 사용한 경우에만 true로 둔다. 화면은 “MLflow 조회 · 인증 없음”처럼 방식과 함께 표시한다.
+- 문서: 로컬 `mlflow server`(산출물 proxy 사용) 예시, 기본 산출물 위치 `mlflow-artifacts:/`가 서버 proxy를 요구한다는 점,
+  인증 없음은 서버에 접근 가능한 누구나 기록을 볼 수 있으므로 신뢰할 수 있는 로컬·내부망에서만 쓰라는 안내를 추가한다.
+  `.env.example`에는 인증 없는 서버에서 OIDC 세 항목과 토큰을 비우라는 주석을 추가한다.
+
 ## 검증
 
 실제 GPU 서버 없이 생성된 SSH 응답/로컬 격리 fixture로 인증 필수 조건, GPU 조회/선택/불일치,
