@@ -6,6 +6,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -51,6 +52,13 @@ TUTORIAL_REFUSAL = "tutorial_sample은 앱에 포함된 연습용 합성 데이�
 
 def tutorial_sample_path():
     return assets_root() / "examples" / "tutorial_sample.json"
+
+
+def tutorial_copy_matches(copy, raw):
+    try:
+        return copy.is_file() and copy.read_bytes() == raw
+    except OSError:  # Still locked by the concurrent writer.
+        return False
 
 
 def reserved_tutorial_id(data):
@@ -264,7 +272,11 @@ class DesktopService:
                     os.replace(temporary, copy)
                 except PermissionError:
                     # A concurrent process may hold the target; success only if it already holds the bundle.
-                    if not copy.is_file() or copy.read_bytes() != raw:
+                    for _ in range(5):
+                        if tutorial_copy_matches(copy, raw):
+                            break
+                        time.sleep(0.1)
+                    else:
                         raise
                 finally:
                     if temporary is not None:
@@ -490,7 +502,8 @@ class DesktopService:
     def history(self, data):
         from mlflow import MlflowClient
 
-        from .auth import configure_oidc
+        from .auth import configure_oidc, require_secure_tracking
+        require_secure_tracking(self.settings["MLFLOW_TRACKING_URI"])
         configure_oidc()
         client = MlflowClient(tracking_uri=self.settings["MLFLOW_TRACKING_URI"])
         if not data.get("experiment_id"):

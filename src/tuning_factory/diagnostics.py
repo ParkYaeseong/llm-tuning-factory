@@ -19,11 +19,12 @@ def check_connections(root, pod_id=None, write_test=False, *, server=None):
             return {"ssh_server": server_report, "gpu_training_verified": False}
     from mlflow import MlflowClient
 
-    from .auth import configure_oidc
+    from .auth import configure_oidc, require_secure_tracking
     from .tracking import MLflowTracker
     uri = os.environ.get("MLFLOW_TRACKING_URI")
     if not uri:
         raise ValueError("MLFLOW_TRACKING_URI or connection profile required")
+    require_secure_tracking(uri)
     # Decided before OIDC refresh, which itself exports MLFLOW_TRACKING_TOKEN.
     auth = ("oidc" if os.environ.get("MLFLOW_OIDC_TOKEN_URL")
             else "token" if os.environ.get("MLFLOW_TRACKING_TOKEN") else "none")

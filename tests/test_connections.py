@@ -76,7 +76,7 @@ def test_connection_report_names_the_mlflow_authentication_mode(tmp_path, monkey
 
     class Client:
         def __init__(self, tracking_uri):
-            assert tracking_uri == "http://127.0.0.1:5000"
+            assert tracking_uri == "https://127.0.0.1:5000"
 
         def search_experiments(self, max_results):
             return []
@@ -86,7 +86,7 @@ def test_connection_report_names_the_mlflow_authentication_mode(tmp_path, monkey
 
     for key in ENV_SETTINGS:
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://127.0.0.1:5000")
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr("mlflow.MlflowClient", Client)

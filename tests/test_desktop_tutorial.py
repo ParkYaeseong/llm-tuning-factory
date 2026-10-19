@@ -117,3 +117,16 @@ def test_tutorial_plan_is_dry_run_and_submission_is_refused(tmp_path):
     with pytest.raises(ValueError, match="export has not been authorized"):
         app.dispatch("submit", {"config": config, "approved": True})
     assert app.dispatch("jobs", {}) == []
+
+
+def test_copy_permission_error_is_reraised_when_copy_differs(tmp_path, monkeypatch):
+    app = desktop.DesktopService(tmp_path)
+
+    def locked(*args):
+        raise PermissionError(32, "sharing violation")
+
+    monkeypatch.setattr(desktop.os, "replace", locked)
+    monkeypatch.setattr(desktop.time, "sleep", lambda seconds: None)
+    with pytest.raises(PermissionError):
+        app.dispatch("tutorial_sample", {})
+    assert list((tmp_path / "tutorial").glob("*.tmp")) == []

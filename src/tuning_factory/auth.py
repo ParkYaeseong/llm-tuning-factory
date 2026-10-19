@@ -52,6 +52,20 @@ OIDC_CLIENT_MISSING = ("OIDC 인증을 선택했지만 클라이언트 인증값
                        "인증값을 입력하거나 ‘인증 없음’을 선택하세요.")
 
 
+INSECURE_TRACKING = ("인증값을 사용하는 MLflow 서버 주소는 HTTPS여야 합니다. 인증 없는 로컬·내부 HTTP 서버는 "
+                     "토큰과 OIDC 값을 비우거나 앱에서 ‘인증 없음’을 선택하세요.")
+
+
+def require_secure_tracking(uri):
+    """Bearer tokens and OIDC secrets never travel over plain HTTP; unauthenticated servers are unaffected."""
+    if not uri:
+        return
+    if any(os.environ.get(key) for key in
+           ("MLFLOW_TRACKING_TOKEN", "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_SECRET")):
+        if urlsplit(str(uri)).scheme != "https":
+            raise ValueError(INSECURE_TRACKING)
+
+
 def configure_oidc():
     token_url = os.environ.get("MLFLOW_OIDC_TOKEN_URL")
     if not token_url:
