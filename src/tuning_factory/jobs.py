@@ -163,14 +163,16 @@ class JobStore:
             return {row['job_id'] for row in db.execute('SELECT job_id FROM job_destinations')}
 
     def raw_server_receipts(self, job_ids):
-        """Stored receipt text of the given jobs in one query; callers parse each row and fail closed."""
+        """Stored receipt text of the given jobs; callers parse each row and fail closed."""
         job_ids = list(job_ids)
-        if not job_ids:
-            return {}
+        receipts = {}
         with self.connection() as db:
-            rows = db.execute('SELECT job_id,receipt FROM job_destinations WHERE job_id IN (%s)'
-                              % ','.join('?' * len(job_ids)), job_ids)
-            return {row['job_id']: row['receipt'] for row in rows}
+            for start in range(0, len(job_ids), 500):  # Stay far below SQLite's variable limit.
+                chunk = job_ids[start:start + 500]
+                rows = db.execute('SELECT job_id,receipt FROM job_destinations WHERE job_id IN (%s)'
+                                  % ','.join('?' * len(chunk)), chunk)
+                receipts.update({row['job_id']: row['receipt'] for row in rows})
+        return receipts
 
     def server_receipt(self, job_id):
         from .gpu_servers import ServerApprovalReceipt
@@ -299,6 +301,10 @@ class JobStore:
               *, server_profile=None, server_facts=None):
         if max_concurrent < 1:
             raise ValueError('max_concurrent must be positive')
+        if server_facts is not None:
+            from .gpu_servers import SSHServerFacts
+            if not isinstance(server_facts, SSHServerFacts):
+                raise ValueError('server_facts must be verified SSHServerFacts')
         if server_profile is not None:
             from .gpu_servers import validate_server_binding
             validate_server_binding(server_profile, server_facts)

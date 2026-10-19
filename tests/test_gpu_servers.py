@@ -1478,3 +1478,53 @@ def test_doctor_rejects_pod_id_combined_with_a_server_profile(tmp_path, monkeypa
                                       "--server-profile", str(path)])
     assert result.exit_code == 2, result.output
     assert "pod-id" in result.output
+
+
+def test_claim_refuses_an_inspection_as_server_facts(tmp_path):
+    from test_graph_store import queued
+
+    from tuning_factory.gpu_servers import SSHServerInspection
+    from tuning_factory.jobs import JobStore
+
+    store = JobStore(tmp_path / "jobs.db")
+    queued(store, "one")
+    facts = observation()
+    inspection = SSHServerInspection(server_id=facts.server_id, transport=settings().transport,
+                                     inventory=facts.inventory, total_hourly_cost_usd=0,
+                                     observed_at=facts.observed_at)
+    with pytest.raises(ValueError, match="server_facts"):
+        store.claim(facts.exclusivity_key, server_facts=inspection)
+    assert store.resource_blocked(inspection) is False
+    assert store.claim(facts.exclusivity_key, server_facts=facts)
+
+
+def test_raw_server_receipts_chunks_large_id_lists(tmp_path):
+    from tuning_factory.jobs import JobStore
+
+    store = JobStore(tmp_path / "jobs.db")
+    ids = [f"job-{index}" for index in range(1201)]
+    with store.connection() as db:
+        db.executemany("INSERT INTO job_destinations (job_id,receipt) VALUES (?,?)",
+                       [(job, "receipt-" + job) for job in ids[::2]])
+    seen = []
+    original = store.connection
+
+    class Spy:
+        def __init__(self, db):
+            self.db = db
+
+        def execute(self, sql, params=()):
+            seen.append(len(params))
+            return self.db.execute(sql, params)
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def spied():
+        with original() as db:
+            yield Spy(db)
+
+    store.connection = spied
+    result = store.raw_server_receipts(ids)
+    assert result == {job: "receipt-" + job for job in ids[::2]}
+    assert max(seen) <= 500 and len(seen) == 3
