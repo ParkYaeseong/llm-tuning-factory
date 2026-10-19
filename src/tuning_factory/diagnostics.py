@@ -8,7 +8,15 @@ from .execution import RunPodController
 from .registry import canonical, digest
 
 
-def check_connections(root, pod_id=None, write_test=False):
+def check_connections(root, pod_id=None, write_test=False, *, server=None):
+    server_report = None
+    if server is not None:
+        from .desktop_runtime import inspect_server
+        server_report = inspect_server(server).model_dump(mode="json")
+        if not os.environ.get("MLFLOW_TRACKING_URI"):
+            if write_test:
+                raise ValueError("MLFLOW_TRACKING_URI required for explicit tracking write test")
+            return {"ssh_server": server_report, "gpu_training_verified": False}
     from mlflow import MlflowClient
 
     from .auth import configure_oidc
@@ -26,6 +34,8 @@ def check_connections(root, pod_id=None, write_test=False):
         registry_readable = False
     report = {"tracking_uri": uri, "mlflow_authenticated_read": True,
               "model_registry_read": registry_readable, "gpu_training_verified": False}
+    if server_report is not None:
+        report["ssh_server"] = server_report
     if pod_id:
         controller = RunPodController(os.environ["RUNPOD_API_KEY"])
         pod = controller.status(pod_id)

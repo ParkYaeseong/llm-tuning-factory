@@ -1,5 +1,6 @@
 """Infrastructure policy and execution adapters; no implicit paid actions."""
 import json
+import math
 import re
 import shlex
 import stat
@@ -13,6 +14,7 @@ import paramiko
 from pydantic import Field
 
 from .config import StrictModel
+from .gpu_servers import SSHServerFacts, safe_remote_root, validate_server_binding
 from .registry import file_digest
 
 
@@ -31,7 +33,7 @@ class Policy(StrictModel):
     max_cost_usd: float = Field(default=5, gt=0)
     max_attempts: int = Field(default=2, ge=1, le=5)
 
-    def check(self, config, dataset, execute=False, approved_transfer=False):
+    def check(self, config, dataset, execute=False, approved_transfer=False, *, server_facts=None):
         resource = config.resource_profile
         estimate = resource.hourly_cost_usd * resource.timeout_seconds / 3600 * resource.gpu_count
         if resource.gpu_count > self.max_gpus:
@@ -45,7 +47,11 @@ class Policy(StrictModel):
                 raise ValueError("dataset export has not been authorized in registry")
             if not approved_transfer:
                 raise ValueError("explicit data-transfer and execution approval required")
-            if resource.hourly_cost_usd <= 0:
+            if server_facts is not None:
+                if not isinstance(server_facts, SSHServerFacts):
+                    raise ValueError("typed verified SSH server observation required")
+                SSHServerFacts.model_validate(server_facts.model_dump()).validate_config(config)
+            if resource.hourly_cost_usd <= 0 and server_facts is None:
                 raise ValueError("positive GPU price required before paid execution")
         return estimate
 
@@ -136,8 +142,22 @@ class SSHExecutor(ExecutionBackend):
     remote = True
 
     def __init__(self, host, port, username, key_file, remote_root="/workspace/factory", client=None, pod=None,
-                 remote_python="python", worker_lock_file=None, hf_home=None):
-        if not re.fullmatch(r"/[a-zA-Z0-9_/-]+", remote_root) or ".." in remote_root:
+                 remote_python="python", worker_lock_file=None, hf_home=None,
+                 server_profile=None, server_facts=None):
+        if server_profile is not None or server_facts is not None:
+            if client is None:
+                raise ValueError("inspected SSH connection required for server execution")
+            if pod is not None or server_profile is None or server_facts is None:
+                raise ValueError("use one truthful provider/resource observation")
+            validate_server_binding(server_profile, server_facts)
+            expected_root = server_profile.transport.remote_root + "/jobs"
+            if remote_root == "/workspace/factory":
+                remote_root = expected_root
+            elif remote_root != expected_root:
+                raise ValueError("remote root differs from pinned server destination")
+        if server_profile is not None:
+            safe_remote_root(remote_root)
+        elif not re.fullmatch(r"/[a-zA-Z0-9_/-]+", remote_root) or ".." in remote_root:
             raise ValueError("remote_root must be a safe absolute Linux path")
         self.client = client or paramiko.SSHClient()
         if client is None:
@@ -147,11 +167,17 @@ class SSHExecutor(ExecutionBackend):
                                 allow_agent=False, look_for_keys=False)
         self.root = remote_root
         self.pod = pod
+        self.server_profile = server_profile
+        self.server_facts = server_facts
         self.remote_python = remote_python
         self.worker_lock_file = worker_lock_file
         self.hf_home = hf_home
 
     def validate_config(self, config):
+        if self.server_profile is not None:
+            validate_server_binding(self.server_profile, self.server_facts)
+            self.server_facts.validate_config(config)
+            return
         pod = self.pod
         resource = config.resource_profile
         if not pod:
@@ -160,7 +186,13 @@ class SSHExecutor(ExecutionBackend):
             raise ValueError("claimed job GPU count differs from live Pod")
         if resource.gpu_type not in {pod.get("gpu", {}).get("id"), pod.get("gpu", {}).get("displayName")}:
             raise ValueError("claimed job GPU type differs from live Pod")
-        if float(pod["costPerHr"]) > resource.hourly_cost_usd * resource.gpu_count:
+        try:
+            price = float(pod["costPerHr"])
+        except (KeyError, ValueError, TypeError):
+            raise ValueError("positive finite live RunPod API price required") from None
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError("positive finite live RunPod API price required")
+        if price > resource.hourly_cost_usd * resource.gpu_count:
             raise ValueError("claimed job price exceeds approved resource budget")
 
     def mkdir(self, sftp, path):
@@ -224,8 +256,12 @@ class SSHExecutor(ExecutionBackend):
         if launch_id is not None and not re.fullmatch(r"[0-9a-f]{32}", launch_id):
             raise ValueError("invalid persisted launch ID")
         remote = self.root + "/" + directory.name + "/" + (launch_id or uuid.uuid4().hex)
-        (directory / "remote-attempt.json").write_text(json.dumps({"remote_path": remote,
-            "pod_id": self.pod.get("id") if self.pod else None, "created": time.time()}), encoding="utf-8")
+        receipt = {"remote_path": remote, "pod_id": self.pod.get("id") if self.pod else None,
+                   "created": time.time()}
+        if self.server_profile is not None:
+            receipt = {"remote_path": remote, "created": time.time(),
+                       "destination": self.server_profile.model_dump(mode="json")}
+        (directory / "remote-attempt.json").write_text(json.dumps(receipt), encoding="utf-8")
         submitted = False
         finished = False
         try:
@@ -233,6 +269,8 @@ class SSHExecutor(ExecutionBackend):
                 self.upload(sftp, directory, remote)
                 command = [self.remote_python, "-m", "tuning_factory.worker", remote, str(timeout)]
                 environment = []
+                if self.server_profile is not None:
+                    environment.append("CUDA_VISIBLE_DEVICES=" + ",".join(self.server_facts.selected_gpu_uuids))
                 if self.worker_lock_file:
                     environment.append("FACTORY_GPU_LOCK_FILE=" + self.worker_lock_file)
                 if self.hf_home:
@@ -300,6 +338,7 @@ class SSHExecutor(ExecutionBackend):
     def collect_result(self, directory):
         directory = Path(directory).resolve()
         record = json.loads((directory / "remote-attempt.json").read_text())
+        self.validate_attempt_destination(record)
         remote = record["remote_path"]
         expected_prefix = self.root + "/" + directory.name + "/"
         if not remote.startswith(expected_prefix) or not re.fullmatch(r"[0-9a-f]{32}", remote[len(expected_prefix):]):
@@ -329,3 +368,10 @@ class SSHExecutor(ExecutionBackend):
                 return result
         finally:
             self.client.close()
+
+    def validate_attempt_destination(self, record):
+        if self.server_profile is not None:
+            if record.get("destination") != self.server_profile.model_dump(mode="json"):
+                raise ValueError("remote attempt destination differs from original execution")
+        elif record.get("destination") is not None:
+            raise ValueError("remote attempt destination differs from original execution")

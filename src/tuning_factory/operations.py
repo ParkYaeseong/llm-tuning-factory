@@ -5,7 +5,7 @@ from pydantic import Field, model_validator
 
 from .benchmarks import BenchmarkSpec, EvaluationRecord, SelectionSpec
 from .config import GraphTrainingConfig, StrictModel
-from .executor_profiles import ExecutorProfile, ResourceFacts
+from .executor_profiles import PublicExecutorProfile, ResourceObservation, validate_resource_binding
 from .model_artifacts import ModelArtifactRef, ModelInput
 from .projects import DatasetRef, LocalId, Sha256
 
@@ -23,15 +23,14 @@ class RuntimeProfile(StrictModel):
 
 
 class OperationResources(StrictModel):
-    executor: ExecutorProfile
-    facts: ResourceFacts
+    executor: PublicExecutorProfile
+    facts: ResourceObservation
     timeout_seconds: int = Field(strict=True, ge=1, le=604800)
     runtime: RuntimeProfile
 
     @model_validator(mode="after")
-    def same_pod(self):
-        if self.executor.pod_id != self.facts.pod_id:
-            raise ValueError("executor/resource Pod mismatch")
+    def same_resource(self):
+        validate_resource_binding(self.executor, self.facts)
         return self
 
 
@@ -59,7 +58,7 @@ class TrainOperation(_Operation):
         if (self.dataset.dataset_id, self.dataset.version) != (self.config.dataset_id, self.config.dataset_version):
             raise ValueError("training dataset differs from resolved config")
         if self.config.resource_profile != self.resources.facts.legacy_resources(self.resources.timeout_seconds):
-            raise ValueError("training resources differ from pinned Pod budget")
+            raise ValueError("training resources differ from pinned resource budget")
         expected = "ppo" if self.config.training_stage == "ppo" else "primary"
         if self.resources.runtime.profile != expected:
             raise ValueError("training runtime mismatch")

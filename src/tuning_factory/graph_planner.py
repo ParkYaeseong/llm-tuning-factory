@@ -19,7 +19,12 @@ from pydantic import Field, model_validator
 from .benchmarks import BenchmarkSpec, EvaluationRecord, SelectionResult
 from .config import GraphTrainingConfig, StrictModel
 from .dataset_splits import _dataset, assert_no_input_overlap, input_fingerprint
-from .executor_profiles import ExecutorProfile, ResourceFacts
+from .executor_profiles import (
+    PublicExecutorProfile,
+    ResourceObservation,
+    approval_destination,
+    observation_key,
+)
 from .graph_schema import (
     EvaluateNode,
     GraphSpec,
@@ -197,7 +202,7 @@ class ExecutionChoices(StrictModel):
     datasets: tuple[DatasetSnapshot, ...] = ()
     models: tuple[ModelContext, ...] = ()
     artifacts: tuple[ArtifactSnapshot, ...] = ()
-    executors: tuple[ExecutorProfile, ...] = ()
+    executors: tuple[PublicExecutorProfile, ...] = ()
     node_resources: tuple[NodeResources, ...] = ()
     base_targets: tuple[ModelTargetEvidence, ...] = ()
     tracking_destination: TrackingDestination | None = None
@@ -224,7 +229,7 @@ class GraphPlan(StrictModel):
     definition_sha256: Sha256
     graph: GraphSpec
     execution_choices: ExecutionChoices
-    resource_snapshots: tuple[ResourceFacts, ...]
+    resource_snapshots: tuple[ResourceObservation, ...]
     nodes: tuple[NodePlan, ...]
     max_estimated_cost_usd: float = Field(ge=0)
     max_duration_seconds: int = Field(ge=0)
@@ -240,9 +245,16 @@ class DestinationRevision(StrictModel):
     pod_id: LocalId
 
 
+class ServerDestinationRevision(StrictModel):
+    profile_id: LocalId
+    revision: LocalId
+    profile_sha256: Sha256
+    resource_id: str
+
+
 class ApprovalGrant(StrictModel):
     plan_sha256: Sha256
-    destination_profile_revisions: tuple[DestinationRevision, ...]
+    destination_profile_revisions: tuple[DestinationRevision | ServerDestinationRevision, ...]
 
     @classmethod
     def for_plan(cls, plan: GraphPlan):
@@ -250,9 +262,10 @@ class ApprovalGrant(StrictModel):
         _check_plan(plan)
         profiles = {resource.executor.profile_id: resource.executor for node in plan.nodes
                     for resource in node.allowed_resources}
+        from pydantic import TypeAdapter
+        destination = TypeAdapter(DestinationRevision | ServerDestinationRevision)
         return cls(plan_sha256=plan.sha256, destination_profile_revisions=tuple(
-            DestinationRevision(profile_id=p.profile_id, revision=p.revision,
-                                profile_sha256=digest(canonical(p.model_dump(mode="json"))), pod_id=p.pod_id)
+            destination.validate_python(approval_destination(p))
             for p in sorted(profiles.values(), key=lambda value: value.profile_id)))
 
     def validate_plan(self, plan: GraphPlan):
@@ -395,10 +408,11 @@ def _config(project, node, recipe, root, context, dataset, resources):
 
 
 def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: ExecutionChoices,
-               resource_snapshots: tuple[ResourceFacts, ...], simulation=True) -> GraphPlan:
+               resource_snapshots: tuple[ResourceObservation, ...], simulation=True) -> GraphPlan:
     project_revision = Revision[ProjectSpec].model_validate(project_revision.model_dump())
     choices = ExecutionChoices.model_validate(execution_choices.model_dump())
-    facts = tuple(ResourceFacts.model_validate(item.model_dump()) for item in resource_snapshots)
+    from pydantic import TypeAdapter
+    facts = tuple(TypeAdapter(ResourceObservation).validate_python(item.model_dump()) for item in resource_snapshots)
     _revision(project_revision)
     graph = GraphSpec.model_validate(project_revision.spec.graph)
     issues = _definition_issues(project_revision.spec, graph, choices.recipes, choices.datasets)
@@ -414,7 +428,7 @@ def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: Execu
                            or any(p.transport_settings_sha256 is None for p in profiles.values())):
         raise ValueError("real planning requires frozen transport and tracking destination revisions")
     resources = _unique(choices.node_resources, lambda x: x.node_id, "node resource choice")
-    by_pod = _unique(facts, lambda x: x.pod_id, "Pod resource snapshot")
+    by_resource = _unique(facts, observation_key, "resource snapshot")
     nodes = {node.id: node for node in graph.nodes}
     bindings = {item.binding_id: item for item in project_revision.spec.datasets}
     roles = {_dataset_key(item.dataset): item.role for item in project_revision.spec.datasets}
@@ -431,10 +445,10 @@ def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: Execu
                 raise ValueError(f"missing resource duration/runtime choice for {node.id}")
             runtime = _runtime(choice.runtime_profile)
             for profile_id in node.executor_profile_ids:
-                if profile_id not in profiles or profiles[profile_id].pod_id not in by_pod:
+                if profile_id not in profiles or observation_key(profiles[profile_id]) not in by_resource:
                     raise ValueError("missing executor profile or resource facts")
                 profile = profiles[profile_id]
-                allowed.append(OperationResources(executor=profile, facts=by_pod[profile.pod_id],
+                allowed.append(OperationResources(executor=profile, facts=by_resource[observation_key(profile)],
                                                  timeout_seconds=choice.timeout_seconds, runtime=runtime))
         if isinstance(node, TrainNode):
             recipe = _recipe(node, recipes)
@@ -472,11 +486,15 @@ def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: Execu
     total = sum(item.max_estimated_cost_usd for item in planned)
     if total > graph.max_total_cost_usd:
         raise ValueError("whole graph including retries exceeds maximum total cost")
-    used_pods = {r.facts.pod_id: r.facts.gpu_count for n in planned for r in n.allowed_resources}
+    used_resources = {}
+    for node in planned:
+        for resource in node.allowed_resources:
+            key = resource.facts.exclusivity_key
+            used_resources[key] = max(used_resources.get(key, 0), resource.facts.gpu_count)
     body = dict(project_revision=project_revision, definition_sha256=digest(canonical(graph.model_dump(mode="json"))),
                 graph=graph, execution_choices=choices, resource_snapshots=facts, nodes=tuple(planned),
                 max_estimated_cost_usd=total, max_duration_seconds=sum(item.max_duration_seconds for item in planned),
-                max_concurrent_gpu_count=sum(sorted(used_pods.values(), reverse=True)[:graph.max_concurrent]),
+                max_concurrent_gpu_count=sum(sorted(used_resources.values(), reverse=True)[:graph.max_concurrent]),
                 simulation=simulation)
     # Serialize through the schema before hashing to normalize datetime/tuple fields.
     result = GraphPlan(**body, sha256="0" * 64)
@@ -594,7 +612,7 @@ class VerifiedBindings:
     """
     registry: Registry
     artifact_store: ModelArtifactStore
-    destination_profile: ExecutorProfile | None = None
+    destination_profile: PublicExecutorProfile | None = None
     outputs: tuple[NodeModelBinding, ...] = ()
     producers: tuple[ProducerEvidence, ...] = ()
     evaluations: tuple[NodeEvaluationBinding, ...] = ()

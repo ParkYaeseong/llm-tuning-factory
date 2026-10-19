@@ -26,10 +26,16 @@ class Factory:
         self.store.get(job_id)
         return self.root / "jobs" / job_id
 
-    def submit(self, config, request_key=None, priority=0, simulation=True):
+    def submit(self, config, request_key=None, priority=0, simulation=True, *, server_receipt=None):
         manifest = resolve(config, self.registry, simulation=simulation)
         self.policy.check(config, manifest["dataset"])
-        job = self.store.submit(manifest, request_key or manifest["sha256"], priority)
+        if server_receipt is not None:
+            from .gpu_servers import ServerApprovalReceipt
+            server_receipt = ServerApprovalReceipt.model_validate(server_receipt.model_dump()
+                if hasattr(server_receipt, "model_dump") else server_receipt)
+            server_receipt.validate_destination(manifest["sha256"], server_receipt.profile.transport, server_receipt.facts)
+            server_receipt.facts.validate_config(config)
+        job = self.store.submit(manifest, request_key or manifest["sha256"], priority, server_receipt=server_receipt)
         self.store.materialize_job_evidence(job["id"])
         if job["status"] == "PENDING":
             self.store.transition(job["id"], "QUEUED")
@@ -56,7 +62,9 @@ class Factory:
     def work(self, executor=None, backend=None, gpu="mock-cpu", approved_transfer=False, select_mode=False, target_job_id=None):
         executor = executor or LocalExecutor()
         job = self.store.claim(gpu, self.policy.max_concurrent, self.policy.max_gpus,
-                               simulation=not executor.remote if select_mode else None, job_id=target_job_id)
+                               simulation=not executor.remote if select_mode else None, job_id=target_job_id,
+                               server_profile=getattr(executor, "server_profile", None),
+                               server_facts=getattr(executor, "server_facts", None))
         if job is None:
             return None
         return self.run_claimed(job, executor, backend, approved_transfer)
@@ -67,8 +75,16 @@ class Factory:
         job = self.store.get(lease.job_id)
         if job["manifest"].get("schema_version") == 2:
             raise NotImplementedError("v2 graph execution requires the operation worker adapter")
-        launch_id = self.store.begin_launch(lease)
         executor = executor or LocalExecutor()
+        server_facts = getattr(executor, "server_facts", None)
+        if server_facts is not None:
+            self.store.verify_server_destination(job['id'], executor.server_profile, server_facts)
+            if lease.resource_id != server_facts.exclusivity_key:
+                raise ValueError("attempt resource differs from verified destination")
+            executor.validate_config(AIConfig.model_validate(job['manifest']['config']))
+        elif self.store.server_receipt(job['id']) is not None:
+            raise ValueError("original SSH server destination executor required")
+        launch_id = self.store.begin_launch(lease)
         approved_transfer = approval
         gpu = lease.resource_id
         job_id = job["id"]
@@ -102,7 +118,8 @@ class Factory:
             if not manifest["simulation"] and not executor.remote:
                 raise ValueError("real training requires the approved RunPod executor")
             dataset = self.registry.get_dataset(config.dataset_id, config.dataset_version)
-            self.policy.check(config, dataset, execute=executor.remote, approved_transfer=approved_transfer)
+            self.policy.check(config, dataset, execute=executor.remote, approved_transfer=approved_transfer,
+                              server_facts=server_facts)
             executor.validate_config(config)
             if dataset != manifest["dataset"]:
                 raise ValueError("dataset registration differs from manifest")
@@ -115,7 +132,8 @@ class Factory:
                 actual = self.registry.get_dataset(validation["dataset_id"], validation["version"])
                 if actual != validation:
                     raise ValueError("validation data differs from immutable manifest")
-                self.policy.check(config, actual, execute=executor.remote, approved_transfer=approved_transfer)
+                self.policy.check(config, actual, execute=executor.remote, approved_transfer=approved_transfer,
+                                  server_facts=server_facts)
                 validation_kind = "preference" if config.evaluation_profile.kind == "reward" else "instruction"
                 backend.prepare_validation(directory, self.registry.dataset_path(actual).read_bytes(), kind=validation_kind)
             if getattr(executor, "pod", None):
@@ -124,6 +142,8 @@ class Factory:
                     "pod_id": gpu, "gpu": pod["gpu"], "image": pod.get("image"),
                     "cost_per_hour_usd": float(pod["costPerHr"]),
                     "network_volume": pod["networkVolume"]["id"]}))
+            elif server_facts is not None:
+                (directory / "execution.json").write_bytes(canonical(server_facts.model_dump(mode="json")))
             # Remove markers from an earlier attempt, without touching its output/checkpoints.
             for name in ("result.json", "cancel", "error.txt", "tracking-error.txt"):
                 (directory / name).unlink(missing_ok=True)

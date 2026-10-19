@@ -43,10 +43,57 @@ def main(ctx: typer.Context, state_dir: Path = Path("state"), policy_file: Path 
 
 
 @app.command()
-def doctor(ctx: typer.Context, pod_id: str | None = None, write_test: bool = False):
+def doctor(ctx: typer.Context, pod_id: str | None = None, write_test: bool = False,
+           server_profile: Path | None = None):
     from .diagnostics import check_connections
     connection = ctx.obj.connection
-    output(check_connections(ctx.obj.root, pod_id or (connection.pod_id if connection else None), write_test))
+    server = server_connection(ctx, server_profile)
+    output(check_connections(ctx.obj.root, None if server else pod_id or (connection.pod_id if connection else None),
+                             write_test, server=server))
+
+
+def server_connection(ctx, path=None):
+    from .connections import load_server_settings
+    if path is not None:
+        settings = load_server_settings(path)
+    elif ctx.obj.connection and ctx.obj.connection.provider == "ssh_server":
+        settings = ctx.obj.connection.ssh_server
+    else:
+        return None
+    return {"provider": "ssh_server", **settings.model_dump(mode="json")}
+
+
+@app.command("server-inspect")
+def server_inspect(profile: Path):
+    from .connections import load_server_settings
+    from .desktop_runtime import inspect_server
+    output(inspect_server({"provider": "ssh_server", **load_server_settings(profile).model_dump(mode="json")})
+           .model_dump(mode="json"))
+
+
+@app.command("server-runtime")
+def server_runtime(ctx: typer.Context, profile: Path, prepare: bool = False,
+                   approve_preparation: bool = False, training_stage: str = "sft"):
+    from .desktop_runtime import inspect_server, runtime
+    if prepare and not approve_preparation:
+        raise typer.BadParameter("--approve-preparation required for private runtime installation")
+    settings = server_connection(ctx, profile)
+    inspection = inspect_server(settings) if prepare else None
+    output(runtime(settings, ctx.obj.root, prepare=prepare, training_stage=training_stage, inspection=inspection))
+
+
+@app.command("server-runtime-status")
+def server_runtime_status(ctx: typer.Context):
+    from .desktop_runtime import runtime_reservations
+    output(runtime_reservations(ctx.obj.root))
+
+
+@app.command("server-runtime-release")
+def server_runtime_release(ctx: typer.Context, profile: Path, reservation_id: str,
+                           confirm_preparation_stopped: bool = False):
+    from .desktop_runtime import release_runtime_reservation
+    output(release_runtime_reservation(server_connection(ctx, profile), ctx.obj.root, reservation_id,
+                                       confirm_preparation_stopped=confirm_preparation_stopped))
 
 
 @app.command("dataset-register")
@@ -61,22 +108,33 @@ def validate(config: Path):
 
 
 @app.command()
-def plan(ctx: typer.Context, config: Path, real: bool = False):
+def plan(ctx: typer.Context, config: Path, real: bool = False, server_profile: Path | None = None):
     manifest = resolve(load_config(config), ctx.obj.registry, simulation=not real)
     estimate = ctx.obj.policy.check(load_config(config), manifest["dataset"])
-    output({"manifest": manifest, "sha256": manifest["sha256"], "estimated_cost_usd": estimate,
-            "dry_run": True, "note": "Estimate excludes storage, transfer, provisioning and idle time."})
+    result = {"manifest": manifest, "sha256": manifest["sha256"], "estimated_cost_usd": estimate,
+              "dry_run": True, "note": "Estimate excludes storage, transfer, provisioning and idle time."}
+    server = server_connection(ctx, server_profile)
+    if server is not None and real:
+        from .desktop_runtime import plan_server_destination
+        result["server_receipt"] = plan_server_destination(server, manifest).model_dump(mode="json")
+    output(result)
 
 
 @app.command()
 def run(ctx: typer.Context, config: Path, mock: bool = False, submit: bool = False,
-        real: bool = False, request_key: str | None = None, priority: int = 0):
+        real: bool = False, request_key: str | None = None, priority: int = 0,
+        server_profile: Path | None = None):
     if mock and real:
         raise typer.BadParameter("--mock and --real are mutually exclusive")
     if not (mock or submit):
-        plan(ctx, config, real)
+        plan(ctx, config, real, server_profile)
         return
-    job = ctx.obj.submit(load_config(config), request_key, priority, simulation=not real)
+    receipt = None
+    server = server_connection(ctx, server_profile)
+    if server is not None and real:
+        from .desktop_runtime import plan_server_destination
+        receipt = plan_server_destination(server, resolve(load_config(config), ctx.obj.registry, simulation=False))
+    job = ctx.obj.submit(load_config(config), request_key, priority, simulation=not real, server_receipt=receipt)
     if mock and job["status"] == "QUEUED":
         job = ctx.obj.work(target_job_id=job["id"])
     output(job)
@@ -94,9 +152,15 @@ def batch(ctx: typer.Context, configs: Annotated[list[Path], typer.Argument()], 
 @app.command()
 def work(ctx: typer.Context, drain: bool = False, pod_id: str | None = None,
          host: str | None = None, port: int = 22, username: str = "root", key_file: Path | None = None,
-         approve_execution_and_transfer: bool = False):
+         approve_execution_and_transfer: bool = False, server_profile: Path | None = None):
     factory = ctx.obj
     factory.store.recover()
+    server = server_connection(ctx, server_profile)
+    if server is not None:
+        if pod_id:
+            raise typer.BadParameter("choose one execution provider")
+        server_work(factory, server, drain, approve_execution_and_transfer)
+        return
     while True:
         executor = None
         selected = None
@@ -153,6 +217,48 @@ def work(ctx: typer.Context, drain: bool = False, pod_id: str | None = None,
             break
 
 
+def server_work(factory, settings, drain, approved):
+    from .config import AIConfig
+    from .desktop_runtime import connection, executor_for
+    from .gpu_servers import ServerApprovalReceipt
+    if not approved:
+        raise typer.BadParameter("--approve-execution-and-transfer is required for real jobs")
+    while True:
+        queued = sorted((job for job in factory.store.list() if job["status"] == "QUEUED"
+                         and not job["graph_run_id"] and not job["manifest"]["simulation"]),
+                        key=lambda job: (-job["priority"], job["created"]))
+        if not queued:
+            output({"idle": True})
+            return
+        # Read-only hardware fit precedes selecting the stage-specific private venv.
+        with connection(settings) as (facts, _):
+            selected = None
+            for job in queued:
+                config = AIConfig.model_validate(job["manifest"]["config"])
+                try:
+                    facts.validate_config(config)
+                except ValueError:
+                    continue
+                if config.resource_profile.gpu_count <= factory.policy.max_gpus:
+                    selected = job
+                    break
+            if selected is None:
+                output({"waiting": True, "reason": "no queued job fits observed server GPU selection and budget"})
+                return
+        receipt = factory.store.server_receipt(selected['id'])
+        stage = selected['manifest']['config']['training_stage']
+        with executor_for(settings, factory.root, training_stage=stage, server_receipt=receipt) as executor:
+            if receipt is None:
+                receipt = ServerApprovalReceipt.create(selected['manifest']['sha256'], executor.server_profile,
+                                                       executor.server_facts)
+                factory.store.bind_server_receipt(selected['id'], receipt)
+            result = factory.work(executor=executor, gpu=executor.server_facts.exclusivity_key,
+                                  approved_transfer=True, select_mode=True, target_job_id=selected['id'])
+        output(result or {"idle": True})
+        if not drain or result is None or result["status"] == "QUEUED":
+            return
+
+
 @app.command()
 def status(ctx: typer.Context, job_id: str | None = None):
     output(ctx.obj.store.get(job_id) if job_id else ctx.obj.store.list())
@@ -184,7 +290,22 @@ def recover(ctx: typer.Context, stale_after_seconds: int = 120):
 
 
 @app.command()
-def reconcile(ctx: typer.Context, job_id: str, pod_id: str, host: str, key_file: Path, port: int = 22):
+def reconcile(ctx: typer.Context, job_id: str,
+              pod_id: Annotated[str | None, typer.Argument()] = None,
+              host: Annotated[str | None, typer.Argument()] = None,
+              key_file: Annotated[Path | None, typer.Argument()] = None, port: int = 22,
+              server_profile: Path | None = None):
+    server = server_connection(ctx, server_profile)
+    if server is not None:
+        from .desktop_runtime import executor_for
+        receipt = ctx.obj.store.server_receipt(job_id)
+        if receipt is None:
+            raise typer.BadParameter("job has no original SSH server destination receipt")
+        with executor_for(server, ctx.obj.root, preflight=False, server_receipt=receipt) as executor:
+            output(ctx.obj.reconcile(job_id, executor))
+        return
+    if not pod_id or not host or not key_file:
+        raise typer.BadParameter("Pod ID, host and key file required for RunPod reconciliation")
     controller = RunPodController(os.environ["RUNPOD_API_KEY"])
     pod = controller.status(pod_id)
     if pod.get("desiredStatus") != "RUNNING" or pod.get("publicIp") != host or int(pod.get("portMappings", {}).get("22", 0)) != port:

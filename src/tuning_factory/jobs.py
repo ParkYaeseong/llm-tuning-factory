@@ -27,6 +27,13 @@ class AttemptLease:
     resource_id: str
 
 
+@dataclass(frozen=True)
+class PreparationLease:
+    reservation_id: str
+    owner_token: str
+    resource_id: str
+
+
 class JobStore:
     def __init__(self, path):
         self.path = Path(path)
@@ -47,6 +54,14 @@ class JobStore:
                   legacy INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS resource_leases (
                   resource_id TEXT PRIMARY KEY, job_id TEXT UNIQUE NOT NULL, attempt_id TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS job_destinations (
+                  job_id TEXT PRIMARY KEY, receipt TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS resource_observations (
+                  attempt_id TEXT PRIMARY KEY, facts TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS preparation_reservations (
+                  reservation_id TEXT PRIMARY KEY, owner_token TEXT NOT NULL,
+                  resource_id TEXT UNIQUE NOT NULL, profile TEXT NOT NULL, facts TEXT NOT NULL,
+                  status TEXT NOT NULL, created REAL NOT NULL);
             ''')
             db.execute('BEGIN IMMEDIATE')
             columns = {r['name'] for r in db.execute('PRAGMA table_info(jobs)')}
@@ -107,10 +122,66 @@ class JobStore:
         db.execute('INSERT INTO events VALUES (?,?,?,?)', (job_id, 'PENDING', now, None))
         return self.decode(db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone())
 
-    def submit(self, manifest, request_key, priority=0):
+    def submit(self, manifest, request_key, priority=0, *, server_receipt=None):
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            return self._submit(db, manifest, request_key, priority)
+            job = self._submit(db, manifest, request_key, priority)
+            if server_receipt is not None:
+                self._bind_server_receipt(db, job, server_receipt)
+            return job
+
+    def _bind_server_receipt(self, db, job, receipt):
+        from .gpu_servers import ServerApprovalReceipt
+        from .registry import canonical
+        receipt = ServerApprovalReceipt.model_validate(receipt.model_dump() if hasattr(receipt, 'model_dump') else receipt)
+        if job['manifest']['sha256'] != receipt.manifest_sha256 or job['manifest'].get('simulation'):
+            raise ValueError('server receipt manifest differs from real submitted job')
+        existing = db.execute('SELECT receipt FROM job_destinations WHERE job_id=?', (job['id'],)).fetchone()
+        serialized = canonical(receipt.model_dump(mode='json')).decode()
+        if existing:
+            original = ServerApprovalReceipt.model_validate_json(existing['receipt'])
+            if original.profile != receipt.profile:
+                raise ValueError('job destination receipt is immutable')
+            original.validate_destination(receipt.manifest_sha256, receipt.profile.transport, receipt.facts)
+            return
+        if job['attempts'] or job['status'] not in {'PENDING', 'QUEUED'}:
+            raise ValueError('cannot retrofit a destination receipt onto an attempted job')
+        db.execute('INSERT INTO job_destinations VALUES (?,?)', (job['id'], serialized))
+
+    def bind_server_receipt(self, job_id, receipt):
+        """CLI explicit execution may freeze its first route before the first claim."""
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None:
+                raise ValueError('unknown job')
+            self._bind_server_receipt(db, self.decode(row), receipt)
+
+    def server_receipt(self, job_id):
+        from .gpu_servers import ServerApprovalReceipt
+        with self.connection() as db:
+            row = db.execute('SELECT receipt FROM job_destinations WHERE job_id=?', (job_id,)).fetchone()
+        return ServerApprovalReceipt.model_validate_json(row['receipt']) if row else None
+
+    def _verify_server_destination(self, db, row, profile, facts):
+        from .gpu_servers import ServerApprovalReceipt, validate_server_binding
+        validate_server_binding(profile, facts)
+        stored = db.execute('SELECT receipt FROM job_destinations WHERE job_id=?', (row['id'],)).fetchone()
+        if stored is None:
+            raise ValueError('approved server destination receipt required before claim')
+        receipt = ServerApprovalReceipt.model_validate_json(stored['receipt'])
+        if receipt.profile != profile:
+            raise ValueError('job destination profile differs from original approval')
+        manifest = json.loads(row['manifest'])
+        receipt.validate_destination(manifest['sha256'], profile.transport, facts)
+        return receipt
+
+    def verify_server_destination(self, job_id, profile, facts):
+        with self.connection() as db:
+            row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row is None:
+                raise ValueError('unknown job')
+            return self._verify_server_destination(db, row, profile, facts)
 
     def get(self, job_id):
         with self.connection() as db:
@@ -166,20 +237,41 @@ class JobStore:
             return 0 if operation['lineage']['simulation'] else operation.get('resources', {}).get('facts', {}).get('gpu_count', 0)
         return 0 if manifest.get('simulation') else manifest.get('config', {}).get('resource_profile', {}).get('gpu_count', 1)
 
-    def _resource_blocked(self, db, resource):
-        if db.execute('SELECT 1 FROM gpu_locks WHERE gpu=?', (resource,)).fetchone():
-            return True
-        # Old names cannot safely be mapped to physical Pods. Quarantine all real claims.
-        if resource.startswith('existing_runpod:'):
-            return bool(db.execute("SELECT 1 FROM gpu_locks g JOIN jobs j ON g.job_id=j.id "
-                                   "WHERE g.gpu NOT LIKE 'existing_runpod:%' AND g.gpu != 'mock-cpu'").fetchone())
+    def _resource_blocked(self, db, resource, resource_facts=None):
+        from .gpu_servers import SSHServerFacts
+        # Provider labels do not prove distinct physical servers. Preserve unknown
+        # locks and quarantine cross-provider claims when hardware cannot be mapped.
+        providers = ('existing_runpod:', 'ssh_server:')
+        provider = next((prefix for prefix in providers if resource.startswith(prefix)), None)
+        held = [(row['resource'], row['facts']) for row in db.execute(
+            'SELECT g.gpu AS resource,o.facts FROM gpu_locks g '
+            'LEFT JOIN resource_leases l ON l.resource_id=g.gpu AND l.job_id=g.job_id '
+            'LEFT JOIN resource_observations o ON o.attempt_id=l.attempt_id')]
+        held += [(row['resource_id'], row['facts']) for row in db.execute('SELECT * FROM preparation_reservations')]
+        for locked, observed in held:
+            if resource == locked:
+                return True
+            if provider is None or locked == 'mock-cpu':
+                continue
+            if not locked.startswith(provider):
+                return True
+            if provider == 'ssh_server:':
+                if not isinstance(resource_facts, SSHServerFacts) or observed is None:
+                    return True
+                previous = SSHServerFacts.model_validate_json(observed)
+                if previous.server_id == resource_facts.server_id or ({gpu.uuid for gpu in previous.inventory}
+                        & {gpu.uuid for gpu in resource_facts.inventory}):
+                    return True
         return False
 
-    def _claim(self, db, row, resource):
+    def _claim(self, db, row, resource, resource_facts=None):
         now, attempt, token, launch = time.time(), uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex
         db.execute('INSERT INTO job_attempts VALUES (?,?,?,?,?,0,0,?)', (attempt, row['id'], token, resource, launch, now))
         db.execute('INSERT INTO gpu_locks VALUES (?,?)', (resource, row['id']))
         db.execute('INSERT INTO resource_leases VALUES (?,?,?)', (resource, row['id'], attempt))
+        if resource_facts is not None:
+            db.execute('INSERT INTO resource_observations VALUES (?,?)',
+                       (attempt, resource_facts.model_dump_json()))
         db.execute("UPDATE jobs SET status='PROVISIONING',attempts=attempts+1,active_attempt_id=?,updated=? WHERE id=?",
                    (attempt, now, row['id']))
         db.execute('INSERT INTO events VALUES (?,?,?,?)', (row['id'], 'PROVISIONING', now, resource))
@@ -187,13 +279,14 @@ class JobStore:
         result.update(lease=AttemptLease(row['id'], attempt, token, resource), launch_id=launch)
         return result
 
-    def claim(self, gpu, max_concurrent=1, max_gpus=None, simulation=None, job_id=None):
+    def claim(self, gpu, max_concurrent=1, max_gpus=None, simulation=None, job_id=None,
+              *, server_profile=None, server_facts=None):
         if max_concurrent < 1:
             raise ValueError('max_concurrent must be positive')
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             active = db.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('PROVISIONING','RUNNING','EVALUATING')").fetchone()[0]
-            if active >= max_concurrent or self._resource_blocked(db, gpu):
+            if active >= max_concurrent or self._resource_blocked(db, gpu, server_facts):
                 return None
             used = sum(self.gpu_count(r[0]) for r in db.execute('SELECT manifest FROM jobs JOIN gpu_locks ON jobs.id=gpu_locks.job_id'))
             for row in db.execute("SELECT * FROM jobs WHERE status='QUEUED' AND graph_run_id IS NULL AND id NOT IN (SELECT job_id FROM gpu_locks) ORDER BY priority DESC,created"):
@@ -201,10 +294,82 @@ class JobStore:
                     continue
                 if simulation is not None and json.loads(row['manifest']).get('simulation') != simulation:
                     continue
+                destination = db.execute('SELECT 1 FROM job_destinations WHERE job_id=?', (row['id'],)).fetchone()
+                if server_profile is not None:
+                    self._verify_server_destination(db, row, server_profile, server_facts)
+                    if gpu != server_facts.exclusivity_key:
+                        raise ValueError('claim resource differs from verified destination')
+                elif destination:
+                    continue
                 if max_gpus is not None and used + self.gpu_count(row['manifest']) > max_gpus:
                     continue
-                return self._claim(db, row, gpu)
+                return self._claim(db, row, gpu, server_facts)
         return None
+
+    def resource_blocked(self, facts):
+        """Shared check for verified hardware, active jobs and preparation reservations."""
+        with self.connection() as db:
+            return self._resource_blocked(db, facts.exclusivity_key, facts)
+
+    def reserve_preparation(self, profile, facts):
+        from .gpu_servers import validate_server_binding
+        validate_server_binding(profile, facts)
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if self._resource_blocked(db, facts.exclusivity_key, facts):
+                raise ValueError('server is reserved or has an uncertain resource lock')
+            lease = PreparationLease(uuid.uuid4().hex, uuid.uuid4().hex, facts.exclusivity_key)
+            db.execute("INSERT INTO preparation_reservations VALUES (?,?,?,?,?,'PREPARING',?)",
+                       (lease.reservation_id, lease.owner_token, lease.resource_id,
+                        profile.model_dump_json(), facts.model_dump_json(), time.time()))
+            return lease
+
+    @staticmethod
+    def _preparation(db, lease):
+        if not isinstance(lease, PreparationLease):
+            raise ValueError('current preparation reservation lease required')
+        row = db.execute('SELECT * FROM preparation_reservations WHERE reservation_id=? AND owner_token=? '
+                         'AND resource_id=?', (lease.reservation_id, lease.owner_token, lease.resource_id)).fetchone()
+        if row is None:
+            raise ValueError('stale preparation reservation lease')
+        return row
+
+    def finish_preparation(self, lease, *, command_stopped=False):
+        if command_stopped is not True:
+            raise ValueError('confirmed remote command termination required before reservation release')
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self._preparation(db, lease)
+            db.execute('DELETE FROM preparation_reservations WHERE reservation_id=?', (lease.reservation_id,))
+
+    def mark_preparation_uncertain(self, lease):
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self._preparation(db, lease)
+            db.execute("UPDATE preparation_reservations SET status='UNCERTAIN' WHERE reservation_id=?",
+                       (lease.reservation_id,))
+
+    def preparation_reservations(self):
+        with self.connection() as db:
+            rows = db.execute('SELECT reservation_id,resource_id,profile,facts,status,created '
+                              'FROM preparation_reservations ORDER BY created').fetchall()
+        return [dict(row) | {'profile': json.loads(row['profile']), 'facts': json.loads(row['facts'])} for row in rows]
+
+    def reconcile_preparation(self, reservation_id, profile, *, confirm_preparation_stopped=False):
+        from .gpu_servers import SSHServerProfile
+        if confirm_preparation_stopped is not True:
+            raise ValueError('explicit operator confirmation of remote preparation termination required')
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM preparation_reservations WHERE reservation_id=?',
+                             (reservation_id,)).fetchone()
+            if row is None:
+                raise ValueError('unknown preparation reservation')
+            if SSHServerProfile.model_validate_json(row['profile']) != profile:
+                raise ValueError('preparation destination differs from original reservation')
+            lease = PreparationLease(reservation_id, row['owner_token'], row['resource_id'])
+            self._preparation(db, lease)
+            db.execute('DELETE FROM preparation_reservations WHERE reservation_id=?', (reservation_id,))
 
     def heartbeat(self, lease):
         with self.connection() as db:

@@ -11,11 +11,22 @@ from pathlib import Path
 
 import paramiko
 
-from .execution import RunPodController, SSHExecutor
+from .execution import ExecutionUncertain, RunPodController, SSHExecutor
+from .gpu_servers import (
+    ServerApprovalReceipt,
+    SSHServerFacts,
+    SSHServerInspection,
+    probe_server,
+    server_settings,
+)
 from .manifest import source_hash
 from .runtime_profiles import engine_profile
 
 REMOTE = "/workspace/factory-desktop"
+
+
+class RemoteCommandFailed(ValueError):
+    """The remote command returned an observed nonzero exit status."""
 
 
 class PinnedHostKey(paramiko.MissingHostKeyPolicy):
@@ -38,7 +49,23 @@ def validate_pod(pod):
 
 
 @contextmanager
-def connection(settings):
+def connection(settings, *, inspection_only=False):
+    if settings.get("provider", "existing_runpod") == "ssh_server":
+        config = server_settings(settings)
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(PinnedHostKey(config.ssh_fingerprint))
+        try:
+            client.connect(config.ssh_host, port=config.ssh_port, username=config.ssh_username,
+                           key_filename=str(config.ssh_key_file), allow_agent=False, look_for_keys=False,
+                           timeout=20, banner_timeout=20, auth_timeout=20)
+            facts = (probe_server(client, config, command, inspection_only=True) if inspection_only
+                     else probe_server(client, config, command))
+            yield facts, client
+        finally:
+            client.close()
+        return
+    if settings.get("provider") not in (None, "", "existing_runpod"):
+        raise ValueError("unsupported execution provider")
     pod = RunPodController(settings["RUNPOD_API_KEY"]).status(settings["pod_id"])
     validate_pod(pod)
     fingerprint = settings.get("ssh_fingerprint", "")
@@ -72,13 +99,13 @@ def command(client, argv, timeout=60):
             raise TimeoutError("remote operation timed out; inspect Pod before retrying preparation")
         time.sleep(.1)
     if channel.recv_exit_status():
-        raise ValueError("GPU runtime command failed. " + output.decode("utf-8", errors="replace")[-3000:])
+        raise RemoteCommandFailed("GPU runtime command failed. " + output.decode("utf-8", errors="replace")[-3000:])
     return output.decode("utf-8", errors="replace")
 
 
-def runtime_path(training_stage="sft"):
+def runtime_path(training_stage="sft", remote_root=REMOTE):
     profile = engine_profile(training_stage)
-    return REMOTE + "/runtime/" + source_hash()[:16] + ("-ppo" if profile["profile"] == "ppo" else "")
+    return remote_root + "/runtime/" + source_hash()[:16] + ("-ppo" if profile["profile"] == "ppo" else "")
 
 
 def prerequisites(client):
@@ -89,9 +116,9 @@ def prerequisites(client):
                     '"or ask its administrator to install a C toolchain before preparing training." >&2; exit 1; }'])
 
 
-def check(client, training_stage="sft"):
+def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=()):
     prerequisites(client)
-    root = runtime_path(training_stage)
+    root = runtime_path(training_stage, remote_root)
     profile = engine_profile(training_stage)
     lock_name = Path(profile["lock_file"]).name
     probe = (
@@ -100,11 +127,15 @@ def check(client, training_stage="sft"):
         "from pathlib import Path;"
         "from tuning_factory.manifest import source_hash;"
         "from tuning_factory.registry import digest;"
+        + ("assert torch.cuda.device_count()==" + str(len(selected_gpu_uuids)) + ";" if selected_gpu_uuids else "") +
         "print(json.dumps(dict(source=source_hash(),engine=importlib.metadata.version('llamafactory'),"
         "cuda=torch.cuda.is_available(),lock=digest(Path(" + repr(root + "/" + lock_name) +
         ").read_bytes()))))"
     )
-    result = json.loads(command(client, [root + "/venv/bin/python", "-c", probe]).splitlines()[-1])
+    argv = [root + "/venv/bin/python", "-c", probe]
+    if selected_gpu_uuids:
+        argv = ["env", "CUDA_VISIBLE_DEVICES=" + ",".join(selected_gpu_uuids), *argv]
+    result = json.loads(command(client, argv).splitlines()[-1])
     from .desktop import assets_root
     expected = hashlib.sha256((assets_root() / profile["lock_file"]).read_bytes()).hexdigest()
     if result != {"source": source_hash(), "engine": profile["engine_version"], "cuda": True, "lock": expected}:
@@ -112,46 +143,131 @@ def check(client, training_stage="sft"):
     return result
 
 
-def runtime(settings, state_root, prepare=False, training_stage="sft"):
+def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspection=None):
+    if settings.get("provider") == "ssh_server" and prepare:
+        if inspection is None:
+            raise ValueError("approved destination inspection required for server preparation")
+        inspection = SSHServerInspection.model_validate(inspection.model_dump()
+            if hasattr(inspection, "model_dump") else inspection)
+        inspection.validate_settings(server_settings(settings))
     profile = engine_profile(training_stage)
     lock_name = Path(profile["lock_file"]).name
     with connection(settings) as (pod, client):
+        generic = isinstance(pod, SSHServerFacts)
+        config = server_settings(settings) if generic else None
+        remote_root = config.remote_root if generic else REMOTE
+        selected = config.selected_gpu_uuids if generic else ()
+        if generic and inspection is not None and (inspection.server_id != pod.server_id
+                                                   or inspection.inventory != pod.inventory):
+            raise ValueError("server hardware differs from approved preparation inspection")
         if prepare:
-            prerequisites(client)
-            from .desktop import assets_root
-            assets = assets_root()
-            wheels = list((assets / "dist").glob("llm_tuning_factory-*.whl"))
-            if len(wheels) != 1:
-                raise ValueError("matching worker wheel missing; rebuild desktop package")
-            root = runtime_path(training_stage)
-            helper = SSHExecutor("", 22, "root", "", client=client, pod=pod)
-            with client.open_sftp() as sftp:
-                helper.mkdir(sftp, root)
-                for path in [assets / profile["lock_file"], wheels[0]]:
-                    sftp.put(str(path), root + "/" + path.name)
-            # uv bootstrap is private to this source-versioned namespace, including Python downloads.
-            script = (
-                "set -eu\n"
-                "command -v flock >/dev/null\n"
-                f"exec 9>{shlex.quote(root + '/prepare.lock')}\nflock -n 9\n"
-                f"export UV_PYTHON_INSTALL_DIR={shlex.quote(REMOTE + '/python')}\n"
-                f"python3 -m pip install --disable-pip-version-check --target {shlex.quote(root + '/bootstrap')} uv==0.11.23\n"
-                f"export PYTHONPATH={shlex.quote(root + '/bootstrap')}\n"
-                f"python3 -m uv venv --python 3.12 --allow-existing {shlex.quote(root + '/venv')}\n"
-                f"python3 -m uv pip sync --python {shlex.quote(root + '/venv/bin/python')} --require-hashes "
-                f"{shlex.quote(root + '/' + lock_name)}\n"
-                f"python3 -m uv pip install --python {shlex.quote(root + '/venv/bin/python')} --no-deps "
-                f"{shlex.quote(root + '/' + wheels[0].name)}\n"
-            )
-            command(client, ["sh", "-c", script], timeout=1800)
-        result = check(client, training_stage)
+            with preparation_guard(state_root, config.profile(pod) if generic else None, pod) as preparation:
+                prerequisites(client)
+                from .desktop import assets_root
+                assets = assets_root()
+                wheels = list((assets / "dist").glob("llm_tuning_factory-*.whl"))
+                if len(wheels) != 1:
+                    raise ValueError("matching worker wheel missing; rebuild desktop package")
+                root = runtime_path(training_stage, remote_root)
+                helper = SSHExecutor("", 22, "root", "", client=client, pod=None if generic else pod)
+                with client.open_sftp() as sftp:
+                    helper.mkdir(sftp, root)
+                    for path in [assets / profile["lock_file"], wheels[0]]:
+                        sftp.put(str(path), root + "/" + path.name)
+                # All installs, Python downloads and caches stay below the private root.
+                script = (
+                    "set -eu\n"
+                    "command -v flock >/dev/null\n"
+                    f"exec 9>{shlex.quote(root + '/prepare.lock')}\nflock -n 9\n"
+                    f"export UV_PYTHON_INSTALL_DIR={shlex.quote(remote_root + '/python')}\n"
+                    f"export UV_CACHE_DIR={shlex.quote(remote_root + '/uv-cache')}\n"
+                    f"python3 -m pip install --disable-pip-version-check --target {shlex.quote(root + '/bootstrap')} uv==0.11.23\n"
+                    f"export PYTHONPATH={shlex.quote(root + '/bootstrap')}\n"
+                    f"python3 -m uv venv --python 3.12 --allow-existing {shlex.quote(root + '/venv')}\n"
+                    f"python3 -m uv pip sync --python {shlex.quote(root + '/venv/bin/python')} --require-hashes "
+                    f"{shlex.quote(root + '/' + lock_name)}\n"
+                    f"python3 -m uv pip install --python {shlex.quote(root + '/venv/bin/python')} --no-deps "
+                    f"{shlex.quote(root + '/' + wheels[0].name)}\n"
+                )
+                preparation["started"] = True
+                try:
+                    command(client, ["sh", "-c", script], timeout=1800)
+                except RemoteCommandFailed:
+                    preparation["stopped"] = True
+                    raise
+                preparation["stopped"] = True
+                result = check(client, training_stage, remote_root, selected) if generic else check(client, training_stage)
+        else:
+            result = check(client, training_stage, remote_root, selected) if generic else check(client, training_stage)
+        if generic:
+            return {"ready": True, "provider": "ssh_server", "facts": pod.model_dump(mode="json"),
+                    "runtime": runtime_path(training_stage, remote_root), "profile": profile["profile"], **result}
         return {"ready": True, "pod_id": pod["id"], "runtime": runtime_path(training_stage),
                 "profile": profile["profile"], **result}
 
 
 @contextmanager
-def executor_for(settings, state_root, preflight=True, training_stage="sft"):
+def preparation_guard(state_root, profile, facts):
+    """No DB transaction spans SSH. Uncertain installations retain durable ownership."""
+    state = {"started": False, "stopped": False}
+    if profile is None:
+        yield state
+        return
+    from .jobs import JobStore
+    store = JobStore(Path(state_root) / "jobs.db")
+    lease = store.reserve_preparation(profile, facts)
+    try:
+        yield state
+    except BaseException as exc:
+        if state["started"] and not state["stopped"]:
+            store.mark_preparation_uncertain(lease)
+            raise ExecutionUncertain("runtime preparation uncertain; reservation " + lease.reservation_id
+                                     + " retained until original-server termination is confirmed") from exc
+        raise
+    finally:
+        if not state["started"] or state["stopped"]:
+            store.finish_preparation(lease, command_stopped=True)
+
+
+def runtime_reservations(state_root):
+    from .jobs import JobStore
+    return JobStore(Path(state_root) / "jobs.db").preparation_reservations()
+
+
+def release_runtime_reservation(settings, state_root, reservation_id, *, confirm_preparation_stopped=False):
+    from .jobs import JobStore
+    config = server_settings(settings)
+    store = JobStore(Path(state_root) / "jobs.db")
+    reservation = next((item for item in store.preparation_reservations()
+                        if item["reservation_id"] == reservation_id), None)
+    if reservation is None:
+        raise ValueError("unknown preparation reservation")
+    facts = SSHServerFacts.model_validate(reservation["facts"])
+    profile = config.profile(facts)
+    store.reconcile_preparation(reservation_id, profile, confirm_preparation_stopped=confirm_preparation_stopped)
+    return {"released": reservation_id}
+
+
+@contextmanager
+def executor_for(settings, state_root, preflight=True, training_stage="sft", *, server_receipt=None):
+    if server_receipt is not None:
+        server_receipt = validate_server_receipt(settings, server_receipt)
     with connection(settings) as (pod, client):
+        if isinstance(pod, SSHServerFacts):
+            config = server_settings(settings)
+            if server_receipt is not None:
+                server_receipt.validate_destination(server_receipt.manifest_sha256, config.transport, pod)
+            if preflight:
+                check(client, training_stage, config.remote_root, config.selected_gpu_uuids)
+            root = runtime_path(training_stage, config.remote_root)
+            lock_name = Path(engine_profile(training_stage)["lock_file"]).name
+            executor = SSHExecutor("", 22, config.ssh_username, "", client=client,
+                                   server_profile=server_receipt.profile if server_receipt else config.profile(pod),
+                                   server_facts=pod,
+                                   remote_root=config.remote_root + "/jobs", remote_python=root + "/venv/bin/python",
+                                   worker_lock_file=root + "/" + lock_name, hf_home=config.remote_root + "/hf-cache")
+            yield executor
+            return
         if preflight:
             check(client, training_stage)
         root = runtime_path(training_stage)
@@ -164,13 +280,13 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft"):
 
 def live_logs(settings, state_root, directory):
     record = json.loads((Path(directory) / "remote-attempt.json").read_bytes())
-    if record.get("pod_id") != settings.get("pod_id"):
-        raise ValueError("live logs Pod differs from original execution")
+    remote_root = validate_original_destination(settings, record)
     remote = record["remote_path"]
-    expected = REMOTE + "/jobs/" + Path(directory).name + "/"
+    expected = remote_root + "/jobs/" + Path(directory).name + "/"
     if not remote.startswith(expected) or not re.fullmatch("[0-9a-f]{32}", remote[len(expected):]):
         raise ValueError("remote attempt outside desktop namespace")
-    with connection(settings) as (_, client):
+    with connection(settings) as (facts, client):
+        validate_original_observation(record, facts)
         with client.open_sftp() as sftp:
             chunks = []
             for name in ("train.log", "worker.log"):
@@ -186,12 +302,14 @@ def live_logs(settings, state_root, directory):
 def read_progress(settings, directory):
     from .desktop_inspection import parse_progress
     record = json.loads((Path(directory) / "remote-attempt.json").read_bytes())
-    expected = REMOTE + "/jobs/" + Path(directory).name + "/"
+    remote_root = validate_original_destination(settings, record)
+    expected = remote_root + "/jobs/" + Path(directory).name + "/"
     remote = record["remote_path"]
-    if (record.get("pod_id") != settings.get("pod_id") or not remote.startswith(expected)
+    if (not remote.startswith(expected)
             or not re.fullmatch("[0-9a-f]{32}", remote[len(expected):])):
         raise ValueError("progress request differs from original Pod or job namespace")
-    with connection(settings) as (_, client):
+    with connection(settings) as (facts, client):
+        validate_original_observation(record, facts)
         with client.open_sftp() as sftp:
             try:
                 with sftp.open(remote + "/output/trainer_log.jsonl", "rb") as handle:
@@ -199,3 +317,52 @@ def read_progress(settings, directory):
                     return parse_progress(handle.read(2 * 1024 * 1024).decode("utf-8", errors="replace"))
             except FileNotFoundError:
                 return parse_progress("")
+
+
+def validate_original_destination(settings, record):
+    """Refuse edited settings before opening SSH to read an old attempt."""
+    from .gpu_servers import SSHServerProfile
+    if settings.get("provider", "existing_runpod") == "ssh_server":
+        config = server_settings(settings)
+        destination = record.get("destination")
+        if destination is None or SSHServerProfile.model_validate(destination).transport != config.transport:
+            raise ValueError("request destination differs from original execution")
+        return config.remote_root
+    if record.get("destination") is not None or record.get("pod_id") != settings.get("pod_id"):
+        raise ValueError("request Pod differs from original execution")
+    return REMOTE
+
+
+def validate_original_observation(record, facts):
+    if isinstance(facts, SSHServerFacts):
+        from .gpu_servers import SSHServerProfile, validate_server_binding
+        validate_server_binding(SSHServerProfile.model_validate(record.get("destination")), facts)
+
+
+def inspect_server(settings):
+    """Read-only discovery accepts an empty selection and returns public inventory."""
+    with connection(settings, inspection_only=True) as (inspection, _):
+        return inspection
+
+
+def plan_server_destination(settings, manifest):
+    """Create the external receipt for a resolved real v1 manifest, before approval."""
+    from .config import AIConfig
+    from .manifest import verify_manifest
+    verify_manifest(manifest)
+    if manifest.get("simulation") or manifest.get("schema_version") != 1:
+        raise ValueError("server destination receipt requires a real v1 manifest")
+    config = server_settings(settings)
+    with connection(settings) as (facts, _):
+        facts.validate_config(AIConfig.model_validate(manifest["config"]))
+        return ServerApprovalReceipt.create(manifest["sha256"], config.profile(facts), facts)
+
+
+def validate_server_receipt(settings, receipt):
+    """Reject edited native settings before any submit or remote connection."""
+    receipt = ServerApprovalReceipt.model_validate(receipt.model_dump() if hasattr(receipt, "model_dump") else receipt)
+    config = server_settings(settings)
+    if (receipt.profile.transport != config.transport
+            or receipt.profile.total_hourly_cost_usd != config.total_hourly_cost_usd):
+        raise ValueError("server receipt destination differs from current settings")
+    return receipt

@@ -21,20 +21,20 @@ from all approved model roots. Both findings passed scoped re-review; Task 5 is 
 Task 6 implementation adds atomic graph/job storage, replayable evidence, fenced attempt ownership,
 stable launch identities, controller leases, conservative legacy-lock migration and typed output/tracking
 ledger hooks. Initial review found a retired-lease queue mutation and inconsistent desktop resource keys.
-Both fixes passed 60 scoped regression tests; amended full-suite and scoped re-review are pending.
+Both fixes passed 60 scoped regression tests, amended full-suite and scoped re-review. Task 6 is complete.
 v2 worker dispatch and the persistent controller are later tasks.
 
-Actual frozen-source verification before the Task 6 review fixes: Python 3.12.12 locked development/tracking sync;
-**532 passed, 1 skipped** in 260.91s; `uv run ruff check src tests` passes. The skip is the existing opt-in
+Actual frozen-source verification after the Task 6 review fixes: Python 3.12.12 locked development/tracking sync;
+**538 passed, 1 skipped** in 240.51s; `uv run ruff check src tests` passes. The skip is the existing opt-in
 real GPU test. Legacy SFT/PPO canonical bytes match the base resolver under the same current true provenance.
 Separate CPU dependency/export preparation passed; it does not yet qualify the unimplemented public
 model-operation numerical path. No GPU, institution data, model weights or external dataset transfer was used.
 
 User scope update on 2026-10-19 adds [general Linux/NVIDIA SSH servers](superpowers/specs/2026-10-19-ssh-gpu-servers-extension.md),
 including BOP-style servers with direct SSH execution. Tasks 6A/6B will add provider-neutral adapters and Windows
-connection settings after Task 6 review; this support is not implemented or tested against a real server yet.
+connection settings. Task 6A core is implemented and undergoing final software regression; independent review remains pending. It includes typed SSH observations/receipts, exact UUID selection, operator-declared zero cost, alias-aware local resource exclusion and durable runtime-preparation reservations. This support is not tested against a real server yet.
 
-Remaining Task 6 review, Tasks 6A/6B and 7–11: general SSH GPU servers, model-operation CPU acceptance,
+Remaining Tasks 6A/6B and 7–11: general SSH GPU servers, model-operation CPU acceptance,
 persistent multi-Pod controller/tracking repair, secure desktop API/broker, Windows UI/installer and Git sharing.
 These foundations are not end-to-end workflow, Windows 0.4.0 or live GPU acceptance. Actual serial handoff,
 multi-Pod concurrency and merge/reevaluation on GPU require separate concrete resource/data authorization.

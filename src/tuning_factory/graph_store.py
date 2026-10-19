@@ -223,6 +223,11 @@ class GraphStore:
         return self.jobs.materialize_job_evidence(job_id)
 
     def claim_ready(self, resource_facts, controller_lease):
+        from pydantic import TypeAdapter
+
+        from .executor_profiles import ResourceObservation, observation_fits
+        if resource_facts is not None:
+            resource_facts = TypeAdapter(ResourceObservation).validate_python(resource_facts.model_dump())
         with self.jobs.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             run = self._controller(db, controller_lease)
@@ -241,15 +246,13 @@ class GraphStore:
                 else:
                     if resource_facts is None:
                         continue
-                    pinned = operation['resources']['facts']
-                    if (resource_facts.pod_id != pinned['pod_id'] or resource_facts.gpu_type != pinned['gpu_type']
-                            or resource_facts.gpu_count != pinned['gpu_count']
-                            or resource_facts.total_hourly_cost_usd > pinned['total_hourly_cost_usd']):
+                    pinned = TypeAdapter(ResourceObservation).validate_python(operation['resources']['facts'])
+                    if not observation_fits(resource_facts, pinned):
                         continue
-                    resource = 'existing_runpod:' + resource_facts.pod_id
-                if self.jobs._resource_blocked(db, resource):
+                    resource = resource_facts.exclusivity_key
+                if self.jobs._resource_blocked(db, resource, resource_facts):
                     continue
-                job = self.jobs._claim(db, row, resource)
+                job = self.jobs._claim(db, row, resource, resource_facts)
                 db.execute("UPDATE nodes SET status='RUNNING' WHERE run_id=? AND node_id=?", (run['id'], row['graph_node_id']))
                 return job
         return None
