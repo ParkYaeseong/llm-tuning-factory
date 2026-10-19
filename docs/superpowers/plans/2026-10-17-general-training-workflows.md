@@ -15,6 +15,9 @@
 진행 중인 Task 6의 검토를 마친 뒤 Task 6A → 6B → 7–11 순으로 실행한다.
 이 추가 범위가 아래 RunPod 전용 문구보다 우선하며 기존 기본 dry-run/데이터 승인/비밀정보 경계는 유지한다.
 
+**2026-10-19 튜토리얼 추가:** 사용자 요청에 따라 [첫 실행 실습형 튜토리얼 설계](../specs/2026-10-19-first-run-tutorial-design.md)와
+[별도 구현 계획](2026-10-19-first-run-tutorial.md)을 추가한다. 실행 순서는 Task 6A 독립 검토 → 6B → 튜토리얼 Task 0–5 → 7–11이다.
+
 ## Global Constraints
 
 - Python 3.12와 `uv sync --extra dev --extra tracking --locked`; 완료 전 `uv run pytest`, `uv run ruff check src tests`.
@@ -176,6 +179,9 @@ RunPod는 실제 API 가격을 검사하고, 일반 서버는 운영자가 명�
 서버의 GPU 목록을 조회하고 UUID를 선택한다. 빈 제공자 필드는 과거 RunPod 설정으로 읽는다.
 RunPod 키/Pod ID는 일반 서버에서 요구하지 않는다. 연결 검사, 환경 확인/명시적 준비,
 학습 승인, 로그/진행률/재조정은 같은 고정된 목적지 정보를 사용한다.
+튜토리얼 연결 단계용으로 연결 대상(RunPod/GPU 서버) 선택 필드 묶음에 `data-tour="connection-provider"`,
+선택한 제공자의 연결 필드 묶음에 `data-tour="connection-fields"`, GPU 학습 환경(환경 확인/준비·GPU 선택) 카드에
+`data-tour="connection-runtime"`을 각각 정확히 하나씩 렌더링한다.
 
 - [ ] **1. RED:** 일반 서버 필드 표시와 save/reopen; 키/인증값 masking 유지;
   일반 서버 GPU 조회/선택/0 비용 실행 계획; 프로필/선택 GPU 변경 시 기존 계획 차단;
@@ -235,6 +241,8 @@ RunPod 키/Pod ID는 일반 서버에서 요구하지 않는다. 연결 검사, 
 
 **Files:** Create `desktop/src/api.ts`, `project-store.ts`, `views/projects.ts`, `views/recipes.ts`, `views/data-import.ts`, `views/graph-editor.ts`, `views/executor-profiles.ts`, `views/graph-runs.ts`, `components/recipe-fields.ts`; Modify `main.ts`, `style.css`, `workbench.ts`; tests는 해당 이름의 `desktop/tests/*.spec.ts`에 둔다.
 
+**Tutorial:** 화면을 바꿀 때 `desktop/src/tutorial-steps.ts`의 단계 내용과 `data-tour` 표시를 함께 갱신하고 `desktop/tests/tutorial.spec.ts`를 통과시킨다.
+
 **Interfaces:** view는 typed bridge wrappers만 호출하며 실행 스케줄을 소유하지 않는다. `ProjectDraft`는 저장 revision/dirty/완전성 issues를 갖고 변경 시 plan/preview 승인을 무효화한다. 기존 stage/method 필드는 recipe-fields로 점진적으로 추출한다. legacy 단일 학습/기록은 계속 접근 가능하다.
 
 - [ ] **1. 실패 시험 작성:** 첫 화면 빈 프로젝트와 자유 이름/목적, save/reopen, optional examples; recipe clone/apply에 data/Pod/approval 미복사; CSV question/context/answer 매핑·인코딩 재선택·행 오류·분할 counts; 클릭과 keyboard로 직렬/병렬 card 추가/입력 연결; 지원 불가 연결과 metric 이유 표시; 하나뿐인 Pod는 대기로 표시; 변경된 profile/recipe/input은 이전 plan 실행 차단.
@@ -251,7 +259,7 @@ RunPod 키/Pod ID는 일반 서버에서 요구하지 않는다. 연결 검사, 
 
 - [ ] **1. 인수 시험 확장:** 예제 없이 새 목적/CSV의 계획 생성, mock diamond 재시작/취소, 잘못된 병합 계획 거절, synthetic 결과의 최상 품질/모델 등록 금지, headless lifecycle을 먼저 assertion으로 추가한다.
 - [ ] **2. 전체 검사:** Python 3.12 locked sync → `uv run pytest` → `uv run ruff check src tests`; 별도 CPU 연산 script; 전체 UI/TypeScript/Vite/Rust; frozen-package 검증을 실행한다. 코드 변경이 생긴 범위의 실패만 고쳐 다시 검사한다.
-- [ ] **3. 설치 인수:** 실제 개발 Windows의 전용 검사 폴더에 새 NSIS를 설치해 sidecar hash, 새 project/data/plan, vault masking, controller 동작·종료·재접속을 확인한다. 실제 기관 데이터/유료 GPU를 쓰지 않는다. 깨끗한 두 번째 PC와 코드 서명은 별도 미검증으로 남긴다.
+- [ ] **3. 설치 인수:** 실제 개발 Windows의 전용 검사 폴더에 새 NSIS를 설치해 sidecar hash, 새 project/data/plan, vault masking, controller 동작·종료·재접속을 확인한다. 튜토리얼 실습 흐름(연습 데이터 미리보기·등록·dry-run 계획)과 `verify_desktop_package.py`의 연습 사본 확인도 수행한다. 실제 기관 데이터/유료 GPU를 쓰지 않는다. 깨끗한 두 번째 PC와 코드 서명은 별도 미검증으로 남긴다.
 - [ ] **4. 기록·검토·공유:** 변경 전체 독립 review 후 필요한 수정과 관련 검사를 완료한다. PROGRESS에 실제 통과/미검증을 날짜별로 적고 소스/설치 파일 SHA256을 남긴다. credential scan 후 사용자 승인된 GitHub 공유 범위로 기능 브랜치를 push하고 PR을 첨부한다. 배포 시 검증한 exe/checksum과 정확한 commit을 연결하고 실제 업로드 digest를 확인한다.
 - [ ] **5. 별도 live GPU 인수 준비:** 위 설치본/계획을 확정한 다음 더미 데이터, 복수 배정 Pod, 제한 시간·총 예상 비용·전송 목적지를 구체적으로 제시한다. 명시적 승인 전에는 자원을 시작/생성하거나 데이터를 전송하지 않는다. 승인 후만 실제 직렬·병렬·병합/재평가·회수까지 검사하고 빌린 Pod의 자동 lifecycle을 금지한다.
 

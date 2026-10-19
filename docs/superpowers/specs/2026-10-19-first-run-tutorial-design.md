@@ -71,11 +71,16 @@ Task 10은 화면을 바꿀 때 `tutorial-steps.ts`와 `data-tour` 표시를 함
 **백엔드**
 - `examples/tutorial_sample.json` — 가상의 연구 업무(시료 ID 추출, 실험노트 요약, 업무 분류) 한국어 Alpaca 합성 예제 8건.
   실제 기관·개인 정보 없음. `scripts/build_desktop.py`가 설치 자산 `assets/examples/`에 복사한다.
-- 데스크톱 동작 `tutorial_sample` — 입력 없음. `{path, sha256, rows, dataset_id: "tutorial_sample", version: "1", kind: "instruction"}`를
-  반환한다. 파일을 등록하거나 쓰지 않는다. Rust `allowed()` 목록에 이 이름만 추가한다.
-- 예약 ID 보호 — `dataset`과 `s3_import`에서 `dataset_id == "tutorial_sample"`이면,
-  `dataset`은 파일 SHA256이 내장 샘플과 같고 `synthetic is True`, `export_allowed is not True`, 버전 `1`, 종류 `instruction`인 경우만 허용한다.
+- 데스크톱 동작 `tutorial_sample` — 입력 없음. 내장 샘플을 사용자 앱 상태 폴더의 `state/tutorial/tutorial_sample.json`에
+  같은 바이트로 복사하고 `{path, sha256, rows, dataset_id: "tutorial_sample", version: "1", kind: "instruction"}`를 반환한다.
+  설치본 엔진은 PyInstaller onefile이라 요청마다 풀리는 임시 자산 폴더가 프로세스 종료 시 사라지므로,
+  다음 요청(미리보기·등록)이 읽을 경로는 영속 상태 폴더여야 한다. 데이터 등록은 하지 않는다.
+  Rust `allowed()` 목록에 이 이름만 추가한다.
+- 예약 ID 보호 — Windows 파일 시스템은 대소문자를 구분하지 않으므로 `dataset_id`를 casefold해 `tutorial_sample`과 같으면 적용한다.
+  `dataset`은 ID 철자가 정확히 `tutorial_sample`이고, 파일 SHA256이 내장 샘플과 같고, `synthetic is True`,
+  `export_allowed is not True`, 버전 `1`, 종류 `instruction`인 경우만 허용한다.
   `s3_import`는 이 ID를 항상 거부한다. 같은 샘플의 재등록은 기존 불변 등록 규칙에 따라 같은 레코드로 통과한다.
+- 작업 공간 ‘시작하기’의 데이터 등록 완료 판정은 `tutorial_sample`을 제외한 데이터 버전만 센다.
 - 실행 계획은 기존 `plan` 동작을 그대로 쓴다. 제출은 기존 정책의 `dataset export has not been authorized in registry`로 거부된다.
 
 ## 오류 처리와 안전
@@ -96,9 +101,11 @@ Task 10은 화면을 바꿀 때 `tutorial-steps.ts`와 `data-tour` 표시를 함
   첫 실행 카드 표시와 [다음에 하기] 후 미표시; 사이드바·Ctrl+K 재시작; 11단계 전체 진행;
   실습 단계는 완료 조건 전 [다음] 비활성이고 [건너뛰기]는 가능; 이미 등록된 샘플이면 6단계 즉시 완료; Esc 종료;
   종료 후 이전 학습 설정·계획 복원; 투어 중 `submit`·`runtime_prepare`·`check`·`settings_save` 호출 0;
-  말풍선 포커스와 키보드 조작; 대상이 없을 때 중앙 표시와 건너뛰기.
+  말풍선 포커스와 키보드 조작; 대상이 없을 때 중앙 표시와 건너뛰기;
+  `tutorial_sample`만 등록된 상태에서 ‘시작하기’ 데이터 등록이 미완료로 남음.
 - 계약 시험: 각 단계의 `anchor`가 그 단계 `page`를 렌더링했을 때 정확히 하나 존재한다.
-- Python 시험: `tutorial_sample` 반환값과 파일 해시; 예약 ID의 다른 내용·전송 허용·합성 해제·다른 버전/종류·S3 거부;
+- Python 시험: `tutorial_sample` 반환값, 상태 폴더 사본과 파일 해시;
+  예약 ID의 다른 내용·전송 허용·합성 해제·다른 버전/종류·대소문자 변형·S3 거부;
   같은 샘플 재등록 통과; 연습 데이터로 계획 성공, 제출 거부.
 - `scripts/verify_desktop_package.py`가 설치 자산의 샘플 존재와 해시를 확인한다.
 - 마무리: `uv run pytest`, `uv run ruff check src tests`, `npm test`, `npm run build`, Rust 허용 목록 시험.
