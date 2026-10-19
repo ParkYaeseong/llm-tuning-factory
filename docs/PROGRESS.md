@@ -74,17 +74,20 @@ SSH connections, probes and SFTP are software fixtures only.
 
 Task 6B-1 (Python desktop backend) routes sidecar actions by `provider`. For `ssh_server`: `connection` inspects
 the server instead of a Pod; new `server_inspect`/`server_facts` return the read-only inventory and selected-GPU
-facts; `runtime_prepare` requires the approved inspection and a free server; new `runtime_reservations` and
+facts; `runtime_prepare` requires the approved inspection and refuses only when that server (machine ID or a shared
+GPU UUID), another provider or an unknown lock is held (`JobStore.resource_blocked`, now used); new `runtime_reservations` and
 `runtime_release` (approval plus confirmed stop) handle preparation reservations; `plan` stays offline and adds
 `destination_sha256`/`destination_issue`; `submit` refuses a changed hash, runs the offline export/policy refusals,
 then freezes a receipt from one read-only observation (zero operator cost allowed); `execute` and `reconcile`
 (recovery executor) use the job receipt. RunPod `execute` and `reconcile` refuse server-bound jobs before any Pod
-contact, `pod` is RunPod-only and `jobs` add a key-free `server_destination`. The sidecar now forwards the fixed
-ExecutionUncertain and TimeoutError messages (still redacted against settings values). MLflow:
+contact, `pod` is RunPod-only and `jobs` add a key-free `server_destination` from one bulk read (`{"invalid": true}`
+for an unreadable receipt, which execute/reconcile refuse with a fixed message). A missing local SSH key is refused
+before connecting. The sidecar forwards the fixed ExecutionUncertain and TimeoutError messages; settings values are
+redacted in raw and repr (escaped Windows path) form. MLflow:
 `auth_mode: "none"` drops OIDC/token values (HTTP then allowed), a missing OIDC client ID/secret is a clear Korean
 ValueError, and the connection report adds `mlflow_read`/`mlflow_auth`. Task 6A follow-ups: `executor_for(recovery=True)`
 is SSH-only, a refused pre-launch check also writes error.txt, and an unreachable observation branch was removed.
-Actual verification: **698 passed, 1 skipped** in 55.77s (46 new cases); Ruff passes. Pending: Rust native settings and
+Actual verification: **711 passed, 1 skipped** in 64.32s (59 new cases); Ruff passes. Pending: Rust native settings and
 action allowlist, TypeScript UI and docs (6B-2/6B-3). No real SSH server, GPU or MLflow server was used.
 
 Remaining Tasks 6A/6B and 7–11: general SSH GPU servers, model-operation CPU acceptance,

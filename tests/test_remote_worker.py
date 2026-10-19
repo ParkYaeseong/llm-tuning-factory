@@ -100,6 +100,31 @@ class FakeSSH:
         pass
 
 
+def test_worker_deadline_message_names_no_provider(tmp_path, monkeypatch):
+    import itertools
+    import time
+
+    from tuning_factory import execution
+
+    class SilentWorker(FakeSSH):
+        def exec_command(self, command, timeout):
+            return None, SimpleNamespace(channel=SimpleNamespace(recv_exit_status=lambda: 0)), None
+
+    clock = itertools.count(0, 1000)
+    monkeypatch.setattr(execution, "time", SimpleNamespace(monotonic=lambda: next(clock), sleep=lambda _: None,
+                                                           time=time.time))
+    directory = tmp_path / ("a" * 32)
+    directory.mkdir()
+    (directory / "train.yaml").write_text("test: true")
+    client = SilentWorker(tmp_path / "remote")
+    client.sftp.root.mkdir()
+    with pytest.raises(ExecutionUncertain) as error:
+        SSHExecutor("test-host", 22, "root", "unused", client=client).run(
+            LlamaFactoryBackend(), directory, 5, lambda: False)
+    assert str(error.value.__cause__) == ("remote worker deadline exceeded; reconcile the remote GPU host "
+                                          "and retain GPU lock")
+
+
 def test_ssh_transfers_and_verifies_artifacts_with_unique_attempt_names(tmp_path):
     directory = tmp_path / ("a" * 32)
     directory.mkdir()

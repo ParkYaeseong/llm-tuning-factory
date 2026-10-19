@@ -312,7 +312,8 @@ class SSHExecutor(ExecutionBackend):
                         if exc.errno != 2:
                             raise
                     if time.monotonic() >= deadline:
-                        raise ExecutionUncertain("remote worker deadline exceeded; reconcile Pod and retain GPU lock")
+                        raise ExecutionUncertain("remote worker deadline exceeded; reconcile the remote GPU host "
+                                                 "and retain GPU lock")
                     time.sleep(1)
                 hashes = self.save_remote_evidence(sftp, remote, directory, result)
                 self.download(sftp, remote, directory, hashes)

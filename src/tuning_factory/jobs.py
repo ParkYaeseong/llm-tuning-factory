@@ -162,6 +162,16 @@ class JobStore:
         with self.connection() as db:
             return {row['job_id'] for row in db.execute('SELECT job_id FROM job_destinations')}
 
+    def raw_server_receipts(self, job_ids):
+        """Stored receipt text of the given jobs in one query; callers parse each row and fail closed."""
+        job_ids = list(job_ids)
+        if not job_ids:
+            return {}
+        with self.connection() as db:
+            rows = db.execute('SELECT job_id,receipt FROM job_destinations WHERE job_id IN (%s)'
+                              % ','.join('?' * len(job_ids)), job_ids)
+            return {row['job_id']: row['receipt'] for row in rows}
+
     def server_receipt(self, job_id):
         from .gpu_servers import ServerApprovalReceipt
         with self.connection() as db:
@@ -243,7 +253,7 @@ class JobStore:
         return 0 if manifest.get('simulation') else manifest.get('config', {}).get('resource_profile', {}).get('gpu_count', 1)
 
     def _resource_blocked(self, db, resource, resource_facts=None):
-        from .gpu_servers import SSHServerFacts
+        from .gpu_servers import SSHServerFacts, SSHServerInspection
         # Provider labels do not prove distinct physical servers. Preserve unknown
         # locks and quarantine cross-provider claims when hardware cannot be mapped.
         providers = ('existing_runpod:', 'ssh_server:')
@@ -261,7 +271,8 @@ class JobStore:
             if not locked.startswith(provider):
                 return True
             if provider == 'ssh_server:':
-                if not isinstance(resource_facts, SSHServerFacts) or observed is None:
+                # A read-only inspection carries the same machine identity and full GPU inventory.
+                if not isinstance(resource_facts, (SSHServerFacts, SSHServerInspection)) or observed is None:
                     return True
                 previous = SSHServerFacts.model_validate_json(observed)
                 if previous.server_id == resource_facts.server_id or ({gpu.uuid for gpu in previous.inventory}
@@ -320,7 +331,7 @@ class JobStore:
         return None
 
     def resource_blocked(self, facts):
-        """Shared check for verified hardware, active jobs and preparation reservations."""
+        """Shared check for verified hardware (facts or inspection), active jobs and preparation reservations."""
         with self.connection() as db:
             return self._resource_blocked(db, facts.exclusivity_key, facts)
 

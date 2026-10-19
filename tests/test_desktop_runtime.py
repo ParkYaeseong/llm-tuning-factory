@@ -43,6 +43,19 @@ def test_recovery_executor_is_refused_for_runpod_before_any_contact(tmp_path, mo
             pytest.fail("RunPod recovery executor created")
 
 
+def test_remote_command_timeout_message_names_no_provider():
+    from types import SimpleNamespace
+
+    from tuning_factory import desktop_runtime as runtime
+
+    channel = SimpleNamespace(set_combine_stderr=lambda _: None, recv_ready=lambda: False,
+                              exit_status_ready=lambda: False, close=lambda: None)
+    client = SimpleNamespace(exec_command=lambda command, timeout: (None, SimpleNamespace(channel=channel), None))
+    with pytest.raises(TimeoutError) as error:
+        runtime.command(client, ["true"], timeout=0)
+    assert str(error.value) == "remote operation timed out; inspect the remote GPU host before retrying preparation"
+
+
 def test_runtime_rejects_missing_compiler_even_when_cuda_is_available(monkeypatch):
     from tuning_factory import desktop_runtime as runtime
     from tuning_factory.desktop import assets_root

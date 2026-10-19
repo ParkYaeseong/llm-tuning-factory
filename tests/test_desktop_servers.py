@@ -21,6 +21,11 @@ from tuning_factory.execution import ExecutionUncertain
 from tuning_factory.gpu_servers import ServerApprovalReceipt, SSHServerInspection, server_settings
 
 CHANGED = "연결 설정이 실행 계획 이후 바뀌었습니다. 실행 계획을 다시 확인하세요."
+RESERVED = ("GPU 서버가 작업이나 다른 환경 준비에 예약되어 있습니다. "
+            "작업을 재조정하거나 준비 예약을 해제한 뒤 다시 준비하세요.")
+UNREADABLE_RECEIPT = "GPU 서버 승인 기록을 읽을 수 없습니다. 작업을 다시 계획·제출하세요."
+MISSING_KEY = "SSH 개인키 파일을 찾을 수 없습니다. 연결 화면에서 키 파일을 다시 선택하세요."
+UUID3 = "GPU-33333333-3333-3333-3333-333333333333"
 
 
 @pytest.fixture(autouse=True)
@@ -114,9 +119,14 @@ def test_plan_is_offline_and_returns_the_saved_destination_hash(tmp_path, monkey
     assert result["dry_run"] is True and result["manifest"]["simulation"] is False
     assert result["destination_sha256"] == inspected.destination_sha256
     assert result["destination_issue"] is None
-    edited = desktop.DesktopService(tmp_path, native(server_remote_root="/home/researcher/other"))
-    assert edited.dispatch("plan", {"config": zero_cost_config(app)})["destination_sha256"] != \
-        result["destination_sha256"]
+    assert result["destination_sha256"] == current.destination_sha256
+    hashes = {result["destination_sha256"]}
+    for edit in (dict(server_remote_root="/home/researcher/other"), dict(server_total_hourly_cost_usd="1.5"),
+                 dict(server_selected_gpu_uuids=json.dumps([UUID1])),
+                 dict(server_selected_gpu_uuids=json.dumps([UUID1, UUID2]))):
+        edited = desktop.DesktopService(tmp_path, native(**edit))
+        hashes.add(edited.dispatch("plan", {"config": zero_cost_config(app)})["destination_sha256"])
+    assert len(hashes) == 5 and None not in hashes
     runpod = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"}).dispatch(
         "plan", {"config": zero_cost_config(app)})
     assert set(runpod) == {"dry_run", "manifest", "estimated_cost_usd", "note"}
@@ -135,8 +145,11 @@ def test_plan_reports_incomplete_server_settings_without_raising(tmp_path, monke
     assert result["destination_sha256"] is None
     assert isinstance(result["destination_issue"], str) and result["destination_issue"]
     assert "test-key" not in result["destination_issue"]
-    with pytest.raises(ValueError, match=CHANGED):
-        app.dispatch("submit", {"approved": True, "config": zero_cost_config(app), "destination_sha256": None})
+    # Invalid current settings report the same issue as plan, not "changed since the plan".
+    for planned in (None, "0" * 64):
+        with pytest.raises(ValueError) as error:
+            app.dispatch("submit", {"approved": True, "config": zero_cost_config(app), "destination_sha256": planned})
+        assert str(error.value) == result["destination_issue"]
     assert app.dispatch("jobs", {}) == []
 
 
@@ -185,42 +198,47 @@ def test_submit_runs_offline_refusals_before_observing_the_server(tmp_path, monk
     assert app.dispatch("jobs", {}) == []
 
 
-@pytest.mark.parametrize("error_type,text", [
-    (ExecutionUncertain, "runtime preparation uncertain; reservation 0123 retained until original-server "
-                         "termination is confirmed"),
-    (TimeoutError, "remote operation timed out; inspect Pod before retrying preparation"),
-])
-def test_sidecar_forwards_uncertain_and_timeout_messages_with_redaction(tmp_path, monkeypatch, capsys,
-                                                                       error_type, text):
+def sidecar_error(tmp_path, monkeypatch, capsys, settings_value, error):
+    """Run desktop.main() over stdin/stdout with a dispatch that raises the given exception."""
     import io
     import sys
 
-    private_root = "/home/researcher/private-root"
-
     def dispatch(self, action, data):
-        raise error_type(text + " under " + private_root)
+        raise error
 
     monkeypatch.setattr(desktop.DesktopService, "dispatch", dispatch)
-    request = {"root": str(tmp_path), "settings": {"server_remote_root": private_root},
-               "action": "runtime_prepare", "data": {}}
+    request = {"root": str(tmp_path), "settings": settings_value, "action": "runtime_prepare", "data": {}}
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request) + "\n"))
     desktop.main()
     response = json.loads(capsys.readouterr().out.splitlines()[-1])
-    assert response == {"ok": False, "error": text + " under [redacted]"}
+    assert response["ok"] is False
+    return response["error"]
+
+
+@pytest.mark.parametrize("error_type,text", [
+    (ExecutionUncertain, "runtime preparation uncertain; reservation 0123 retained until original-server "
+                         "termination is confirmed"),
+    (TimeoutError, "remote operation timed out; inspect the remote GPU host before retrying preparation"),
+])
+def test_sidecar_forwards_uncertain_and_timeout_messages_with_redaction(tmp_path, monkeypatch, capsys,
+                                                                       error_type, text):
+    private_root = "/home/researcher/private-root"
+    error = sidecar_error(tmp_path, monkeypatch, capsys, {"server_remote_root": private_root},
+                          error_type(text + " under " + private_root))
+    assert error == text + " under [redacted]"
 
 
 def test_sidecar_still_hides_other_exception_details(tmp_path, monkeypatch, capsys):
-    import io
-    import sys
+    assert sidecar_error(tmp_path, monkeypatch, capsys, {},
+                         RuntimeError("Authorization: Bearer not-for-the-ui")) == "RuntimeError"
 
-    def dispatch(self, action, data):
-        raise RuntimeError("Authorization: Bearer not-for-the-ui")
 
-    monkeypatch.setattr(desktop.DesktopService, "dispatch", dispatch)
-    request = {"root": str(tmp_path), "settings": {}, "action": "connection", "data": {}}
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request) + "\n"))
-    desktop.main()
-    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {"ok": False, "error": "RuntimeError"}
+def test_sidecar_redacts_the_escaped_form_of_windows_paths(tmp_path, monkeypatch, capsys):
+    key = r"C:\Users\researcher\.ssh\id_ed25519"
+    raised = FileNotFoundError(2, "No such file or directory", key)
+    assert key not in str(raised) and key.replace("\\", "\\\\") in str(raised)
+    error = sidecar_error(tmp_path, monkeypatch, capsys, {"server_ssh_key_file": key}, raised)
+    assert "id_ed25519" not in error and "researcher" not in error and "[redacted]" in error
 
 
 def test_zero_cost_server_job_plans_submits_and_executes_on_the_receipt(tmp_path, monkeypatch):
@@ -361,16 +379,48 @@ def test_runtime_prepare_requires_approval_inspection_and_a_free_server(tmp_path
     assert calls[1][1] == {"prepare": False, "training_stage": "sft"}
 
 
-def test_runtime_prepare_refuses_a_reserved_server(tmp_path, monkeypatch):
+def reserve_other_server(store, server_id, ssh_host, uuid):
+    """A preparation reservation on another destination that observed only the given GPU UUID."""
+    from tuning_factory.gpu_servers import GPUDevice
+
+    other = settings().model_copy(update={"ssh_host": ssh_host, "selected_gpu_uuids": (uuid,)})
+    facts = a4000(other, server_id=server_id, inventory=(GPUDevice(uuid=uuid, name=A4000, memory_mib=16376),))
+    return store.reserve_preparation(other.profile(facts), facts)
+
+
+@pytest.mark.parametrize("holder", ["same_server", "gpu_uuid_alias", "runpod_job", "unknown_lock"])
+def test_runtime_prepare_refuses_while_this_server_an_alias_or_another_provider_is_held(tmp_path, monkeypatch,
+                                                                                        holder):
     from test_graph_store import queued
 
     monkeypatch.setattr(desktop_runtime, "runtime", lambda *a, **kw: pytest.fail("reserved server prepared"))
     app = desktop.DesktopService(tmp_path, native())
-    queued(app.factory.store, "blocked")
-    app.factory.store.claim("unknown-existing-lock")
-    with pytest.raises(ValueError, match="예약"):
+    store = app.factory.store
+    if holder == "same_server":
+        current = server_settings(native())
+        facts = a4000(current)
+        assert facts.server_id == inspection_for().server_id
+        store.reserve_preparation(current.profile(facts), facts)
+    elif holder == "gpu_uuid_alias":
+        # Another machine ID, but it reports one of this server's GPU UUIDs.
+        reserve_other_server(store, "d" * 64, "alias.example", UUID2)
+    else:
+        # v1 cross-provider policy: a RunPod or unknown lock blocks SSH preparation.
+        queued(store, "held")
+        store.claim("existing_runpod:borrowed" if holder == "runpod_job" else "unknown-existing-lock")
+    with pytest.raises(ValueError) as error:
         app.dispatch("runtime_prepare", {"approved": True, "inspection": inspection_for().model_dump(mode="json")})
-    assert app.factory.store.gpu_locked("unknown-existing-lock")
+    assert str(error.value) == RESERVED
+
+
+def test_runtime_prepare_is_not_blocked_by_another_servers_reservation(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(desktop_runtime, "runtime", lambda *a, **kw: calls.append(kw) or {"ready": True})
+    app = desktop.DesktopService(tmp_path, native())
+    reserve_other_server(app.factory.store, "c" * 64, "other.example", UUID3)
+    inspection = inspection_for().model_dump(mode="json")
+    assert app.dispatch("runtime_prepare", {"approved": True, "inspection": inspection}) == {"ready": True}
+    assert len(calls) == 1 and calls[0]["inspection"].server_id == "a" * 64
 
 
 def test_runtime_reservations_are_listed_and_released_only_with_both_confirmations(tmp_path):
@@ -450,10 +500,12 @@ def test_unknown_provider_is_refused(tmp_path):
             app.dispatch(action, {"approved": True, "job_id": "a" * 32, "config": {}})
 
 
-def test_jobs_show_a_public_server_destination_without_key_fields(tmp_path):
+def test_jobs_show_a_public_server_destination_without_key_fields(tmp_path, monkeypatch):
     app = desktop.DesktopService(tmp_path, native())
     job, receipt = bound_job(app)
     other = unbound_job(app)
+    # One bulk read for the listing, not a receipt query per job.
+    monkeypatch.setattr(app.factory.store, "server_receipt", lambda *a: pytest.fail("per-job receipt query"))
     jobs = {item["id"]: item for item in app.dispatch("jobs", {})}
     assert jobs[job["id"]]["server_destination"] == {
         "ssh_host": "gpu.example", "ssh_port": 22, "ssh_username": "researcher",
@@ -465,3 +517,61 @@ def test_jobs_show_a_public_server_destination_without_key_fields(tmp_path):
     runpod = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"}).dispatch("jobs", {})
     assert {item["id"]: item["server_destination"] for item in runpod} == {
         job["id"]: jobs[job["id"]]["server_destination"], other["id"]: None}
+
+
+@pytest.mark.parametrize("corruption", ["tampered_digest", "unknown_field", "not_json"])
+def test_an_unreadable_receipt_keeps_the_listing_and_fails_closed(tmp_path, monkeypatch, corruption):
+    app = desktop.DesktopService(tmp_path, native())
+    job, receipt = bound_job(app)
+    other = unbound_job(app)
+    body = receipt.model_dump(mode="json")
+    if corruption == "tampered_digest":
+        body["profile"]["transport"]["ssh_host"] = "elsewhere.example"
+    elif corruption == "unknown_field":
+        body["schema_note"] = "added by a newer version"
+    raw = "{not json" if corruption == "not_json" else json.dumps(body)
+    with app.factory.store.connection() as db:
+        db.execute("UPDATE job_destinations SET receipt=? WHERE job_id=?", (raw, job["id"]))
+    listed = {item["id"]: item["server_destination"] for item in app.dispatch("jobs", {})}
+    assert listed == {job["id"]: {"invalid": True}, other["id"]: None}
+    calls = recording_executor(monkeypatch)
+    for provider in (native(), {"pod_id": "borrowed", "RUNPOD_API_KEY": "fixture-only"}):
+        service = desktop.DesktopService(tmp_path, provider)
+        for action, data in (("execute", {"approved": True, "job_id": job["id"]}),
+                             ("reconcile", {"job_id": job["id"]})):
+            with pytest.raises(ValueError) as error:
+                service.dispatch(action, data)
+            assert str(error.value) == UNREADABLE_RECEIPT
+    assert calls == [] and app.factory.store.get(job["id"])["attempts"] == 0
+
+
+def test_missing_server_key_file_is_refused_before_connecting(tmp_path, monkeypatch):
+    monkeypatch.setattr(desktop_runtime.paramiko, "SSHClient", lambda: pytest.fail("SSH client created"))
+    missing = tmp_path / "keys" / "id_ed25519"
+    app = desktop.DesktopService(tmp_path, native(server_ssh_key_file=str(missing)))
+    for action in ("server_inspect", "server_facts", "connection", "runtime_check"):
+        with pytest.raises(ValueError) as error:
+            app.dispatch(action, {})
+        assert str(error.value) == MISSING_KEY
+
+
+def test_an_existing_server_key_file_reaches_ssh(tmp_path, monkeypatch):
+    check = desktop_runtime.local_key_file
+    server = FakeServer(tmp_path / "remote").install(monkeypatch)
+    monkeypatch.setattr(desktop_runtime, "local_key_file", check)  # The real check, not the fixture bypass.
+    key = tmp_path / "id_ed25519"
+    key.write_text("software fixture, not a key")
+    desktop.DesktopService(tmp_path, native(server_ssh_key_file=str(key))).dispatch("server_inspect", {})
+    assert server.connects[0][1]["key_filename"] == str(key)
+
+
+def test_server_progress_namespace_refusal_names_no_provider(tmp_path):
+    directory = tmp_path / ("e" * 32)
+    directory.mkdir()
+    current = server_settings(native())
+    record = {"remote_path": "/elsewhere/" + "f" * 32,
+              "destination": current.profile(a4000(current)).model_dump(mode="json")}
+    (directory / "remote-attempt.json").write_text(json.dumps(record))
+    with pytest.raises(ValueError) as error:
+        desktop_runtime.read_progress(native(), directory)
+    assert str(error.value) == "progress request differs from original remote GPU host or job namespace"

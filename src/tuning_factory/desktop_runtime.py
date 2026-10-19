@@ -26,6 +26,15 @@ from .manifest import source_hash
 from .runtime_profiles import engine_profile
 
 REMOTE = "/workspace/factory-desktop"
+MISSING_KEY = "SSH 개인키 파일을 찾을 수 없습니다. 연결 화면에서 키 파일을 다시 선택하세요."
+
+
+def local_key_file(path):
+    """Refuse a missing private key before any network contact, without echoing its path."""
+    path = Path(path).expanduser()
+    if not path.is_file():
+        raise ValueError(MISSING_KEY)
+    return str(path)
 
 
 class RemoteCommandFailed(ValueError):
@@ -56,11 +65,12 @@ def connection(settings, *, inspection_only=False, recovery=False):
     """SSH server modes: launch facts (default), read-only inspection, or recovery identity only."""
     if settings.get("provider", "existing_runpod") == "ssh_server":
         config = server_settings(settings)
+        key_file = local_key_file(config.ssh_key_file)
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(PinnedHostKey(config.ssh_fingerprint))
         try:
             client.connect(config.ssh_host, port=config.ssh_port, username=config.ssh_username,
-                           key_filename=str(config.ssh_key_file), allow_agent=False, look_for_keys=False,
+                           key_filename=key_file, allow_agent=False, look_for_keys=False,
                            timeout=20, banner_timeout=20, auth_timeout=20)
             if recovery:
                 facts = probe_server_identity(client, config, command)
@@ -104,7 +114,8 @@ def command(client, argv, timeout=60):
             break
         if time.monotonic() >= deadline:
             channel.close()
-            raise TimeoutError("remote operation timed out; inspect Pod before retrying preparation")
+            raise TimeoutError("remote operation timed out; inspect the remote GPU host "
+                               "before retrying preparation")
         time.sleep(.1)
     if channel.recv_exit_status():
         raise RemoteCommandFailed("GPU runtime command failed. " + output.decode("utf-8", errors="replace")[-3000:])
@@ -352,7 +363,7 @@ def read_progress(settings, directory):
     remote = record["remote_path"]
     if (not remote.startswith(expected)
             or not re.fullmatch("[0-9a-f]{32}", remote[len(expected):])):
-        raise ValueError("progress request differs from original Pod or job namespace")
+        raise ValueError("progress request differs from original remote GPU host or job namespace")
     with connection(settings, recovery=True) as (facts, client):
         validate_original_observation(record, facts)
         with client.open_sftp() as sftp:

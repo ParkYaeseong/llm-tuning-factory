@@ -24,6 +24,13 @@ def settings(**updates):
                              selected_gpu_uuids=(UUID2,), total_hourly_cost_usd=0, **updates)
 
 
+def skip_key_file_check(monkeypatch):
+    """Fixture key paths such as "test-key" are not files; the real check has its own desktop tests."""
+    from tuning_factory import desktop_runtime
+
+    monkeypatch.setattr(desktop_runtime, "local_key_file", lambda path: str(path))
+
+
 def observation(config=None, **updates):
     from tuning_factory.gpu_servers import GPUDevice, SSHServerFacts
 
@@ -121,6 +128,7 @@ def test_ssh_connection_uses_nonroot_and_never_runpod(monkeypatch):
             pass
 
     monkeypatch.setattr(desktop_runtime.paramiko, "SSHClient", Client)
+    skip_key_file_check(monkeypatch)
     monkeypatch.setattr(desktop_runtime, "RunPodController", lambda *a, **k: pytest.fail("RunPod called"))
     monkeypatch.setattr(desktop_runtime, "probe_server", lambda client, config, run: observation(config))
     with desktop_runtime.connection({"provider": "ssh_server", **settings().model_dump(mode="json")}) as (facts, _):
@@ -232,6 +240,7 @@ def test_readonly_inspection_can_list_inventory_before_selection(monkeypatch):
             pass
 
     monkeypatch.setattr(desktop_runtime.paramiko, "SSHClient", Client)
+    skip_key_file_check(monkeypatch)
     native = {"provider": "ssh_server", **settings().model_dump(mode="json"), "selected_gpu_uuids": []}
     result = desktop_runtime.inspect_server(native)
     assert result.inventory[0].uuid == UUID1 and result.selected_gpu_uuids == ()
@@ -956,6 +965,7 @@ class FakeServer:
 
         monkeypatch.setattr(desktop_runtime.paramiko, "SSHClient", Client)
         monkeypatch.setattr(desktop_runtime, "command", self.command)
+        skip_key_file_check(monkeypatch)
         return self
 
     def command(self, client, argv, timeout=60, **kwargs):

@@ -57,10 +57,21 @@ class SSHTransport(_SSHAddress):
         return digest(canonical(self.model_dump(mode="json")))
 
 
+def destination_sha256(transport, total_hourly_cost_usd):
+    """Approval-dialog identity of a destination: public transport plus operator-declared cost."""
+    return digest(canonical(dict(transport=transport.model_dump(mode="json"),
+                                 total_hourly_cost_usd=total_hourly_cost_usd)))
+
+
 class SSHServerSettings(_SSHAddress):
     """Local/native fields. Keys are resolved only by SSH; never copied to plans."""
     ssh_key_file: Path
     total_hourly_cost_usd: float = Field(ge=0)
+
+    @property
+    def destination_sha256(self):
+        """Offline; equals SSHServerInspection.destination_sha256 for the same settings."""
+        return destination_sha256(self.transport, self.total_hourly_cost_usd)
 
     @field_validator("ssh_key_file", mode="before")
     @classmethod
@@ -161,8 +172,11 @@ class SSHServerInspection(StrictModel):
 
     @property
     def destination_sha256(self):
-        return digest(canonical(dict(transport=self.transport.model_dump(mode="json"),
-                                     total_hourly_cost_usd=self.total_hourly_cost_usd)))
+        return destination_sha256(self.transport, self.total_hourly_cost_usd)
+
+    @property
+    def exclusivity_key(self):
+        return "ssh_server:" + self.server_id
 
     def validate_settings(self, settings):
         if self.transport != settings.transport or self.total_hourly_cost_usd != settings.total_hourly_cost_usd:
