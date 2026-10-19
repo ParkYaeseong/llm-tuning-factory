@@ -90,6 +90,27 @@ is SSH-only, a refused pre-launch check also writes error.txt, and an unreachabl
 Actual verification: **711 passed, 1 skipped** in 64.32s (59 new cases); Ruff passes. Pending: Rust native settings and
 action allowlist, TypeScript UI and docs (6B-2/6B-3). No real SSH server, GPU or MLflow server was used.
 
+Task 6B-2 (Windows native settings and connection screen): native settings save `provider` and the eight public
+`server_*` strings, refuse an unknown provider or `auth_mode` and a selection that is not a JSON array of at most 8
+strings, and allow `server_inspect`/`server_facts`/`runtime_reservations`/`runtime_release`. A pure MLflow filter
+withholds the OIDC URL, client ID and secret (and, for `none`, the token) from the sidecar; vault values stay saved.
+The connection screen adds a provider card, GPU server fields (no RunPod key or Pod ID), GPU inventory selection
+saved as a JSON string, server facts applied with a per-GPU price that never multiplies back below the server total
+(a one-ulp upward correction where float division undercuts it, about 3% of cent-valued cases), inspect → approve →
+`runtime_prepare` with the unmodified inspection, a reservation list whose uncertain entries are released only after
+an approval stating the remote preparation stopped (refreshed automatically after a prepare error), MLflow
+“인증 없음” with a trusted-network note, auth-method connection results and an unverified-training row, provider-specific
+overview, plan and approval texts, a disabled start for a null destination hash, `destination_sha256` on submit and
+a job destination column. Saving a changed provider, `server_*` field or selection clears the plan, inspection,
+reservations and reports. The three `data-tour` anchors render once for both providers, and no remote action runs
+on page load, navigation or provider/auth switching. The MLflow URI label is now “MLflow 서버 주소” so field names
+stay unique. Actual verification: Playwright **36 passed** (13 new in `desktop/tests/connections.spec.ts`;
+`workspace.spec.ts` unchanged), `npm run build` (tsc + Vite) passes, Rust **8 passed** (4 new), Python **711 passed,
+1 skipped**, Ruff passes. Unverified: docs (6B-3), installer acceptance (Task 11), the real Tauri/WebView2 shell and
+Credential Manager (the UI is tested against a mocked bridge) and any real SSH server, GPU or MLflow server.
+Known carry-over: as for `token`, `settings_get` under `none` omits the saved OIDC URL and client ID, so switching back
+to OIDC shows the defaults until re-entered.
+
 Remaining Tasks 6A/6B and 7–11: general SSH GPU servers, model-operation CPU acceptance,
 persistent multi-Pod controller/tracking repair, secure desktop API/broker, Windows UI/installer and Git sharing.
 These foundations are not end-to-end workflow, Windows 0.4.0 or live GPU acceptance. Actual serial handoff,

@@ -44,3 +44,51 @@ export function progressView(progress: Obj | null) {
   ${progress.percent !== null && progress.percent !== undefined ? `<progress max="100" value="${Number(progress.percent)}" aria-label="학습 진행률"></progress>` : ""}
   ${chart}<div class="chart-caption">LLaMA-Factory 원본 학습 로그 · 최대 200개 지점 · 업무 품질 점수가 아닙니다</div>`;
 }
+
+// GPU server (provider "ssh_server") settings are native strings; the selection is a JSON-encoded UUID array.
+const SERVER_KEYS = ["server_ssh_host", "server_ssh_port", "server_ssh_username", "server_ssh_fingerprint",
+  "server_remote_root", "server_ssh_key_file", "server_total_hourly_cost_usd", "server_selected_gpu_uuids"];
+export const isServer = (settings: Obj) => settings.provider === "ssh_server";
+export function selectedGpus(settings: Obj): string[] {
+  try {
+    const value = JSON.parse(settings.server_selected_gpu_uuids || "[]");
+    return Array.isArray(value) ? value.filter(item => typeof item === "string") : [];
+  } catch { return []; }
+}
+export const sshAddress = (user: unknown, host: unknown, port?: unknown) =>
+  `${user || "?"}@${host || "?"}${port === undefined ? "" : ":" + (port || 22)}`;
+export const serverAddress = (settings: Obj, port = true) =>
+  sshAddress(settings.server_ssh_username, settings.server_ssh_host, port ? settings.server_ssh_port : undefined);
+export const serverConfigured = (settings: Obj) => ["server_ssh_host", "server_ssh_username", "server_ssh_fingerprint",
+  "server_ssh_key_file", "server_remote_root", "server_total_hourly_cost_usd"].every(key => String(settings[key] ?? "").trim())
+  && selectedGpus(settings).length > 0;
+/** Saved values that identify the training destination; any change makes plans and inspections stale. */
+export const destinationSettings = (settings: Obj) => JSON.stringify([isServer(settings), ...SERVER_KEYS.map(key => settings[key] ?? "")]);
+/** Per-GPU price for the training config. The backend refuses total > price × count, so a binary
+ * rounding of the division that lands below the total is moved up to the next representable value. */
+export function perGpuHourlyCost(total: number, count: number) {
+  let price = total / count;
+  const bits = new DataView(new ArrayBuffer(8));
+  while (price * count < total) { bits.setFloat64(0, price); bits.setBigUint64(0, bits.getBigUint64(0) + 1n); price = bits.getFloat64(0); }
+  return price;
+}
+export const shortUuid = (uuid: string) => uuid.length > 16 ? uuid.slice(0, 12) + "…" : uuid;
+export const gibibytes = (mib: unknown) => typeof mib === "number" ? (mib / 1024).toLocaleString("ko-KR", { maximumFractionDigits: 1 }) + " GiB" : "—";
+export function gpuSummary(inventory: Obj[]) {
+  const names = new Map<string, number>();
+  for (const gpu of inventory) names.set(gpu.name, (names.get(gpu.name) || 0) + 1);
+  return `GPU ${inventory.length}개 · ${[...names].map(([name, count]) => count > 1 ? `${name} ×${count}` : name).join(", ")}`;
+}
+export function jobDestination(job: Obj) {
+  const destination = job.server_destination;
+  if (destination?.invalid) return "승인 기록 손상";
+  return destination ? "GPU 서버 · " + destination.ssh_host : "RunPod";
+}
+const authNames: Obj = { none: "인증 없음", oidc: "기관 인증(OIDC)", token: "발급 토큰" };
+/** MLflow line of a connection report; older reports only carried mlflow_authenticated_read. */
+export function mlflowStatus(report: Obj) {
+  const read = report.mlflow_read ?? report.mlflow_authenticated_read;
+  if (read === undefined) return "확인하지 않음 · 서버 주소 없음";
+  if (read !== true) return "확인 필요";
+  return authNames[report.mlflow_auth] ? "확인됨 · " + authNames[report.mlflow_auth] : "확인됨";
+}

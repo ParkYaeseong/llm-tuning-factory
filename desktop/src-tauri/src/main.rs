@@ -6,12 +6,16 @@ use tauri::Manager;
 
 const SECRETS: [&str; 7] = ["RUNPOD_API_KEY", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLOW_TRACKING_TOKEN",
     "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN", "HF_TOKEN"];
-const FIELDS: [&str; 19] = [
+const FIELDS: [&str; 28] = [
     "MLFLOW_TRACKING_URI", "FACTORY_MLFLOW_ARTIFACT_LOCATION", "FACTORY_OPERATOR",
     "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "pod_id", "ssh_key_file",
     "ssh_fingerprint", "RUNPOD_API_KEY", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLOW_TRACKING_TOKEN", "auth_mode",
     "S3_ENDPOINT_URL", "S3_REGION", "S3_ADDRESSING_STYLE", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN", "HF_TOKEN",
+    // GPU server connection: public strings validated by the sidecar. The key file is a local path, not key content.
+    "provider", "server_ssh_host", "server_ssh_port", "server_ssh_username", "server_ssh_fingerprint",
+    "server_remote_root", "server_ssh_key_file", "server_total_hourly_cost_usd", "server_selected_gpu_uuids",
 ];
+const MLFLOW_OIDC: [&str; 3] = ["MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "MLFLOW_OIDC_CLIENT_SECRET"];
 struct SaveLock(Mutex<()>);
 
 fn app_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -43,14 +47,18 @@ fn read_settings(root: &PathBuf, secrets: bool) -> Result<Value, String> {
             Err(_) => return Err("Windows 자격 증명에 접근할 수 없습니다.".into()),
         }
     }
-    if value["auth_mode"] == "token" {
-        value.as_object_mut().unwrap().remove("MLFLOW_OIDC_TOKEN_URL");
-        value.as_object_mut().unwrap().remove("MLFLOW_OIDC_CLIENT_ID");
-        value.as_object_mut().unwrap().remove("MLFLOW_OIDC_CLIENT_SECRET");
-    } else if secrets {
-        value.as_object_mut().unwrap().remove("MLFLOW_TRACKING_TOKEN");
-    }
+    filter_mlflow_auth(value.as_object_mut().unwrap(), secrets);
     Ok(value)
+}
+
+/// Only the chosen MLflow method's values reach the sidecar. Saved credentials stay in the vault,
+/// so their `*_saved` flags remain and switching back reuses them.
+fn filter_mlflow_auth(settings: &mut Map<String, Value>, secrets: bool) {
+    match settings.get("auth_mode").and_then(Value::as_str).unwrap_or("") {
+        "token" => for name in MLFLOW_OIDC { settings.remove(name); },
+        "none" => for name in MLFLOW_OIDC.iter().chain(["MLFLOW_TRACKING_TOKEN"].iter()) { settings.remove(*name); },
+        _ => if secrets { settings.remove("MLFLOW_TRACKING_TOKEN"); },
+    }
 }
 
 #[tauri::command]
@@ -72,6 +80,18 @@ fn merge_public_settings(existing: Value, input: &Map<String, Value>) -> Result<
         .map(|(name, value)| (name.clone(), value.clone())).collect();
     for (name, value) in input {
         if !SECRETS.contains(&name.as_str()) { public.insert(name.clone(), value.clone()); }
+    }
+    let text = |name: &str| public.get(name).and_then(Value::as_str).unwrap_or("");
+    if !["", "existing_runpod", "ssh_server"].contains(&text("provider")) {
+        return Err("GPU 연결 대상은 RunPod 또는 GPU 서버여야 합니다.".into());
+    }
+    if !["", "oidc", "token", "none"].contains(&text("auth_mode")) {
+        return Err("MLflow 인증 방식은 기관 인증·발급 토큰·인증 없음 중 하나여야 합니다.".into());
+    }
+    let selection = text("server_selected_gpu_uuids");
+    if !selection.is_empty() && !serde_json::from_str::<Value>(selection).ok().and_then(|value| value.as_array().cloned())
+        .is_some_and(|items| items.len() <= 8 && items.iter().all(Value::is_string)) {
+        return Err("선택한 GPU 목록은 GPU UUID 문자열 최대 8개의 JSON 배열이어야 합니다.".into());
     }
     if let Some(endpoint) = public.get("S3_ENDPOINT_URL").and_then(Value::as_str) {
         if !endpoint.is_empty() {
@@ -139,7 +159,8 @@ fn allowed(action: &str) -> bool {
         "jobs" | "logs" | "cancel" | "recover" | "reconcile" | "resume" | "connection" |
         "pod" | "runtime_check" | "runtime_prepare" | "live_logs" | "history" | "compare" | "model_revision" |
         "dataset_preview" | "job_progress" | "capabilities" | "s3_list" | "s3_head" | "s3_import" |
-        "model_search" | "model_inspect" | "model_import")
+        "model_search" | "model_inspect" | "model_import" |
+        "server_inspect" | "server_facts" | "runtime_reservations" | "runtime_release")
 }
 
 #[tauri::command]
@@ -231,5 +252,91 @@ mod tests {
         assert!(!result.contains_key("HF_TOKEN"));
         assert_eq!(result.get("pod_id"), Some(&json!("assigned")));
         assert!(SECRETS.contains(&"HF_TOKEN"));
+    }
+    const SERVER_FIELDS: [&str; 8] = ["server_ssh_host", "server_ssh_port", "server_ssh_username",
+        "server_ssh_fingerprint", "server_remote_root", "server_ssh_key_file", "server_total_hourly_cost_usd",
+        "server_selected_gpu_uuids"];
+    fn merge(input: Value) -> Result<Map<String, Value>, String> {
+        merge_public_settings(json!({"pod_id": "assigned", "ssh_fingerprint": "SHA256:pod"}), input.as_object().unwrap())
+    }
+    #[test]
+    fn server_settings_are_public_fields_and_keep_the_inactive_pod_settings() {
+        for name in SERVER_FIELDS.iter().chain(["provider"].iter()) {
+            assert!(FIELDS.contains(name), "{name} must be a saved field");
+            assert!(!SECRETS.contains(name), "{name} is not a credential");
+        }
+        let result = merge(json!({"provider": "ssh_server", "server_ssh_host": "gpu.example", "server_ssh_port": "2222",
+            "server_ssh_username": "researcher", "server_ssh_fingerprint": format!("SHA256:{}", "A".repeat(43)),
+            "server_remote_root": "/home/researcher/factory", "server_ssh_key_file": "C:\\keys\\id_ed25519",
+            "server_total_hourly_cost_usd": "0", "server_selected_gpu_uuids": "[\"GPU-11111111-2222-3333-4444-555555555555\"]",
+            "RUNPOD_API_KEY": "", "MLFLOW_OIDC_CLIENT_SECRET": "synthetic-secret"})).unwrap();
+        for name in SERVER_FIELDS { assert!(result.contains_key(name), "{name} was not saved"); }
+        assert_eq!(result.get("provider"), Some(&json!("ssh_server")));
+        assert_eq!(result.get("pod_id"), Some(&json!("assigned")));
+        assert_eq!(result.get("ssh_fingerprint"), Some(&json!("SHA256:pod")));
+        for name in SECRETS { assert!(!result.contains_key(name)); }
+    }
+    #[test]
+    fn provider_auth_mode_and_gpu_selection_are_validated() {
+        let nine = format!("[{}]", vec!["\"GPU-x\""; 9].join(","));
+        for input in [json!({"provider": "runpod"}), json!({"provider": "SSH_SERVER"}), json!({"provider": " ssh_server"}),
+            json!({"auth_mode": "basic"}), json!({"auth_mode": "NONE"}), json!({"server_selected_gpu_uuids": "GPU-1"}),
+            json!({"server_selected_gpu_uuids": "{\"uuid\":\"GPU-1\"}"}), json!({"server_selected_gpu_uuids": "[1]"}),
+            json!({"server_selected_gpu_uuids": "[\"GPU-1\""}), json!({"server_selected_gpu_uuids": "null"}),
+            json!({"server_selected_gpu_uuids": nine})] {
+            let error = merge(input.clone()).expect_err(&format!("{input} was accepted"));
+            assert!(!error.is_empty());
+        }
+        let eight = format!("[{}]", vec!["\"GPU-x\""; 8].join(","));
+        for input in [json!({"provider": ""}), json!({"provider": "existing_runpod"}), json!({"provider": "ssh_server"}),
+            json!({"auth_mode": ""}), json!({"auth_mode": "oidc"}), json!({"auth_mode": "token"}), json!({"auth_mode": "none"}),
+            json!({"server_selected_gpu_uuids": ""}), json!({"server_selected_gpu_uuids": "[]"}),
+            json!({"server_selected_gpu_uuids": eight})] {
+            assert!(merge(input.clone()).is_ok(), "{input} was refused");
+        }
+    }
+    fn mlflow_settings(mode: &str) -> Map<String, Value> {
+        json!({"auth_mode": mode, "MLFLOW_TRACKING_URI": "http://127.0.0.1:5000", "MLFLOW_OIDC_TOKEN_URL": "https://sso.example/token",
+            "MLFLOW_OIDC_CLIENT_ID": "mlflow", "MLFLOW_OIDC_CLIENT_SECRET": "synthetic-secret", "MLFLOW_TRACKING_TOKEN": "synthetic-token",
+            "MLFLOW_OIDC_CLIENT_SECRET_saved": true, "MLFLOW_TRACKING_TOKEN_saved": true}).as_object().unwrap().clone()
+    }
+    #[test]
+    fn mlflow_auth_mode_controls_which_credentials_reach_the_sidecar() {
+        const OIDC: [&str; 3] = ["MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "MLFLOW_OIDC_CLIENT_SECRET"];
+        for secrets in [true, false] {
+            let mut none = mlflow_settings("none");
+            filter_mlflow_auth(&mut none, secrets);
+            for name in OIDC.iter().chain(["MLFLOW_TRACKING_TOKEN"].iter()) { assert!(!none.contains_key(*name), "none kept {name}"); }
+            assert_eq!(none.get("MLFLOW_TRACKING_URI"), Some(&json!("http://127.0.0.1:5000")));
+            // Saved credentials stay in the vault; only the flags remain visible.
+            assert_eq!(none.get("MLFLOW_OIDC_CLIENT_SECRET_saved"), Some(&json!(true)));
+            assert_eq!(none.get("MLFLOW_TRACKING_TOKEN_saved"), Some(&json!(true)));
+            let mut token = mlflow_settings("token");
+            filter_mlflow_auth(&mut token, secrets);
+            for name in OIDC { assert!(!token.contains_key(name), "token kept {name}"); }
+            assert_eq!(token.get("MLFLOW_TRACKING_TOKEN"), Some(&json!("synthetic-token")));
+        }
+        for mode in ["oidc", ""] {
+            let mut sidecar = mlflow_settings(mode);
+            filter_mlflow_auth(&mut sidecar, true);
+            assert!(!sidecar.contains_key("MLFLOW_TRACKING_TOKEN"));
+            assert_eq!(sidecar.get("MLFLOW_OIDC_CLIENT_SECRET"), Some(&json!("synthetic-secret")));
+            assert_eq!(sidecar.get("MLFLOW_OIDC_TOKEN_URL"), Some(&json!("https://sso.example/token")));
+            let mut public = mlflow_settings(mode);
+            filter_mlflow_auth(&mut public, false);
+            assert_eq!(public, mlflow_settings(mode));
+        }
+        let mut legacy = mlflow_settings("oidc");
+        legacy.remove("auth_mode");
+        filter_mlflow_auth(&mut legacy, true);
+        assert!(!legacy.contains_key("MLFLOW_TRACKING_TOKEN"));
+        assert!(legacy.contains_key("MLFLOW_OIDC_CLIENT_SECRET"));
+    }
+    #[test]
+    fn server_sidecar_actions_are_named_operations() {
+        for action in ["server_inspect", "server_facts", "runtime_reservations", "runtime_release"] {
+            assert!(allowed(action), "{action} must be allowed");
+        }
+        for action in ["shell", "server_start", "server_stop", "ssh", "runtime_release_all"] { assert!(!allowed(action)); }
     }
 }
