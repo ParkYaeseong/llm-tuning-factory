@@ -21,7 +21,8 @@ export interface TutorialStep {
   kind: "explain" | "practice";
   done?(state: Obj, sample: Obj | null): boolean;
   enter?(context: TutorialContext): Promise<void>;
-  cta?: { label: string; run(context: TutorialContext): Promise<void> };
+  /** `run` returns the state to apply; the engine drops it when the tour ended or restarted meanwhile. */
+  cta?: { label: string; run(context: TutorialContext): Promise<Obj | void> };
 }
 
 const practiceData = (id: unknown, version: unknown) => id === TUTORIAL_DATASET.id && version === TUTORIAL_DATASET.version;
@@ -39,9 +40,8 @@ export const tutorialSteps: TutorialStep[] = [
     body: "‘연습 샘플 채우기’를 누르면 앱에 포함된 합성 예제 8건이 양식에 채워집니다. 이어서 양식의 ‘샘플 미리보기’를 눌러 형식과 건수를 확인하세요.\n미리보기는 이 PC에서만 실행됩니다.",
     cta: { label: "연습 샘플 채우기", async run(context) {
       const sample = await context.loadSample();
-      context.state.datasetDraft = { dataset_id: sample.dataset_id, version: sample.version, kind: sample.kind,
-        path: sample.path, synthetic: true, export_allowed: false };
-      context.state.preview = null;
+      return { datasetDraft: { dataset_id: sample.dataset_id, version: sample.version, kind: sample.kind,
+        path: sample.path, synthetic: true, export_allowed: false }, preview: null };
     } },
     done: (state, sample) => Boolean(sample && state.preview?.rows === sample.rows && state.datasetDraft?.path === sample.path) },
   { id: "data-register", page: "datasets", anchor: "dataset-submit", kind: "practice", title: "연습 데이터 등록",

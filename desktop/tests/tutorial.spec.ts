@@ -4,7 +4,8 @@ import { tutorialSteps } from "../src/tutorial-steps.ts";
 
 const config = JSON.parse(readFileSync(new URL("./config.json", import.meta.url), "utf8"));
 const forbidden = ["submit", "execute", "resume", "runtime_check", "runtime_prepare", "connection", "pod",
-  "s3_list", "s3_head", "s3_import", "server_inspect", "server_facts", "runtime_reservations", "runtime_release"];
+  "s3_list", "s3_head", "s3_import", "server_inspect", "server_facts", "runtime_reservations", "runtime_release",
+  "save_profile", "model_import", "cancel", "recover", "reconcile"];
 type Boot = { registered?: boolean; withoutDummy?: boolean; seen?: boolean };
 
 async function boot(page: Page, options: Boot = {}) {
@@ -52,6 +53,19 @@ const tourButton = (page: Page, name: string) => popover(page).getByRole("button
 
 async function expectStep(page: Page, id: string) {
   await expect(popover(page).locator("#tour-title")).toHaveText(tutorialSteps.find(s => s.id === id)!.title);
+}
+
+/** Holds the next request for `action` until the returned release function is called. */
+async function holdAction(page: Page, action: string) {
+  await page.evaluate(action => {
+    const native = (window as any).__TAURI_INTERNALS__;
+    const original = native.invoke;
+    native.invoke = async (command: string, args: any) => {
+      if (command === "factory_action" && args.action === action) await new Promise(resolve => (window as any).__release = resolve);
+      return original(command, args);
+    };
+  }, action);
+  return () => page.evaluate(() => (window as any).__release());
 }
 
 async function advanceTo(page: Page, id: string) {
@@ -176,4 +190,172 @@ test("Ctrl+K starts the tutorial and each step moves focus to its title", async 
   await expectStep(page, "connection-provider");
   await expect(page.locator("#tour-title")).toBeFocused();
   await expect(page.getByRole("dialog", { name: "GPU 연결 방식 고르기" })).toBeVisible();
+});
+
+test("ending while a plan request is pending waits for it and then restores the draft", async ({ page }) => {
+  await boot(page, { registered: true });
+  await page.getByRole("button", { name: "튜토리얼 시작" }).click();
+  await expectStep(page, "welcome");
+  await advanceTo(page, "training-dataset");
+  await page.getByLabel("학습 데이터", { exact: true }).selectOption("tutorial_sample:1");
+  await tourButton(page, "다음").click();
+  await expectStep(page, "training-plan");
+  const release = await holdAction(page, "plan");
+  await page.getByRole("button", { name: "실행 계획 확인" }).click();
+  await expect(popover(page)).toContainText("처리 중입니다");
+  await page.keyboard.press("Escape");
+  await expect(popover(page)).toContainText("진행 중인 작업이 끝나면 튜토리얼을 종료합니다.");
+  await release();
+  await expect(popover(page)).toHaveCount(0);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("학습 설정");
+  await expect(page.getByLabel("학습 데이터", { exact: true })).toHaveValue("dummy:1");
+  await expect(page.getByRole("heading", { name: "실행 전 확인" })).toHaveCount(0);
+});
+
+test("ending while the sample request is pending keeps the dataset draft from before the tour", async ({ page }) => {
+  await boot(page);
+  await page.getByRole("button", { name: "데이터", exact: true }).click();
+  await page.getByLabel("데이터 ID", { exact: true }).fill("my_data");
+  await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
+  await expectStep(page, "welcome");
+  await advanceTo(page, "data-preview");
+  await expect(page.getByLabel("데이터 ID", { exact: true })).toHaveValue("my_data");
+  const release = await holdAction(page, "tutorial_sample");
+  await tourButton(page, "연습 샘플 채우기").click();
+  await expect(tourButton(page, "연습 샘플 채우기")).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await expect(popover(page)).toContainText("진행 중인 작업이 끝나면 튜토리얼을 종료합니다.");
+  await release();
+  await expect(popover(page)).toHaveCount(0);
+  await expect(page.getByLabel("데이터 ID", { exact: true })).toHaveValue("my_data");
+});
+
+test("returning to an anchored step scrolls to it and keeps the popover on screen", async ({ page }) => {
+  // Instant scrolling: an unfinished smooth scroll from the first visit would otherwise mask the defect.
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await boot(page, { seen: true });
+  await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
+  await expectStep(page, "welcome");
+  await advanceTo(page, "training-plan");
+  await page.getByRole("button", { name: "실행 관리", exact: true }).click();
+  await expect(popover(page)).toContainText("다른 화면을 보고 있습니다");
+  await tourButton(page, "이 단계로 이동").click();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("학습 설정");
+  await expect(page.locator('#app [data-tour="training-plan"]')).toBeInViewport();
+  await expect(popover(page)).toBeInViewport({ ratio: 1 });
+  await expect(popover(page).locator("#tour-title")).toBeInViewport();
+});
+
+test("a centered explanation sits over the content area beside the narrow sidebar", async ({ page }) => {
+  await page.setViewportSize({ width: 990, height: 800 });
+  await boot(page, { seen: true });
+  await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
+  await expectStep(page, "welcome");
+  await advanceTo(page, "plan-reading");
+  await expect(popover(page)).toHaveClass(/centered/);
+  await expect.poll(async () => {
+    const [box, area] = [await popover(page).boundingBox(), await page.locator("#app main").boundingBox()];
+    return Math.abs(box!.x + box!.width / 2 - (area!.x + area!.width / 2));
+  }).toBeLessThan(2);
+  await expect(popover(page)).toBeInViewport({ ratio: 1 });
+});
+
+test("ending the tutorial returns focus to the tutorial button", async ({ page }) => {
+  await boot(page, { seen: true });
+  const launcher = page.getByRole("button", { name: "튜토리얼", exact: true });
+  await launcher.click();
+  await expectStep(page, "welcome");
+  await page.keyboard.press("Escape");
+  await expect(popover(page)).toHaveCount(0);
+  await expect(launcher).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expectStep(page, "welcome");
+  await tourButton(page, "그만하기").click();
+  await expect(popover(page)).toHaveCount(0);
+  await expect(launcher).toBeFocused();
+});
+
+test("the last step's call-to-action ends the tour on the connection page", async ({ page }) => {
+  await boot(page, { seen: true });
+  const launcher = page.getByRole("button", { name: "튜토리얼", exact: true });
+  await launcher.click();
+  await expectStep(page, "welcome");
+  await advanceTo(page, "finish");
+  await tourButton(page, "연결 설정으로 이동").click();
+  await expect(popover(page)).toHaveCount(0);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("연결 설정");
+  await expect(launcher).toBeFocused();
+});
+
+test("app re-renders keep the popover in place without re-announcing the step", async ({ page }) => {
+  await boot(page, { seen: true });
+  await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
+  await expectStep(page, "welcome");
+  await tourButton(page, "다음").click();
+  await expectStep(page, "connection-provider");
+  await page.evaluate(() => {
+    const layer = document.querySelector("#tutorial-layer")!;
+    layer.querySelector<HTMLElement>("#tour-title")!.dataset.kept = "yes";
+    (window as any).__announcements = 0;
+    new MutationObserver(records => (window as any).__announcements += records.length)
+      .observe(layer.querySelector(".sr-only")!, { childList: true, characterData: true, subtree: true });
+  });
+  await page.getByLabel("연결 대상", { exact: true }).selectOption("ssh_server");
+  await expect(page.getByLabel("서버 주소", { exact: true })).toBeVisible();
+  await expect(popover(page).locator('#tour-title[data-kept="yes"]')).toHaveCount(1);
+  expect(await page.evaluate(() => (window as any).__announcements)).toBe(0);
+});
+
+test("starting the tutorial while work is in progress explains why it did not start", async ({ page }) => {
+  await boot(page, { seen: true });
+  await page.getByRole("button", { name: "데이터", exact: true }).click();
+  await page.getByLabel("파일 경로", { exact: true }).fill("C:\\data\\held.json");
+  const release = await holdAction(page, "dataset_preview");
+  await page.getByRole("button", { name: "샘플 미리보기" }).click();
+  await expect(page.locator(".notice.busy")).toBeVisible();
+  await page.keyboard.press("Control+K");
+  await page.getByLabel("페이지 검색").fill("튜토리얼");
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("작업 공간을 불러오거나 진행 중인 작업이 끝난 뒤 튜토리얼을 시작하세요.")).toBeVisible();
+  await expect(popover(page)).toHaveCount(0);
+  await release();
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+});
+
+test("the tutorial button restarts an active tour and the end still restores the original draft", async ({ page }) => {
+  await boot(page, { registered: true });
+  await page.getByRole("button", { name: "학습 설정", exact: true }).click();
+  await page.getByLabel("업무 AI ID", { exact: true }).fill("my_draft");
+  await page.getByLabel("업무 AI ID", { exact: true }).blur();
+  await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
+  await expectStep(page, "welcome");
+  await advanceTo(page, "training-plan");
+  await expect(page.getByLabel("업무 AI ID", { exact: true })).toHaveValue("paper_extraction");
+  await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
+  await expectStep(page, "welcome");
+  await expect(popover(page)).toContainText(`1 / ${tutorialSteps.length}`);
+  await expect(page.locator("#tour-title")).toBeFocused();
+  await advanceTo(page, "data-register");
+  await expect(tourButton(page, "다음")).toBeEnabled();
+  await page.keyboard.press("Escape");
+  await expect(popover(page)).toHaveCount(0);
+  await page.getByRole("button", { name: "학습 설정", exact: true }).click();
+  await expect(page.getByLabel("업무 AI ID", { exact: true })).toHaveValue("my_draft");
+});
+
+test("restarting ignores a sample request from the previous run", async ({ page }) => {
+  await boot(page, { seen: true });
+  await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
+  await expectStep(page, "welcome");
+  await advanceTo(page, "data-preview");
+  const release = await holdAction(page, "tutorial_sample");
+  await tourButton(page, "연습 샘플 채우기").click();
+  await expect(tourButton(page, "연습 샘플 채우기")).toBeDisabled();
+  await page.getByRole("button", { name: "튜토리얼", exact: true }).click();
+  await expectStep(page, "welcome");
+  await release();
+  await advanceTo(page, "data-preview");
+  await expect(page.getByLabel("데이터 ID", { exact: true })).toHaveValue("my_dataset");
+  await expect(tourButton(page, "연습 샘플 채우기")).toBeEnabled();
+  await expect(tourButton(page, "다음")).toBeDisabled();
 });

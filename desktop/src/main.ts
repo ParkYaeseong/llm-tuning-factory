@@ -629,7 +629,10 @@ async function action(name: string) {
     render(); await action("hub-inspect"); return;
   }
   if (name === "search") { commandSearch(); return; }
-  if (name === "tutorial") { if (state.busy || !state.config) return; captureConfig(); captureDrafts(); await tutorial.start(); return; }
+  if (name === "tutorial") {
+    if (state.busy || !state.config) { state.notice = "작업 공간을 불러오거나 진행 중인 작업이 끝난 뒤 튜토리얼을 시작하세요."; render(); return; }
+    captureConfig(); captureDrafts(); await tutorial.start(); return;
+  }
   if (name === "tutorial-dismiss") { rememberTutorial("dismissed"); render(); return; }
   if (name.startsWith("nav:")) { captureConfig(); captureDrafts(); state.page = name.split(":")[1]; render(); if (state.page === "training" && !state.capabilities && !state.capabilityPending) { await checkCapabilities(); render(); } return; }
   if (name.startsWith("template:")) {
