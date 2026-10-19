@@ -241,7 +241,7 @@ acceptance remain outstanding (see PROGRESS.md).
 ### Upgrade note: a leftover RunPod lock blocks GPU servers
 
 Because of the cross-provider quarantine, an unfinished or uncertain RunPod job lock (for example one left by 0.3.0) blocks all
-GPU server work and preparation. The desktop shows "다른 연결 대상(RunPod)의 끝나지 않은 작업 잠금이 남아 있어 GPU 서버를 사용할 수 없습니다. …".
+GPU server work and preparation. The desktop shows "다른 연결 대상(RunPod 등)의 끝나지 않은 작업 잠금이 남아 있어 GPU 서버를 사용할 수 없습니다. …".
 Remedy: first try 재연결 · 결과 회수 in 실행 관리. If the original process and Pod are confirmed stopped and reconcile cannot
 succeed, release the lock with the CLI against the desktop state folder. `release-lock` refuses unless the job is FAILED,
 CANCELED or COMPLETED and ATTEMPT_ID is the job's current attempt:

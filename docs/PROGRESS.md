@@ -147,8 +147,20 @@ Commits of the SSH GPU server and MLflow work, in order:
   server and MLflow doc corrections), 682e84e (flush deferred renders before reading form drafts), 1186832 (explain cross-provider
   locks; check destinations before resume; refuse the practice dataset at submit; test env isolation; provider-neutral OIDC
   message and fail-fast), c071985 (drop a stale tutorial plan on exit after destination changes; cost-aware reservation matching
-  and Korean refusal; waiting notice mentions other-provider locks) and the docs commit `docs: record final verification, upgrade
-  notes and lock remedy`.
+  and Korean refusal; waiting notice mentions other-provider locks) d6a1201 (the backend returns the fixed Korean
+  reservation-release refusal "다른 서버 설정(비용·키 파일 포함)으로 만든 예약입니다. 그 설정으로 바꾼 뒤 해제하세요." for cost and key
+  mismatches; `CROSS_PROVIDER_LOCK` now says "다른 연결 대상(RunPod 등)…"), ecd987b (the UI test uses the backend's Korean refusal;
+  waiting-notice wording aligned), a8fb57d (docs: record final verification, upgrade notes and lock remedy) and the docs commit
+  `docs: record the final review and follow-ups`.
+
+Final independent whole-branch review (06ceb65..c071985, plus d6a1201 and ecd987b as minor follow-ups) returned "Ready to merge: Yes"
+after fixes.
+
+Remaining follow-ups / deferred: in the reverse direction (an SSH lock or reservation blocking RunPod), RunPod preparation still says
+"Pod is reserved by a job" in English and RunPod execute shows only the waiting notice; `CROSS_PROVIDER_LOCK` in server execute can be
+misattributed when `work` returns None for another reason while a foreign lock exists; the `main.ts` render deferral and the
+per-action provider forks in `desktop.py` should be consolidated in Task 8/9/10; the secret-scan history findings from local commits
+c8df219 and 0b569dc still need a history rewrite or a user decision before any push.
 
 Upgrade / user-facing changes:
 - 0.3.0 settings without `provider` are read as RunPod; the first save writes `existing_runpod`. Without `auth_mode` the mode is `oidc`.
@@ -157,7 +169,7 @@ Upgrade / user-facing changes:
 - An OIDC URL without a secret: the app starts and MLflow actions show "OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. 인증값을
   입력하거나 토큰·OIDC 값을 비우세요(앱에서는 ‘인증 없음’ 선택)."; the CLI checks before claiming, the desktop before submit and execute.
 - Cross-provider quarantine pitfall: a leftover RunPod job lock from 0.3.0 blocks all GPU server work and preparation (the desktop shows
-  the "다른 연결 대상(RunPod)의 끝나지 않은 작업 잠금…" message). Remedy: 재연결 · 결과 회수 first; if the Pod and process are confirmed
+  the "다른 연결 대상(RunPod 등)의 끝나지 않은 작업 잠금…" message). Remedy: 재연결 · 결과 회수 first; if the Pod and process are confirmed
   stopped, `uv run factory --state-dir "$env:APPDATA\kr.kbiofoundry.tuningfactory\state" release-lock JOB_ID ATTEMPT_ID
   --confirm-execution-stopped` (JOB_ID is in the jobs table; ATTEMPT_ID is `active_attempt_id` in `status JOB_ID`).
 - The SSH username pattern was widened (institution/LDAP names); `.ppk` and pasted private keys are refused.
@@ -200,11 +212,11 @@ receipt hardening), 2f08f67 (native allowlist and package asset), f0f33c3, 7104e
 on-screen popover, first-click fix), 6eebbe9, 32b9eeb (checklist exclusion, ASCII path hint), aacdd0f (package verifier checks the
 tutorial refusal and registration exactly) and the docs commit `docs: guide first-time users through the desktop tutorial`.
 
-Final actual verification at HEAD c071985 (2026-10-19, Windows; the later docs commit changes no code): `uv run pytest -q` **752 passed,
-1 skipped** in 59.72s; `uv run ruff check src tests` passes; `npx playwright test` **81 passed** (1.8m); `npm run build` (tsc + Vite)
+Final actual verification at HEAD ecd987b (2026-10-19, Windows; the later docs commits change no code): `uv run pytest -q` **754 passed,
+1 skipped** in 75.68s; `uv run ruff check src tests` passes; `npx playwright test` **81 passed**; `npm run build` (tsc + Vite)
 passes; `cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` **12 passed**;
-`uv run python scripts/check_secrets.py` reports only the historical `main.rs` finding (`Checked 603 staged/historical file
-versions; 1 findings.`) and `git grep` for private-key headers finds nothing (exit 1). Earlier numbers in this section (743/72 at
+`uv run python scripts/check_secrets.py` reports only the historical `main.rs` finding (`Checked 614 staged/historical file
+versions; 1 findings.`) and `git grep` for private-key headers finds nothing (exit 1). Earlier numbers (752/81 at c071985, 743/72 at
 aacdd0f, 743 at 24135cb) are superseded.
 
 Unverified for the tutorial: the real Tauri/WebView2 rendering and layout of the tour, the installed frozen package and
