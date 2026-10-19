@@ -270,11 +270,13 @@ def release_runtime_reservation(settings, state_root, reservation_id, *, confirm
 @contextmanager
 def executor_for(settings, state_root, preflight=True, training_stage="sft", *, server_receipt=None,
                  recovery=False):
-    if recovery and settings.get("provider", "existing_runpod") == "ssh_server":
+    # recovery=True always means the SSH recovery-only executor; RunPod reconciles with preflight=False.
+    if recovery:
+        if settings.get("provider", "existing_runpod") != "ssh_server":
+            raise ValueError("recovery-only executor requires an SSH server destination")
         with recovery_executor(settings, server_receipt) as executor:
             yield executor
         return
-    preflight = preflight and not recovery
     if server_receipt is not None:
         server_receipt = validate_server_receipt(settings, server_receipt)
     with connection(settings) as (pod, client):
@@ -377,11 +379,10 @@ def validate_original_destination(settings, record):
 
 
 def validate_original_observation(record, facts):
-    from .gpu_servers import SSHServerProfile, validate_server_binding
+    """Recovery connections yield SSHServerIdentity (server) or the Pod dictionary (RunPod)."""
+    from .gpu_servers import SSHServerProfile
     if isinstance(facts, SSHServerIdentity):
         validate_recovery_identity(SSHServerProfile.model_validate(record.get("destination")), facts.transport, facts)
-    elif isinstance(facts, SSHServerFacts):
-        validate_server_binding(SSHServerProfile.model_validate(record.get("destination")), facts)
 
 
 def inspect_server(settings):

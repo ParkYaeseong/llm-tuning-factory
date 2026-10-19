@@ -29,6 +29,20 @@ def test_runtime_requires_running_network_volume_pod():
         validate_pod(pod)
 
 
+@pytest.mark.parametrize("provider", [None, "", "existing_runpod"])
+def test_recovery_executor_is_refused_for_runpod_before_any_contact(tmp_path, monkeypatch, provider):
+    from tuning_factory import desktop_runtime as runtime
+
+    monkeypatch.setattr(runtime, "connection", lambda *a, **kw: pytest.fail("Pod contacted"))
+    monkeypatch.setattr(runtime, "RunPodController", lambda *a, **kw: pytest.fail("RunPod called"))
+    settings = {"pod_id": "borrowed", "RUNPOD_API_KEY": "fixture-only"}
+    if provider is not None:
+        settings["provider"] = provider
+    with pytest.raises(ValueError, match="recovery"):
+        with runtime.executor_for(settings, tmp_path, preflight=False, recovery=True):
+            pytest.fail("RunPod recovery executor created")
+
+
 def test_runtime_rejects_missing_compiler_even_when_cuda_is_available(monkeypatch):
     from tuning_factory import desktop_runtime as runtime
     from tuning_factory.desktop import assets_root

@@ -1,4 +1,5 @@
 """One common pipeline for all AIs. Durable evidence stays on the control plane."""
+import contextlib
 import json
 import threading
 import time
@@ -82,10 +83,17 @@ class Factory:
         try:
             self._verify_before_launch(job, lease, executor, server_facts)
         except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
             try:
-                self.store.abandon_unlaunched(lease, f"{type(exc).__name__}: {exc}")
+                abandoned = self.store.abandon_unlaunched(lease, error)
             except ValueError:
-                pass  # A newer actor owns the attempt; its lock stays untouched.
+                abandoned = False  # A newer actor owns the attempt; its lock stays untouched.
+            if abandoned:
+                # Same evidence as other failures; a started attempt's own error.txt stays intact.
+                with contextlib.suppress(OSError):
+                    directory = self.root / "jobs" / lease.job_id
+                    directory.mkdir(parents=True, exist_ok=True)
+                    (directory / "error.txt").write_text(error, encoding="utf-8")
             raise
         launch_id = self.store.begin_launch(lease)
         approved_transfer = approval

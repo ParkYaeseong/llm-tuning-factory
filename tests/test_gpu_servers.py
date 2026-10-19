@@ -1320,6 +1320,8 @@ def test_refused_pre_launch_check_fails_and_releases_the_unlaunched_attempt(tmp_
         factory.run_claimed(claimed, executor, None, True)
     job = factory.store.get(claimed["id"])
     assert job["status"] == "FAILED" and job["error"]
+    # The desktop error view reads error.txt, as for every other failed attempt.
+    assert (factory.directory(claimed["id"]) / "error.txt").read_text(encoding="utf-8") == job["error"]
     assert launch_started(factory.store, claimed["lease"]) == 0
     assert not factory.store.gpu_locked(facts.exclusivity_key)
     factory.store.reset_for_resume(claimed["id"])
@@ -1333,10 +1335,13 @@ def test_refused_takeover_of_a_launched_attempt_keeps_its_lock(tmp_path):
     factory.store.begin_launch(claimed["lease"])
     factory.store.transition(claimed["lease"], "FAILED", "heartbeat expired")
     takeover = factory.store.takeover(claimed["lease"])
+    (factory.directory(claimed["id"]) / "error.txt").write_text("heartbeat expired", encoding="utf-8")
     with pytest.raises(ValueError, match="destination"):
         factory.run_claimed(takeover, LocalExecutor(), None, True)
     assert factory.store.get(claimed["id"])["status"] == "FAILED"
     assert factory.store.gpu_locked(receipt.facts.exclusivity_key)
+    # The launched attempt's own evidence is not replaced by the refused takeover.
+    assert (factory.directory(claimed["id"]) / "error.txt").read_text(encoding="utf-8") == "heartbeat expired"
 
 
 @pytest.mark.parametrize("name", ["Researcher", "1user", "2024student", "john.doe", "user@EXAMPLE.ORG",
