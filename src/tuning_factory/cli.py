@@ -48,6 +48,9 @@ def doctor(ctx: typer.Context, pod_id: str | None = None, write_test: bool = Fal
     from .diagnostics import check_connections
     connection = ctx.obj.connection
     server = server_connection(ctx, server_profile)
+    if server is not None and pod_id:
+        raise typer.BadParameter("--pod-id cannot be combined with an SSH server profile; choose one provider",
+                                 param_hint="--pod-id")
     output(check_connections(ctx.obj.root, None if server else pod_id or (connection.pod_id if connection else None),
                              write_test, server=server))
 

@@ -1337,3 +1337,129 @@ def test_refused_takeover_of_a_launched_attempt_keeps_its_lock(tmp_path):
         factory.run_claimed(takeover, LocalExecutor(), None, True)
     assert factory.store.get(claimed["id"])["status"] == "FAILED"
     assert factory.store.gpu_locked(receipt.facts.exclusivity_key)
+
+
+@pytest.mark.parametrize("name", ["Researcher", "1user", "2024student", "john.doe", "user@EXAMPLE.ORG",
+                                  "AB_c-d", "_svc", "a" * 64])
+def test_ssh_username_accepts_institution_ldap_accounts(name):
+    from tuning_factory.gpu_servers import SSHServerSettings
+
+    assert SSHServerSettings.model_validate(settings().model_dump() | {"ssh_username": name}).ssh_username == name
+
+
+@pytest.mark.parametrize("name", ["", "-oProxyCommand=x", ".user", "@user", "user name", "user\n", "u\tx",
+                                  "user\x00", "user;id", "a" * 65, "üser"])
+def test_ssh_username_rejects_option_like_whitespace_or_control_characters(name):
+    from tuning_factory.gpu_servers import SSHServerSettings
+
+    with pytest.raises(ValueError):
+        SSHServerSettings.model_validate(settings().model_dump() | {"ssh_username": name})
+
+
+def private_preparation_fixture(tmp_path, monkeypatch, run):
+    from contextlib import contextmanager
+
+    from test_remote_worker import FakeSSH
+
+    from tuning_factory import desktop, desktop_runtime
+    from tuning_factory.gpu_servers import SSHServerInspection
+
+    config = settings()
+    facts = observation(config)
+    inspected = SSHServerInspection(server_id=facts.server_id, transport=config.transport,
+        inventory=facts.inventory, total_hourly_cost_usd=0, observed_at=facts.observed_at)
+    client = FakeSSH(tmp_path / "remote")
+    client.sftp.root.mkdir()
+    assets = tmp_path / "assets"
+    (assets / "dist").mkdir(parents=True)
+    (assets / "containers").mkdir()
+    (assets / "dist/llm_tuning_factory-fixture.whl").write_text("local fixture")
+    (assets / "containers/gpu-requirements.lock").write_text("fixture")
+
+    @contextmanager
+    def connect(_):
+        yield facts, client
+
+    monkeypatch.setattr(desktop_runtime, "connection", connect)
+    monkeypatch.setattr(desktop_runtime, "command", run)
+    monkeypatch.setattr(desktop_runtime, "check", lambda *a, **kw: {"source": "fixture"})
+    monkeypatch.setattr(desktop, "assets_root", lambda: assets)
+    return {"provider": "ssh_server", **config.model_dump(mode="json")}, inspected, client
+
+
+def test_runtime_preparation_reports_missing_pip_before_any_transfer(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    from tuning_factory.jobs import JobStore
+
+    commands = []
+
+    def run(_, argv, **kwargs):
+        commands.append(argv)
+        if argv == ["python3", "-m", "pip", "--version"]:
+            raise desktop_runtime.RemoteCommandFailed("GPU runtime command failed. No module named pip")
+        return ""
+
+    native, inspected, client = private_preparation_fixture(tmp_path, monkeypatch, run)
+    with pytest.raises(ValueError, match="python3 -m pip"):
+        desktop_runtime.runtime(native, tmp_path, prepare=True, inspection=inspected)
+    assert not any(argv[:2] == ["sh", "-c"] and "uv venv" in argv[2] for argv in commands)
+    assert not any(client.sftp.root.iterdir())  # Nothing transferred.
+    assert JobStore(tmp_path / "jobs.db").preparation_reservations() == []
+
+
+def test_runtime_preparation_keeps_pip_downloads_and_cache_below_private_root(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+
+    commands = []
+
+    def run(_, argv, **kwargs):
+        commands.append(argv)
+        return ""
+
+    native, inspected, _ = private_preparation_fixture(tmp_path, monkeypatch, run)
+    assert desktop_runtime.runtime(native, tmp_path, prepare=True, inspection=inspected)["ready"]
+    pip_check = commands.index(["python3", "-m", "pip", "--version"])
+    script = next(index for index, argv in enumerate(commands) if argv[:2] == ["sh", "-c"] and "uv venv" in argv[2])
+    assert pip_check < script
+    install = next(line for line in commands[script][2].splitlines() if "pip install" in line and "--target" in line)
+    assert "--no-cache-dir" in install and settings().remote_root + "/runtime/" in install
+
+
+def test_linux_probe_reports_unreadable_machine_id_instead_of_a_traceback(tmp_path, monkeypatch, capsys):
+    import pathlib
+    import sys
+
+    from tuning_factory import gpu_servers
+
+    original = pathlib.Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        if self.as_posix().endswith("/etc/machine-id"):
+            raise FileNotFoundError("fixture: missing /etc/machine-id")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", read_text)
+    monkeypatch.setattr(sys, "argv", ["probe", str(tmp_path)])
+    exec(compile(gpu_servers._LINUX_PROBE, "<fixed-probe>", "exec"), {"__name__": "__main__"})
+    reply = json.loads(capsys.readouterr().out)
+    assert reply["machine_id"] is None
+    reply.update(system="Linux", tools={"flock": True, "cc": True}, workspace_safe=True, workspace_writable=True)
+    for probe in (gpu_servers.probe_server, gpu_servers.probe_server_identity):
+        with pytest.raises(ValueError, match="/etc/machine-id"):
+            probe(None, settings(), lambda *_, **kw: json.dumps(reply))
+
+
+def test_doctor_rejects_pod_id_combined_with_a_server_profile(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from tuning_factory import desktop_runtime
+    from tuning_factory.cli import app
+
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.setattr(desktop_runtime, "inspect_server", lambda _: pytest.fail("ambiguous doctor contacted"))
+    path = tmp_path / "server.json"
+    path.write_text(settings().model_dump_json())
+    result = CliRunner().invoke(app, ["--state-dir", str(tmp_path / "state"), "doctor", "--pod-id", "pod1",
+                                      "--server-profile", str(path)])
+    assert result.exit_code == 2, result.output
+    assert "pod-id" in result.output

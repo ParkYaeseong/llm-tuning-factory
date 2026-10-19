@@ -30,7 +30,9 @@ def safe_remote_root(value):
 class _SSHAddress(StrictModel):
     ssh_host: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}$")
     ssh_port: int = Field(default=22, strict=True, ge=1, le=65535)
-    ssh_username: str = Field(pattern=r"^[a-z_][a-z0-9_.-]{0,63}$")
+    # Institution/LDAP accounts may be uppercase, digit-led or realm-qualified. Paramiko sends
+    # the name as data, never through a shell; a leading "-" and whitespace/controls stay invalid.
+    ssh_username: str = Field(pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.@-]{0,63}$")
     ssh_fingerprint: str = Field(pattern=r"^SHA256:[A-Za-z0-9+/]{43}$")
     remote_root: str
     selected_gpu_uuids: tuple[GPUUUID, ...] = Field(default=(), max_length=8)
@@ -264,7 +266,11 @@ from pathlib import Path
 p=Path(sys.argv[1]); ancestors=(p,*p.parents)
 safe=all(not x.is_symlink() and (not x.exists() or x.is_dir()) for x in ancestors)
 existing=next(x for x in ancestors if x.exists())
-print(json.dumps(dict(system=platform.system(),machine_id=Path('/etc/machine-id').read_text().strip(),
+try:
+    machine_id=Path('/etc/machine-id').read_text().strip()
+except (OSError,UnicodeError):
+    machine_id=None
+print(json.dumps(dict(system=platform.system(),machine_id=machine_id,
  python=list(sys.version_info[:3]),tools={x:bool(shutil.which(x)) for x in ('flock','cc')},
  workspace_safe=safe,workspace_writable=os.access(existing,os.W_OK|os.X_OK))))
 """
@@ -272,7 +278,12 @@ print(json.dumps(dict(system=platform.system(),machine_id=Path('/etc/machine-id'
 
 def _observe_linux(client, settings, run_command):
     system = json.loads(run_command(client, ["python3", "-c", _LINUX_PROBE, settings.remote_root]))
-    if system.get("system") != "Linux" or not re.fullmatch(r"[0-9a-fA-F]{32}", system.get("machine_id", "")):
+    if system.get("system") != "Linux":
+        raise ValueError("supported Linux server with stable machine identity required")
+    if not system.get("machine_id"):
+        raise ValueError("GPU 서버의 /etc/machine-id를 읽을 수 없어 같은 서버인지 확인할 수 없습니다 "
+                         "(지원하지 않는 서버)")
+    if not isinstance(system["machine_id"], str) or not re.fullmatch(r"[0-9a-fA-F]{32}", system["machine_id"]):
         raise ValueError("supported Linux server with stable machine identity required")
     if not system.get("workspace_safe"):
         raise ValueError("remote workspace must be writable and free of symlinks")

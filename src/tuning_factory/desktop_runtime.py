@@ -124,6 +124,15 @@ def prerequisites(client):
                     '"or ask its administrator to install a C toolchain before preparing training." >&2; exit 1; }'])
 
 
+def bootstrap_prerequisites(client):
+    """Fixed check before any transfer: the private uv bootstrap needs `python3 -m pip`."""
+    try:
+        command(client, ["python3", "-m", "pip", "--version"])
+    except RemoteCommandFailed:
+        raise ValueError("python3 -m pip is required to bootstrap the private runtime; ask the server "
+                         "administrator to install pip for python3 (for example the python3-pip package)") from None
+
+
 def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=()):
     prerequisites(client)
     root = runtime_path(training_stage, remote_root)
@@ -171,6 +180,7 @@ def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspec
         if prepare:
             with preparation_guard(state_root, config.profile(pod) if generic else None, pod) as preparation:
                 prerequisites(client)
+                bootstrap_prerequisites(client)
                 from .desktop import assets_root
                 assets = assets_root()
                 wheels = list((assets / "dist").glob("llm_tuning_factory-*.whl"))
@@ -189,7 +199,8 @@ def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspec
                     f"exec 9>{shlex.quote(root + '/prepare.lock')}\nflock -n 9\n"
                     f"export UV_PYTHON_INSTALL_DIR={shlex.quote(remote_root + '/python')}\n"
                     f"export UV_CACHE_DIR={shlex.quote(remote_root + '/uv-cache')}\n"
-                    f"python3 -m pip install --disable-pip-version-check --target {shlex.quote(root + '/bootstrap')} uv==0.11.23\n"
+                    f"python3 -m pip install --disable-pip-version-check --no-cache-dir "
+                    f"--target {shlex.quote(root + '/bootstrap')} uv==0.11.23\n"
                     f"export PYTHONPATH={shlex.quote(root + '/bootstrap')}\n"
                     f"python3 -m uv venv --python 3.12 --allow-existing {shlex.quote(root + '/venv')}\n"
                     f"python3 -m uv pip sync --python {shlex.quote(root + '/venv/bin/python')} --require-hashes "
