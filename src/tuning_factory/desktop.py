@@ -19,7 +19,7 @@ from .execution import ExecutionUncertain, Policy, RunPodController
 from .gpu_servers import ServerApprovalReceipt, SSHServerInspection, server_settings
 from .manifest import resolve
 from .model_hub import ModelHub, register_model, registered_models
-from .registry import canonical, safe_name
+from .registry import canonical, digest, parse_dataset, safe_name
 from .runner import Factory
 
 PROVIDERS = ("existing_runpod", "ssh_server")
@@ -43,6 +43,29 @@ def assets_root():
     if hasattr(sys, "_MEIPASS"):
         return Path(sys._MEIPASS) / "assets"
     return Path(__file__).resolve().parents[2]
+
+
+TUTORIAL_DATASET_ID = "tutorial_sample"
+TUTORIAL_REFUSAL = "tutorial_sample은 앱에 포함된 연습용 합성 데이터만 GPU 전송 없이 등록할 수 있습니다."
+
+
+def tutorial_sample_path():
+    return assets_root() / "examples" / "tutorial_sample.json"
+
+
+def reserved_tutorial_id(data):
+    # Windows registry folders are case-insensitive, so spelling variants share the reserved name.
+    return str(data.get("dataset_id", "")).casefold() == TUTORIAL_DATASET_ID
+
+
+def check_tutorial_registration(data):
+    """The practice ID only ever names the bundled synthetic sample, never transferable data."""
+    path = Path(str(data.get("path", "")))
+    if (data.get("dataset_id") != TUTORIAL_DATASET_ID or data.get("version") != "1"
+            or data.get("kind", "instruction") != "instruction" or data.get("synthetic") is not True
+            or data.get("export_allowed") is True or not path.is_file()
+            or digest(path.read_bytes()) != digest(tutorial_sample_path().read_bytes())):
+        raise ValueError(TUTORIAL_REFUSAL)
 
 
 def compare_runs(base, candidate):
@@ -227,9 +250,22 @@ class DesktopService:
             directory.mkdir(exist_ok=True)
             (directory / (safe_name(config.ai_id) + ".json")).write_bytes(canonical(config.model_dump()))
             return {"saved": True}
+        if action == "tutorial_sample":
+            # The frozen onefile asset folder disappears after this process; later requests read the state copy.
+            raw = tutorial_sample_path().read_bytes()
+            copy = self.root / "tutorial" / "tutorial_sample.json"
+            if not copy.is_file() or copy.read_bytes() != raw:
+                copy.parent.mkdir(parents=True, exist_ok=True)
+                temporary = copy.with_suffix(".tmp")
+                temporary.write_bytes(raw)
+                os.replace(temporary, copy)
+            return {"dataset_id": TUTORIAL_DATASET_ID, "version": "1", "kind": "instruction",
+                    "path": str(copy), "sha256": digest(raw), "rows": len(parse_dataset(raw, "instruction")[0])}
         if action == "dataset_preview":
             return inspect_dataset(data["path"], data.get("kind", "instruction"))
         if action == "dataset":
+            if reserved_tutorial_id(data):
+                check_tutorial_registration(data)
             return self.factory.registry.register_dataset(
                 data["dataset_id"], data["version"], Path(data["path"]),
                 export_allowed=data.get("export_allowed") is True, synthetic=data.get("synthetic") is True,
@@ -241,6 +277,8 @@ class DesktopService:
             return {**self.storage().head(data["bucket"], data["key"], data.get("version_id")),
                     "import_max_bytes": 32 * 1024 * 1024, "free_bytes": shutil.disk_usage(self.root).free}
         if action == "s3_import":
+            if reserved_tutorial_id(data):
+                raise ValueError(TUTORIAL_REFUSAL)
             if data.get("approved") is not True:
                 raise ValueError("explicit S3 download approval required")
             safe_name(data["dataset_id"])
