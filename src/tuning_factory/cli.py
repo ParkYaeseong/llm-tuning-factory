@@ -156,8 +156,11 @@ def batch(ctx: typer.Context, configs: Annotated[list[Path], typer.Argument()], 
 
 def require_secure_tracker(factory):
     """Refuse an insecure tracking setup before any job is claimed, so no attempt is consumed."""
-    from .auth import require_secure_artifacts, require_secure_tracking
-    require_secure_tracking(getattr(factory.tracker, "uri", None))
+    from .auth import require_complete_oidc, require_secure_artifacts, require_secure_tracking
+    uri = getattr(factory.tracker, "uri", None)
+    require_secure_tracking(uri)
+    if uri:
+        require_complete_oidc()
     require_secure_artifacts(os.environ.get("FACTORY_MLFLOW_ARTIFACT_LOCATION"))
 
 

@@ -164,3 +164,22 @@ def test_cli_work_refuses_insecure_tracking_before_claiming(tmp_path, monkeypatc
     assert len(Factory(tmp_path / "state").store.list()) == jobs_before
     stored = Factory(tmp_path / "state").store.get(job["id"])
     assert stored["status"] == "QUEUED" and stored["attempts"] == 0
+
+
+def test_cli_work_fails_fast_on_incomplete_oidc_before_claiming(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from tuning_factory.auth import OIDC_CLIENT_MISSING
+    from tuning_factory.cli import app
+    from tuning_factory.config import load_config
+    from tuning_factory.runner import Factory
+
+    factory = Factory(tmp_path / "state")
+    factory.registry.register_dataset("dummy", "1", "examples/dummy.json", export_allowed=False)
+    job = factory.submit(load_config("configs/ai/paper_extraction.yaml"))
+    monkeypatch.setenv("MLFLOW_OIDC_TOKEN_URL", "https://idp.example/token")
+    result = CliRunner().invoke(app, ["--state-dir", str(tmp_path / "state"), "--tracking-uri",
+                                      "https://mlflow.example", "work"])
+    assert type(result.exception) is ValueError and str(result.exception) == OIDC_CLIENT_MISSING
+    stored = Factory(tmp_path / "state").store.get(job["id"])
+    assert stored["status"] == "QUEUED" and stored["attempts"] == 0

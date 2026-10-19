@@ -33,7 +33,8 @@ def isolated(monkeypatch):
     """The sidecar exports settings to the process environment; restore it after every case.
     No case here may reach the RunPod API or an external tracking server."""
     for key in ENV_SETTINGS:
-        monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv(key, "x")  # Registers teardown even for keys that start absent.
+        monkeypatch.delenv(key)
 
     def runpod(*args, **kwargs):
         pytest.fail("RunPod API called")
@@ -410,7 +411,56 @@ def test_runtime_prepare_refuses_while_this_server_an_alias_or_another_provider_
         store.claim("existing_runpod:borrowed" if holder == "runpod_job" else "unknown-existing-lock")
     with pytest.raises(ValueError) as error:
         app.dispatch("runtime_prepare", {"approved": True, "inspection": inspection_for().model_dump(mode="json")})
-    assert str(error.value) == RESERVED
+    expected = desktop.CROSS_PROVIDER_LOCK if holder in {"runpod_job", "unknown_lock"} else RESERVED
+    assert str(error.value) == expected
+
+
+def test_cross_provider_lock_message_explains_cause_and_remedy():
+    assert desktop.CROSS_PROVIDER_LOCK == (
+        "다른 연결 대상(RunPod)의 끝나지 않은 작업 잠금이 남아 있어 GPU 서버를 사용할 수 없습니다. "
+        "실행 관리에서 해당 작업을 재연결·결과 회수하거나, 원래 프로세스가 끝난 것을 확인한 뒤 "
+        "CLI release-lock으로 해제하세요.")
+
+
+def test_execute_explains_a_server_blocked_by_a_leftover_runpod_lock(tmp_path, monkeypatch):
+    from test_graph_store import queued
+
+    app = desktop.DesktopService(tmp_path, native())
+    job, receipt = bound_job(app)
+    held = queued(app.factory.store, "held")
+    assert app.factory.store.claim("existing_runpod:borrowed", job_id=held["id"])
+    recording_executor(monkeypatch, receipt.facts)
+    monkeypatch.setattr(app.factory, "work", lambda **kwargs: None)
+    with pytest.raises(ValueError) as error:
+        app.dispatch("execute", {"approved": True, "job_id": job["id"]})
+    assert str(error.value) == desktop.CROSS_PROVIDER_LOCK
+
+
+def test_execute_keeps_waiting_when_only_the_same_server_is_busy(tmp_path, monkeypatch):
+    app = desktop.DesktopService(tmp_path, native())
+    job, receipt = bound_job(app)
+    recording_executor(monkeypatch, receipt.facts)
+    monkeypatch.setattr(app.factory, "work", lambda **kwargs: None)
+    assert app.factory.store.foreign_provider_lock(receipt.facts.exclusivity_key) is False
+    assert app.dispatch("execute", {"approved": True, "job_id": job["id"]}) is None
+
+
+def test_resume_checks_the_destination_before_any_state_change(tmp_path, monkeypatch):
+    app = desktop.DesktopService(tmp_path, native())
+    job, _ = bound_job(app)
+    monkeypatch.setattr(app.factory, "resume", lambda *a, **kw: pytest.fail("resume reached"))
+    runpod = desktop.DesktopService(tmp_path, {"pod_id": "borrowed", "RUNPOD_API_KEY": "fixture-only"})
+    monkeypatch.setattr(runpod.factory, "resume", lambda *a, **kw: pytest.fail("resume reached"))
+    with pytest.raises(ValueError, match="이 작업은 GPU 서버용으로 승인되었습니다"):
+        runpod.dispatch("resume", {"approved": True, "job_id": job["id"], "checkpoint": "checkpoint-1"})
+    unbound = unbound_job(app)
+    with pytest.raises(ValueError, match="GPU 서버용 승인 기록이 없는 작업입니다"):
+        app.dispatch("resume", {"approved": True, "job_id": unbound["id"], "checkpoint": "checkpoint-1"})
+    edited = desktop.DesktopService(tmp_path, native(server_ssh_host="other.example"))
+    monkeypatch.setattr(edited.factory, "resume", lambda *a, **kw: pytest.fail("resume reached"))
+    with pytest.raises(ValueError, match="differs from current settings"):
+        edited.dispatch("resume", {"approved": True, "job_id": job["id"], "checkpoint": "checkpoint-1"})
+    assert app.factory.store.get(job["id"])["status"] == "QUEUED"
 
 
 def test_runtime_prepare_is_not_blocked_by_another_servers_reservation(tmp_path, monkeypatch):

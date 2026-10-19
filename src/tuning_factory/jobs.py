@@ -339,6 +339,17 @@ class JobStore:
                 return self._claim(db, row, gpu, server_facts)
         return None
 
+    def foreign_provider_lock(self, resource):
+        """True when a job lock or preparation reservation belongs to another provider than `resource`."""
+        providers = ('existing_runpod:', 'ssh_server:')
+        provider = next((prefix for prefix in providers if resource.startswith(prefix)), None)
+        if provider is None:
+            return False
+        with self.connection() as db:
+            held = [row[0] for row in db.execute('SELECT gpu FROM gpu_locks')]
+            held += [row[0] for row in db.execute('SELECT resource_id FROM preparation_reservations')]
+        return any(locked != 'mock-cpu' and not locked.startswith(provider) for locked in held)
+
     def resource_blocked(self, facts):
         """Shared check for verified hardware (facts or inspection), active jobs and preparation reservations."""
         with self.connection() as db:

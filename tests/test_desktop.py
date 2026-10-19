@@ -78,7 +78,8 @@ def isolated_environment(monkeypatch):
     """DesktopService exports its settings to the process environment; restore it after the case."""
     from tuning_factory.connections import ENV_SETTINGS
     for key in ENV_SETTINGS:
-        monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv(key, "x")  # Registers teardown even for keys that start absent.
+        monkeypatch.delenv(key)
 
 
 def test_unauthenticated_tracking_allows_local_http_and_drops_stale_credentials(tmp_path, isolated_environment):

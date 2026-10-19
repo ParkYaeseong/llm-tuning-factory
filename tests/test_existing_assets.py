@@ -64,7 +64,7 @@ def test_oidc_without_client_credentials_reports_a_clear_error(monkeypatch, clie
     with pytest.raises(ValueError) as error:
         auth.configure_oidc()
     assert str(error.value) == ("OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. "
-                                "인증값을 입력하거나 ‘인증 없음’을 선택하세요.")
+                                "인증값을 입력하거나 토큰·OIDC 값을 비우세요(앱에서는 ‘인증 없음’ 선택).")
     monkeypatch.delenv("MLFLOW_OIDC_TOKEN_URL")
     assert auth.configure_oidc() is None
 

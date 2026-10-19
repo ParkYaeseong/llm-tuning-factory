@@ -114,9 +114,35 @@ def test_tutorial_plan_is_dry_run_and_submission_is_refused(tmp_path):
     config.update(dataset_id="tutorial_sample", dataset_version="1")
     plan = app.dispatch("plan", {"config": config})
     assert plan["dry_run"] is True and plan["manifest"]["dataset"]["rows"] == 8
+    with pytest.raises(ValueError) as error:
+        app.dispatch("submit", {"config": config, "approved": True})
+    assert str(error.value) == desktop.PRACTICE_SUBMIT_REFUSAL
+    assert app.dispatch("jobs", {}) == []
+
+
+def test_practice_dataset_is_refused_at_submit_even_as_validation_data_or_with_export_allowed(tmp_path):
+    app = desktop.DesktopService(tmp_path)
+    config = next(x["config"] for x in app.dispatch("catalog", {})["templates"] if x["name"] == "paper_extraction")
+    app.dispatch("dataset", {"dataset_id": "real", "version": "1", "path": str(SAMPLE), "export_allowed": True})
+    config.update(dataset_id="real", dataset_version="1")
+    config["evaluation_profile"].update(kind="extraction", dataset_id="Tutorial_Sample", dataset_version="1")
+    with pytest.raises(ValueError) as error:
+        app.dispatch("submit", {"config": config, "approved": True})
+    assert str(error.value) == desktop.PRACTICE_SUBMIT_REFUSAL
+    config["evaluation_profile"].update(dataset_id=None, dataset_version=None)
+    config.update(dataset_id="TUTORIAL_SAMPLE")
+    with pytest.raises(ValueError) as error:
+        app.dispatch("submit", {"config": config, "approved": True})
+    assert str(error.value) == desktop.PRACTICE_SUBMIT_REFUSAL
+
+
+def test_unauthorized_export_is_still_refused_for_other_datasets(tmp_path):
+    app = desktop.DesktopService(tmp_path)
+    app.dispatch("dataset", {"dataset_id": "private", "version": "1", "path": str(SAMPLE)})
+    config = next(x["config"] for x in app.dispatch("catalog", {})["templates"] if x["name"] == "paper_extraction")
+    config.update(dataset_id="private", dataset_version="1")
     with pytest.raises(ValueError, match="export has not been authorized"):
         app.dispatch("submit", {"config": config, "approved": True})
-    assert app.dispatch("jobs", {}) == []
 
 
 def test_copy_permission_error_is_reraised_when_copy_differs(tmp_path, monkeypatch):

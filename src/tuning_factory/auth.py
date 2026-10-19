@@ -49,7 +49,14 @@ class OIDCTokenRefresher:
 
 
 OIDC_CLIENT_MISSING = ("OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. "
-                       "인증값을 입력하거나 ‘인증 없음’을 선택하세요.")
+                       "인증값을 입력하거나 토큰·OIDC 값을 비우세요(앱에서는 ‘인증 없음’ 선택).")
+
+
+def require_complete_oidc():
+    """An OIDC token URL without client credentials fails here, before any claim or remote work."""
+    if os.environ.get("MLFLOW_OIDC_TOKEN_URL") and not (
+            os.environ.get("MLFLOW_OIDC_CLIENT_ID") and os.environ.get("MLFLOW_OIDC_CLIENT_SECRET")):
+        raise ValueError(OIDC_CLIENT_MISSING)
 
 
 INSECURE_TRACKING = ("인증값을 사용하는 MLflow 서버 주소는 HTTPS여야 합니다. 인증 없는 로컬·내부 HTTP 서버는 "
@@ -78,10 +85,9 @@ def configure_oidc():
     token_url = os.environ.get("MLFLOW_OIDC_TOKEN_URL")
     if not token_url:
         return None
+    require_complete_oidc()
     client_id = os.environ.get("MLFLOW_OIDC_CLIENT_ID")
     client_secret = os.environ.get("MLFLOW_OIDC_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        raise ValueError(OIDC_CLIENT_MISSING)
     refresher = OIDCTokenRefresher(token_url, client_id, client_secret)
     refresher.start()
     return refresher

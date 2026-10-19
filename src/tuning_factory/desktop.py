@@ -35,6 +35,10 @@ UNBOUND_SERVER_JOB = ("GPU 서버용 승인 기록이 없는 작업입니다. "
                       "GPU 서버 연결에서 실행 계획을 다시 확인하고 제출하세요.")
 SERVER_BOUND_JOB = "이 작업은 GPU 서버용으로 승인되었습니다. 연결 대상을 그 GPU 서버로 바꾼 뒤 실행하세요."
 UNREADABLE_RECEIPT = "GPU 서버 승인 기록을 읽을 수 없습니다. 작업을 다시 계획·제출하세요."
+CROSS_PROVIDER_LOCK = ("다른 연결 대상(RunPod)의 끝나지 않은 작업 잠금이 남아 있어 GPU 서버를 사용할 수 없습니다. "
+                       "실행 관리에서 해당 작업을 재연결·결과 회수하거나, 원래 프로세스가 끝난 것을 확인한 뒤 "
+                       "CLI release-lock으로 해제하세요.")
+PRACTICE_SUBMIT_REFUSAL = "연습용 데이터(tutorial_sample)로는 실제 학습을 시작할 수 없습니다."
 SERVER_RESERVED = ("GPU 서버가 작업이나 다른 환경 준비에 예약되어 있습니다. "
                    "작업을 재조정하거나 준비 예약을 해제한 뒤 다시 준비하세요.")
 
@@ -131,6 +135,12 @@ class DesktopService:
         if provider not in PROVIDERS:
             raise ValueError("unsupported execution provider")
         return provider == "ssh_server"
+
+    def require_tracking_ready(self):
+        """Fail before any remote work when the configured MLflow OIDC values are incomplete."""
+        if self.settings.get("MLFLOW_TRACKING_URI"):
+            from .auth import require_complete_oidc
+            require_complete_oidc()
 
     def require_server(self):
         if not self.is_server():
@@ -329,6 +339,7 @@ class DesktopService:
             return result
         if action == "submit":
             self.require_approval(data)
+            self.require_tracking_ready()
             server = self.is_server()
             if server:
                 planned, issue = self.server_destination()
@@ -337,6 +348,9 @@ class DesktopService:
                 if data.get("destination_sha256") != planned:
                     raise ValueError(DESTINATION_CHANGED)
             config = AIConfig.model_validate(data["config"])
+            if any(reserved_tutorial_id({"dataset_id": identifier}) for identifier in
+                   (config.dataset_id, config.evaluation_profile.dataset_id or "")):
+                raise ValueError(PRACTICE_SUBMIT_REFUSAL)  # Before any registry read or SSH connection.
             manifest = self.manifest(config)
             receipt = None
             if server:
@@ -358,6 +372,7 @@ class DesktopService:
                                        server_receipt=receipt)
         if action == "execute":
             self.require_approval(data)
+            self.require_tracking_ready()
             from .desktop_runtime import executor_for
             server = self.is_server()
             job_id = data["job_id"]
@@ -367,8 +382,12 @@ class DesktopService:
             if server:
                 with executor_for(self.settings, self.root, training_stage=stage,
                                   server_receipt=receipt) as executor:
-                    return self.factory.work(executor=executor, gpu=executor.server_facts.exclusivity_key,
-                                             approved_transfer=True, select_mode=True, target_job_id=job_id)
+                    result = self.factory.work(executor=executor, gpu=executor.server_facts.exclusivity_key,
+                                               approved_transfer=True, select_mode=True, target_job_id=job_id)
+                    if result is None and self.factory.store.foreign_provider_lock(
+                            executor.server_facts.exclusivity_key):
+                        raise ValueError(CROSS_PROVIDER_LOCK)
+                    return result
             with executor_for(self.settings, self.root, training_stage=stage) as executor:
                 return self.factory.work(executor=executor, gpu="existing_runpod:" + self.settings["pod_id"],
                                          approved_transfer=True, select_mode=True, target_job_id=job_id)
@@ -412,6 +431,12 @@ class DesktopService:
             self.require_approval(data)
             directory = self.job_directory(data["job_id"])
             checkpoint = safe_name(data["checkpoint"])
+            # Destination checks precede resume, which moves the job back to QUEUED.
+            server = self.is_server()
+            receipt = self.job_receipt(data["job_id"], server)
+            if server:
+                from .desktop_runtime import validate_server_receipt
+                validate_server_receipt(self.settings, receipt)
             self.factory.resume(data["job_id"], directory / "output" / checkpoint)
             return self.factory.store.get(data["job_id"])
         if action == "connection":
@@ -445,7 +470,8 @@ class DesktopService:
                 # Same alias rules as claims: this machine ID or any of its GPU UUIDs, plus the v1
                 # cross-provider and unknown-lock policy. reserve_preparation re-checks with fresh facts.
                 if self.factory.store.resource_blocked(inspection):
-                    raise ValueError(SERVER_RESERVED)
+                    raise ValueError(CROSS_PROVIDER_LOCK if self.factory.store.foreign_provider_lock(
+                        inspection.exclusivity_key) else SERVER_RESERVED)
                 return runtime(self.settings, self.root, prepare=True,
                                training_stage=data.get("training_stage", "sft"), inspection=inspection)
             if action == "runtime_prepare" and self.factory.store.gpu_locked("existing_runpod:" + self.settings.get("pod_id", "")):
