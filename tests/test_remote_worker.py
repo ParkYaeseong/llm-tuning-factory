@@ -258,3 +258,19 @@ def test_cancel_signal_is_idempotent_with_sftp_v3_existing_file_error(tmp_path):
     executor.run(LlamaFactoryBackend(), directory, 5, lambda: True)
     remote = json.loads((directory / 'remote-attempt.json').read_text())['remote_path']
     assert client.sftp.path(remote + '/cancel').read_text() == 'observer signal must remain unchanged'
+
+
+def test_ssh_uses_persisted_launch_identity(tmp_path):
+    directory = tmp_path / ('a' * 32)
+    directory.mkdir()
+    (directory / 'train.yaml').write_text('test: true')
+    client = FakeSSH(tmp_path / 'remote')
+    client.sftp.root.mkdir()
+    executor = SSHExecutor('test-host', 22, 'root', 'unused', client=client)
+    launch_id = 'b' * 32
+    executor.run(LlamaFactoryBackend(), directory, 5, lambda: False, launch_id=launch_id)
+    receipt = json.loads((directory / 'remote-attempt.json').read_text())
+    assert receipt['remote_path'].endswith('/' + launch_id)
+    assert launch_id in client.commands[0]
+    with pytest.raises(ValueError, match='launch'):
+        executor.run(LlamaFactoryBackend(), directory, 5, lambda: False, launch_id='../unsafe')

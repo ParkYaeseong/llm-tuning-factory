@@ -10,12 +10,18 @@
 
 **Spec:** [승인된 설계](../specs/2026-10-17-general-training-workflows-design.md). 사용자 설계 승인: 2026-10-17 “진행해”. 구현 계획/실행 방식 승인: 2026-10-17 “계획 확인: 기능별 담당 구현·독립 검토로 진행”. 상태: 구현 진행.
 
+**2026-10-19 범위 추가:** 사용자 요청과 “SSH 접속 후 서버에서 직접 실행” 선택에 따라
+[일반 SSH GPU 서버 확장](../specs/2026-10-19-ssh-gpu-servers-extension.md)을 포함한다.
+진행 중인 Task 6의 검토를 마친 뒤 Task 6A → 6B → 7–11 순으로 실행한다.
+이 추가 범위가 아래 RunPod 전용 문구보다 우선하며 기존 기본 dry-run/데이터 승인/비밀정보 경계는 유지한다.
+
 ## Global Constraints
 
 - Python 3.12와 `uv sync --extra dev --extra tracking --locked`; 완료 전 `uv run pytest`, `uv run ruff check src tests`.
 - 기존 단일 학습 API와 Windows 0.3.0 설정은 계속 읽는다. 학습 엔진과 인프라 어댑터를 분리한다.
 - 기본은 dry-run. 명세에 인증값을 넣지 않는다. 유료 자원과 데이터 전송은 명시적 승인 없이 실행하지 않는다.
-- 기존 배정 Pod만 사용하며 Pod를 생성·시작·정지·삭제하지 않는다. 실제 동시 실행은 서로 다른 Pod에서만 한다.
+- 기존 배정 Pod 또는 기존 Linux SSH GPU 서버를 사용하며 자원을 생성·시작·정지·삭제하지 않는다.
+  실제 동시 실행은 서로 다른 배타 자원에서만 한다. 같은 서버/Pod의 별칭은 같은 잠금을 공유한다.
 - 그래프 최대 64개 노드·256개 간선. 기본 동시 실행 수 1. 파일당 32 MiB. UTF-8/UTF-8 BOM, CSV만 CP949 선택.
 - 병합은 서로 다른 완료 실제 LoRA/QLoRA 2~4개, 양의 유한 가중치 합 1, `cat`, 합산 rank ≤256.
 - 병합 후 기본 허용 퇴보 0. 동점은 산출물 ID 사전순. 부분 성공은 명시 선택하고 성공 후보 최소 2개.
@@ -133,6 +139,55 @@
 - [ ] **3. 구현:** active 변이는 attempt_id+lease_token CAS를 요구한다. controller 교체 시 execution launch identity는 보존하고 actor lease만 재발급한다. claim 전에 자원 적합 후보를 고른다. legacy active 작업은 불확실 상태/기존 remote 경로를 보존하고 자동 재시작하지 않는다. CLI release-lock 우회도 현재 시도와 종료 확인을 요구하도록 변경한다.
 - [ ] **4. 검증:** 새 시험 + 기존 `tests/test_jobs.py tests/test_runner_cli.py tests/test_reconciliation.py tests/test_remote_worker.py` 전부 통과. graph controller가 claim 후 work()로 재claim하지 않는 시험 포함.
 - [ ] **5. 커밋:** `feat: persist graph jobs atomically with fenced execution attempts`.
+
+### Task 6A: 일반 Linux SSH GPU 서버와 제공자 중립 자원 계약
+
+**Files:** Create `gpu_servers.py`, `tests/test_gpu_servers.py`; Modify `executor_profiles.py`,
+`operations.py`, `graph_planner.py`, `graph_store.py`, `jobs.py`, `execution.py`, `connections.py`,
+`desktop_runtime.py`, `cli.py`, `diagnostics.py` 및 해당 범위 시험. 기존 승인된 Task 6을 기반으로 한다.
+
+**Requirements:** [SSH 서버 확장 명세](../specs/2026-10-19-ssh-gpu-servers-extension.md).
+일반 서버용 typed profile/observation을 추가하고 기존 RunPod 공개 바이트/해석은 보존한다.
+공통 자원 identity/가격/관측/배타 키를 사용하며 일반 서버를 가짜 Pod dictionary로 표현하지 않는다.
+GPU 선택과 작업 경로·목적지 설정은 계획/승인/복구 identity에 포함한다.
+RunPod는 실제 API 가격을 검사하고, 일반 서버는 운영자가 명시한 0 이상 유한 비용을 사용한다.
+
+- [ ] **1. RED:** RunPod 키 없이 SSH 서버 검사/준비/실행 어댑터 구성; 비-root 계정/사용자 지정 경로;
+  실제 GPU UUID 선택과 개수/종류 불일치; 잘못된 지문/경로/원격 명령 입력 차단;
+  같은 물리 서버 별칭의 잠금과 알려지지 않은 기존 잠금 보존; 내부 서버 비용 0 허용;
+  목적지/경로/GPU 변경 후 원래 시도 로그·복구 거부; RunPod API 미호출을 시험한다.
+- [ ] **2. 구현:** 고정 SSH probe로 Linux/NVIDIA/작업 환경을 확인하고 선택 GPU를 실행 환경에 바인딩한다.
+  기본 Python을 바꾸지 않는 버전별 private venv와 기존 worker 검증을 재사용한다.
+  원격 부트스트랩은 명시적 prepare 동작에서만 한다. CLI에는 일반 SSH 서버 연결/검사/실행 경로를 제공한다.
+  GraphPlan/Operation/GraphStore는 제공자 이름을 추측하지 않고 검증된 공통 자원 계약을 사용한다.
+- [ ] **3. 검증:** 새 GPU 서버 시험과 기존 graph/jobs/runner/remote/runtime/connections/CLI 회귀 시험,
+  root의 전체 pytest/Ruff 및 독립 검토. 실제 SSH/BOP 접속·GPU 실행은 수행하지 않는다.
+- [ ] **4. 보고/커밋:** 소비할 typed API, native/UI 설정 계약, 관측 근거/비용 출처,
+  잠금/복구 보장과 미검증을 기록한다. `feat: support existing Linux GPU servers over SSH`.
+
+### Task 6B: Windows 일반 GPU 서버 연결 화면과 설정 보존
+
+**Files:** Modify `desktop.py`, `desktop/src-tauri/src/main.rs`, `desktop/src/main.ts`, `workbench.ts`,
+필요한 `style.css`, Python desktop 시험, `desktop/tests/workspace.spec.ts`,
+`README.md`, `docs/CONFIGURATION.md`, `docs/WINDOWS_APP.md`.
+
+**Requirements:** Task 6A의 검토된 계약을 사용한다. 연결 대상 RunPod/일반 SSH 서버를 선택하고
+일반 서버 주소·포트·계정·키 파일·호스트 지문·작업 경로·비용을 저장한다.
+서버의 GPU 목록을 조회하고 UUID를 선택한다. 빈 제공자 필드는 과거 RunPod 설정으로 읽는다.
+RunPod 키/Pod ID는 일반 서버에서 요구하지 않는다. 연결 검사, 환경 확인/명시적 준비,
+학습 승인, 로그/진행률/재조정은 같은 고정된 목적지 정보를 사용한다.
+
+- [ ] **1. RED:** 일반 서버 필드 표시와 save/reopen; 키/인증값 masking 유지;
+  일반 서버 GPU 조회/선택/0 비용 실행 계획; 프로필/선택 GPU 변경 시 기존 계획 차단;
+  환경 준비·실행 확인 취소 시 부작용 없음; RunPod/HF/S3/history 기존 흐름 보존.
+- [ ] **2. 구현:** native 설정 allowlist와 엄격한 typed backend 동작을 확장한다.
+  자유 입력과 에러를 HTML escape하고 native form/keyboard/busy 상태를 보존한다.
+  홈/확인 화면의 연결 정보도 선택 제공자에 맞게 표시한다. 전역 환경에 SSH 비밀값을 추가하지 않는다.
+  앞으로 Task 9/10의 다중 프로필/그래프 화면에서도 이 계약을 그대로 재사용하도록 모듈 경계를 둔다.
+- [ ] **3. 검증:** 해당 Python/native 설정 시험, 전체 Playwright 및 TypeScript/Vite build,
+  root 전체 pytest/Ruff와 독립 검토. 실제 기관 서버/자격 증명/데이터는 사용하지 않는다.
+- [ ] **4. 문서/커밋:** SSH 직접 실행 설정 예시와 관측/비용/검증 한계를 설명한다.
+  실제 설치본 수용은 Task 11에 포함한다. `feat: configure SSH GPU servers in Windows workbench`.
 
 ### Task 7: 실제 부모 모델 전달·평가·병합·전체 모델 확정 연산
 

@@ -99,6 +99,7 @@ def work(ctx: typer.Context, drain: bool = False, pod_id: str | None = None,
     factory.store.recover()
     while True:
         executor = None
+        selected = None
         if pod_id:
             if not approve_execution_and_transfer:
                 raise typer.BadParameter("--approve-execution-and-transfer is required for real jobs")
@@ -110,11 +111,21 @@ def work(ctx: typer.Context, drain: bool = False, pod_id: str | None = None,
                 output({"waiting": True, "reason": "Pod not running; start separately with explicit approval"})
                 return
             # Refuse to silently exceed the declared price or resource budget.
-            queued = [j for j in factory.store.list() if j["status"] == "QUEUED" and not j["manifest"]["simulation"]]
+            queued = [j for j in factory.store.list() if j["status"] == "QUEUED" and not j["graph_run_id"] and not j["manifest"]["simulation"]]
             if not queued:
                 output({"idle": True})
                 return
-            selected = sorted(queued, key=lambda j: (-j["priority"], j["created"]))[0]
+            def fits(job):
+                profile = job["manifest"]["config"]["resource_profile"]
+                return ("costPerHr" in pod
+                        and float(pod["costPerHr"]) <= profile["hourly_cost_usd"] * profile["gpu_count"]
+                        and pod.get("gpu", {}).get("count") == profile["gpu_count"]
+                        and profile["gpu_type"] in {pod.get("gpu", {}).get("id"), pod.get("gpu", {}).get("displayName")}
+                        and profile["gpu_count"] <= factory.policy.max_gpus)
+            selected = next((job for job in sorted(queued, key=lambda j: (-j["priority"], j["created"])) if fits(job)), None)
+            if selected is None:
+                output({"waiting": True, "reason": "no queued job fits the observed Pod and GPU budget"})
+                return
             configured = selected["manifest"]["config"]["resource_profile"]
             if "costPerHr" not in pod or float(pod["costPerHr"]) > configured["hourly_cost_usd"] * configured["gpu_count"]:
                 raise typer.BadParameter("Pod live price unavailable or exceeds configured total hourly price")
@@ -128,11 +139,12 @@ def work(ctx: typer.Context, drain: bool = False, pod_id: str | None = None,
                 raise typer.BadParameter("verified network volume mounted at /workspace required")
             executor = SSHExecutor(host, port, username, key_file, pod=pod)
         try:
-            result = factory.work(executor=executor, gpu=pod_id or "mock-cpu",
-                                  approved_transfer=approve_execution_and_transfer, select_mode=True)
+            result = factory.work(executor=executor, gpu=("existing_runpod:" + pod_id) if pod_id else "mock-cpu",
+                                  approved_transfer=approve_execution_and_transfer, select_mode=True,
+                                  target_job_id=selected["id"] if selected else None)
         finally:
             # Borrowed Pods have no ownership record and are never changed here.
-            remaining = any(j["status"] == "QUEUED" and not j["manifest"]["simulation"] for j in factory.store.list())
+            remaining = any(j["status"] == "QUEUED" and not j["graph_run_id"] and not j["manifest"]["simulation"] for j in factory.store.list())
             if (pod_id and (not drain or not remaining) and
                     (factory.root / "managed-pods" / f"{pod_id}.json").is_file()):
                 ManagedPods(factory.root, controller, factory.policy).stop(pod_id)
@@ -182,12 +194,15 @@ def reconcile(ctx: typer.Context, job_id: str, pod_id: str, host: str, key_file:
 
 
 @app.command("release-lock")
-def release_lock(ctx: typer.Context, job_id: str, confirm_execution_stopped: bool = False):
+def release_lock(ctx: typer.Context, job_id: str, attempt_id: str, confirm_execution_stopped: bool = False):
     if not confirm_execution_stopped:
         raise typer.BadParameter("verify remote process is stopped, then supply --confirm-execution-stopped")
     if ctx.obj.store.get(job_id)["status"] not in {"FAILED", "CANCELED", "COMPLETED"}:
         raise typer.BadParameter("cannot release an active job's lock")
-    ctx.obj.store.release_gpu(job_id)
+    lease = ctx.obj.store.current_lease(job_id)
+    if lease.attempt_id != attempt_id:
+        raise typer.BadParameter("attempt ID is stale; confirm termination of the current attempt")
+    ctx.obj.store.release_gpu(lease, execution_stopped=True)
     output({"released": job_id})
 
 

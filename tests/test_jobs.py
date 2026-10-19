@@ -14,8 +14,9 @@ def test_idempotency_and_transition(tmp_path):
     with pytest.raises(ValueError):
         store.transition(first["id"], "COMPLETED")
     store.transition(first["id"], "QUEUED")
-    assert store.claim("gpu1", max_concurrent=1)["id"] == first["id"]
-    store.transition(first["id"], "RUNNING")
+    claimed = store.claim("gpu1", max_concurrent=1)
+    assert claimed["id"] == first["id"]
+    store.transition(claimed["lease"], "RUNNING")
     store.cancel(first["id"])
     assert store.get(first["id"])["cancel_requested"]
 
@@ -37,14 +38,14 @@ def test_recovery_does_not_release_unknown_remote_execution(tmp_path):
     store = JobStore(tmp_path / "jobs.db")
     job = store.submit({"sha256": "abc"}, "x")
     store.transition(job["id"], "QUEUED")
-    store.claim("pod1", 1)
-    store.transition(job["id"], "RUNNING")
+    claimed = store.claim("pod1", 1)
+    store.transition(claimed["lease"], "RUNNING")
     store.recover(stale_after_seconds=0)
     recovered = store.get(job["id"])
     assert recovered["status"] == "FAILED"
     assert "reconcile" in recovered["error"]
     assert store.gpu_locked("pod1")
-    store.release_gpu(job["id"])
+    store.release_gpu(claimed["lease"], execution_stopped=True)
     assert not store.gpu_locked("pod1")
 
 

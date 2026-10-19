@@ -150,7 +150,7 @@ def test_real_pipeline_candidate_contract_with_mock_remote_transport(tmp_path):
     class TransportFixture(LocalExecutor):
         remote = True
 
-        def run(self, backend, directory, timeout, canceled, checkpoint=None):
+        def run(self, backend, directory, timeout, canceled, checkpoint=None, *, launch_id=None):
             output = directory / "output"
             output.mkdir()
             (output / "adapter_config.json").write_text("{}")

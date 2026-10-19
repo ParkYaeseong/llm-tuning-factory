@@ -30,8 +30,7 @@ class Factory:
         manifest = resolve(config, self.registry, simulation=simulation)
         self.policy.check(config, manifest["dataset"])
         job = self.store.submit(manifest, request_key or manifest["sha256"], priority)
-        directory = self.directory(job["id"])
-        immutable_write(directory / "manifest.json", canonical(manifest))
+        self.store.materialize_job_evidence(job["id"])
         if job["status"] == "PENDING":
             self.store.transition(job["id"], "QUEUED")
         return self.store.get(job["id"])
@@ -60,8 +59,22 @@ class Factory:
                                simulation=not executor.remote if select_mode else None, job_id=target_job_id)
         if job is None:
             return None
+        return self.run_claimed(job, executor, backend, approved_transfer)
+
+    def run_claimed(self, claimed, executor=None, backend=None, approval=False):
+        """Execute one preclaimed attempt. A takeover reconciles; it never relaunches."""
+        lease = claimed["lease"]
+        job = self.store.get(lease.job_id)
+        if job["manifest"].get("schema_version") == 2:
+            raise NotImplementedError("v2 graph execution requires the operation worker adapter")
+        launch_id = self.store.begin_launch(lease)
+        executor = executor or LocalExecutor()
+        approved_transfer = approval
+        gpu = lease.resource_id
         job_id = job["id"]
         directory = self.directory(job_id)
+        self.store.materialize_job_evidence(job_id)
+        (directory / "launch.json").write_bytes(canonical({"attempt_id": lease.attempt_id, "launch_id": launch_id}))
         manifest = job["manifest"]
         backend = backend or (MockTrainingBackend() if manifest["simulation"] else LlamaFactoryBackend())
         status, error, metrics, uncertain = "FAILED", None, {}, False
@@ -69,7 +82,10 @@ class Factory:
 
         def heartbeat():
             while not stop_heartbeat.wait(10):
-                self.store.heartbeat(job_id)
+                try:
+                    self.store.heartbeat(lease)
+                except ValueError:
+                    return  # Actor ownership changed; subsequent mutations remain fenced.
 
         thread = threading.Thread(target=heartbeat, daemon=True)
         thread.start()
@@ -92,7 +108,7 @@ class Factory:
                 raise ValueError("dataset registration differs from manifest")
             if self.tracker:
                 run_id = self.tracker.start(job_id, manifest)
-                self.store.set_run_id(job_id, run_id)
+                self.store.set_run_id(lease, run_id)
             backend.prepare(config, directory, self.registry.dataset_path(dataset).read_bytes())
             validation = manifest.get("validation_dataset")
             if validation:
@@ -114,12 +130,12 @@ class Factory:
             checkpoint = None
             if (directory / "resume.json").exists():
                 checkpoint = directory / json.loads((directory / "resume.json").read_text())["checkpoint"]
-            self.store.transition(job_id, "RUNNING")
+            self.store.transition(lease, "RUNNING")
             executor.run(backend, directory, config.resource_profile.timeout_seconds,
-                         lambda: bool(self.store.get(job_id)["cancel_requested"]), checkpoint)
+                         lambda: bool(self.store.get(job_id)["cancel_requested"]), checkpoint, launch_id=launch_id)
             if self.store.get(job_id)["cancel_requested"]:
                 raise CanceledError("cancellation requested")
-            self.store.transition(job_id, "EVALUATING")
+            self.store.transition(lease, "EVALUATING")
             metrics, quality = self.evaluate(directory, config, manifest["simulation"],
                                              (manifest.get("validation_dataset") or {}).get("sha256"))
             if dataset.get("synthetic") or (manifest.get("validation_dataset") or {}).get("synthetic"):
@@ -162,18 +178,19 @@ class Factory:
             # Preserve attempt evidence before any retry/resume overwrites live logs.
             archive = directory / "attempts" / str(job["attempts"])
             archive.mkdir(parents=True, exist_ok=True)
-            for name in ("train.log", "train.yaml", "error.txt", "evaluation.json", "tracking-error.txt", "runtime.json", "execution.json"):
+            for name in ("train.log", "train.yaml", "error.txt", "evaluation.json", "tracking-error.txt", "runtime.json", "execution.json",
+                         "launch.json", "remote-attempt.json", "remote-result.json", "remote-artifacts.json"):
                 if (directory / name).is_file():
                     (archive / name).write_bytes((directory / name).read_bytes())
             (archive / "outcome.json").write_bytes(canonical({"status": status, "error": error,
                                                              "run_id": run_id, "timestamp": time.time()}))
             try:
-                self.store.transition(job_id, status, error)
+                self.store.transition(lease, status, error)
                 if status == "RETRYING":
-                    self.store.transition(job_id, "QUEUED", error)
+                    self.store.transition(lease, "QUEUED", error)
             finally:
                 if not uncertain:
-                    self.store.release_gpu(job_id)
+                    self.store.release_gpu(lease, execution_stopped=True)
                 backend.cleanup(directory)
         return self.store.get(job_id)
 
@@ -228,9 +245,17 @@ class Factory:
         job = self.store.get(job_id)
         if job["status"] != "FAILED":
             raise ValueError("recover stale active jobs before reconciling; only FAILED jobs are eligible")
+        lease = self.store.current_lease(job_id)
         manifest = job["manifest"]
         verify_manifest(manifest)
         directory = self.directory(job_id)
+        with self.store.connection() as db:
+            attempt = self.store._validate_lease(db, lease)
+        receipt_path = directory / "remote-attempt.json"
+        if attempt["launch_id"] and receipt_path.is_file():
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if receipt.get("remote_path", "").rsplit("/", 1)[-1] != attempt["launch_id"]:
+                raise ValueError("remote receipt differs from current immutable launch identity")
         result = executor.collect_result(directory)
         if result is None:
             return job
@@ -250,6 +275,6 @@ class Factory:
             self.tracker.finish(job["run_id"], metrics, directory, status, error)
             if status == "COMPLETED" and not manifest["simulation"] and not manifest["dataset"].get("synthetic"):
                 self.tracker.register_candidate(job["run_id"], manifest, quality["quality_status"] == "qualified")
-        self.store.reconcile_result(job_id, status, error)
+        self.store.reconcile_result(lease, status, error)
         (directory / "reconciliation.json").write_bytes(canonical({"status": status, "run_id": job["run_id"], "at": time.time()}))
         return self.store.get(job_id)

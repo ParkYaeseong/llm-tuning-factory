@@ -120,11 +120,11 @@ class ExecutionBackend(ABC):
         pass
 
     @abstractmethod
-    def run(self, backend, directory, timeout, canceled, checkpoint=None): ...
+    def run(self, backend, directory, timeout, canceled, checkpoint=None, *, launch_id=None): ...
 
 
 class LocalExecutor(ExecutionBackend):
-    def run(self, backend, directory, timeout, canceled, checkpoint=None):
+    def run(self, backend, directory, timeout, canceled, checkpoint=None, *, launch_id=None):
         if checkpoint:
             backend.resume(directory, checkpoint, timeout, canceled)
         else:
@@ -216,12 +216,14 @@ class SSHExecutor(ExecutionBackend):
                 finally:
                     temporary.unlink(missing_ok=True)
 
-    def run(self, backend, directory, timeout, canceled, checkpoint=None):
+    def run(self, backend, directory, timeout, canceled, checkpoint=None, *, launch_id=None):
         directory = Path(directory).resolve()
         if not re.fullmatch(r"[0-9a-f]{32}", directory.name):
             raise ValueError("invalid remote job directory")
         # Fresh remote attempt namespace prevents stale completion markers after resume/retry.
-        remote = self.root + "/" + directory.name + "/" + uuid.uuid4().hex
+        if launch_id is not None and not re.fullmatch(r"[0-9a-f]{32}", launch_id):
+            raise ValueError("invalid persisted launch ID")
+        remote = self.root + "/" + directory.name + "/" + (launch_id or uuid.uuid4().hex)
         (directory / "remote-attempt.json").write_text(json.dumps({"remote_path": remote,
             "pod_id": self.pod.get("id") if self.pod else None, "created": time.time()}), encoding="utf-8")
         submitted = False
