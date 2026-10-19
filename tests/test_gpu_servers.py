@@ -1280,3 +1280,60 @@ def test_mixed_gpu_type_selection_is_refused_before_execution():
                                                    GPUDevice(uuid=UUID2, name="H100", memory_mib=81920)))
     inspection = probe_server(None, mixed, server.command, inspection_only=True)
     assert {gpu.name for gpu in inspection.inventory} == {A4000, "NVIDIA H100"}
+
+
+def claimed_server_job(tmp_path):
+    from tuning_factory.gpu_servers import ServerApprovalReceipt
+
+    factory, ai_config, manifest = real_factory(tmp_path / "state")
+    facts = a4000()
+    receipt = ServerApprovalReceipt.create(manifest["sha256"], settings().profile(facts), facts)
+    job = factory.submit(ai_config, simulation=False, server_receipt=receipt)
+    claimed = factory.store.claim(facts.exclusivity_key, server_profile=receipt.profile, server_facts=facts,
+                                  job_id=job["id"])
+    return factory, receipt, claimed
+
+
+def launch_started(store, lease):
+    with store.connection() as db:
+        return db.execute("SELECT launch_started FROM job_attempts WHERE attempt_id=?",
+                          (lease.attempt_id,)).fetchone()[0]
+
+
+@pytest.mark.parametrize("case", ["runpod_or_local_executor", "drifted_destination", "recovery_executor"])
+def test_refused_pre_launch_check_fails_and_releases_the_unlaunched_attempt(tmp_path, case):
+    from tuning_factory.execution import LocalExecutor, SSHExecutor
+    from tuning_factory.gpu_servers import GPUDevice
+
+    factory, receipt, claimed = claimed_server_job(tmp_path)
+    facts = receipt.facts
+    if case == "runpod_or_local_executor":
+        executor = LocalExecutor()
+    elif case == "drifted_destination":
+        drifted = a4000(inventory=(GPUDevice(uuid=UUID2, name=A4000, memory_mib=16376),))
+        executor = SSHExecutor("", 22, "researcher", "", client=object(), server_profile=receipt.profile,
+                               server_facts=drifted)
+    else:
+        executor = SSHExecutor("", 22, "researcher", "", client=object(), server_profile=receipt.profile,
+                               server_facts=facts, recovery_only=True)
+    with pytest.raises(ValueError, match="destination|recovery"):
+        factory.run_claimed(claimed, executor, None, True)
+    job = factory.store.get(claimed["id"])
+    assert job["status"] == "FAILED" and job["error"]
+    assert launch_started(factory.store, claimed["lease"]) == 0
+    assert not factory.store.gpu_locked(facts.exclusivity_key)
+    factory.store.reset_for_resume(claimed["id"])
+    assert factory.store.get(claimed["id"])["status"] == "QUEUED"
+
+
+def test_refused_takeover_of_a_launched_attempt_keeps_its_lock(tmp_path):
+    from tuning_factory.execution import LocalExecutor
+
+    factory, receipt, claimed = claimed_server_job(tmp_path)
+    factory.store.begin_launch(claimed["lease"])
+    factory.store.transition(claimed["lease"], "FAILED", "heartbeat expired")
+    takeover = factory.store.takeover(claimed["lease"])
+    with pytest.raises(ValueError, match="destination"):
+        factory.run_claimed(takeover, LocalExecutor(), None, True)
+    assert factory.store.get(claimed["id"])["status"] == "FAILED"
+    assert factory.store.gpu_locked(receipt.facts.exclusivity_key)

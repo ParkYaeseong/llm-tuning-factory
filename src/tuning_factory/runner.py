@@ -79,15 +79,14 @@ class Factory:
             raise NotImplementedError("v2 graph execution requires the operation worker adapter")
         executor = executor or LocalExecutor()
         server_facts = getattr(executor, "server_facts", None)
-        if getattr(executor, "recovery_only", False):
-            raise ValueError("recovery-only executor cannot launch a job")
-        if server_facts is not None:
-            self.store.verify_server_destination(job['id'], executor.server_profile, server_facts)
-            if lease.resource_id != server_facts.exclusivity_key:
-                raise ValueError("attempt resource differs from verified destination")
-            executor.validate_config(AIConfig.model_validate(job['manifest']['config']))
-        elif self.store.server_receipt(job['id']) is not None:
-            raise ValueError("original SSH server destination executor required")
+        try:
+            self._verify_before_launch(job, lease, executor, server_facts)
+        except Exception as exc:
+            try:
+                self.store.abandon_unlaunched(lease, f"{type(exc).__name__}: {exc}")
+            except ValueError:
+                pass  # A newer actor owns the attempt; its lock stays untouched.
+            raise
         launch_id = self.store.begin_launch(lease)
         approved_transfer = approval
         gpu = lease.resource_id
@@ -217,6 +216,17 @@ class Factory:
                     self.store.release_gpu(lease, execution_stopped=True)
                 backend.cleanup(directory)
         return self.store.get(job_id)
+
+    def _verify_before_launch(self, job, lease, executor, server_facts):
+        if getattr(executor, "recovery_only", False):
+            raise ValueError("recovery-only executor cannot launch a job")
+        if server_facts is not None:
+            self.store.verify_server_destination(job['id'], executor.server_profile, server_facts)
+            if lease.resource_id != server_facts.exclusivity_key:
+                raise ValueError("attempt resource differs from verified destination")
+            executor.validate_config(AIConfig.model_validate(job['manifest']['config']))
+        elif self.store.server_receipt(job['id']) is not None:
+            raise ValueError("original SSH server destination executor required")
 
     @staticmethod
     def evaluate(directory, config, simulation, validation_sha=None):

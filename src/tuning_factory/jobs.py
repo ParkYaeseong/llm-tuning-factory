@@ -407,6 +407,20 @@ class JobStore:
             db.execute('UPDATE job_attempts SET launch_started=1 WHERE attempt_id=?', (lease.attempt_id,))
             return row['launch_id']
 
+    def abandon_unlaunched(self, lease, error):
+        """Pre-launch refusal: begin_launch never ran, so no remote process can exist.
+        Fail the attempt and free its lock; a started, legacy or non-provisioning attempt is untouched."""
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = self._validate_lease(db, lease)
+            if row['launch_started'] or row['legacy'] or row['status'] != 'PROVISIONING':
+                return False
+            now = time.time()
+            db.execute("UPDATE jobs SET status='FAILED',error=?,updated=? WHERE id=?", (error, now, lease.job_id))
+            db.execute('INSERT INTO events VALUES (?,?,?,?)', (lease.job_id, 'FAILED', now, error))
+            self._release(db, lease)
+            return True
+
     def takeover(self, lease):
         """Explicit trusted actor handoff; does not authorize another remote launch."""
         with self.connection() as db:
