@@ -15,6 +15,7 @@ const paths: Record<string, string> = {
   file: '<path d="M14 2H5v20h14V7zM14 2v6h5M8 13h8M8 17h5"/>',
   chevron: '<path d="m9 5 7 7-7 7"/>',
   folder: '<path d="M3 6V4h6l2 3h10v13H3z"/>',
+  tutorial: '<circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2.2 4.8-4.8 2.2 2.2-4.8z"/>',
 };
 export function icon(name: string, size = 16) {
   return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.file}</svg>`;

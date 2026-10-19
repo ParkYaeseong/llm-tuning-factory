@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { version } from "../package.json";
 import { button, filterRuns, formatDate, icon, progressView } from "./workbench";
+import { createTutorial, rememberTutorial, tutorialSeen } from "./tutorial";
 import { connectionResult, destinationChange, GPU_POLICY_MESSAGE, inventoryTable, isServer, jobDestination, jobDestinationIssue,
   MAX_GPUS_PER_JOB, prepareApproval, prepareIssue, puttyKeyPath, releaseApproval, reservationMatches, reservationTable, resourcesFromFacts,
   sameSelection, selectedGpus, selectionPolicyIssue, serverAddress, serverBridge, serverConfigured, settingsRoute, shortIdentifier,
@@ -90,10 +91,10 @@ function commandSearch() {
   const input = dialog.querySelector("input")!;
   const options = dialog.querySelector(".command-options")!;
   const update = () => {
-    options.innerHTML = Object.entries(pages).filter(([, name]) => name.includes(input.value.trim())).map(([id, name]) =>
+    options.innerHTML = [...Object.entries(pages), ["tutorial", "튜토리얼"] as [string, string]].filter(([, name]) => name.includes(input.value.trim())).map(([id, name]) =>
       `<button data-command="${id}">${icon(id)}<span>${name}</span>${icon("arrow", 13)}</button>`).join("");
     options.querySelectorAll<HTMLButtonElement>("[data-command]").forEach(el => el.addEventListener("click", () => {
-      const id = el.dataset.command!; dialog.close(); dialog.remove(); void action("nav:" + id);
+      const id = el.dataset.command!; dialog.close(); dialog.remove(); void action(id === "tutorial" ? "tutorial" : "nav:" + id);
     }));
   };
   input.addEventListener("input", update);
@@ -259,6 +260,10 @@ async function approve(title: string, body: string): Promise<boolean> {
     dialog.addEventListener("cancel", e => { e.preventDefault(); done(false); });
   });
 }
+function tutorialCard() {
+  if (tutorial.active() || tutorialSeen()) return "";
+  return `<section class="tutorial-card" aria-label="튜토리얼 안내"><div><h3>처음 사용하시나요?</h3><p>약 5분 실습 튜토리얼로 연결 → 데이터 → 학습 설정 → 실행 계획 순서를 익혀 보세요. GPU를 사용하거나 데이터를 전송하지 않습니다.</p></div><div class="actions">${button("다음에 하기", "tutorial-dismiss")}${button("튜토리얼 시작", "tutorial", "primary")}</div></section>`;
+}
 function overview() {
   const running = state.jobs.filter((j: Obj) => ["RUNNING", "PROVISIONING", "EVALUATING"].includes(j.status)).length;
   const complete = state.jobs.filter((j: Obj) => j.status === "COMPLETED").length;
@@ -268,13 +273,13 @@ function overview() {
     { page: "datasets", label: "데이터 버전 등록", text: "학습·검증 데이터를 준비하세요.", done: state.catalog.datasets.length > 0 },
     { page: "training", label: "첫 학습 준비", text: "업무와 모델을 선택하고 계획을 확인하세요.", done: state.jobs.length > 0 },
   ];
-  return `<div class="summary-strip"><div><span class="status-dot blue"></span>진행 중 <b>${running}</b></div><div>완료한 실행 <b>${complete}</b></div><div>데이터 버전 <b>${state.catalog.datasets.length}</b></div><div>저장한 설정 <b>${state.catalog.profiles.length}</b></div></div>
+  return `${tutorialCard()}<div class="summary-strip"><div><span class="status-dot blue"></span>진행 중 <b>${running}</b></div><div>완료한 실행 <b>${complete}</b></div><div>데이터 버전 <b>${state.catalog.datasets.length}</b></div><div>저장한 설정 <b>${state.catalog.profiles.length}</b></div></div>
   <div class="workspace-columns"><div><section class="panel"><div class="panel-heading"><h3>최근 실행 <span class="count">${state.jobs.length}</span></h3>${button("전체 보기 " + icon("arrow", 13), "nav:jobs", "quiet")}</div>
   ${state.jobs.length ? `<div class="table-scroll"><table><thead><tr><th>실험</th><th>상태</th><th>데이터</th><th>업데이트</th></tr></thead><tbody>${state.jobs.slice(0, 7).map((j: Obj) => `<tr><td><button class="row-link" data-action="job:${esc(j.id)}">${esc(j.manifest.config.ai_id)}</button><small class="mono">${esc(j.manifest.config.base_model.split("/").at(-1))}</small></td><td>${badge(j.status)}</td><td>${esc(j.manifest.config.dataset_id)}<small>v${esc(j.manifest.config.dataset_version)}</small></td><td>${formatDate(j.updated)}</td></tr>`).join("")}</tbody></table></div>` :
   `<div class="empty-workspace"><div class="empty-symbol">${icon("training", 28)}</div><h3>첫 번째 실험을 시작해 보세요</h3><p>데이터와 모델을 고르면 실행 전에<br>설정과 예상 비용을 확인할 수 있습니다.</p>${button(icon("plus") + " 새 학습 설정", "nav:training", "primary")}<small>계획 확인만으로 GPU가 실행되지는 않습니다.</small></div>`}</section>
   <section class="panel task-library"><div class="panel-heading"><h3>업무별 시작점</h3><span class="subtle">설정을 불러와 자유롭게 수정하세요</span></div>
   ${state.catalog.templates.map((t: Obj, i: number) => `<button class="template-row" data-action="template:${i}"><span class="template-icon">${icon(i === 0 ? "file" : i === 1 ? "folder" : "overview", 19)}</span><span><b>${esc(taskNames[t.name] || t.name)}</b><small>${esc(t.config.workflow_id)}</small></span><span class="model-tag">LoRA</span>${icon("chevron", 14)}</button>`).join("")}</section></div>
-  <div class="workspace-rail"><section class="panel"><div class="panel-heading"><h3>시작하기</h3><span class="count">${steps.filter(s => s.done).length} / 3</span></div><div class="setup-list">${steps.map(s => `<button data-action="nav:${s.page}" class="setup-row"><span class="setup-check ${s.done ? "done" : ""}">${s.done ? icon("check", 12) : ""}</span><span><b>${s.label}</b><small>${s.text}</small></span>${icon("chevron", 12)}</button>`).join("")}</div></section>
+  <div class="workspace-rail"><section class="panel" data-tour="overview-setup"><div class="panel-heading"><h3>시작하기</h3><span class="count">${steps.filter(s => s.done).length} / 3</span></div><div class="setup-list">${steps.map(s => `<button data-action="nav:${s.page}" class="setup-row"><span class="setup-check ${s.done ? "done" : ""}">${s.done ? icon("check", 12) : ""}</span><span><b>${s.label}</b><small>${s.text}</small></span>${icon("chevron", 12)}</button>`).join("")}</div></section>
   <section class="panel"><div class="panel-heading"><h3>연결 정보</h3>${button("설정", "nav:connections", "quiet")}</div><dl class="connection-list"><div><dt>${icon("connections")} ${server ? "GPU 서버" : "RunPod"}</dt><dd>${server ? (saved.server_ssh_host ? esc(serverAddress(saved, false)) : "미설정") : saved.pod_id ? esc(saved.pod_id) : "미설정"}</dd></div><div><dt>${icon("history")} MLflow</dt><dd>${state.settings.MLFLOW_TRACKING_URI ? "주소 저장됨" : "미설정"}</dd></div></dl><p class="panel-note">저장 상태입니다. 실제 연결은 연결 설정에서 검사하세요.</p></section>
   <p class="rail-note">내 PC에서 작업을 관리하고<br>배정받은 RunPod 또는 GPU 서버에서 학습합니다.<br>실행 기록은 공용 MLflow에 모입니다.</p></div></div>`;
 }
@@ -347,11 +352,11 @@ function runtimeCard(server: boolean, pending: boolean) {
 }
 function datasets() {
   return `<section class="card"><h3>새 데이터 버전 등록</h3><p>학습 단계에 맞는 JSON·JSONL을 등록합니다. 지시·대화, 텍스트, 선호 쌍, 선호 라벨, 프롬프트를 검사합니다. 등록 시 로컬 사본과 해시를 보존하며, 같은 버전은 덮어쓰지 않습니다.</p>
-  <form id="dataset-form"><div class="grid">${field("데이터 ID", "dataset_id", state.datasetDraft.dataset_id || "my_dataset")}${field("버전", "version", state.datasetDraft.version || "1")}
+  <form id="dataset-form" data-tour="dataset-form"><div class="grid">${field("데이터 ID", "dataset_id", state.datasetDraft.dataset_id || "my_dataset")}${field("버전", "version", state.datasetDraft.version || "1")}
   ${select("데이터 종류", "kind", state.datasetDraft.kind || "instruction", datasetKinds)}${field("파일 경로", "path", state.datasetDraft.path || "")}<div class="field"><span>데이터 선택</span>${button(icon("folder") + " 파일 찾기", "pick:dataset")}</div></div>
   <label class="check"><input name="synthetic" type="checkbox" ${state.datasetDraft.synthetic ? "checked" : ""}> 더미·합성 데이터입니다</label>
   <label class="check"><input name="export_allowed" type="checkbox" ${state.datasetDraft.export_allowed ? "checked" : ""}> 이 데이터를 선택한 GPU로 전송해도 됩니다</label>
-  <p class="muted">여기서는 PC에만 등록합니다. 실제 전송은 학습 실행 시 별도로 확인합니다.</p><div class="actions">${button("샘플 미리보기", "dataset-preview")}<button class="primary" type="submit">검사하고 등록</button></div></form></section>
+  <p class="muted">여기서는 PC에만 등록합니다. 실제 전송은 학습 실행 시 별도로 확인합니다.</p><div class="actions">${button("샘플 미리보기", "dataset-preview")}<button class="primary" type="submit" data-tour="dataset-submit">검사하고 등록</button></div></form></section>
   ${s3Datasets()}
   ${state.preview ? `<section class="card"><div class="section-title"><h3>데이터 미리보기</h3><span class="badge">${esc(state.preview.format)} · ${num(state.preview.rows)}건</span></div>
   <p class="${state.preview.duplicate_rows ? "warning-text" : "muted"}">중복 레코드 ${num(state.preview.duplicate_rows)}건 · 앞 3건 미리보기 · 긴 내용은 일부만 표시합니다.</p><div class="sample-list">${state.preview.samples.map((sample: Obj, i: number) => `<article><small>SAMPLE ${String(i + 1).padStart(2, "0")}</small><pre>${esc(JSON.stringify(sample, null, 2))}</pre></article>`).join("")}</div></section>` : ""}
@@ -365,7 +370,7 @@ function training() {
   return `${modelHubView()}<form id="training-form"><section class="card"><div class="section-title"><h3>업무 AI 설정</h3>${button("설정 저장", "save-profile")}</div><div class="grid">
   ${select("예제·저장한 설정 불러오기", "template", "", [["", "현재 설정"], ...state.catalog.templates.map((t: Obj, i: number) => ["t:" + i, t.name]), ...state.catalog.profiles.map((p: Obj, i: number) => ["p:" + i, "저장됨 · " + p.ai_id])])}
   ${configField("업무 AI ID", "ai_id")}${configField("업무 흐름 ID", "workflow_id")}
-  ${select("학습 데이터", "train_dataset", c.dataset_id + ":" + c.dataset_version, datasetOptions)}
+  ${select("학습 데이터", "train_dataset", c.dataset_id + ":" + c.dataset_version, datasetOptions).replace('<label class="field">', '<label class="field" data-tour="train-dataset">')}
   ${select("검증 데이터", "validation_dataset", c.evaluation_profile.dataset_id ? c.evaluation_profile.dataset_id + ":" + c.evaluation_profile.dataset_version : "", [["", "없음 · 학습 완료만 확인"], ...datasetOptions.slice(1)])}
   ${configSelect("평가 방식", "evaluation_profile.kind", [["pipeline", "학습 완료 확인"], ["json", "JSON 형식"], ["classification", "분류"], ["extraction", "정보 추출"], ["kbf_extraction", "KBF 추출"], ["reward", "보상 점수 · RM"]])}
   </div></section><section class="card"><h3>모델과 학습</h3><div class="grid">
@@ -395,8 +400,8 @@ function training() {
   ${configField("최대 실행 시간 (초)", "resource_profile.timeout_seconds", "number")}
   ${configField("최대 예상 GPU 비용 (USD)", "resource_profile.max_cost_usd", "number")}
   </div><p class="muted">현재 앱 정책은 동시 GPU 1개, 최대 4시간·예상 비용 $5입니다. 기존 Pod의 실제 청구를 차단하는 한도는 아닙니다.</p>
-  ${compatibilityView()}<div class="actions"><button class="primary" type="submit" ${!state.capabilities?.valid || state.capabilityPending ? "disabled" : ""}>실행 계획 확인</button>${button("설정 저장", "save-profile")}</div></section></form>
-  ${state.plan ? `<section class="card plan"><h3>실행 전 확인</h3><div class="stats"><article><small>업무 AI</small><b>${esc(state.plan.manifest.config.ai_id)}</b></article><article><small>학습 데이터</small><b>${esc(state.plan.manifest.dataset.dataset_id)} · ${num(state.plan.manifest.dataset.rows)}건</b></article><article><small>최대 시간 기준 예상 GPU 비용</small><b>$${num(state.plan.estimated_cost_usd)}</b></article></div>
+  ${compatibilityView()}<div class="actions"><button class="primary" type="submit" data-tour="training-plan" ${!state.capabilities?.valid || state.capabilityPending ? "disabled" : ""}>실행 계획 확인</button>${button("설정 저장", "save-profile")}</div></section></form>
+  ${state.plan ? `<section class="card plan" data-tour="plan-summary"><h3>실행 전 확인</h3><div class="stats"><article><small>업무 AI</small><b>${esc(state.plan.manifest.config.ai_id)}</b></article><article><small>학습 데이터</small><b>${esc(state.plan.manifest.dataset.dataset_id)} · ${num(state.plan.manifest.dataset.rows)}건</b></article><article><small>최대 시간 기준 예상 GPU 비용</small><b>$${num(state.plan.estimated_cost_usd)}</b></article></div>
   <p>${esc(state.plan.note)}</p><p class="muted">${isServer(state.settings) ? `GPU 서버: ${esc(serverAddress(state.settings))} · 선택 GPU ${selectedGpus(state.settings).length}개` : `Pod: ${esc(state.settings.pod_id || "미설정")}`} · GPU: ${esc(state.plan.manifest.config.resource_profile.gpu_type)}</p>
   ${planIssues().map(issue => `<p class="warning-text">${esc(issue)}</p>`).join("")}
   ${button("데이터 전송에 동의하고 학습 시작", "start", "primary", planIssues().length > 0)}
@@ -412,7 +417,7 @@ function planIssues(): string[] {
 function jobs() {
   const active = state.jobs.find((j: Obj) => j.id === state.active);
   const resumeSupported = state.jobCapabilities && state.jobCapabilities.resume_supported !== false;
-  return `<section class="card"><div class="section-title"><h3>이 PC의 작업</h3><div class="actions">${button("새로고침", "refresh")}${button("연결 끊긴 작업 확인", "recover")}</div></div>
+  return `<section class="card" data-tour="jobs-list"><div class="section-title"><h3>이 PC의 작업</h3><div class="actions">${button("새로고침", "refresh")}${button("연결 끊긴 작업 확인", "recover")}</div></div>
   <p class="muted">학습은 원격에서 계속됩니다. PC를 다시 열면 이전 작업을 선택해 결과 회수를 시도하세요. GPU가 사용 중이면 종료하지 마세요.</p>
   ${state.jobs.length ? `<table><thead><tr><th>업무 AI / 작업</th><th>상태</th><th>시도</th><th>종류</th><th>실행 위치</th><th></th></tr></thead><tbody>${state.jobs.map((j: Obj) => `<tr><td><b>${esc(j.manifest.config.ai_id)}</b><small class="mono">${esc(j.id)}</small></td><td>${badge(j.status)}</td><td>${j.attempts}</td><td>${j.manifest.simulation ? "모의" : "실제"}</td><td>${esc(jobDestination(j))}</td><td>${button("선택", "job:" + j.id)}</td></tr>`).join("")}</tbody></table>` : '<div class="empty">실행 계획을 확인한 뒤 학습을 시작해 보세요.</div>'}</section>
   ${active ? `<section class="card"><div class="section-title"><h3>${esc(active.manifest.config.ai_id)} ${badge(active.status)}</h3><div class="actions">${button("저장된 진행 지표", "progress-local")}${button("원격 진행 지표", "progress-remote")}</div></div>${progressView(state.progress)}${active.error ? `<p class="error">${esc(active.error)}</p>` : ""}
@@ -444,12 +449,13 @@ function render() {
   const views: Obj = { overview, connections, datasets, training, jobs, history };
   root.innerHTML = `<aside><div class="brand"><span class="brand-mark"><svg width="22" height="24" viewBox="0 0 22 24" fill="none"><path d="M3 5h16M3 12h11M3 19h6" stroke="currentColor" stroke-width="3.2" stroke-linecap="square"/><circle cx="18" cy="19" r="2" fill="currentColor"/></svg></span><div>Tuning Factory<small>개인 워크스페이스</small></div>${icon("chevron", 12)}</div>
   <button class="command-trigger" data-action="search">${icon("search")}<span>바로 가기</span><kbd>Ctrl K</kbd></button><div class="nav-label">워크스페이스</div><nav>${Object.entries(pages).filter(([id]) => id !== "connections").map(([id, name]) => `<button aria-label="${name}" data-action="nav:${id}" class="${state.page === id ? "selected" : ""}">${icon(id)}<span>${name}</span>${id === "jobs" && state.jobs.filter((j: Obj) => j.status === "RUNNING").length ? '<i class="activity-marker"></i>' : ""}</button>`).join("")}</nav>
-  <div class="nav-label settings-label">설정</div><nav><button aria-label="연결 설정" data-action="nav:connections" class="${state.page === "connections" ? "selected" : ""}">${icon("connections")}<span>연결 설정</span></button></nav>
+  <div class="nav-label settings-label">설정</div><nav><button aria-label="연결 설정" data-action="nav:connections" class="${state.page === "connections" ? "selected" : ""}">${icon("connections")}<span>연결 설정</span></button><button aria-label="튜토리얼" data-action="tutorial">${icon("tutorial")}<span>튜토리얼</span></button></nav>
   <div class="sidebar-foot"><span class="avatar">${esc((state.settings.FACTORY_OPERATOR || "U").slice(0, 1).toUpperCase())}</span><div><b>${esc(state.settings.FACTORY_OPERATOR || "사용자 미설정")}</b><small>Windows · 내부 검토 ${esc(version)}</small></div></div></aside>
   <main><div class="appbar"><span class="breadcrumb">내 워크스페이스 <span>/</span> <b>${esc(pages[state.page])}</b></span><span class="local-context">${icon("folder", 13)} 내 PC에서 작업 관리</span></div><div class="content"><header class="page-heading"><div><h1>${esc(pages[state.page])}</h1><p>${esc(descriptions[state.page])}</p></div>${state.page === "overview" ? button(icon("plus") + " 새 학습", "nav:training", "primary") : ""}</header>
   <div aria-live="polite">${state.busy ? `<div class="notice busy"><span class="spinner"></span>${esc(state.busy)}<small>다른 화면에서도 작업 상태를 확인할 수 있습니다.</small></div>` : ""}${state.notice ? `<div class="notice">${esc(state.notice)}</div>` : ""}${state.error ? `<div class="notice error" role="alert">${esc(state.error)}</div>` : ""}</div>
   ${views[state.page]()}</div></main>`;
   bind();
+  tutorial.afterRender();
 }
 async function refresh() { state.jobs = await api("jobs"); }
 async function catalog() { state.catalog = await api("catalog"); }
@@ -623,6 +629,8 @@ async function action(name: string) {
     render(); await action("hub-inspect"); return;
   }
   if (name === "search") { commandSearch(); return; }
+  if (name === "tutorial") { if (state.busy || !state.config) return; captureConfig(); captureDrafts(); await tutorial.start(); return; }
+  if (name === "tutorial-dismiss") { rememberTutorial("dismissed"); render(); return; }
   if (name.startsWith("nav:")) { captureConfig(); captureDrafts(); state.page = name.split(":")[1]; render(); if (state.page === "training" && !state.capabilities && !state.capabilityPending) { await checkCapabilities(); render(); } return; }
   if (name.startsWith("template:")) {
     state.config = structuredClone(state.catalog.templates[Number(name.split(":")[1])].config);
@@ -785,6 +793,7 @@ async function action(name: string) {
     }
   });
 }
+const tutorial = createTutorial({ state, navigate: page => action("nav:" + page), render, api, checkCapabilities, normalizeConfig });
 render();
 void task("작업 공간 불러오는 중", async () => {
   state.settings = await invoke("settings_get"); await catalog(); await refresh();
