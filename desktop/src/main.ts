@@ -264,7 +264,7 @@ function overview() {
   const complete = state.jobs.filter((j: Obj) => j.status === "COMPLETED").length;
   const saved = state.settings, server = isServer(saved);
   const steps = [
-    { page: "connections", label: "연결 정보 설정", text: "RunPod 또는 GPU 서버와 MLflow 연결을 확인하세요.", done: server ? serverConfigured(saved) : Boolean(saved.RUNPOD_API_KEY_saved && saved.pod_id) },
+    { page: "connections", label: "연결 정보 설정", text: server && selectionPolicyIssue(saved) ? GPU_POLICY_MESSAGE : "RunPod 또는 GPU 서버와 MLflow 연결을 확인하세요.", done: server ? serverConfigured(saved) : Boolean(saved.RUNPOD_API_KEY_saved && saved.pod_id) },
     { page: "datasets", label: "데이터 버전 등록", text: "학습·검증 데이터를 준비하세요.", done: state.catalog.datasets.length > 0 },
     { page: "training", label: "첫 학습 준비", text: "업무와 모델을 선택하고 계획을 확인하세요.", done: state.jobs.length > 0 },
   ];

@@ -430,6 +430,13 @@ test("incomplete server settings leave the setup step open", async ({ page }) =>
   await expect(page.locator(".setup-row", { hasText: "연결 정보 설정" }).locator(".setup-check.done")).toHaveCount(0);
 });
 
+test("a saved selection over the GPU policy leaves the setup step open with the policy hint", async ({ page }) => {
+  await open(page, { ...server, server_selected_gpu_uuids: JSON.stringify([GPU_A, GPU_B]) });
+  const step = page.locator(".setup-row", { hasText: "연결 정보 설정" });
+  await expect(step.locator(".setup-check.done")).toHaveCount(0);
+  await expect(step).toContainText("현재 앱 정책은 작업당 GPU 1개입니다. GPU를 하나만 선택하세요.");
+});
+
 test("an unauthenticated round trip keeps the saved OIDC address and client ID", async ({ page }) => {
   await open(page, { auth_mode: "oidc", MLFLOW_OIDC_TOKEN_URL: "https://sso.custom.example/token", MLFLOW_OIDC_CLIENT_ID: "custom-client",
     MLFLOW_OIDC_CLIENT_SECRET_saved: true });

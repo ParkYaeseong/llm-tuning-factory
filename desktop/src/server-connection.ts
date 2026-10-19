@@ -35,7 +35,7 @@ export const serverAddress = (settings: Obj, port = true) =>
   sshAddress(settings.server_ssh_username, settings.server_ssh_host, port ? settings.server_ssh_port : undefined);
 export const serverConfigured = (settings: Obj) => ["server_ssh_host", "server_ssh_username", "server_ssh_fingerprint",
   "server_ssh_key_file", "server_remote_root", "server_total_hourly_cost_usd"].every(key => String(settings[key] ?? "").trim())
-  && selectedGpus(settings).length > 0;
+  && selectedGpus(settings).length > 0 && !selectionPolicyIssue(settings);
 /** "destination" when the provider or a server field changed, "selection" when only the GPU selection did. */
 export function destinationChange(before: Obj, after: Obj): "none" | "selection" | "destination" {
   const route = (settings: Obj) => JSON.stringify([isServer(settings), ...ROUTE_KEYS.map(key => settings[key] ?? "")]);
