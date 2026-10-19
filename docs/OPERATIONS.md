@@ -46,6 +46,31 @@ Each attempt creates a run and logs the resolved manifest, training YAML, metric
 Job metadata stores the current run ID; attempts/N/outcome.json preserves older IDs. Production candidates are registered
 with approval=pending and compatibility tags. Model registration is separate from deployment and human approval.
 
+### Unauthenticated local or internal MLflow server
+
+A local or internal-network server without authentication is supported. In the desktop app choose the authentication
+method "인증 없음 · 로컬·내부 서버" and enter the server address. In the CLI leave `MLFLOW_TRACKING_TOKEN` empty and
+clear the three `MLFLOW_OIDC_*` values (`.env.example` pre-fills the OIDC address and client ID). The connection check
+then reports `mlflow_auth: none`, shown in the desktop as "확인됨 · 인증 없음"; `mlflow_authenticated_read` is true only
+when real credentials were used.
+
+```powershell
+mlflow server --host 127.0.0.1 --port 5000
+# .env: MLFLOW_TRACKING_URI=http://127.0.0.1:5000
+```
+
+- HTTP is accepted only without credentials. A token or OIDC client credentials require HTTPS.
+- If an OIDC address is set but the client ID or secret is missing, the app stops with
+  "OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. 인증값을 입력하거나 ‘인증 없음’을 선택하세요." Fill the
+  credentials or clear the OIDC address.
+- The default `FACTORY_MLFLOW_ARTIFACT_LOCATION=mlflow-artifacts:/llm-tuning-factory` stores artifacts through the
+  tracking server's artifact proxy. MLflow 2 and later `mlflow server` normally serves that proxy by default, but confirm
+  with `mlflow server --help` for your installed version. With a file-based or proxy-less server, uploads of
+  logs and models fail; set an artifact location the server supports.
+- Anyone who can reach an unauthenticated server can read its records and artifacts. Bind it to `127.0.0.1` or use it
+  only on a trusted internal network, and never expose it to the public internet. This project did not verify a real
+  unauthenticated MLflow server yet; only mocked connections were tested.
+
 ## GPU image
 
 First start your Docker daemon. No image has been built in the current environment.
@@ -99,6 +124,92 @@ simulation manifests. Existing borrowed Pods are left running: their owner remai
 During acceptance, the user may explicitly authorize starting and stopping a named existing test Pod for a bounded
 session. That exception applies only to that Pod/session; it grants no ownership of other borrowed Pods.
 Do not use an unrelated SSH host even if you control its key; the live provider mapping is checked before transfer.
+
+## Existing Linux GPU server over SSH
+
+For an institution server (for example a BOP-style Linux host) the app connects with SSH and runs the same training
+worker directly on the server, in the same way as the existing Pod path. This part describes the development branch.
+It was tested only with fake SSH responses; no real SSH server or GPU was used and it is not in the released 0.3.0
+installer. Nothing below is authorization to connect, transfer data or spend: each step needs the owner's approval.
+
+### What the app never does
+
+It never creates, starts, stops or deletes a server, and never touches Docker or Slurm. It does not use sudo or apt, does not
+change the system Python, and does not trust a host key it merely observed. Private keys stay on your PC. No credentials are
+written to manifests or profiles. Data transfer, execution and environment preparation each need their own explicit flag.
+
+### Prerequisites
+
+- Linux, a readable `/etc/machine-id`, and NVIDIA GPUs visible to `nvidia-smi` (MIG partitions are rejected).
+- `python3` (3.8 or newer) with `python3 -m pip`, `flock` and a C compiler (`cc`). Missing tools are reported, never installed.
+- An absolute work folder, for example `/home/USER/factory`, that is writable and contains no symlinks.
+- SSH key authentication and the server's `SHA256:` host fingerprint obtained from the administrator by a trusted route.
+  Root is not required.
+- An operator-entered whole-server hourly cost (0 is allowed for internal servers; it is not a cloud price).
+
+Under the work folder the app keeps a private runtime for each app source version (`runtime/`), job files (`jobs/`), the model
+cache (`hf-cache/`) and a uv cache (`uv-cache/`). pip runs with no cache. The selected GPU UUIDs are bound with
+`CUDA_VISIBLE_DEVICES`. The first preparation downloads dependencies and can take a long time.
+
+### Concurrency and locks
+
+One factory job runs per server. Registering the same server under another address or profile does not bypass the lock
+(identity is derived from the machine ID and shared GPU UUIDs). In this version the default concurrency is 1, so any SSH job
+or preparation reservation blocks RunPod claims and preparation, and the reverse also holds.
+
+### CLI flow
+
+Create a server profile JSON (fields in [CONFIGURATION.md](CONFIGURATION.md)), then:
+
+```powershell
+uv run factory server-inspect server.json
+uv run factory server-runtime server.json
+uv run factory server-runtime server.json --prepare --approve-preparation --training-stage sft
+uv run factory dataset-register approved_data 1 PATH_TO_APPROVED_JSON --export-allowed
+uv run factory plan PATH_TO_AI_YAML --real --server-profile server.json
+uv run factory run PATH_TO_AI_YAML --real --submit --server-profile server.json
+uv run factory work --server-profile server.json --approve-execution-and-transfer
+uv run factory reconcile JOB_ID --server-profile server.json
+uv run factory doctor --server-profile server.json
+```
+
+1. `server-inspect` is read-only. It prints the observed GPU UUIDs, names and memory; copy the UUIDs you may use into
+   `selected_gpu_uuids`.
+2. `server-runtime` without `--prepare` checks the private runtime. `--prepare` installs it and requires
+   `--approve-preparation`. `--training-stage` selects the stage environment (default `sft`).
+3. `plan --real --server-profile` makes one read-only observation and prints the destination receipt. The AI YAML's GPU type,
+   count and per-GPU price must match the selected GPUs and the declared cost. `run ... --submit --real --server-profile`
+   freezes that receipt for the job. Without `--submit` the command only prints the plan.
+4. `work --server-profile` fails without `--approve-execution-and-transfer`. With it, the worker transfers the approved
+   data to the server and runs the job there. Only unbound jobs and jobs whose receipt matches the current
+   destination are chosen; others wait without blocking it. `--drain` keeps working until the queue is empty.
+   `--pod-id` cannot be combined with a server profile.
+5. `reconcile JOB_ID --server-profile` re-attaches to an existing attempt to collect results, logs and progress. It uses
+   the job's original receipt and refuses a different server, key, work folder or GPU selection, but tolerates drift in
+   unrelated GPUs and operator cost. It never launches work. `doctor --server-profile` runs the read-only connection
+   check; it cannot be combined with `--pod-id`. A connection profile (`--connection-file`) with `provider: ssh_server`
+   is also accepted in place of `--server-profile`.
+
+### Uncertain preparation reservations
+
+A preparation that loses its connection leaves a reservation whose remote end is unknown. It keeps blocking the same
+server (and RunPod) until released. First confirm on the server that the preparation process has ended, then:
+
+```powershell
+uv run factory server-runtime-status
+uv run factory server-runtime-release server.json RESERVATION_ID --confirm-preparation-stopped
+```
+
+`server-runtime-status` lists reservations in the local state directory. Release refuses without
+`--confirm-preparation-stopped` and only for a reservation made with the same server settings. In the desktop app this is
+the "준비 예약 확인" button and "원격 준비 종료 확인 · 예약 해제" with an approval dialog. Do not release while the
+preparation may still run.
+
+### Limits
+
+Cost is the operator-entered value, not a measurement; there is no observation of other users' load on the server, and the
+app does not stop the remote worker automatically beyond the job's own time limit. Real BOP/SSH, GPU and installer
+acceptance remain outstanding (see PROGRESS.md).
 
 ## Managed paid Pod
 

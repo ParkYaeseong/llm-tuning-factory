@@ -79,3 +79,65 @@ or claim they came from a model. For automatic orchestration evaluation, a futur
 `output/predictions.json` from the actual trained adapter and the registered validation corpus. The initial SFT worker
 does not perform this generation step. Without this file, task quality is explicitly not_evaluated.
 Never use examples/evaluation.json as evidence of model quality.
+
+## Execution destination settings
+
+These settings choose where real training runs. They never appear in the AI YAML or in v1 manifests; the AI YAML only
+declares the resource profile (GPU type/count and the per-GPU price). This part describes the development branch and
+is not in the released 0.3.0 installer. Secrets never belong here: use the desktop credential store or the local `.env`.
+
+### Desktop settings (public settings.json)
+
+| Key | Value |
+| --- | --- |
+| `provider` | `existing_runpod` (default; also assumed when absent in older settings) or `ssh_server`. Any other value is refused when saving. |
+| `server_ssh_host` | Host name or IP address of the GPU server. |
+| `server_ssh_port` | SSH port as a string, default `22`. |
+| `server_ssh_username` | SSH account. Root is not required. |
+| `server_ssh_key_file` | Local path of the private key file. A pasted `PRIVATE KEY` text is refused. The key stays where it is. |
+| `server_ssh_fingerprint` | Host key fingerprint `SHA256:...` supplied by the administrator. Observed keys are never trusted automatically. |
+| `server_remote_root` | Absolute work folder on the server, for example `/home/USER/factory`. Letters, digits, `_ . / -` only, no trailing slash, no `.` or `..` parts, no symlinks, writable. |
+| `server_total_hourly_cost_usd` | Whole-server hourly cost typed by the operator; `0` is allowed for internal servers. It is a user setting, not a cloud price. |
+| `server_selected_gpu_uuids` | A JSON string holding an array of at most 8 distinct GPU UUIDs, for example `["GPU-00000000-0000-0000-0000-000000000000"]`. |
+| `auth_mode` | MLflow authentication: `oidc`, `token` or `none`. An empty value is read as `oidc`; other values are refused. |
+
+The `server_` keys are separate from the Pod's `ssh_key_file` and `ssh_fingerprint`, so switching provider does not
+lose the other connection. With `auth_mode` set to `none` the OIDC address, client ID, client secret and token are not
+passed to the Python engine (the saved values are kept for a later switch back). Authenticated MLflow
+(token or OIDC secret) requires an HTTPS tracking URI; `none` also allows HTTP such as `http://127.0.0.1:5000`.
+
+### CLI server profile (JSON)
+
+The CLI reads one local JSON file for `--server-profile` and for the `server-inspect`, `server-runtime` and
+`server-runtime-release` commands. Unknown fields are rejected. Use placeholder values like these:
+
+```json
+{
+  "ssh_host": "gpu.example.org",
+  "ssh_port": 22,
+  "ssh_username": "alice",
+  "ssh_key_file": "keys/id_ed25519",
+  "ssh_fingerprint": "SHA256:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq",
+  "remote_root": "/home/alice/factory",
+  "total_hourly_cost_usd": 0,
+  "selected_gpu_uuids": ["GPU-00000000-0000-0000-0000-000000000000"]
+}
+```
+
+- `ssh_port` defaults to 22 and must be an integer. `selected_gpu_uuids` may be empty for `server-inspect`, but
+  preparation, `plan --real`, submission and `work` need at least one observed UUID.
+- A relative `ssh_key_file` is resolved next to the JSON file. The file contains a path only, never key content.
+- `total_hourly_cost_usd` is required (>= 0) and applies to the whole server.
+- A job's resource profile in the AI YAML must still match the selected GPU count and GPU name.
+  Use `server-inspect` to read the exact name and UUIDs.
+
+### Destination hash and receipt
+
+Public destination settings (address, port, user, host fingerprint, remote work folder, selected GPU UUIDs, a hash of the
+resolved key path and the operator cost) form a destination hash. The desktop shows it in the plan, and submission refuses a job
+if the settings changed after the plan. On submission the app freezes an approval receipt from one read-only observation
+of the server: server identity, transport settings, selected GPUs and cost. The receipt is stored next to the job, not in
+the v1 manifest, and holds no credentials. Execution, logs, progress, cancel and result collection use that receipt:
+a different server, key path, work folder or GPU selection is refused instead of being linked to the old job. Changes to
+the server's other, unselected GPUs or operator cost do not block recovery of an existing attempt.
+Changing a destination setting invalidates earlier previews, plans and approvals.

@@ -4,7 +4,8 @@
 LLaMA-Factory 학습 엔진과 RunPod 실행기를 분리하고, 데이터·명세서·산출물을 해시로 추적합니다.
 기존 KBF 프로젝트의 ShareGPT 데이터 규격·Keycloak 인증 방식·순수 추출 평가 함수를 재사용합니다.
 
-**운영 방식:** 각자 PC에 설치하여 작업을 관리하고, 학습은 각자 배정받은 RunPod GPU에서 실행합니다.
+**운영 방식:** 각자 PC에 설치하여 작업을 관리하고, 학습은 각자 배정받은 RunPod Pod 또는
+SSH로 접속하는 기관 GPU 서버에서 실행합니다.
 실행 기록과 업로드한 산출물은 공용 MLflow에 모읍니다. 별도 NCP 관리 서버는 필요하지 않습니다.
 Windows 앱은 **0.3.0 내부 검토 버전**입니다.
 
@@ -30,6 +31,15 @@ PPO 전용 실제 패키지 import, 로컬 S3 서명·전송 계약을 검증했
 PPO·OFT 등의 upstream 재개/평가 제한은 이유와 함께 차단합니다.
 멀티모달·임의 모델/플러그인·대량 스트리밍·다중 PC 스케줄링·서빙·코드 서명은 이번 범위에 포함하지 않습니다.
 
+**GPU 서버(개발 브랜치):** RunPod 외에 BOP 같은 기관의 Linux/NVIDIA GPU 서버에 SSH 키 인증과 관리자가 전달한
+SHA256 지문으로 직접 접속해 학습할 수 있습니다. 서버의 작업 폴더 아래에만 전용 환경을 만들며 서버를 켜거나 끄지 않습니다.
+설정 절차는 [Windows 사용 안내](docs/WINDOWS_APP.md), CLI 절차와 요구 조건은 [운영 안내](docs/OPERATIONS.md)를 확인하세요.
+실제 서버·GPU 시험은 아직 하지 않았으며 설치 파일 0.3.0에는 포함되어 있지 않습니다.
+
+**MLflow 인증 없음(개발 브랜치):** 로컬(`127.0.0.1`)·내부망 MLflow 서버는 앱에서 “인증 없음”을 선택하거나
+CLI `.env`의 토큰과 OIDC 세 항목을 비워 연결합니다. 서버에 접근할 수 있는 누구나 기록을 볼 수 있으므로
+신뢰할 수 있는 망에서만 사용하세요. 자세한 내용은 [운영 안내](docs/OPERATIONS.md)와 [Windows 사용 안내](docs/WINDOWS_APP.md)에 있습니다.
+
 ## 처음 설치하기
 
 Git과 [uv](https://docs.astral.sh/uv/getting-started/installation/)를 준비한 뒤 아래 순서로 실행합니다.
@@ -46,6 +56,7 @@ macOS/Linux에서는 마지막 명령 대신 `cp .env.example .env`를 사용합
 로컬 `.env`를 열어 본인 RunPod API 키, 관리자가 별도로 전달한 MLflow 인증 정보,
 기록을 구분할 `FACTORY_OPERATOR`를 입력합니다. 서버 주소는 예시에 들어 있습니다.
 OIDC 대신 발급받은 토큰을 쓰면 OIDC 세 항목을 비우고 `MLFLOW_TRACKING_TOKEN`을 채웁니다.
+인증 없는 로컬·내부 서버는 토큰과 OIDC 세 항목을 모두 비웁니다.
 
 ```powershell
 uv run factory doctor
@@ -87,7 +98,7 @@ uv run factory evaluate examples/evaluation.json --kind classification
 ## 실제 학습과 공유 시 주의점
 
 실제 학습은 [운영 안내](docs/OPERATIONS.md)의 GPU 런타임 준비와 데이터 전송 승인이 필요합니다.
-로컬 설치만으로 RunPod에 학습 환경이 설치되거나 GPU가 자동 시작되지는 않습니다.
+로컬 설치만으로 RunPod나 GPU 서버에 학습 환경이 설치되거나 GPU가 자동 시작되지는 않습니다.
 PC를 켜 두고 실행해야 작업 관리와 결과 회수가 이어집니다.
 
 각 PC의 `state/`에는 별도의 작업 목록·데이터 사본·GPU 잠금이 저장됩니다.

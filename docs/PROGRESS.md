@@ -87,8 +87,9 @@ redacted in raw and repr (escaped Windows path) form. MLflow:
 `auth_mode: "none"` drops OIDC/token values (HTTP then allowed), a missing OIDC client ID/secret is a clear Korean
 ValueError, and the connection report adds `mlflow_read`/`mlflow_auth`. Task 6A follow-ups: `executor_for(recovery=True)`
 is SSH-only, a refused pre-launch check also writes error.txt, and an unreachable observation branch was removed.
-Actual verification: **711 passed, 1 skipped** in 64.32s (59 new cases); Ruff passes. Pending: Rust native settings and
-action allowlist, TypeScript UI and docs (6B-2/6B-3). No real SSH server, GPU or MLflow server was used.
+Actual verification at that point: **711 passed, 1 skipped** in 64.32s (59 new cases); Ruff passes. The Rust native
+settings, action allowlist and TypeScript UI followed in 6B-2 and the docs in 6B-3 (below). No real SSH server, GPU or
+MLflow server was used.
 
 Task 6B-2 (Windows native settings and connection screen): native settings save `provider` and the eight public
 `server_*` strings, refuse an unknown provider or `auth_mode` and a selection that is not a JSON array of at most 8
@@ -116,10 +117,30 @@ server settings can be released; the connection check waits for an unsaved provi
 price inputs throw; connection inputs are locked while a task runs so its final re-render cannot drop typing.
 Actual verification: Playwright **45 passed** (22 in `desktop/tests/connections.spec.ts`; `workspace.spec.ts`
 unchanged), `npm run build` (tsc + Vite) passes, Rust **10 passed** (6 new), Python **711 passed, 1 skipped**, Ruff
-passes. Unverified: docs (6B-3), installer acceptance (Task 11), the real Tauri/WebView2 shell and Credential Manager
-(the UI is tested against a mocked bridge) and any real SSH server, GPU or MLflow server.
+passes. The UI is tested against a mocked bridge, so the real Tauri/WebView2 shell and Credential Manager stay unverified.
 
-Remaining Tasks 6A/6B and 7–11: general SSH GPU servers, model-operation CPU acceptance,
+Task 6B-3 (user documentation) updates README.md, docs/WINDOWS_APP.md, docs/CONFIGURATION.md, docs/OPERATIONS.md and
+.env.example for direct-SSH GPU servers (desktop steps, server prerequisites, profile JSON, CLI flow, reservation
+release, limits) and the unauthenticated MLflow mode (HTTP only without credentials, local `mlflow server` example,
+artifact-proxy note, trusted-network warning). **Task 6B is complete in software.** Task 6 commits: 6f3c70f, 570498d,
+16235c6, 15b118d, c0ee9a9, c8df219, 0b569dc and the docs commit `docs: guide SSH GPU servers and unauthenticated MLflow`.
+
+Latest actual verification (2026-10-19, Windows, on the docs commit's tree): `uv run pytest -q` **711 passed, 1 skipped**
+in 99.82s; `uv run ruff check src tests` passes; Playwright **47 passed**; `npm run build` (tsc + Vite) passes;
+`cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` **11 passed**.
+`scripts/check_secrets.py` reports one finding, `desktop/src-tauri/src/main.rs: private key`: the Rust unit tests
+contain fake `-----BEGIN ... PRIVATE KEY-----` stubs (not key material) that exercise the pasted-key refusal. It predates this docs
+commit and still needs an allowlist or a fixture built at run time.
+
+Still unverified: a real SSH/BOP server, real NVIDIA GPU execution, a real MLflow server (authenticated or not), the real
+Tauri/WebView2 shell and Windows Credential Manager, and installer acceptance (Task 11). All SSH behavior was tested with
+fake SSH responses.
+
+Deferred hardening: `claim()` should reject a `server_facts` that is not an `SSHServerFacts` (defence in depth); the
+`raw_server_receipts` IN-list needs a cap; some sidecar refusals are still in English; the key identity is derived from a
+hash of the local key path (moving the key breaks recovery, replacing it in place is undetected).
+
+Remaining Tasks 7–11 (Tasks 6A/6B are complete in software): model-operation CPU acceptance,
 persistent multi-Pod controller/tracking repair, secure desktop API/broker, Windows UI/installer and Git sharing.
 These foundations are not end-to-end workflow, Windows 0.4.0 or live GPU acceptance. Actual serial handoff,
 multi-Pod concurrency and merge/reevaluation on GPU require separate concrete resource/data authorization.
