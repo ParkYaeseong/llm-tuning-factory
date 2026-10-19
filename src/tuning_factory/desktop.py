@@ -105,10 +105,11 @@ class DesktopService:
             os.environ.pop(key, None)
             if self.settings.get(key):
                 os.environ[key] = str(self.settings[key])
-        from .auth import require_secure_tracking
+        from .auth import require_secure_artifacts, require_secure_tracking
         from .tracking import LazyMLflowTracker
         uri = self.settings.get("MLFLOW_TRACKING_URI")
         require_secure_tracking(uri)
+        require_secure_artifacts(self.settings.get("FACTORY_MLFLOW_ARTIFACT_LOCATION"))
         self.factory = Factory(self.root, policy=Policy(),
                                tracker=LazyMLflowTracker(uri) if uri else None)
 

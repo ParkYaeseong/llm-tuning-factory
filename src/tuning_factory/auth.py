@@ -57,8 +57,9 @@ INSECURE_TRACKING = ("인증값을 사용하는 MLflow 서버 주소는 HTTPS여
 
 
 def credentials_configured():
-    return any(os.environ.get(key) for key in
-               ("MLFLOW_TRACKING_TOKEN", "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_SECRET"))
+    # A bare OIDC URL is only a default; configure_oidc refuses before any request without a secret.
+    return bool(os.environ.get("MLFLOW_TRACKING_TOKEN")
+                or (os.environ.get("MLFLOW_OIDC_TOKEN_URL") and os.environ.get("MLFLOW_OIDC_CLIENT_SECRET")))
 
 
 def require_secure_tracking(uri):

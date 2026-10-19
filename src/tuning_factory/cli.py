@@ -137,6 +137,8 @@ def run(ctx: typer.Context, config: Path, mock: bool = False, submit: bool = Fal
     if server is not None and real:
         from .desktop_runtime import plan_server_destination
         receipt = plan_server_destination(server, resolve(load_config(config), ctx.obj.registry, simulation=False))
+    if mock:
+        require_secure_tracker(ctx.obj)
     job = ctx.obj.submit(load_config(config), request_key, priority, simulation=not real, server_receipt=receipt)
     if mock and job["status"] == "QUEUED":
         job = ctx.obj.work(target_job_id=job["id"])
@@ -152,14 +154,19 @@ def batch(ctx: typer.Context, configs: Annotated[list[Path], typer.Argument()], 
         output({"dry_run": True, "manifests": [resolve(load_config(p), ctx.obj.registry, not real) for p in configs]})
 
 
+def require_secure_tracker(factory):
+    """Refuse an insecure tracking setup before any job is claimed, so no attempt is consumed."""
+    from .auth import require_secure_artifacts, require_secure_tracking
+    require_secure_tracking(getattr(factory.tracker, "uri", None))
+    require_secure_artifacts(os.environ.get("FACTORY_MLFLOW_ARTIFACT_LOCATION"))
+
+
 @app.command()
 def work(ctx: typer.Context, drain: bool = False, pod_id: str | None = None,
          host: str | None = None, port: int = 22, username: str = "root", key_file: Path | None = None,
          approve_execution_and_transfer: bool = False, server_profile: Path | None = None):
     factory = ctx.obj
-    # Refuse an insecure tracking setup before any job is claimed, so no attempt is consumed.
-    from .auth import require_secure_tracking
-    require_secure_tracking(getattr(factory.tracker, "uri", None))
+    require_secure_tracker(factory)
     factory.store.recover()
     server = server_connection(ctx, server_profile)
     if server is not None:

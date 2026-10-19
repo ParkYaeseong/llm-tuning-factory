@@ -29,7 +29,16 @@ class MLflowTracker:
                 "factory.workflow_id": manifest["config"]["workflow_id"]}
         if os.environ.get("FACTORY_OPERATOR"):
             tags["factory.operator"] = os.environ["FACTORY_OPERATOR"]
-        run_id = self.client.create_run(self.experiment_id, tags=tags).info.run_id
+        run_info = self.client.create_run(self.experiment_id, tags=tags).info
+        run_id = run_info.run_id
+        from .auth import require_secure_artifacts
+        artifact_uri = getattr(run_info, "artifact_uri", None)
+        try:
+            # A server-assigned default artifact root is only known per run; refuse before any upload.
+            require_secure_artifacts(artifact_uri if isinstance(artifact_uri, str) else None)
+        except ValueError:
+            self.client.set_terminated(run_id, status="FAILED")
+            raise
         try:
             for key, value in manifest.items():
                 self.client.log_param(run_id, key, json.dumps(value, sort_keys=True)[:5900])
