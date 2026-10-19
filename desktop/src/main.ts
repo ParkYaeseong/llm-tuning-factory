@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { version } from "../package.json";
 import { button, filterRuns, formatDate, icon, progressView } from "./workbench";
 import { createTutorial, rememberTutorial, tutorialSeen } from "./tutorial";
+import { TUTORIAL_DATASET } from "./tutorial-steps";
 import { connectionResult, destinationChange, GPU_POLICY_MESSAGE, inventoryTable, isServer, jobDestination, jobDestinationIssue,
   MAX_GPUS_PER_JOB, prepareApproval, prepareIssue, puttyKeyPath, releaseApproval, reservationMatches, reservationTable, resourcesFromFacts,
   sameSelection, selectedGpus, selectionPolicyIssue, serverAddress, serverBridge, serverConfigured, settingsRoute, shortIdentifier,
@@ -270,7 +271,7 @@ function overview() {
   const saved = state.settings, server = isServer(saved);
   const steps = [
     { page: "connections", label: "연결 정보 설정", text: server && selectionPolicyIssue(saved) ? GPU_POLICY_MESSAGE : "RunPod 또는 GPU 서버와 MLflow 연결을 확인하세요.", done: server ? serverConfigured(saved) : Boolean(saved.RUNPOD_API_KEY_saved && saved.pod_id) },
-    { page: "datasets", label: "데이터 버전 등록", text: "학습·검증 데이터를 준비하세요.", done: state.catalog.datasets.length > 0 },
+    { page: "datasets", label: "데이터 버전 등록", text: "학습·검증 데이터를 준비하세요.", done: state.catalog.datasets.some((d: Obj) => d.dataset_id !== TUTORIAL_DATASET.id) },
     { page: "training", label: "첫 학습 준비", text: "업무와 모델을 선택하고 계획을 확인하세요.", done: state.jobs.length > 0 },
   ];
   return `${tutorialCard()}<div class="summary-strip"><div><span class="status-dot blue"></span>진행 중 <b>${running}</b></div><div>완료한 실행 <b>${complete}</b></div><div>데이터 버전 <b>${state.catalog.datasets.length}</b></div><div>저장한 설정 <b>${state.catalog.profiles.length}</b></div></div>

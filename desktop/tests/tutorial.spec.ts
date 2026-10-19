@@ -382,3 +382,9 @@ test("restarting ignores a sample request from the previous run", async ({ page 
   await expect(tourButton(page, "연습 샘플 채우기")).toBeEnabled();
   await expect(tourButton(page, "다음")).toBeDisabled();
 });
+
+test("the practice sample alone does not complete the data checklist item", async ({ page }) => {
+  await boot(page, { registered: true, withoutDummy: true, seen: true });
+  const row = page.locator(".setup-row", { hasText: "데이터 버전 등록" });
+  await expect(row.locator(".setup-check")).not.toHaveClass(/done/);
+});
