@@ -96,7 +96,7 @@ pip가 있는 python3, flock, C 컴파일러(cc). 작업 폴더는 쓰기 가능
 실행 기록을 볼 수 있으므로 신뢰할 수 있는 로컬·내부망에서만 사용하세요.** 로컬 서버 실행 예는
 [운영 안내](OPERATIONS.md)를 확인하세요. **연결 검사 결과**의 MLflow 조회 줄은 “확인됨 · 인증 없음”처럼 방식과 함께 표시되며,
 GPU 서버 연결에서는 “GPU 서버” 줄에 주소와 GPU 요약, “실제 GPU 학습” 줄에 아직 확인하지 않았음이 표시됩니다.
-OIDC를 선택했는데 클라이언트 인증값이 없으면 “OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. 인증값을 입력하거나 ‘인증 없음’을 선택하세요.”라는 오류가 표시됩니다.
+OIDC를 선택했는데 클라이언트 인증값이 없으면 “OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. 인증값을 입력하거나 토큰·OIDC 값을 비우세요(앱에서는 ‘인증 없음’ 선택).”라는 오류가 표시됩니다. 제출·실행 전에도 같은 점검을 합니다.
 
 ## 학습
 
@@ -190,6 +190,20 @@ loss를 제외하며 최대 200개 지점을 표시합니다. 기록이 없으�
   PC 실행기 강제 종료 후 결과 회수·MLflow 산출물 왕복 해시를 확인했습니다.
   다른 모델·대규모 데이터·새 PC 설치·코드 서명은 검증하지 않았습니다.
   [GPU 검증 보고서](GPU_ACCEPTANCE_2026-10-15.md)를 확인하세요.
+
+## 업그레이드 시 주의
+
+RunPod와 GPU 서버는 같은 장비인지 증명할 수 없어 교차 격리합니다. 0.3.0에서 끝나지 않았거나 불확실한 RunPod 작업의 잠금이 남아 있으면
+GPU 서버 작업·준비가 막히고 “다른 연결 대상(RunPod)의 끝나지 않은 작업 잠금이 남아 있어 GPU 서버를 사용할 수 없습니다. …”가 표시됩니다.
+먼저 **실행 관리**에서 **재연결 · 결과 회수**를 시도하세요. 원래 프로세스와 Pod가 멈춘 것을 확인했고 회수가 불가능할 때만 앱 데이터 폴더의
+state를 지정해 CLI로 잠금을 해제합니다(작업이 FAILED·CANCELED·COMPLETED이고 ATTEMPT_ID가 현재 시도일 때만 허용).
+
+    uv run factory --state-dir "$env:APPDATA\kr.kbiofoundry.tuningfactory\state" status JOB_ID
+    uv run factory --state-dir "$env:APPDATA\kr.kbiofoundry.tuningfactory\state" release-lock JOB_ID ATTEMPT_ID --confirm-execution-stopped
+
+JOB_ID는 실행 관리 표의 업무 AI 이름 아래에 표시됩니다. ATTEMPT_ID는 표에 없으며 `status JOB_ID` 출력의 `active_attempt_id`에서 확인합니다.
+실제 학습 제출은 연습용 데이터(`tutorial_sample`)를 거부하며 “연습용 데이터(tutorial_sample)로는 실제 학습을 시작할 수 없습니다.”를 표시합니다.
+재개는 원래 작업의 목적지를 먼저 확인한 뒤 작업 상태를 되돌립니다.
 
 ## 개발·빌드
 

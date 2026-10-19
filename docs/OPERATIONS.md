@@ -71,8 +71,9 @@ uvx --from mlflow==3.17.1 mlflow server --host 127.0.0.1 --port 5000
   credentials, plain HTTP is allowed. With credentials set, even local stores are refused: so a `file:` or `sqlite:` tracking URI is also refused while they are set; clear
   them when using a local store.
 - If an OIDC address is set but the client ID or secret is missing, MLflow actions stop with
-  "OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. 인증값을 입력하거나 ‘인증 없음’을 선택하세요." Fill the
-  credentials or clear the OIDC address.
+  "OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. 인증값을 입력하거나 토큰·OIDC 값을 비우세요(앱에서는 ‘인증 없음’ 선택)." Fill the
+  credentials or clear the OIDC values. The CLI checks this before claiming (`work`, `run --mock`), and the desktop checks it
+  before submit and execute. In the CLI, `.env.example` pre-fills the OIDC token URL and client ID, so clear them for a no-auth server.
 - The default `FACTORY_MLFLOW_ARTIFACT_LOCATION=mlflow-artifacts:/llm-tuning-factory` stores artifacts through the
   tracking server's artifact proxy. MLflow 2 and later `mlflow server` normally serves that proxy by default, but confirm
   with `mlflow server --help` for your installed version (`--serve-artifacts` defaults to on in 3.17.1). The
@@ -237,6 +238,22 @@ Cost is the operator-entered value, not a measurement; there is no observation o
 app does not stop the remote worker automatically beyond the job's own time limit. Real BOP/SSH, GPU and installer
 acceptance remain outstanding (see PROGRESS.md).
 
+### Upgrade note: a leftover RunPod lock blocks GPU servers
+
+Because of the cross-provider quarantine, an unfinished or uncertain RunPod job lock (for example one left by 0.3.0) blocks all
+GPU server work and preparation. The desktop shows "다른 연결 대상(RunPod)의 끝나지 않은 작업 잠금이 남아 있어 GPU 서버를 사용할 수 없습니다. …".
+Remedy: first try 재연결 · 결과 회수 in 실행 관리. If the original process and Pod are confirmed stopped and reconcile cannot
+succeed, release the lock with the CLI against the desktop state folder. `release-lock` refuses unless the job is FAILED,
+CANCELED or COMPLETED and ATTEMPT_ID is the job's current attempt:
+
+```powershell
+uv run factory --state-dir "$env:APPDATA\kr.kbiofoundry.tuningfactory\state" status JOB_ID
+uv run factory --state-dir "$env:APPDATA\kr.kbiofoundry.tuningfactory\state" release-lock JOB_ID ATTEMPT_ID --confirm-execution-stopped
+```
+
+JOB_ID is shown under the task name in the desktop jobs table. The ATTEMPT_ID is not shown there; read the `active_attempt_id`
+field in the `status JOB_ID` output. The state folder is the app data folder (`kr.kbiofoundry.tuningfactory`) plus `state`.
+
 ## Managed paid Pod
 
 Prepare a JSON request matching the official REST API:
@@ -279,7 +296,7 @@ confirm the old attempt ended. Preserve/retrieve the checkpoint directory from /
 Then reconcile the local artifact inventory and use:
 
 ```powershell
-uv run factory release-lock JOB_ID --confirm-execution-stopped
+uv run factory release-lock JOB_ID ATTEMPT_ID --confirm-execution-stopped
 uv run factory resume JOB_ID --checkpoint FULL_PATH_TO_ORIGINAL_JOB_CHECKPOINT
 uv run factory work
 ```

@@ -142,7 +142,7 @@ Public destination settings (address, port, user, host fingerprint, remote work 
 resolved key path and the operator cost) form a destination hash. The plan carries it (it is not displayed), and submission refuses a job
 if the settings changed after the plan. On submission the app freezes an approval receipt from one read-only observation
 of the server: server identity, transport settings, selected GPUs and cost. The receipt is stored next to the job, not in
-the v1 manifest, and holds no credentials. Execution, logs, progress, cancel and result collection use that receipt:
+the v1 manifest, and holds no credentials. Execution, logs, progress and result collection use that receipt (cancel is a local flag and does not consult it):
 a different server, key path, work folder or GPU selection is refused instead of being linked to the old job. Changes to
 the server's other, unselected GPUs or operator cost do not block recovery of an existing attempt.
 Changing a destination setting invalidates earlier previews, plans and approvals.

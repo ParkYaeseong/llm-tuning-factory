@@ -143,9 +143,28 @@ Commits of the SSH GPU server and MLflow work, in order:
   job, `.ppk` keys refused), 20d6f30 (credentials kept off http artifact roots, fail fast before claiming), acaf393 (count only
   policy-compliant GPU selections as configured), 24135cb (OIDC counts as configured only with a secret; run artifact roots checked), de2124f (over-limit plans cannot start,
   `.ppk` trailing-dot check, clearer PREPARING warning), 2f08f67 (tutorial native allowlist and package asset), 65c5183 (tests pin
-  the code revision so concurrent commits cannot break manifests; tighter `run --mock` refusal test).
+  the code revision so concurrent commits cannot break manifests; tighter `run --mock` refusal test), c783878 (finish the SSH
+  server and MLflow doc corrections), 682e84e (flush deferred renders before reading form drafts), 1186832 (explain cross-provider
+  locks; check destinations before resume; refuse the practice dataset at submit; test env isolation; provider-neutral OIDC
+  message and fail-fast), c071985 (drop a stale tutorial plan on exit after destination changes; cost-aware reservation matching
+  and Korean refusal; waiting notice mentions other-provider locks) and the docs commit `docs: record final verification, upgrade
+  notes and lock remedy`.
 
-MLflow rule as of 24135cb ( treat OIDC as configured only with a secret and check run artifact roots): if `MLFLOW_TRACKING_TOKEN`
+Upgrade / user-facing changes:
+- 0.3.0 settings without `provider` are read as RunPod; the first save writes `existing_runpod`. Without `auth_mode` the mode is `oidc`.
+- New refusals when MLflow credentials are present: an http artifact location, an existing experiment's or a run's http artifact
+  root, and CLI `work`/`run --mock` with a non-https tracking URI, including `file:`/`sqlite:`.
+- An OIDC URL without a secret: the app starts and MLflow actions show "OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. 인증값을
+  입력하거나 토큰·OIDC 값을 비우세요(앱에서는 ‘인증 없음’ 선택)."; the CLI checks before claiming, the desktop before submit and execute.
+- Cross-provider quarantine pitfall: a leftover RunPod job lock from 0.3.0 blocks all GPU server work and preparation (the desktop shows
+  the "다른 연결 대상(RunPod)의 끝나지 않은 작업 잠금…" message). Remedy: 재연결 · 결과 회수 first; if the Pod and process are confirmed
+  stopped, `uv run factory --state-dir "$env:APPDATA\kr.kbiofoundry.tuningfactory\state" release-lock JOB_ID ATTEMPT_ID
+  --confirm-execution-stopped` (JOB_ID is in the jobs table; ATTEMPT_ID is `active_attempt_id` in `status JOB_ID`).
+- The SSH username pattern was widened (institution/LDAP names); `.ppk` and pasted private keys are refused.
+- Desktop `submit` refuses the practice dataset ("연습용 데이터(tutorial_sample)로는 실제 학습을 시작할 수 없습니다."); resume checks the
+  job's destination before resetting it; legacy jobs show "RunPod" in 실행 위치.
+
+MLflow rule as of 24135cb (treat OIDC as configured only with a secret and check run artifact roots): if `MLFLOW_TRACKING_TOKEN`
 is set, or both `MLFLOW_OIDC_TOKEN_URL` and `MLFLOW_OIDC_CLIENT_SECRET` are set, the tracking URI must be https (CLI and desktop;
 `work` and `run --mock` check before claiming), an http artifact location (including a run's server-assigned one) is refused, and even local `file:`/
 `sqlite:` URIs are refused with credentials set. No-auth http is allowed.
@@ -181,11 +200,12 @@ receipt hardening), 2f08f67 (native allowlist and package asset), f0f33c3, 7104e
 on-screen popover, first-click fix), 6eebbe9, 32b9eeb (checklist exclusion, ASCII path hint), aacdd0f (package verifier checks the
 tutorial refusal and registration exactly) and the docs commit `docs: guide first-time users through the desktop tutorial`.
 
-Actual verification at HEAD aacdd0f (2026-10-19, Windows): `uv run pytest -q` **743 passed, 1 skipped** in 51.89s;
-`uv run ruff check src tests` passes; `npx playwright test` **72 passed** (1.6m); `npm run build` (tsc + Vite) passes;
-`cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` **12 passed**;
-`uv run python scripts/check_secrets.py` reports only the historical `main.rs` finding (`Checked 582 staged/historical file
-versions; 1 findings.`) and `git grep` for private-key headers finds nothing.
+Final actual verification at HEAD c071985 (2026-10-19, Windows; the later docs commit changes no code): `uv run pytest -q` **752 passed,
+1 skipped** in 59.72s; `uv run ruff check src tests` passes; `npx playwright test` **81 passed** (1.8m); `npm run build` (tsc + Vite)
+passes; `cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` **12 passed**;
+`uv run python scripts/check_secrets.py` reports only the historical `main.rs` finding (`Checked 603 staged/historical file
+versions; 1 findings.`) and `git grep` for private-key headers finds nothing (exit 1). Earlier numbers in this section (743/72 at
+aacdd0f, 743 at 24135cb) are superseded.
 
 Unverified for the tutorial: the real Tauri/WebView2 rendering and layout of the tour, the installed frozen package and
 `verify_desktop_package.py` (Task 11), and any real GPU, server or MLflow. Known minor limits: a deferred render can fire mid-press
