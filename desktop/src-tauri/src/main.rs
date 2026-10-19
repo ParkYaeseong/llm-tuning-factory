@@ -15,7 +15,9 @@ const FIELDS: [&str; 28] = [
     "provider", "server_ssh_host", "server_ssh_port", "server_ssh_username", "server_ssh_fingerprint",
     "server_remote_root", "server_ssh_key_file", "server_total_hourly_cost_usd", "server_selected_gpu_uuids",
 ];
-const MLFLOW_OIDC: [&str; 3] = ["MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "MLFLOW_OIDC_CLIENT_SECRET"];
+// OIDC values first, then the issued token: token mode withholds the first three, "none" all four.
+const MLFLOW_CREDENTIALS: [&str; 4] = ["MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "MLFLOW_OIDC_CLIENT_SECRET",
+    "MLFLOW_TRACKING_TOKEN"];
 struct SaveLock(Mutex<()>);
 
 fn app_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -51,14 +53,16 @@ fn read_settings(root: &PathBuf, secrets: bool) -> Result<Value, String> {
     Ok(value)
 }
 
-/// Only the chosen MLflow method's values reach the sidecar. Saved credentials stay in the vault,
-/// so their `*_saved` flags remain and switching back reuses them.
+/// Only the chosen MLflow method's values reach the sidecar (`secrets`). The public view used by the form
+/// keeps every field and the vault keeps every credential, so switching the method back reuses them.
 fn filter_mlflow_auth(settings: &mut Map<String, Value>, secrets: bool) {
-    match settings.get("auth_mode").and_then(Value::as_str).unwrap_or("") {
-        "token" => for name in MLFLOW_OIDC { settings.remove(name); },
-        "none" => for name in MLFLOW_OIDC.iter().chain(["MLFLOW_TRACKING_TOKEN"].iter()) { settings.remove(*name); },
-        _ => if secrets { settings.remove("MLFLOW_TRACKING_TOKEN"); },
-    }
+    if !secrets { return; }
+    let withheld: &[&str] = match settings.get("auth_mode").and_then(Value::as_str).unwrap_or("") {
+        "token" => &MLFLOW_CREDENTIALS[..3],
+        "none" => &MLFLOW_CREDENTIALS,
+        _ => &MLFLOW_CREDENTIALS[3..],
+    };
+    for name in withheld { settings.remove(*name); }
 }
 
 #[tauri::command]
@@ -89,9 +93,14 @@ fn merge_public_settings(existing: Value, input: &Map<String, Value>) -> Result<
         return Err("MLflow 인증 방식은 기관 인증·발급 토큰·인증 없음 중 하나여야 합니다.".into());
     }
     let selection = text("server_selected_gpu_uuids");
-    if !selection.is_empty() && !serde_json::from_str::<Value>(selection).ok().and_then(|value| value.as_array().cloned())
-        .is_some_and(|items| items.len() <= 8 && items.iter().all(Value::is_string)) {
+    let valid_selection = selection.is_empty() || matches!(serde_json::from_str::<Value>(selection),
+        Ok(Value::Array(items)) if items.len() <= 8 && items.iter().all(Value::is_string));
+    if !valid_selection {
         return Err("선택한 GPU 목록은 GPU UUID 문자열 최대 8개의 JSON 배열이어야 합니다.".into());
+    }
+    // settings.json is plaintext: a pasted key must never be stored where only a path belongs.
+    if ["ssh_key_file", "server_ssh_key_file"].iter().any(|name| text(name).contains("PRIVATE KEY")) {
+        return Err("SSH 개인키 파일에는 키 내용이 아니라 키 파일 경로를 입력하세요.".into());
     }
     if let Some(endpoint) = public.get("S3_ENDPOINT_URL").and_then(Value::as_str) {
         if !endpoint.is_empty() {
@@ -303,34 +312,49 @@ mod tests {
     #[test]
     fn mlflow_auth_mode_controls_which_credentials_reach_the_sidecar() {
         const OIDC: [&str; 3] = ["MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "MLFLOW_OIDC_CLIENT_SECRET"];
-        for secrets in [true, false] {
-            let mut none = mlflow_settings("none");
-            filter_mlflow_auth(&mut none, secrets);
-            for name in OIDC.iter().chain(["MLFLOW_TRACKING_TOKEN"].iter()) { assert!(!none.contains_key(*name), "none kept {name}"); }
-            assert_eq!(none.get("MLFLOW_TRACKING_URI"), Some(&json!("http://127.0.0.1:5000")));
-            // Saved credentials stay in the vault; only the flags remain visible.
-            assert_eq!(none.get("MLFLOW_OIDC_CLIENT_SECRET_saved"), Some(&json!(true)));
-            assert_eq!(none.get("MLFLOW_TRACKING_TOKEN_saved"), Some(&json!(true)));
-            let mut token = mlflow_settings("token");
-            filter_mlflow_auth(&mut token, secrets);
-            for name in OIDC { assert!(!token.contains_key(name), "token kept {name}"); }
-            assert_eq!(token.get("MLFLOW_TRACKING_TOKEN"), Some(&json!("synthetic-token")));
-        }
+        let mut none = mlflow_settings("none");
+        filter_mlflow_auth(&mut none, true);
+        for name in OIDC.iter().chain(["MLFLOW_TRACKING_TOKEN"].iter()) { assert!(!none.contains_key(*name), "none kept {name}"); }
+        assert_eq!(none.get("MLFLOW_TRACKING_URI"), Some(&json!("http://127.0.0.1:5000")));
+        // Saved credentials stay in the vault; only the flags remain visible.
+        assert_eq!(none.get("MLFLOW_OIDC_CLIENT_SECRET_saved"), Some(&json!(true)));
+        assert_eq!(none.get("MLFLOW_TRACKING_TOKEN_saved"), Some(&json!(true)));
+        let mut token = mlflow_settings("token");
+        filter_mlflow_auth(&mut token, true);
+        for name in OIDC { assert!(!token.contains_key(name), "token kept {name}"); }
+        assert_eq!(token.get("MLFLOW_TRACKING_TOKEN"), Some(&json!("synthetic-token")));
         for mode in ["oidc", ""] {
             let mut sidecar = mlflow_settings(mode);
             filter_mlflow_auth(&mut sidecar, true);
             assert!(!sidecar.contains_key("MLFLOW_TRACKING_TOKEN"));
             assert_eq!(sidecar.get("MLFLOW_OIDC_CLIENT_SECRET"), Some(&json!("synthetic-secret")));
             assert_eq!(sidecar.get("MLFLOW_OIDC_TOKEN_URL"), Some(&json!("https://sso.example/token")));
-            let mut public = mlflow_settings(mode);
-            filter_mlflow_auth(&mut public, false);
-            assert_eq!(public, mlflow_settings(mode));
         }
         let mut legacy = mlflow_settings("oidc");
         legacy.remove("auth_mode");
         filter_mlflow_auth(&mut legacy, true);
         assert!(!legacy.contains_key("MLFLOW_TRACKING_TOKEN"));
         assert!(legacy.contains_key("MLFLOW_OIDC_CLIENT_SECRET"));
+    }
+    #[test]
+    fn public_settings_keep_every_mlflow_field_so_switching_back_reuses_them() {
+        // settings_get/settings_save feed the form; dropping the OIDC URL or client ID there would let a
+        // none → oidc round trip overwrite the saved values with the form defaults.
+        for mode in ["", "oidc", "token", "none"] {
+            let mut public = mlflow_settings(mode);
+            filter_mlflow_auth(&mut public, false);
+            assert_eq!(public, mlflow_settings(mode), "public view changed for {mode:?}");
+        }
+    }
+    #[test]
+    fn key_file_settings_refuse_pasted_private_keys() {
+        for name in ["ssh_key_file", "server_ssh_key_file"] {
+            for pasted in ["-----BEGIN OPENSSH PRIVATE KEY----\nb3BlbnNzaC1rZXktdjE=", "-----BEGIN RSA PRIVATE KEY----"] {
+                let error = merge(json!({name: pasted})).expect_err("a pasted private key was accepted");
+                assert!(error.contains("파일 경로"), "{error}");
+            }
+            assert!(merge(json!({name: "C:\\Users\\researcher\\.ssh\\id_ed25519"})).is_ok());
+        }
     }
     #[test]
     fn server_sidecar_actions_are_named_operations() {

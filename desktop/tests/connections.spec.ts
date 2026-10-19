@@ -28,19 +28,20 @@ const facts = (count: number, total: number) => {
     observed_at: "2026-10-19T01:02:03+00:00" };
 };
 
-async function open(page: Page, settings: Record<string, string> = {}) {
+async function open(page: Page, settings: Record<string, unknown> = {}) {
   await page.addInitScript(({ config, settings, inspection, secrets }) => {
     const calls: any[] = [];
     const saved = sessionStorage.getItem("mock-settings");
     const stored: Record<string, any> = saved ? JSON.parse(saved) : { ...settings };
     const mock: any = (window as any).__mock = { inspection, facts: null, connection: {}, jobs: [], reservations: [],
-      prepareError: "", destination: { destination_sha256: "d".repeat(64), destination_issue: null } };
+      prepareError: "", gate: null, destination: { destination_sha256: "d".repeat(64), destination_issue: null } };
     (window as any).__testCalls = calls;
     (window as any).__TAURI_INTERNALS__ = { invoke: async (command: string, args: any) => {
       calls.push({ command, args: args === undefined ? undefined : structuredClone(args) });
       if (command === "settings_get") return { ...stored };
       if (command === "settings_save") {
-        // Native contract: credentials go to the vault and only *_saved flags come back.
+        // Native contract: credentials go to the vault and only *_saved flags come back. Public MLflow
+        // fields (OIDC URL, client ID) stay in the public view for every auth mode.
         for (const [key, value] of Object.entries(args.values)) {
           if (secrets.includes(key)) { if (value) stored[key + "_saved"] = true; }
           else stored[key] = value;
@@ -63,7 +64,7 @@ async function open(page: Page, settings: Record<string, string> = {}) {
         note: "계획만 확인했습니다.", ...(stored.provider === "ssh_server" ? mock.destination : {}) };
       if (action === "submit") return { id: "c".repeat(32), status: "QUEUED", attempts: 0, manifest: { config: data.config, simulation: false } };
       if (action === "execute") return null;
-      if (action === "runtime_prepare") { if (mock.prepareError) throw mock.prepareError; return { prepared: true }; }
+      if (action === "runtime_prepare") { if (mock.gate) await mock.gate; if (mock.prepareError) throw mock.prepareError; return { prepared: true }; }
       if (action === "runtime_reservations") return structuredClone(mock.reservations);
       if (action === "runtime_release") { mock.reservations = mock.reservations.filter((r: any) => r.reservation_id !== data.reservation_id); return { released: data.reservation_id }; }
       return {};
@@ -79,7 +80,7 @@ const connectionsPage = (page: Page) => page.locator('nav [data-action="nav:conn
 const trainingPage = (page: Page) => page.locator('nav [data-action="nav:training"]').click();
 
 test("provider switch shows server fields and save/reopen persists them without secrets", async ({ page }) => {
-  await open(page, { pod_id: "assigned-pod", RUNPOD_API_KEY_saved: "true" });
+  await open(page, { pod_id: "assigned-pod", RUNPOD_API_KEY_saved: true });
   await connectionsPage(page);
   await expect(page.getByLabel("RunPod API 키", { exact: true })).toBeVisible();
   await expect(page.getByLabel("서버 주소", { exact: true })).toHaveCount(0);
@@ -92,6 +93,7 @@ test("provider switch shows server fields and save/reopen persists them without 
   // Runtime actions use saved settings, so they wait for the provider switch to be saved.
   await expect(page.getByRole("button", { name: "GPU 목록 조회", exact: true })).toBeDisabled();
   await expect(page.getByText("바꾼 연결 대상을 저장한 뒤 사용할 수 있습니다.", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "연결 검사", exact: true })).toBeDisabled();
   await page.getByLabel("서버 주소", { exact: true }).fill("gpu.example.org");
   await page.getByLabel("SSH 포트", { exact: true }).fill("2222");
   await page.getByLabel("접속 계정", { exact: true }).fill("researcher");
@@ -104,6 +106,7 @@ test("provider switch shows server fields and save/reopen persists them without 
   await page.getByRole("button", { name: "연결 정보 저장", exact: true }).click();
   await expect(page.locator(".notice")).toContainText("연결 정보를 저장했습니다.");
   await expect(page.getByRole("button", { name: "GPU 목록 조회", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "연결 검사", exact: true })).toBeEnabled();
   const values = (await saves(page)).at(-1);
   expect(values).toMatchObject({ provider: "ssh_server", server_ssh_host: "gpu.example.org", server_ssh_port: "2222",
     server_ssh_username: "researcher", server_ssh_key_file: "C:\\keys\\picked_ed25519", server_ssh_fingerprint: FINGERPRINT,
@@ -199,6 +202,10 @@ test("GPU inventory selection saves a JSON string and server facts fill exact tr
   await page.getByRole("button", { name: "GPU 선택 저장", exact: true }).click();
   expect((await saves(page)).at(-1)).toEqual({ server_selected_gpu_uuids: JSON.stringify([GPU_A, GPU_B]) });
   await expect(page.locator(".notice")).toContainText("GPU 2개");
+  // A new selection on the same server keeps the inventory instead of forcing another SSH inspection.
+  await expect(runtime.locator("tbody tr")).toHaveCount(2);
+  await expect(page.getByLabel(`${GPU_B} 학습에 사용`, { exact: true })).toBeChecked();
+  expect(await calls(page, "server_inspect")).toHaveLength(1);
 
   // 0.11 / 5 rounds below 0.11 when multiplied back; the per-GPU price must never undercut the server total.
   await page.evaluate(f => (window as any).__mock.facts = f, facts(5, 0.11));
@@ -404,4 +411,187 @@ test("saved server settings drive the overview and job destination labels", asyn
 test("incomplete server settings leave the setup step open", async ({ page }) => {
   await open(page, { ...server, server_selected_gpu_uuids: "[]" });
   await expect(page.locator(".setup-row", { hasText: "연결 정보 설정" }).locator(".setup-check.done")).toHaveCount(0);
+});
+
+test("an unauthenticated round trip keeps the saved OIDC address and client ID", async ({ page }) => {
+  await open(page, { auth_mode: "oidc", MLFLOW_OIDC_TOKEN_URL: "https://sso.custom.example/token", MLFLOW_OIDC_CLIENT_ID: "custom-client",
+    MLFLOW_OIDC_CLIENT_SECRET_saved: true });
+  await connectionsPage(page);
+  await expect(page.getByLabel("인증 서버 주소", { exact: true })).toHaveValue("https://sso.custom.example/token");
+  await page.getByLabel("인증 방식", { exact: true }).selectOption("none");
+  await page.getByRole("button", { name: "연결 정보 저장", exact: true }).click();
+  await page.reload();
+  await expect(page.getByText("작업 공간 불러오는 중")).toHaveCount(0);
+  await connectionsPage(page);
+  await page.getByLabel("인증 방식", { exact: true }).selectOption("oidc");
+  await expect(page.getByLabel("인증 서버 주소", { exact: true })).toHaveValue("https://sso.custom.example/token");
+  await expect(page.getByLabel("클라이언트 ID", { exact: true })).toHaveValue("custom-client");
+  await expect(page.getByText("보안 저장됨", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "연결 정보 저장", exact: true }).click();
+  expect((await saves(page)).at(-1)).toMatchObject({ auth_mode: "oidc", MLFLOW_OIDC_TOKEN_URL: "https://sso.custom.example/token",
+    MLFLOW_OIDC_CLIENT_ID: "custom-client", MLFLOW_OIDC_CLIENT_SECRET: "" });
+});
+
+const route = { ssh_host: "gpu.example.org", ssh_port: 2222, ssh_username: "researcher", remote_root: "/home/researcher/factory", selected_gpu_uuids: [GPU_A] };
+const SERVER_BOUND_JOB = "이 작업은 GPU 서버용으로 승인되었습니다. 연결 대상을 그 GPU 서버로 바꾼 뒤 실행하세요.";
+const UNBOUND_SERVER_JOB = "GPU 서버용 승인 기록이 없는 작업입니다. GPU 서버 연결에서 실행 계획을 다시 확인하고 제출하세요.";
+const UNREADABLE_RECEIPT = "GPU 서버 승인 기록을 읽을 수 없습니다. 작업을 다시 계획·제출하세요.";
+async function selectJob(page: Page, destination: unknown) {
+  await page.evaluate(({ config, destination }) => (window as any).__mock.jobs = [{ id: "4".repeat(32), status: "QUEUED", attempts: 0,
+    manifest: { config, simulation: false }, server_destination: destination }], { config, destination });
+  await page.locator('nav [data-action="nav:jobs"]').click();
+  await page.getByRole("button", { name: "새로고침", exact: true }).click();
+  await page.getByRole("button", { name: "선택", exact: true }).click();
+  await expect(page.getByRole("button", { name: "체크포인트에서 재개", exact: true })).toBeEnabled();
+}
+async function expectRefused(page: Page, message: string) {
+  for (const name of ["대기 작업 실행", "체크포인트에서 재개"]) {
+    await page.getByRole("button", { name, exact: true }).click();
+    await expect(page.getByRole("alert")).toHaveText(message);
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+  }
+  expect(await calls(page, "execute")).toEqual([]);
+  expect(await calls(page, "resume")).toEqual([]);
+}
+
+test("RunPod connection refuses server-bound or unreadable jobs before approval", async ({ page }) => {
+  await open(page, { pod_id: "assigned-pod" });
+  await selectJob(page, route);
+  await expectRefused(page, SERVER_BOUND_JOB);
+  await selectJob(page, { invalid: true });
+  await expectRefused(page, UNREADABLE_RECEIPT);
+  await selectJob(page, null);
+  await page.getByRole("button", { name: "대기 작업 실행", exact: true }).click();
+  await expect(page.getByRole("dialog")).toContainText("RunPod로 전송하고 실제 학습을 실행합니다.");
+  await page.getByRole("button", { name: "돌아가기", exact: true }).click();
+  expect(await calls(page, "execute")).toEqual([]);
+});
+
+test("server connection approves only jobs bound to the saved server and names the job destination", async ({ page }) => {
+  await open(page, server);
+  await selectJob(page, null);
+  await expectRefused(page, UNBOUND_SERVER_JOB);
+  await selectJob(page, { invalid: true });
+  await expectRefused(page, UNREADABLE_RECEIPT);
+  await selectJob(page, { ...route, ssh_host: "other.example.org" });
+  await expectRefused(page, SERVER_BOUND_JOB);
+  await selectJob(page, route);
+  await page.getByRole("button", { name: "체크포인트에서 재개", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("선택한 GPU 서버(researcher@gpu.example.org)로 학습·검증 데이터를 전송");
+  await expect(dialog).toContainText("/home/researcher/factory");
+  await page.getByRole("button", { name: "돌아가기", exact: true }).click();
+  expect(await calls(page, "resume")).toEqual([]);
+});
+
+test("saving an unchanged GPU selection keeps the plan and says nothing changed", async ({ page }) => {
+  await open(page, server);
+  await trainingPage(page);
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  await connectionsPage(page);
+  await page.getByRole("button", { name: "GPU 목록 조회", exact: true }).click();
+  await page.getByRole("button", { name: "GPU 선택 저장", exact: true }).click();
+  await expect(page.locator(".notice")).toHaveText("GPU 선택이 바뀌지 않았습니다.");
+  await trainingPage(page);
+  await expect(page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" })).toBeEnabled();
+});
+
+test("environment preparation refuses unsaved GPU checkboxes and saved GPUs missing from the server", async ({ page }) => {
+  await open(page, server);
+  await connectionsPage(page);
+  await page.getByRole("button", { name: "GPU 목록 조회", exact: true }).click();
+  await page.getByLabel(`${GPU_B} 학습에 사용`, { exact: true }).check();
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await expect(page.getByRole("alert")).toHaveText("GPU 선택을 먼저 저장하세요.");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calls(page, "server_inspect")).toHaveLength(1);
+  await expect(page.getByLabel(`${GPU_B} 학습에 사용`, { exact: true })).toBeChecked();
+
+  const GPU_GONE = "GPU-77777777-2222-3333-4444-555555555555";
+  await page.getByLabel(`${GPU_B} 학습에 사용`, { exact: true }).uncheck();
+  await page.evaluate(gone => (window as any).__mock.inspection.transport.selected_gpu_uuids.push(gone), GPU_GONE);
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("이번 조회에 없는 GPU");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calls(page, "runtime_prepare")).toEqual([]);
+});
+
+test("reservations made with other server settings cannot be released here", async ({ page }) => {
+  await open(page, server);
+  await page.evaluate(() => {
+    const transport = { ...(window as any).__mock.inspection.transport, ssh_host: "other.example.org" };
+    (window as any).__mock.reservations = [{ reservation_id: "a".repeat(32), resource_id: "ssh_server:" + "9".repeat(64), status: "UNCERTAIN",
+      created: 1791960000, profile: { transport }, facts: {} }];
+  });
+  await connectionsPage(page);
+  await page.getByRole("button", { name: "준비 예약 확인", exact: true }).click();
+  await expect(page.getByRole("button", { name: "원격 준비 종료 확인 · 예약 해제", exact: true })).toBeDisabled();
+  await expect(page.getByText("다른 서버 설정으로 만든 예약입니다. 그 서버 설정으로 바꾼 뒤 해제하세요.", { exact: true })).toBeVisible();
+  expect(await calls(page, "runtime_release")).toEqual([]);
+});
+
+test("connection controls are locked while a server preparation runs", async ({ page }) => {
+  await open(page, server);
+  await page.evaluate(() => { const mock = (window as any).__mock; mock.gate = new Promise(resolve => mock.open = resolve); });
+  await connectionsPage(page);
+  await page.getByRole("button", { name: "GPU 목록 조회", exact: true }).click();
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice.busy")).toBeVisible();
+  for (const label of ["서버 주소", "연결 대상", "인증 방식", "S3 Region", "HF 읽기 토큰", `${GPU_A} 학습에 사용`])
+    await expect(page.getByLabel(label, { exact: true }), label).toBeDisabled();
+  await page.evaluate(() => (window as any).__mock.open());
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+  for (const label of ["서버 주소", "연결 대상", "S3 Region", `${GPU_A} 학습에 사용`])
+    await expect(page.getByLabel(label, { exact: true }), label).toBeEnabled();
+});
+
+test("a destination change clears the inspection, reservations and connection report", async ({ page }) => {
+  await open(page, server);
+  await page.evaluate(inspection => {
+    const mock = (window as any).__mock;
+    mock.connection = { ssh_server: inspection, gpu_training_verified: false };
+    mock.reservations = [{ reservation_id: "b".repeat(32), resource_id: "ssh_server:" + "f".repeat(64), status: "PREPARING", created: 1791960100,
+      profile: { transport: inspection.transport }, facts: {} }];
+  }, inspection);
+  await connectionsPage(page);
+  const runtime = page.locator('[data-tour="connection-runtime"]');
+  await page.getByRole("button", { name: "GPU 목록 조회", exact: true }).click();
+  await page.getByRole("button", { name: "준비 예약 확인", exact: true }).click();
+  await page.getByRole("button", { name: "연결 검사", exact: true }).click();
+  await expect(runtime.locator("table")).toHaveCount(2);
+  await expect(page.getByRole("heading", { name: "연결 검사 결과" })).toBeVisible();
+  await page.getByLabel("작업 폴더 · 절대 경로", { exact: true }).fill("/home/researcher/factory-2");
+  await page.getByRole("button", { name: "연결 정보 저장", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("연결 정보를 저장했습니다.");
+  await expect(runtime.locator("table")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "환경 준비 예약" })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "연결 검사 결과" })).toHaveCount(0);
+});
+
+test("the server connection module refuses invalid prices and escapes rendered values", async ({ page }) => {
+  await open(page);
+  await page.addScriptTag({ type: "module", content: 'import * as m from "/src/server-connection.ts"; window.__serverConnection = m;' });
+  await page.waitForFunction(() => (window as any).__serverConnection);
+  const result = await page.evaluate(() => {
+    const m = (window as any).__serverConnection;
+    const price = (total: number, count: number) => { try { return m.perGpuHourlyCost(total, count); } catch { return "refused"; } };
+    const name = "<script>alert(1)</script>";
+    const transport = { ssh_host: "<b>h</b>", ssh_port: 22, ssh_username: "u", selected_gpu_uuids: [] };
+    const inspection = { transport, observed_at: "2026-10-19T00:00:00Z", total_hourly_cost_usd: 0,
+      inventory: [{ uuid: '"><img src=x>', name, memory_mib: 1024 }] };
+    return {
+      refused: [[-1, 1], [NaN, 1], [Infinity, 1], [1, 0], [1, 1.5], [1, -2], [1, NaN]].map(([t, c]) => price(t, c)),
+      accepted: [price(0, 1), price(0.11, 5) * 5 >= 0.11, price(4, 2)],
+      resources: m.resourcesFromFacts({ gpu_type: "A100", gpu_count: 3, total_hourly_cost_usd: 0.21 }),
+      html: m.inventoryTable(inspection, [], []) + m.connectionResult({ ssh_server: inspection, mlflow_read: true, mlflow_auth: name })
+        + m.reservationTable([{ reservation_id: name, status: "UNCERTAIN", created: 1, profile: { transport } }], {}, false),
+    };
+  });
+  expect(result.refused).toEqual(Array(7).fill("refused"));
+  expect(result.accepted).toEqual([0, true, 2]);
+  expect(result.resources.gpu_type).toBe("A100"); expect(result.resources.gpu_count).toBe(3);
+  expect(result.resources.hourly_cost_usd * 3).toBeGreaterThanOrEqual(0.21);
+  expect(result.html).not.toContain("<script>"); expect(result.html).not.toContain("<img"); expect(result.html).not.toContain("<b>");
+  expect(result.html).toContain("&lt;script&gt;");
 });

@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { version } from "../package.json";
-import { destinationSettings, filterRuns, formatDate, gibibytes, gpuSummary, icon, isServer, jobDestination, mlflowStatus, perGpuHourlyCost,
-  progressView, selectedGpus, serverAddress, serverConfigured, shortUuid, sshAddress } from "./workbench";
+import { button, filterRuns, formatDate, icon, progressView } from "./workbench";
+import { connectionResult, destinationChange, inventoryTable, isServer, jobDestination, jobDestinationIssue, prepareApproval, prepareIssue,
+  releaseApproval, reservationMatches, reservationTable, resourcesFromFacts, sameSelection, selectedGpus, serverAddress, serverBridge,
+  serverConfigured, settingsRoute, shortIdentifier, transferApproval } from "./server-connection";
 import "./style.css";
 
 type Obj = Record<string, any>;
@@ -31,7 +33,6 @@ const num = (v: unknown) => typeof v === "number" ? v.toLocaleString("ko-KR", { 
 const statusName: Obj = { QUEUED: "대기", PENDING: "준비", PROVISIONING: "전송 준비", RUNNING: "학습 중",
   EVALUATING: "평가 중", COMPLETED: "완료", FINISHED: "완료", FAILED: "실패", CANCELED: "취소", KILLED: "취소" };
 function badge(status: string) { return `<span class="badge ${/COMPLETED|FINISHED/.test(status) ? "green" : /FAILED/.test(status) ? "red" : ""}">${esc(statusName[status] || status)}</span>`; }
-const button = (label: string, action: string, cls = "") => `<button type="button" class="${cls}" data-action="${action}">${label}</button>`;
 const descriptions: Obj = {
   overview: "최근 실행과 다음 작업을 한곳에서 확인하세요.",
   connections: "학습에 사용할 GPU와 공용 기록 저장소를 연결합니다.",
@@ -50,6 +51,7 @@ function select(label: string, key: string, value: string, options: [string, str
 async function api(action: string, data: Obj = {}) {
   return invoke<any>("factory_action", { action, data });
 }
+const gpuServer = serverBridge(api);
 async function task(label: string, operation: () => Promise<void>) {
   captureDrafts();
   state.error = ""; state.notice = ""; state.busy = label; render();
@@ -278,6 +280,8 @@ function overview() {
 function connections() {
   const s = { ...defaults, ...state.settings, ...(state.settingsDraft || {}) };
   const server = isServer(s), auth = s.auth_mode || "oidc";
+  // Remote checks use saved settings; an unsaved provider switch would target the other destination.
+  const pending = server !== isServer(state.settings);
   const operator = field("기록에 표시할 이름", "FACTORY_OPERATOR", s.FACTORY_OPERATOR);
   const runpod = `<section class="card" data-tour="connection-fields"><div class="section-title"><h3>RunPod 연결</h3><span class="badge">기존 Pod 사용</span></div><div class="grid">
   ${field("RunPod API 키", "RUNPOD_API_KEY", s.RUNPOD_API_KEY || "", "password", s.RUNPOD_API_KEY_saved ? "보안 저장됨 · 변경할 때만 입력" : "API 키는 Windows 자격 증명 저장소에 보관합니다.")}
@@ -311,41 +315,28 @@ function connections() {
   ${field("클라이언트 인증값", "MLFLOW_OIDC_CLIENT_SECRET", s.MLFLOW_OIDC_CLIENT_SECRET || "", "password", s.MLFLOW_OIDC_CLIENT_SECRET_saved ? "보안 저장됨" : "관리자에게 별도로 전달받으세요.")}` : ""}
   ${auth === "token" ? field("별도 발급 토큰", "MLFLOW_TRACKING_TOKEN", s.MLFLOW_TRACKING_TOKEN || "", "password", s.MLFLOW_TRACKING_TOKEN_saved ? "보안 저장됨" : "관리자에게 발급받은 토큰을 입력하세요.") : ""}
   </div>${auth === "none" ? '<p class="warning-text">인증 없음은 MLflow 서버에 접근할 수 있는 누구나 실행 기록을 볼 수 있습니다. 신뢰할 수 있는 로컬·내부망에서만 사용하세요. 저장된 인증값은 지우지 않으며 사용하지도 않습니다.</p>' : ""}
-  <div class="actions"><button class="primary" type="submit">연결 정보 저장</button>${button("연결 검사", "check")}${button("저장된 인증값 삭제", "forget", "danger")}</div></section></form>
-  ${runtimeCard(server)}
+  <div class="actions"><button class="primary" type="submit">연결 정보 저장</button>${button("연결 검사", "check", "", pending)}${button("저장된 인증값 삭제", "forget", "danger")}</div></section></form>
+  ${runtimeCard(server, pending)}
   ${s3Connections()}
   <form id="hf-settings-form"><section class="card"><h3>Hugging Face 접근</h3><div class="grid">${field("HF 읽기 토큰", "HF_TOKEN", state.hfDraft?.HF_TOKEN || "", "password", s.HF_TOKEN_saved ? "보안 저장됨 · 변경할 때만 입력" : "공개 모델 검색에는 필요하지 않습니다. 비공개·접근 제한 메타데이터 조회용입니다.")}</div><div class="actions"><button type="submit" class="primary">HF 인증값 저장</button></div><p class="muted">Windows 자격 증명 저장소에 보관합니다. GPU에는 전달하지 않으므로 제한 모델은 GPU의 사전 접근 권한과 캐시가 필요합니다.</p></section></form>
-  ${connectionResult()}`;
+  ${connectionResult(state.connectionReport)}`;
 }
-function connectionResult() {
-  const report = state.connectionReport;
-  if (!report) return "";
-  const t = report.ssh_server?.transport;
-  const rows = [["MLflow 조회", mlflowStatus(report)],
-    t ? ["GPU 서버", `${sshAddress(t.ssh_username, t.ssh_host, t.ssh_port)} · ${gpuSummary(report.ssh_server.inventory || [])}`] : ["Pod 상태", report.runpod?.status || "조회하지 않음"],
-    ["실제 GPU 학습", report.gpu_training_verified === true ? "확인됨" : "아직 확인하지 않음 · 조회만 확인"]];
-  return `<section class="card"><h3>연결 검사 결과</h3><dl class="connection-list">${rows.map(([name, value]) => `<div><dt>${name}</dt><dd title="${esc(value)}">${esc(value)}</dd></div>`).join("")}</dl></section>`;
-}
-function runtimeCard(server: boolean) {
-  // Runtime actions use saved settings; an unsaved provider switch would target the other destination.
-  const pending = server !== isServer(state.settings);
-  const action = (label: string, name: string, cls = "", disabled = false) => button(label, name, cls).replace("<button ", pending || disabled ? "<button disabled " : "<button ");
+function runtimeCard(server: boolean, pending: boolean) {
+  const runtimeButton = (label: string, name: string, cls = "", disabled = false) => button(label, name, cls, pending || disabled);
   const note = pending ? '<p class="warning-text">바꾼 연결 대상을 저장한 뒤 사용할 수 있습니다.</p>' : "";
-  if (!server) return `<section class="card" data-tour="connection-runtime"><h3>GPU 학습 환경</h3><p>선택한 학습 단계에 맞는 학습 엔진을 Pod의 별도 폴더에 설치합니다. PPO는 별도 환경을 사용합니다. 첫 준비는 다운로드 용량에 따라 시간이 걸립니다.</p>${note}
-  <div class="actions">${action("환경 확인", "runtime_check")}${action("학습 환경 준비", "runtime_prepare", "primary")}${action("GPU 정보 → 학습 설정에 적용", "apply-pod")}</div></section>`;
+  if (!server) return `<section class="card" data-tour="connection-runtime"><h3>GPU 학습 환경</h3>
+  <p>선택한 학습 단계에 맞는 학습 엔진을 Pod의 별도 폴더에 설치합니다. PPO는 별도 환경을 사용합니다. 첫 준비는 다운로드 용량에 따라 시간이 걸립니다.</p>${note}
+  <div class="actions">${runtimeButton("환경 확인", "runtime_check")}${runtimeButton("학습 환경 준비", "runtime_prepare", "primary")}${runtimeButton("GPU 정보 → 학습 설정에 적용", "apply-pod")}</div></section>`;
   const saved = selectedGpus(state.settings), inspection = state.serverInspection;
-  const checked: string[] = state.gpuDraft || saved;
-  const uuid = (value: string) => `<span class="mono" title="${esc(value)}">${esc(shortUuid(value))}</span>`;
-  const missing = inspection ? saved.filter(id => !inspection.inventory.some((gpu: Obj) => gpu.uuid === id)) : [];
-  const t = inspection?.transport;
-  const inventory = inspection ? `<p class="muted">${esc(sshAddress(t.ssh_username, t.ssh_host, t.ssh_port))} · ${esc(gpuSummary(inspection.inventory))} · 조회 ${esc(formatDate(Date.parse(inspection.observed_at) / 1000))} · 시간당 $${num(inspection.total_hourly_cost_usd)} (직접 입력한 비용)</p>
-  ${missing.length ? `<p class="warning-text">저장된 선택 중 ${missing.length}개 GPU가 이번 조회에 없습니다. 선택을 다시 저장하세요.</p>` : ""}
-  <div class="table-scroll"><table><thead><tr><th>사용</th><th>GPU UUID</th><th>이름</th><th>메모리</th></tr></thead><tbody>${inspection.inventory.map((gpu: Obj) => `<tr><td><input type="checkbox" data-gpu="${esc(gpu.uuid)}" aria-label="${esc(gpu.uuid)} 학습에 사용" ${checked.includes(gpu.uuid) ? "checked" : ""}></td><td>${uuid(gpu.uuid)}</td><td>${esc(gpu.name)}</td><td>${esc(gibibytes(gpu.memory_mib))}</td></tr>`).join("")}</tbody></table></div>` : "";
-  const reservations = state.reservations ? (state.reservations.length ? `<h3 class="subheading">환경 준비 예약</h3><p class="muted">‘종료 확인 필요’는 준비 명령이 끝났는지 앱이 확인하지 못한 예약입니다. 원래 서버에서 준비 프로세스가 끝났는지 직접 확인한 뒤 해제하세요.</p>
-  <div class="table-scroll"><table><thead><tr><th>예약</th><th>서버</th><th>상태</th><th>시작 시각</th><th></th></tr></thead><tbody>${state.reservations.map((item: Obj, index: number) => `<tr><td>${uuid(String(item.reservation_id))}</td><td>${esc(sshAddress(item.profile?.transport?.ssh_username, item.profile?.transport?.ssh_host))}</td><td><span class="badge">${item.status === "UNCERTAIN" ? "종료 확인 필요" : "준비 중"}</span></td><td>${formatDate(item.created)}</td><td>${item.status === "UNCERTAIN" ? action("원격 준비 종료 확인 · 예약 해제", "release:" + index, "danger") : ""}</td></tr>`).join("")}</tbody></table></div>` : '<p class="muted">진행 중이거나 확인이 필요한 환경 준비 예약이 없습니다.</p>') : "";
-  return `<section class="card" data-tour="connection-runtime"><h3>GPU 학습 환경</h3><p>저장된 GPU 서버의 작업 폴더 아래 별도 환경에 학습 엔진을 설치합니다. 서버의 기본 Python과 시스템 패키지는 변경하지 않습니다. 학습에 사용할 GPU를 조회해 선택하세요. 첫 준비는 다운로드 용량에 따라 시간이 걸립니다.</p>${note}
-  <p class="muted">저장된 선택 GPU: ${saved.length ? saved.map(uuid).join(", ") : "없음 · GPU 목록을 조회해 선택하세요"}</p>${inventory}
-  <div class="actions">${action("GPU 목록 조회", "server-inspect")}${action("GPU 선택 저장", "server-select", "", !inspection)}${action("환경 확인", "runtime_check")}${action("학습 환경 준비", "runtime_prepare", "primary")}${action("GPU 정보 → 학습 설정에 적용", "apply-pod")}${action("준비 예약 확인", "server-reservations")}</div>${reservations}</section>`;
+  const actions = [runtimeButton("GPU 목록 조회", "server-inspect"), runtimeButton("GPU 선택 저장", "server-select", "", !inspection),
+    runtimeButton("환경 확인", "runtime_check"), runtimeButton("학습 환경 준비", "runtime_prepare", "primary"),
+    runtimeButton("GPU 정보 → 학습 설정에 적용", "apply-pod"), runtimeButton("준비 예약 확인", "server-reservations")];
+  return `<section class="card" data-tour="connection-runtime"><h3>GPU 학습 환경</h3>
+  <p>저장된 GPU 서버의 작업 폴더 아래 별도 환경에 학습 엔진을 설치합니다. 서버의 기본 Python과 시스템 패키지는 변경하지 않습니다. 학습에 사용할 GPU를 조회해 선택하세요. 첫 준비는 다운로드 용량에 따라 시간이 걸립니다.</p>${note}
+  <p class="muted">저장된 선택 GPU: ${saved.length ? saved.map(shortIdentifier).join(", ") : "없음 · GPU 목록을 조회해 선택하세요"}</p>
+  ${inspection ? inventoryTable(inspection, state.gpuDraft || saved, saved) : ""}
+  <div class="actions">${actions.join("")}</div>
+  ${state.reservations ? reservationTable(state.reservations, state.settings, pending) : ""}</section>`;
 }
 function datasets() {
   return `<section class="card"><h3>새 데이터 버전 등록</h3><p>학습 단계에 맞는 JSON·JSONL을 등록합니다. 지시·대화, 텍스트, 선호 쌍, 선호 라벨, 프롬프트를 검사합니다. 등록 시 로컬 사본과 해시를 보존하며, 같은 버전은 덮어쓰지 않습니다.</p>
@@ -401,7 +392,7 @@ function training() {
   ${state.plan ? `<section class="card plan"><h3>실행 전 확인</h3><div class="stats"><article><small>업무 AI</small><b>${esc(state.plan.manifest.config.ai_id)}</b></article><article><small>학습 데이터</small><b>${esc(state.plan.manifest.dataset.dataset_id)} · ${num(state.plan.manifest.dataset.rows)}건</b></article><article><small>최대 시간 기준 예상 GPU 비용</small><b>$${num(state.plan.estimated_cost_usd)}</b></article></div>
   <p>${esc(state.plan.note)}</p><p class="muted">${isServer(state.settings) ? `GPU 서버: ${esc(serverAddress(state.settings))} · 선택 GPU ${selectedGpus(state.settings).length}개` : `Pod: ${esc(state.settings.pod_id || "미설정")}`} · GPU: ${esc(state.plan.manifest.config.resource_profile.gpu_type)}</p>
   ${planBlocked() ? `<p class="warning-text">${esc(state.plan.destination_issue || "GPU 서버 연결 설정을 확인하고 실행 계획을 다시 확인하세요.")}</p>` : ""}
-  ${button("데이터 전송에 동의하고 학습 시작", "start", "primary").replace("<button ", planBlocked() ? "<button disabled " : "<button ")}
+  ${button("데이터 전송에 동의하고 학습 시작", "start", "primary", planBlocked())}
   <details><summary>확정된 설정 보기</summary><pre>${esc(JSON.stringify(state.plan.manifest.config, null, 2))}</pre></details></section>` : ""}`;
 }
 // The offline plan reports no destination hash when the saved server settings cannot be approved.
@@ -451,12 +442,15 @@ function render() {
 async function refresh() { state.jobs = await api("jobs"); }
 async function catalog() { state.catalog = await api("catalog"); }
 async function saveSettings(values: Obj) {
-  const before = destinationSettings(state.settings);
+  const before = state.settings;
   state.settings = await invoke("settings_save", { values });
-  if (destinationSettings(state.settings) === before) return;
-  // Plans, inspections, reservations and reports made for the previous destination must not be reused.
-  state.runtimeReport = null; state.serverInspection = null; state.gpuDraft = null; state.reservations = null; state.connectionReport = null;
-  invalidatePlan();
+  const change = destinationChange(before, state.settings);
+  if (change === "none") return change;
+  // A plan or runtime report made for the previous destination or GPU selection must not be reused.
+  state.runtimeReport = null; state.gpuDraft = null; invalidatePlan();
+  // The observed inventory stays valid for a new selection on the same server; other destination data does not.
+  if (change === "destination") { state.serverInspection = null; state.reservations = null; state.connectionReport = null; }
+  return change;
 }
 async function readHistory(append = false) {
   const result = await api("history", { experiment_id: state.experiment, page_token: append ? state.nextToken : null });
@@ -491,7 +485,12 @@ function bind() {
     e.preventDefault(); const values = settingsFromForm(e.currentTarget as HTMLFormElement);
     void task("HF 인증값 저장 중", async () => { state.settings = await invoke("settings_save", {values}); state.hfDraft = null; state.notice = "HF 인증값을 보안 저장했습니다."; });
   });
-  if (state.busy) document.querySelectorAll<HTMLButtonElement>("button[data-action]:not([data-action^='nav:']), button[type='submit']").forEach(el => el.disabled = true);
+  if (state.busy) {
+    document.querySelectorAll<HTMLButtonElement>("button[data-action]:not([data-action^='nav:']), button[type='submit']").forEach(el => el.disabled = true);
+    // A task's final re-render would drop typing, so connection inputs stay locked until it finishes.
+    document.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(":is(#settings-form, #s3-settings-form, #hf-settings-form) "
+      + ":is(input, select, textarea), [data-gpu]").forEach(el => el.disabled = true);
+  }
   document.querySelectorAll<HTMLButtonElement>("[data-action]").forEach(el => el.addEventListener("click", () => void action(el.dataset.action!)));
   document.querySelector<HTMLFormElement>("#settings-form")?.addEventListener("submit", e => {
     e.preventDefault(); const values = settingsFromForm(e.currentTarget as HTMLFormElement);
@@ -572,43 +571,37 @@ function bind() {
     state.comparison = null; render();
   }));
 }
-function transferApproval(name: string) {
-  if (!isServer(state.settings)) return "선택한 작업의 학습·검증 데이터를 RunPod로 전송하고 실제 학습을 실행합니다. 실행 기록과 산출물은 공용 MLflow에 저장됩니다. 기존 Pod는 작업이 끝나도 자동 종료되지 않습니다.";
-  const job = name === "start" ? null : state.jobs.find((j: Obj) => j.id === state.active);
-  const d = job?.server_destination?.ssh_host ? job.server_destination : null;
-  const account = d ? sshAddress(d.ssh_username, d.ssh_host) : serverAddress(state.settings, false);
-  return `선택한 GPU 서버(${account})로 학습·검증 데이터를 전송하고 실제 학습을 실행합니다. 작업 파일은 서버 작업 폴더(${d ? d.remote_root : state.settings.server_remote_root}) 아래에 만들어지고 실행 기록과 산출물은 공용 MLflow에 저장됩니다. 앱은 서버를 켜거나 끄지 않습니다.`;
-}
 async function prepareServer() {
+  captureDrafts();
+  if (state.gpuDraft && !sameSelection(state.gpuDraft, selectedGpus(state.settings))) { state.error = "GPU 선택을 먼저 저장하세요."; render(); return; }
   const stage = state.config?.training_stage || "sft";
   let inspection = null as Obj | null;
   await task("GPU 서버 조회 중", async () => {
-    const result = await api("server_inspect");
+    const result = await gpuServer.serverInspect();
     state.serverInspection = result; state.gpuDraft = null;
-    if (!result.transport.selected_gpu_uuids.length) throw new Error("학습에 사용할 GPU를 조회·선택하고 저장한 뒤 환경을 준비하세요.");
+    const issue = prepareIssue(result);
+    if (issue) throw new Error(issue);
     inspection = result;
   });
   if (!inspection) return;
-  const t = inspection.transport, names = new Map(inspection.inventory.map((gpu: Obj) => [gpu.uuid, gpu.name]));
-  const gpus = t.selected_gpu_uuids.map((uuid: string) => `${names.get(uuid) || "조회되지 않은 GPU"} (${uuid})`).join(", ");
-  if (!await approve("GPU 서버 학습 환경 준비", `${sshAddress(t.ssh_username, t.ssh_host, t.ssh_port)}의 작업 폴더 ${t.remote_root} 아래에 ${stage} 학습용 앱 전용 환경을 설치합니다. 의존성·Python·학습 도구는 이 폴더로 다운로드하며 서버의 기본 Python과 시스템 패키지는 변경하지 않습니다.\n선택 GPU: ${gpus}\n사용자 데이터는 전송하지 않습니다. 앱은 서버를 켜거나 끄지 않습니다.`)) return;
+  const approved = inspection;
+  if (!await approve("GPU 서버 학습 환경 준비", prepareApproval(approved, stage))) return;
   await task("GPU 환경 준비 중 · 첫 설치는 수 분 이상 걸릴 수 있습니다", async () => {
-    try { state.runtimeReport = await api("runtime_prepare", { approved: true, inspection, training_stage: stage }); }
+    try { state.runtimeReport = await gpuServer.runtimePrepare(approved, stage); }
     catch (error) {
       // An interrupted preparation can keep an uncertain reservation; show it beside the error.
-      state.reservations = await api("runtime_reservations").catch(() => state.reservations);
+      state.reservations = await gpuServer.runtimeReservations().catch(() => state.reservations);
       throw error;
     }
     state.notice = "GPU 서버 작업 폴더에 학습 환경을 준비하고 CUDA를 확인했습니다.";
   });
 }
 async function releaseReservation(reservation: Obj | undefined) {
-  if (!reservation) return;
-  const t = reservation.profile?.transport || {};
-  if (!await approve("환경 준비 예약 해제", `원래 GPU 서버(${sshAddress(t.ssh_username, t.ssh_host, t.ssh_port)})에서 학습 환경 준비 프로세스가 종료된 것을 직접 확인했습니다.\n예약 ${reservation.reservation_id}을 해제하면 이 서버에서 다시 준비하거나 학습할 수 있습니다. 준비가 아직 실행 중이면 해제하지 마세요. 같은 서버에서 작업이 겹칠 수 있습니다.`)) return;
+  if (!reservation || !reservationMatches(reservation, state.settings)) return;
+  if (!await approve("환경 준비 예약 해제", releaseApproval(reservation))) return;
   await task("준비 예약 해제 중", async () => {
-    await api("runtime_release", { approved: true, confirm_preparation_stopped: true, reservation_id: reservation.reservation_id });
-    state.reservations = await api("runtime_reservations"); state.notice = "환경 준비 예약을 해제했습니다.";
+    await gpuServer.runtimeRelease(reservation.reservation_id);
+    state.reservations = await gpuServer.runtimeReservations(); state.notice = "환경 준비 예약을 해제했습니다.";
   });
 }
 async function action(name: string) {
@@ -671,7 +664,11 @@ async function action(name: string) {
     captureConfig();
     if (name === "start" && !state.plan) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
     if (name === "start" && planBlocked()) { state.error = state.plan.destination_issue || "GPU 서버 연결 설정을 확인하고 실행 계획을 다시 확인하세요."; render(); return; }
-    if (!await approve("실제 GPU 학습 실행", transferApproval(name))) return;
+    // Execute and resume run where the job was approved; resume resets the job before the sidecar could refuse.
+    const job = name === "start" ? null : state.jobs.find((j: Obj) => j.id === state.active);
+    const issue = job ? jobDestinationIssue(job, state.settings) : null;
+    if (issue) { state.error = issue; render(); return; }
+    if (!await approve("실제 GPU 학습 실행", transferApproval(job ? job.server_destination ?? null : settingsRoute(state.settings)))) return;
   }
   const checkpoint = document.querySelector<HTMLInputElement>("#checkpoint")?.value;
   captureConfig();
@@ -700,14 +697,15 @@ async function action(name: string) {
       }
     }
     else if (name === "runtime_check" || name === "runtime_prepare") { state.runtimeReport = await api(name, { approved: name === "runtime_prepare", training_stage: state.config?.training_stage || "sft" }); state.notice = `선택한 ${isServer(state.settings) ? "GPU 서버" : "Pod"}에서 앱과 일치하는 학습 환경과 CUDA를 확인했습니다.`; }
-    else if (name === "server-inspect") { state.serverInspection = null; state.gpuDraft = null; state.serverInspection = await api("server_inspect"); }
+    else if (name === "server-inspect") { state.serverInspection = null; state.gpuDraft = null; state.serverInspection = await gpuServer.serverInspect(); }
     else if (name === "server-select") {
       const selected: string[] = state.gpuDraft ?? selectedGpus(state.settings);
       if (selected.length > 8) throw new Error("GPU는 최대 8개까지 선택할 수 있습니다.");
-      await saveSettings({ server_selected_gpu_uuids: JSON.stringify(selected) });
-      state.notice = selected.length ? `학습에 사용할 GPU ${selected.length}개를 저장했습니다. 실행 계획을 다시 확인하세요.` : "GPU 선택을 비웠습니다. 학습 전에 GPU를 선택하세요.";
+      const change = await saveSettings({ server_selected_gpu_uuids: JSON.stringify(selected) });
+      state.notice = change === "none" ? "GPU 선택이 바뀌지 않았습니다." : selected.length
+        ? `학습에 사용할 GPU ${selected.length}개를 저장했습니다. 실행 계획을 다시 확인하세요.` : "GPU 선택을 비웠습니다. 학습 전에 GPU를 선택하세요.";
     }
-    else if (name === "server-reservations") { state.reservations = await api("runtime_reservations"); }
+    else if (name === "server-reservations") { state.reservations = await gpuServer.runtimeReservations(); }
     else if (name === "dataset-preview") {
       if (!state.datasetDraft.path) throw new Error("먼저 데이터 파일을 선택하세요.");
       state.preview = await api("dataset_preview", { path: state.datasetDraft.path, kind: state.datasetDraft.kind || "instruction" });
@@ -732,9 +730,7 @@ async function action(name: string) {
       state.liveProgress = name === "progress-remote";
     }
     else if (name === "apply-pod" && isServer(state.settings)) {
-      const facts = await api("server_facts"), resource = state.config.resource_profile;
-      resource.gpu_type = facts.gpu_type; resource.gpu_count = facts.gpu_count;
-      resource.hourly_cost_usd = perGpuHourlyCost(Number(facts.total_hourly_cost_usd), facts.gpu_count);
+      Object.assign(state.config.resource_profile, resourcesFromFacts(await gpuServer.serverFacts()));
       state.plan = null; await checkCapabilities(); state.notice = "선택한 GPU 서버의 GPU 종류·수와 직접 입력한 시간당 비용을 학습 설정에 적용했습니다.";
     }
     else if (name === "apply-pod") {

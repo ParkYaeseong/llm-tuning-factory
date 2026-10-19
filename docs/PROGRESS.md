@@ -92,8 +92,10 @@ action allowlist, TypeScript UI and docs (6B-2/6B-3). No real SSH server, GPU or
 
 Task 6B-2 (Windows native settings and connection screen): native settings save `provider` and the eight public
 `server_*` strings, refuse an unknown provider or `auth_mode` and a selection that is not a JSON array of at most 8
-strings, and allow `server_inspect`/`server_facts`/`runtime_reservations`/`runtime_release`. A pure MLflow filter
-withholds the OIDC URL, client ID and secret (and, for `none`, the token) from the sidecar; vault values stay saved.
+strings or a key-file field containing pasted `PRIVATE KEY` text, and allow `server_inspect`/`server_facts`/
+`runtime_reservations`/`runtime_release`. A pure MLflow filter withholds the OIDC URL, client ID and secret (and, for
+`none`, the token) from the sidecar only; the public form view keeps every field and the vault keeps every credential,
+so a `none` → `oidc` round trip reuses the saved address, client ID and secret.
 The connection screen adds a provider card, GPU server fields (no RunPod key or Pod ID), GPU inventory selection
 saved as a JSON string, server facts applied with a per-GPU price that never multiplies back below the server total
 (a one-ulp upward correction where float division undercuts it, about 3% of cent-valued cases), inspect → approve →
@@ -101,15 +103,21 @@ saved as a JSON string, server facts applied with a per-GPU price that never mul
 an approval stating the remote preparation stopped (refreshed automatically after a prepare error), MLflow
 “인증 없음” with a trusted-network note, auth-method connection results and an unverified-training row, provider-specific
 overview, plan and approval texts, a disabled start for a null destination hash, `destination_sha256` on submit and
-a job destination column. Saving a changed provider, `server_*` field or selection clears the plan, inspection,
-reservations and reports. The three `data-tour` anchors render once for both providers, and no remote action runs
-on page load, navigation or provider/auth switching. The MLflow URI label is now “MLflow 서버 주소” so field names
-stay unique. Actual verification: Playwright **36 passed** (13 new in `desktop/tests/connections.spec.ts`;
-`workspace.spec.ts` unchanged), `npm run build` (tsc + Vite) passes, Rust **8 passed** (4 new), Python **711 passed,
-1 skipped**, Ruff passes. Unverified: docs (6B-3), installer acceptance (Task 11), the real Tauri/WebView2 shell and
-Credential Manager (the UI is tested against a mocked bridge) and any real SSH server, GPU or MLflow server.
-Known carry-over: as for `token`, `settings_get` under `none` omits the saved OIDC URL and client ID, so switching back
-to OIDC shows the defaults until re-entered.
+a job destination column. Saving a changed provider or server field clears the plan, inspection, reservations and
+reports; a selection-only change clears the plan but keeps the observed inventory, and an unchanged save says so.
+The three `data-tour` anchors render once for both providers, and no remote action runs on page load, navigation or
+provider/auth switching. The MLflow URI label is now “MLflow 서버 주소” so field names stay unique.
+Review fixes: the contract lives in `desktop/src/server-connection.ts` (settings helpers, typed bridge calls, approval
+texts, `resourcesFromFacts` and escaped renderers; `main.ts` keeps the state glue). Execute and resume refuse, with the
+sidecar's fixed messages and before any dialog, a job whose destination differs from the saved connection (resume
+would otherwise reset the job first), and their approval names the job's own server. Preparation refuses unsaved
+GPU checkboxes and saved GPUs missing from the fresh inventory before approval; only reservations made with the saved
+server settings can be released; the connection check waits for an unsaved provider switch to be saved; invalid
+price inputs throw; connection inputs are locked while a task runs so its final re-render cannot drop typing.
+Actual verification: Playwright **45 passed** (22 in `desktop/tests/connections.spec.ts`; `workspace.spec.ts`
+unchanged), `npm run build` (tsc + Vite) passes, Rust **10 passed** (6 new), Python **711 passed, 1 skipped**, Ruff
+passes. Unverified: docs (6B-3), installer acceptance (Task 11), the real Tauri/WebView2 shell and Credential Manager
+(the UI is tested against a mocked bridge) and any real SSH server, GPU or MLflow server.
 
 Remaining Tasks 6A/6B and 7–11: general SSH GPU servers, model-operation CPU acceptance,
 persistent multi-Pod controller/tracking repair, secure desktop API/broker, Windows UI/installer and Git sharing.
