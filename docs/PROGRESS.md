@@ -123,14 +123,16 @@ Task 6B-3 (user documentation) updates README.md, docs/WINDOWS_APP.md, docs/CONF
 .env.example for direct-SSH GPU servers (desktop steps, server prerequisites, profile JSON, CLI flow, reservation
 release, limits) and the unauthenticated MLflow mode (HTTP only without credentials, local `mlflow server` example,
 artifact-proxy note, trusted-network warning). **Task 6B is complete in software.** Task 6 commits: 6f3c70f, 570498d,
-16235c6, 15b118d, c0ee9a9, c8df219, 0b569dc and the docs commit `docs: guide SSH GPU servers and unauthenticated MLflow`.
+16235c6, 15b118d, c0ee9a9, c8df219, 0b569dc, e67b90e (docs: guide SSH GPU servers and unauthenticated MLflow), 5447ce5 (test fixtures build fake key headers
+at runtime) and the follow-up docs commit `docs: state MLflow HTTPS enforcement exactly and record the secret-scan history finding`.
 
 Latest actual verification (2026-10-19, Windows, on the docs commit's tree): `uv run pytest -q` **711 passed, 1 skipped**
 in 99.82s; `uv run ruff check src tests` passes; Playwright **47 passed**; `npm run build` (tsc + Vite) passes;
 `cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` **11 passed**.
-`scripts/check_secrets.py` reports one finding, `desktop/src-tauri/src/main.rs: private key`: the Rust unit tests
-contain fake `-----BEGIN ... PRIVATE KEY-----` stubs (not key material) that exercise the pasted-key refusal. It predates this docs
-commit and still needs an allowlist or a fixture built at run time.
+Secret scan: after 5447ce5 the current tree is clean (`git grep` finds no contiguous private-key header). However
+`scripts/check_secrets.py` walks all reachable history and still reports `desktop/src-tauri/src/main.rs: private key` from the
+unpushed local commits c0ee9a9, c8df219 and 0b569dc (fake header stubs in Rust tests, not key material). Pending: before any
+push those commits need a history rewrite, or another decision from the user.
 
 Still unverified: a real SSH/BOP server, real NVIDIA GPU execution, a real MLflow server (authenticated or not), the real
 Tauri/WebView2 shell and Windows Credential Manager, and installer acceptance (Task 11). All SSH behavior was tested with
@@ -138,7 +140,8 @@ fake SSH responses.
 
 Deferred hardening: `claim()` should reject a `server_facts` that is not an `SSHServerFacts` (defence in depth); the
 `raw_server_receipts` IN-list needs a cap; some sidecar refusals are still in English; the key identity is derived from a
-hash of the local key path (moving the key breaks recovery, replacing it in place is undetected).
+hash of the local key path (moving the key breaks recovery, replacing it in place is undetected); the CLI does not refuse
+MLFLOW_TRACKING_TOKEN over plain HTTP.
 
 Remaining Tasks 7–11 (Tasks 6A/6B are complete in software): model-operation CPU acceptance,
 persistent multi-Pod controller/tracking repair, secure desktop API/broker, Windows UI/installer and Git sharing.

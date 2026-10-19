@@ -104,7 +104,7 @@ is not in the released 0.3.0 installer. Secrets never belong here: use the deskt
 The `server_` keys are separate from the Pod's `ssh_key_file` and `ssh_fingerprint`, so switching provider does not
 lose the other connection. With `auth_mode` set to `none` the OIDC address, client ID, client secret and token are not
 passed to the Python engine (the saved values are kept for a later switch back). Authenticated MLflow
-(token or OIDC secret) requires an HTTPS tracking URI; `none` also allows HTTP such as `http://127.0.0.1:5000`.
+(token or OIDC secret) requires an HTTPS tracking URI in the desktop app (the CLI requires HTTPS for OIDC token URLs and connection profiles, but does not refuse a bare token over HTTP; use HTTPS anyway); `none` also allows HTTP such as `http://127.0.0.1:5000`.
 
 ### CLI server profile (JSON)
 

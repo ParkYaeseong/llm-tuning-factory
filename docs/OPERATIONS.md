@@ -59,7 +59,7 @@ mlflow server --host 127.0.0.1 --port 5000
 # .env: MLFLOW_TRACKING_URI=http://127.0.0.1:5000
 ```
 
-- HTTP is accepted only without credentials. A token or OIDC client credentials require HTTPS.
+- The desktop app refuses authenticated MLflow (token or OIDC secret) over HTTP; HTTP works only without credentials. The CLI requires HTTPS for OIDC token URLs and connection profiles but does not refuse `MLFLOW_TRACKING_TOKEN` over plain HTTP, so use HTTPS whenever a token is used.
 - If an OIDC address is set but the client ID or secret is missing, the app stops with
   "OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. 인증값을 입력하거나 ‘인증 없음’을 선택하세요." Fill the
   credentials or clear the OIDC address.
