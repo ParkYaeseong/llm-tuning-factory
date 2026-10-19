@@ -105,13 +105,17 @@ def test_gpu_config_mismatch_and_zero_cost_policy_need_verified_server_context()
 def test_ssh_connection_uses_nonroot_and_never_runpod(monkeypatch):
     from tuning_factory import desktop_runtime
 
+    policies = []
+
     class Client:
         def set_missing_host_key_policy(self, policy):
-            pass
+            policies.append(policy)
 
         def connect(self, host, **kwargs):
+            assert policies, "host key policy must be pinned before connecting"
             assert host == "gpu.example" and kwargs["username"] == "researcher"
             assert kwargs["key_filename"] == "test-key"
+            assert kwargs["allow_agent"] is False and kwargs["look_for_keys"] is False
 
         def close(self):
             pass
@@ -121,6 +125,22 @@ def test_ssh_connection_uses_nonroot_and_never_runpod(monkeypatch):
     monkeypatch.setattr(desktop_runtime, "probe_server", lambda client, config, run: observation(config))
     with desktop_runtime.connection({"provider": "ssh_server", **settings().model_dump(mode="json")}) as (facts, _):
         assert facts.provider == "ssh_server"
+    assert len(policies) == 1 and isinstance(policies[0], desktop_runtime.PinnedHostKey)
+    assert policies[0].fingerprint == PIN
+
+
+def test_pinned_host_key_accepts_only_the_configured_sha256_fingerprint():
+    import base64
+    import hashlib
+    from types import SimpleNamespace
+
+    from tuning_factory.desktop_runtime import PinnedHostKey, paramiko
+
+    key = SimpleNamespace(asbytes=lambda: b"software-fixture host key")
+    pin = "SHA256:" + base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
+    PinnedHostKey(pin).missing_host_key(None, "gpu.example", key)
+    with pytest.raises(paramiko.SSHException, match="fingerprint"):
+        PinnedHostKey(PIN).missing_host_key(None, "gpu.example", key)
 
 
 def test_destination_receipt_is_bound_to_manifest_and_edited_settings():
@@ -1070,3 +1090,193 @@ def test_recovery_executor_can_never_claim_or_launch(tmp_path, monkeypatch):
         with pytest.raises(ValueError, match="recovery"):
             executor.run(None, factory.directory(job["id"]), 5, lambda: False, launch_id="d" * 32)
     assert factory.store.get(job["id"])["status"] == "QUEUED"
+
+
+def server_cli(tmp_path, monkeypatch):
+    """CLI fixture: on-disk server profile, paramiko fake, no RunPod key and no tracking."""
+    from tuning_factory.connections import load_server_settings
+
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    monkeypatch.setattr("tuning_factory.cli.RunPodController", lambda *a, **k: pytest.fail("RunPod called"))
+    path = tmp_path / "server.json"
+    path.write_text(settings().model_dump_json())
+    server = FakeServer(tmp_path / "remote").install(monkeypatch)
+    return path, load_server_settings(path), server
+
+
+def test_executor_for_ssh_launch_binds_observed_destination_and_selected_gpus(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    from tuning_factory.gpu_servers import ServerApprovalReceipt
+    from tuning_factory.registry import digest
+
+    server = FakeServer(tmp_path / "remote").install(monkeypatch)
+    monkeypatch.setattr(desktop_runtime, "RunPodController", lambda *a, **k: pytest.fail("RunPod called"))
+    checks = []
+    monkeypatch.setattr(desktop_runtime, "check", lambda *args, **kw: checks.append(args[1:]) or {})
+    config = settings()
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    with desktop_runtime.executor_for(native, tmp_path, training_stage="sft") as executor:
+        facts = executor.server_facts
+        assert facts.server_id == digest(("b" * 32).encode()) and facts.selected_gpu_uuids == (UUID2,)
+        assert facts.gpu_type == A4000 and facts.gpu_count == 1
+        assert executor.server_profile == config.profile(facts) and executor.pod is None
+        assert executor.root == config.remote_root + "/jobs"
+        assert executor.remote_python.startswith(config.remote_root + "/runtime/")
+        assert executor.hf_home == config.remote_root + "/hf-cache" and not executor.recovery_only
+    assert checks == [("sft", config.remote_root, (UUID2,))]
+    assert server.connects[0][0] == "gpu.example" and server.policies[0].fingerprint == PIN
+    receipt = ServerApprovalReceipt.create("1" * 64, config.profile(facts, profile_id="lab"), facts)
+    with desktop_runtime.executor_for(native, tmp_path, preflight=False, server_receipt=receipt) as executor:
+        assert executor.server_profile == receipt.profile
+    connects = len(server.connects)
+    for change in (dict(ssh_host="other.example"), dict(total_hourly_cost_usd=1.0)):
+        edited = {"provider": "ssh_server", **config.model_copy(update=change).model_dump(mode="json")}
+        with pytest.raises(ValueError, match="destination"):
+            with desktop_runtime.executor_for(edited, tmp_path, server_receipt=receipt):
+                pytest.fail("edited settings reached execution")
+    assert len(server.connects) == connects
+
+
+def test_plan_server_destination_binds_real_manifest_to_observed_server(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    from tuning_factory.manifest import resolve
+
+    server = FakeServer(tmp_path / "remote").install(monkeypatch)
+    factory, ai_config, manifest = real_factory(tmp_path / "state")
+    config = settings()
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    receipt = desktop_runtime.plan_server_destination(native, manifest)
+    assert receipt.manifest_sha256 == manifest["sha256"]
+    assert receipt.profile == config.profile(receipt.facts)
+    assert receipt.facts.selected_gpu_uuids == (UUID2,) and receipt.facts.gpu_type == A4000
+    assert "test-key" not in receipt.model_dump_json()
+    with pytest.raises(ValueError, match="real v1"):
+        desktop_runtime.plan_server_destination(native, resolve(ai_config, factory.registry, simulation=True))
+    with pytest.raises(ValueError):
+        desktop_runtime.plan_server_destination(native, manifest | {"priority_hint": "tampered"})
+    server.inventory = ((UUID1, "NVIDIA H100", 81559), (UUID2, "NVIDIA H100", 81559))
+    with pytest.raises(ValueError, match="GPU type"):
+        desktop_runtime.plan_server_destination(native, manifest)
+
+
+def test_validate_server_receipt_rejects_any_edited_destination_or_digest():
+    from tuning_factory.desktop_runtime import validate_server_receipt
+    from tuning_factory.gpu_servers import ServerApprovalReceipt
+
+    config = settings()
+    facts = observation(config)
+    receipt = ServerApprovalReceipt.create("1" * 64, config.profile(facts), facts)
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    assert validate_server_receipt(native, receipt) == receipt
+    assert validate_server_receipt(native, receipt.model_dump(mode="json")) == receipt
+    for change in (dict(ssh_host="other.example"), dict(ssh_port=2222), dict(ssh_username="other"),
+                   dict(ssh_fingerprint="SHA256:" + "B" * 43), dict(remote_root="/home/researcher/other"),
+                   dict(selected_gpu_uuids=(UUID1,)), dict(ssh_key_file="other-key"),
+                   dict(total_hourly_cost_usd=1.0)):
+        edited = {"provider": "ssh_server", **config.model_copy(update=change).model_dump(mode="json")}
+        with pytest.raises(ValueError, match="destination"):
+            validate_server_receipt(edited, receipt)
+    with pytest.raises(ValueError, match="digest"):
+        validate_server_receipt(native, receipt.model_dump(mode="json") | {"manifest_sha256": "2" * 64})
+    with pytest.raises(ValueError, match="SSH server provider"):
+        validate_server_receipt({"provider": "existing_runpod"}, receipt)
+
+
+def test_cli_plan_real_with_server_profile_returns_external_receipt(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from tuning_factory.cli import app
+
+    path, current, server = server_cli(tmp_path, monkeypatch)
+    real_factory(tmp_path / "state")
+    runner = CliRunner()
+    args = ["--state-dir", str(tmp_path / "state"), "plan", "configs/ai/paper_extraction.yaml"]
+    dry = runner.invoke(app, [*args, "--server-profile", str(path)])
+    assert dry.exit_code == 0, dry.output
+    assert "server_receipt" not in json.loads(dry.output) and not server.connects
+    result = runner.invoke(app, [*args, "--real", "--server-profile", str(path)])
+    assert result.exit_code == 0, result.output
+    body = json.loads(result.output)
+    receipt = body["server_receipt"]
+    assert body["dry_run"] is True and receipt["manifest_sha256"] == body["sha256"]
+    assert receipt["profile"]["transport"] == current.transport.model_dump(mode="json")
+    assert receipt["facts"]["selected_gpu_uuids"] == [UUID2] and "test-key" not in result.output
+
+
+def test_cli_run_submit_real_with_server_profile_freezes_receipt(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from tuning_factory.cli import app
+    from tuning_factory.runner import Factory
+
+    path, current, server = server_cli(tmp_path, monkeypatch)
+    real_factory(tmp_path / "state")
+    result = CliRunner().invoke(app, ["--state-dir", str(tmp_path / "state"), "run",
+                                      "configs/ai/paper_extraction.yaml", "--submit", "--real",
+                                      "--server-profile", str(path)])
+    assert result.exit_code == 0, result.output
+    job = json.loads(result.output)
+    assert job["status"] == "QUEUED" and job["attempts"] == 0
+    receipt = Factory(tmp_path / "state").store.server_receipt(job["id"])
+    assert receipt.manifest_sha256 == job["manifest"]["sha256"]
+    assert receipt.profile == current.profile(receipt.facts)
+    assert all(argv[0] in {"python3", "nvidia-smi"} for argv in server.commands)
+
+
+@pytest.mark.parametrize("drift", [None, "selected_missing"])
+def test_cli_reconcile_with_server_profile_collects_original_attempt(tmp_path, monkeypatch, drift):
+    from typer.testing import CliRunner
+
+    from tuning_factory.cli import app
+    from tuning_factory.config import load_config
+
+    path, current, server = server_cli(tmp_path, monkeypatch)
+    factory, job, receipt = launched_server_attempt(tmp_path, server, current)
+    unbound = factory.submit(load_config("configs/ai/paper_extraction.yaml"), request_key="unbound",
+                             simulation=False)
+    if drift:
+        server.inventory = DRIFT[drift]
+    runner = CliRunner()
+    args = ["--state-dir", str(factory.root), "reconcile"]
+    missing = runner.invoke(app, [*args, unbound["id"], "--server-profile", str(path)])
+    assert missing.exit_code != 0 and "receipt" in missing.output
+    result = runner.invoke(app, [*args, job["id"], "--server-profile", str(path)])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["status"] == "COMPLETED"
+    assert not factory.store.gpu_locked(receipt.facts.exclusivity_key)
+
+
+def test_gpu_type_mismatch_between_config_and_server_selection_is_refused():
+    from tuning_factory.config import load_config
+    from tuning_factory.execution import Policy, SSHExecutor
+
+    config = load_config("configs/ai/paper_extraction.yaml")
+    facts = a4000()
+    executor = SSHExecutor("", 22, "researcher", "", client=object(), server_profile=settings().profile(facts),
+                           server_facts=facts)
+    executor.validate_config(config)
+    other = config.model_copy(update={"resource_profile": config.resource_profile.model_copy(
+        update={"gpu_type": "NVIDIA H100"})})
+    with pytest.raises(ValueError, match="GPU type"):
+        facts.validate_config(other)
+    with pytest.raises(ValueError, match="GPU type"):
+        executor.validate_config(other)
+    with pytest.raises(ValueError, match="GPU type"):
+        Policy().check(other, {"export_allowed": True}, execute=True, approved_transfer=True, server_facts=facts)
+
+
+def test_mixed_gpu_type_selection_is_refused_before_execution():
+    from tuning_factory.gpu_servers import GPUDevice, probe_server
+
+    server = FakeServer.__new__(FakeServer)
+    server.machine_id, server.commands = "b" * 32, []
+    server.inventory = ((UUID1, A4000, 16376), (UUID2, "NVIDIA H100", 81559))
+    mixed = settings().model_copy(update={"selected_gpu_uuids": (UUID1, UUID2)})
+    with pytest.raises(ValueError, match="selected GPU types"):
+        probe_server(None, mixed, server.command)
+    with pytest.raises(ValueError, match="selected GPU types"):
+        observation(mixed, gpu_count=2, inventory=(GPUDevice(uuid=UUID1, name="A100", memory_mib=81920),
+                                                   GPUDevice(uuid=UUID2, name="H100", memory_mib=81920)))
+    inspection = probe_server(None, mixed, server.command, inspection_only=True)
+    assert {gpu.name for gpu in inspection.inventory} == {A4000, "NVIDIA H100"}
