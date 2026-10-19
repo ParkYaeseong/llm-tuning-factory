@@ -15,7 +15,7 @@ from .capabilities import compatibility, model_catalog, training_stages
 from .config import AIConfig
 from .connections import ENV_SETTINGS
 from .desktop_inspection import inspect_dataset, parameter_changes, parse_progress
-from .execution import Policy, RunPodController
+from .execution import ExecutionUncertain, Policy, RunPodController
 from .gpu_servers import SSHServerInspection, server_settings
 from .manifest import resolve
 from .model_hub import ModelHub, register_model, registered_models
@@ -250,6 +250,11 @@ class DesktopService:
             receipt = None
             if server:
                 from .desktop_runtime import plan_server_destination
+                # Offline refusals first; the price check needs the observed server facts below.
+                for dataset in filter(None, (manifest["dataset"], manifest.get("validation_dataset"))):
+                    self.factory.policy.check(config, dataset)
+                    if not dataset.get("export_allowed"):
+                        raise ValueError("dataset export has not been authorized in registry")
                 # Read-only observation; the receipt freezes the approved destination for this job.
                 receipt = plan_server_destination(self.settings, manifest)
             facts = receipt.facts if receipt else None
@@ -310,14 +315,16 @@ class DesktopService:
             from .desktop_runtime import executor_for
             server = self.is_server()
             self.job_directory(data["job_id"])
+            receipt = self.factory.store.server_receipt(data["job_id"])
             if server:
-                receipt = self.factory.store.server_receipt(data["job_id"])
                 if receipt is None:
                     raise ValueError(UNBOUND_SERVER_JOB)
                 # Recovery binds the original server, transport and attempt record, not current inventory.
                 with executor_for(self.settings, self.root, preflight=False, server_receipt=receipt,
                                   recovery=True) as executor:
                     return self.factory.reconcile(data["job_id"], executor)
+            if receipt is not None:
+                raise ValueError(SERVER_BOUND_JOB)  # Before any RunPod API call or SSH connection.
             with executor_for(self.settings, self.root, preflight=False) as executor:
                 return self.factory.reconcile(data["job_id"], executor)
         if action == "resume":
@@ -456,8 +463,10 @@ def main():
             service = DesktopService(request["root"], request.get("settings"))
             response = {"ok": True, "result": service.dispatch(request["action"], request.get("data", {}))}
     except Exception as exc:
-        # Avoid HTTP/SSH exception details that can contain credentials or request headers.
-        message = str(exc) if isinstance(exc, (ValueError, KeyError, FileNotFoundError)) else type(exc).__name__
+        # Avoid HTTP/SSH exception details that can contain credentials or request headers. Uncertain
+        # execution/preparation and remote timeouts carry fixed operator guidance (e.g. a retained reservation).
+        message = str(exc) if isinstance(exc, (ValueError, KeyError, FileNotFoundError, ExecutionUncertain,
+                                               TimeoutError)) else type(exc).__name__
         for value in (request.get("settings", {}) if isinstance(locals().get("request"), dict) else {}).values():
             if isinstance(value, str) and len(value) >= 8:
                 message = message.replace(value, "[redacted]")

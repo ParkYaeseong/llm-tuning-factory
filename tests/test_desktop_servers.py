@@ -17,6 +17,7 @@ from test_gpu_servers import (
 
 from tuning_factory import desktop, desktop_runtime
 from tuning_factory.connections import ENV_SETTINGS
+from tuning_factory.execution import ExecutionUncertain
 from tuning_factory.gpu_servers import ServerApprovalReceipt, SSHServerInspection, server_settings
 
 CHANGED = "연결 설정이 실행 계획 이후 바뀌었습니다. 실행 계획을 다시 확인하세요."
@@ -159,6 +160,69 @@ def test_submit_refuses_a_changed_destination_before_any_connection(tmp_path, mo
     assert app.dispatch("jobs", {}) == []
 
 
+@pytest.mark.parametrize("case", ["training_not_exportable", "validation_not_exportable", "gpu_policy"])
+def test_submit_runs_offline_refusals_before_observing_the_server(tmp_path, monkeypatch, case):
+    offline(monkeypatch)
+    app = desktop.DesktopService(tmp_path, native())
+    config = app.dispatch("catalog", {})["templates"][0]["config"]
+    config["resource_profile"]["hourly_cost_usd"] = 0
+    practice = case == "training_not_exportable"
+    app.dispatch("dataset", {"dataset_id": "dummy", "version": "1", "path": "examples/dummy.json",
+                             "export_allowed": not practice, "synthetic": practice})
+    message = "dataset export has not been authorized in registry"
+    if case == "validation_not_exportable":
+        heldout = tmp_path / "heldout.json"
+        heldout.write_text('[{"instruction":"held-out question","output":"answer"}]')
+        app.dispatch("dataset", {"dataset_id": "heldout", "version": "1", "path": str(heldout)})
+        config["evaluation_profile"].update(kind="json", dataset_id="heldout", dataset_version="1")
+    elif case == "gpu_policy":
+        config["resource_profile"]["gpu_count"] = 2
+        message = "GPU count exceeds policy"
+    planned, issue = app.server_destination()
+    assert planned and issue is None
+    with pytest.raises(ValueError, match=message):
+        app.dispatch("submit", {"approved": True, "config": config, "destination_sha256": planned})
+    assert app.dispatch("jobs", {}) == []
+
+
+@pytest.mark.parametrize("error_type,text", [
+    (ExecutionUncertain, "runtime preparation uncertain; reservation 0123 retained until original-server "
+                         "termination is confirmed"),
+    (TimeoutError, "remote operation timed out; inspect Pod before retrying preparation"),
+])
+def test_sidecar_forwards_uncertain_and_timeout_messages_with_redaction(tmp_path, monkeypatch, capsys,
+                                                                       error_type, text):
+    import io
+    import sys
+
+    private_root = "/home/researcher/private-root"
+
+    def dispatch(self, action, data):
+        raise error_type(text + " under " + private_root)
+
+    monkeypatch.setattr(desktop.DesktopService, "dispatch", dispatch)
+    request = {"root": str(tmp_path), "settings": {"server_remote_root": private_root},
+               "action": "runtime_prepare", "data": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request) + "\n"))
+    desktop.main()
+    response = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert response == {"ok": False, "error": text + " under [redacted]"}
+
+
+def test_sidecar_still_hides_other_exception_details(tmp_path, monkeypatch, capsys):
+    import io
+    import sys
+
+    def dispatch(self, action, data):
+        raise RuntimeError("Authorization: Bearer not-for-the-ui")
+
+    monkeypatch.setattr(desktop.DesktopService, "dispatch", dispatch)
+    request = {"root": str(tmp_path), "settings": {}, "action": "connection", "data": {}}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request) + "\n"))
+    desktop.main()
+    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {"ok": False, "error": "RuntimeError"}
+
+
 def test_zero_cost_server_job_plans_submits_and_executes_on_the_receipt(tmp_path, monkeypatch):
     from tuning_factory.execution import SSHExecutor
 
@@ -228,6 +292,17 @@ def test_runpod_execute_refuses_a_job_approved_for_a_server(tmp_path, monkeypatc
     with pytest.raises(ValueError, match="이 작업은 GPU 서버용으로 승인되었습니다"):
         app.dispatch("execute", {"approved": True, "job_id": job["id"]})
     assert calls == [] and app.factory.store.get(job["id"])["attempts"] == 0
+
+
+def test_runpod_reconcile_refuses_a_server_job_before_any_pod_or_ssh_contact(tmp_path, monkeypatch):
+    # No executor fake: the autouse guard fails on any RunPod API call, and SSH clients fail here.
+    monkeypatch.setattr(desktop_runtime.paramiko, "SSHClient", lambda: pytest.fail("SSH client created"))
+    job, _ = bound_job(desktop.DesktopService(tmp_path, native()))
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed", "RUNPOD_API_KEY": "fixture-only",
+                                            "ssh_key_file": "pod-key", "ssh_fingerprint": "SHA256:" + "P" * 43})
+    with pytest.raises(ValueError, match="이 작업은 GPU 서버용으로 승인되었습니다"):
+        app.dispatch("reconcile", {"job_id": job["id"]})
+    assert app.factory.store.get(job["id"])["status"] == "QUEUED"
 
 
 def test_reconcile_uses_a_recovery_executor_with_the_original_receipt(tmp_path, monkeypatch):
