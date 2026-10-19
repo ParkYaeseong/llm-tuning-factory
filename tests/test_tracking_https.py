@@ -157,7 +157,10 @@ def test_cli_work_refuses_insecure_tracking_before_claiming(tmp_path, monkeypatc
     result = CliRunner().invoke(app, [*base, "work"])
     assert result.exit_code != 0
     assert type(result.exception) is ValueError and str(result.exception) == INSECURE_TRACKING
-    mock = CliRunner().invoke(app, [*base, "run", "configs/ai/paper_extraction.yaml", "--mock"])
+    jobs_before = len(Factory(tmp_path / "state").store.list())
+    mock = CliRunner().invoke(app, [*base, "run", "configs/ai/paper_extraction.yaml", "--mock",
+                                  "--request-key", "another-submission"])
     assert type(mock.exception) is ValueError and str(mock.exception) == INSECURE_TRACKING
+    assert len(Factory(tmp_path / "state").store.list()) == jobs_before
     stored = Factory(tmp_path / "state").store.get(job["id"])
     assert stored["status"] == "QUEUED" and stored["attempts"] == 0
