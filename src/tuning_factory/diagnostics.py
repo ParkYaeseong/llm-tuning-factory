@@ -24,6 +24,9 @@ def check_connections(root, pod_id=None, write_test=False, *, server=None):
     uri = os.environ.get("MLFLOW_TRACKING_URI")
     if not uri:
         raise ValueError("MLFLOW_TRACKING_URI or connection profile required")
+    # Decided before OIDC refresh, which itself exports MLFLOW_TRACKING_TOKEN.
+    auth = ("oidc" if os.environ.get("MLFLOW_OIDC_TOKEN_URL")
+            else "token" if os.environ.get("MLFLOW_TRACKING_TOKEN") else "none")
     configure_oidc()
     client = MlflowClient(tracking_uri=uri)
     client.search_experiments(max_results=1)
@@ -32,7 +35,8 @@ def check_connections(root, pod_id=None, write_test=False, *, server=None):
         client.search_registered_models(max_results=1)
     except Exception:
         registry_readable = False
-    report = {"tracking_uri": uri, "mlflow_authenticated_read": True,
+    report = {"tracking_uri": uri, "mlflow_read": True, "mlflow_auth": auth,
+              "mlflow_authenticated_read": auth != "none",
               "model_registry_read": registry_readable, "gpu_training_verified": False}
     if server_report is not None:
         report["ssh_server"] = server_report

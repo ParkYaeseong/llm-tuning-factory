@@ -64,6 +64,39 @@ def test_secret_references_support_existing_colon_and_export_formats(tmp_path, m
         ConnectionProfile(tracking_uri="http://public.example", oidc_token_url="https://sso.example/token")
 
 
+@pytest.mark.parametrize("environment,mode", [
+    ({}, "none"), ({"MLFLOW_TRACKING_TOKEN": "fixture-token"}, "token"),
+    ({"MLFLOW_OIDC_TOKEN_URL": "https://sso.example/token"}, "oidc"),
+    ({"MLFLOW_OIDC_TOKEN_URL": "https://sso.example/token", "MLFLOW_TRACKING_TOKEN": "refreshed"}, "oidc"),
+])
+def test_connection_report_names_the_mlflow_authentication_mode(tmp_path, monkeypatch, environment, mode):
+    from tuning_factory import auth
+    from tuning_factory.connections import ENV_SETTINGS
+    from tuning_factory.diagnostics import check_connections
+
+    class Client:
+        def __init__(self, tracking_uri):
+            assert tracking_uri == "http://127.0.0.1:5000"
+
+        def search_experiments(self, max_results):
+            return []
+
+        def search_registered_models(self, max_results):
+            return []
+
+    for key in ENV_SETTINGS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("mlflow.MlflowClient", Client)
+    monkeypatch.setattr(auth, "configure_oidc", lambda: None)
+    report = check_connections(tmp_path)
+    assert report["mlflow_read"] is True and report["mlflow_auth"] == mode
+    assert report["mlflow_authenticated_read"] is (mode != "none")
+    assert json.loads((tmp_path / "connection-check.json").read_text())["mlflow_auth"] == mode
+
+
 def test_live_runpod_machine_shape_normalization():
     normalized = RunPodController.normalize({"id": "test", "gpuCount": 1,
         "machine": {"gpuTypeId": "NVIDIA H200", "gpuDisplayName": "H200"}, "networkVolume": {"id": "v"}})

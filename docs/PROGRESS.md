@@ -72,6 +72,19 @@ Actual verification after the Task 6A review fixes: Python 3.12.12 locked develo
 passes. The skip is the existing opt-in real GPU test. Unverified: no real SSH/BOP server and no GPU were used;
 SSH connections, probes and SFTP are software fixtures only.
 
+Task 6B-1 (Python desktop backend) routes sidecar actions by `provider`. For `ssh_server`: `connection` inspects
+the server instead of a Pod; new `server_inspect`/`server_facts` return the read-only inventory and selected-GPU
+facts; `runtime_prepare` requires the approved inspection and a free server; new `runtime_reservations` and
+`runtime_release` (approval plus confirmed stop) handle preparation reservations; `plan` stays offline and adds
+`destination_sha256`/`destination_issue`; `submit` refuses a changed hash, then freezes a receipt from one read-only
+observation (zero operator cost allowed); `execute` and `reconcile` (recovery executor) use the job receipt. RunPod
+`execute` refuses server-bound jobs, `pod` is RunPod-only and `jobs` add a key-free `server_destination`. MLflow:
+`auth_mode: "none"` drops OIDC/token values (HTTP then allowed), a missing OIDC client ID/secret is a clear Korean
+ValueError, and the connection report adds `mlflow_read`/`mlflow_auth`. Task 6A follow-ups: `executor_for(recovery=True)`
+is SSH-only, a refused pre-launch check also writes error.txt, and an unreachable observation branch was removed.
+Actual verification: **691 passed, 1 skipped** in 56.19s (39 new cases); Ruff passes. Pending: Rust native settings and
+action allowlist, TypeScript UI and docs (6B-2/6B-3). No real SSH server, GPU or MLflow server was used.
+
 Remaining Tasks 6A/6B and 7–11: general SSH GPU servers, model-operation CPU acceptance,
 persistent multi-Pod controller/tracking repair, secure desktop API/broker, Windows UI/installer and Git sharing.
 These foundations are not end-to-end workflow, Windows 0.4.0 or live GPU acceptance. Actual serial handoff,

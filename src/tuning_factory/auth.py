@@ -48,11 +48,18 @@ class OIDCTokenRefresher:
         threading.Thread(target=loop, daemon=True).start()
 
 
+OIDC_CLIENT_MISSING = ("OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. "
+                       "인증값을 입력하거나 ‘인증 없음’을 선택하세요.")
+
+
 def configure_oidc():
     token_url = os.environ.get("MLFLOW_OIDC_TOKEN_URL")
     if not token_url:
         return None
-    refresher = OIDCTokenRefresher(token_url, os.environ["MLFLOW_OIDC_CLIENT_ID"],
-                                 os.environ["MLFLOW_OIDC_CLIENT_SECRET"])
+    client_id = os.environ.get("MLFLOW_OIDC_CLIENT_ID")
+    client_secret = os.environ.get("MLFLOW_OIDC_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise ValueError(OIDC_CLIENT_MISSING)
+    refresher = OIDCTokenRefresher(token_url, client_id, client_secret)
     refresher.start()
     return refresher

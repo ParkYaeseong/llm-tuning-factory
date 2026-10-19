@@ -69,6 +69,33 @@ def test_authenticated_tracking_cannot_use_plain_http(tmp_path):
                                          "MLFLOW_TRACKING_TOKEN": "private-token"})
 
 
+AUTH_SETTINGS = ("MLFLOW_TRACKING_TOKEN", "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID",
+                 "MLFLOW_OIDC_CLIENT_SECRET")
+
+
+@pytest.fixture
+def isolated_environment(monkeypatch):
+    """DesktopService exports its settings to the process environment; restore it after the case."""
+    from tuning_factory.connections import ENV_SETTINGS
+    for key in ENV_SETTINGS:
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_unauthenticated_tracking_allows_local_http_and_drops_stale_credentials(tmp_path, isolated_environment):
+    import os
+    stale = {"MLFLOW_TRACKING_TOKEN": "stale-token-value", "MLFLOW_OIDC_TOKEN_URL": "https://sso.example/token",
+             "MLFLOW_OIDC_CLIENT_ID": "mlflow-client", "MLFLOW_OIDC_CLIENT_SECRET": "stale-secret-value"}
+    app = desktop.DesktopService(tmp_path, {"MLFLOW_TRACKING_URI": "http://127.0.0.1:5000", "auth_mode": "none",
+                                           **stale})
+    assert os.environ["MLFLOW_TRACKING_URI"] == "http://127.0.0.1:5000"
+    assert not any(key in os.environ or key in app.settings for key in AUTH_SETTINGS)
+    desktop.DesktopService(tmp_path, {"MLFLOW_TRACKING_URI": "http://127.0.0.1:5000"})
+    for mode in ("token", "oidc", ""):
+        with pytest.raises(ValueError, match="HTTPS"):
+            desktop.DesktopService(tmp_path, {"MLFLOW_TRACKING_URI": "http://127.0.0.1:5000", "auth_mode": mode,
+                                             **stale})
+
+
 def test_runtime_preparation_refuses_a_reserved_pod(tmp_path, monkeypatch):
     app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
     monkeypatch.setattr(app.factory.store, "gpu_locked", lambda pod: True)

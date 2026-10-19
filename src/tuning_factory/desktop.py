@@ -16,10 +16,22 @@ from .config import AIConfig
 from .connections import ENV_SETTINGS
 from .desktop_inspection import inspect_dataset, parameter_changes, parse_progress
 from .execution import Policy, RunPodController
+from .gpu_servers import SSHServerInspection, server_settings
 from .manifest import resolve
 from .model_hub import ModelHub, register_model, registered_models
-from .registry import canonical, safe_name
+from .registry import canonical, digest, safe_name
 from .runner import Factory
+
+PROVIDERS = ("existing_runpod", "ssh_server")
+# Withheld for unauthenticated MLflow servers, even if a caller still sends them.
+MLFLOW_AUTH_SETTINGS = ("MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "MLFLOW_OIDC_CLIENT_SECRET",
+                        "MLFLOW_TRACKING_TOKEN")
+# The public route of a server-bound job; never the key path, key hash or host pin.
+PUBLIC_SERVER_DESTINATION = {"ssh_host", "ssh_port", "ssh_username", "remote_root", "selected_gpu_uuids"}
+DESTINATION_CHANGED = "연결 설정이 실행 계획 이후 바뀌었습니다. 실행 계획을 다시 확인하세요."
+UNBOUND_SERVER_JOB = ("GPU 서버용 승인 기록이 없는 작업입니다. "
+                      "GPU 서버 연결에서 실행 계획을 다시 확인하고 제출하세요.")
+SERVER_BOUND_JOB = "이 작업은 GPU 서버용으로 승인되었습니다. 연결 대상을 그 GPU 서버로 바꾼 뒤 실행하세요."
 
 
 def assets_root():
@@ -51,6 +63,9 @@ class DesktopService:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.settings = settings or {}
+        if self.settings.get("auth_mode") == "none":
+            # Defense in depth: native settings also stop sending these for unauthenticated servers.
+            self.settings = {key: value for key, value in self.settings.items() if key not in MLFLOW_AUTH_SETTINGS}
         uri = self.settings.get("MLFLOW_TRACKING_URI")
         if uri and any(self.settings.get(k) for k in ("MLFLOW_TRACKING_TOKEN", "MLFLOW_OIDC_CLIENT_SECRET")):
             if urlsplit(uri).scheme != "https":
@@ -75,6 +90,31 @@ class DesktopService:
         if validation and validation["sha256"] == manifest["dataset"]["sha256"]:
             raise ValueError("training and validation snapshots are identical; 별도 검증 데이터를 선택하세요.")
         return manifest
+
+    def is_server(self):
+        """Validated provider choice; a missing or empty provider is a legacy RunPod setting."""
+        provider = self.settings.get("provider") or "existing_runpod"
+        if provider not in PROVIDERS:
+            raise ValueError("unsupported execution provider")
+        return provider == "ssh_server"
+
+    def require_server(self):
+        if not self.is_server():
+            raise ValueError("GPU 서버 연결을 선택한 경우에만 사용할 수 있습니다.")
+
+    def server_destination(self):
+        """Offline (destination_sha256, issue) of the saved server settings. Never opens SSH."""
+        try:
+            config = server_settings(self.settings)
+            transport = config.transport
+        except (ValueError, TypeError, RuntimeError, OSError):
+            # Validation details can echo local paths; the connection screen shows the fields.
+            return None, "GPU 서버 연결 설정이 비어 있거나 올바르지 않습니다. 연결 화면에서 확인하세요."
+        if not transport.selected_gpu_uuids:
+            return None, "학습에 사용할 GPU를 연결 화면에서 선택하세요."
+        # Same formula as SSHServerInspection.destination_sha256.
+        return digest(canonical({"transport": transport.model_dump(mode="json"),
+                                 "total_hourly_cost_usd": config.total_hourly_cost_usd})), None
 
     def dispatch(self, action, data):
         if action == "catalog":
@@ -188,30 +228,66 @@ class DesktopService:
                     export_allowed=data.get("export_allowed") is True, synthetic=data.get("synthetic") is True,
                     kind=data.get("kind", "instruction"), source_metadata=result["source"])
         if action == "plan":
+            server = self.is_server()
             config = AIConfig.model_validate(data["config"])
             manifest = self.manifest(config)
             estimate = self.factory.policy.check(config, manifest["dataset"])
-            return {"dry_run": True, "manifest": manifest, "estimated_cost_usd": estimate,
-                    "note": "저장·전송·대기 비용 별도. 실행 버튼 전에는 GPU 작업을 시작하지 않습니다."}
+            result = {"dry_run": True, "manifest": manifest, "estimated_cost_usd": estimate,
+                      "note": "저장·전송·대기 비용 별도. 실행 버튼 전에는 GPU 작업을 시작하지 않습니다."}
+            if server:
+                # Offline only (no SSH or provider API); submit refuses a different destination.
+                result["destination_sha256"], result["destination_issue"] = self.server_destination()
+            return result
         if action == "submit":
             self.require_approval(data)
+            server = self.is_server()
+            if server:
+                planned, _ = self.server_destination()
+                if planned is None or data.get("destination_sha256") != planned:
+                    raise ValueError(DESTINATION_CHANGED)
             config = AIConfig.model_validate(data["config"])
             manifest = self.manifest(config)
-            self.factory.policy.check(config, manifest["dataset"], execute=True, approved_transfer=True)
+            receipt = None
+            if server:
+                from .desktop_runtime import plan_server_destination
+                # Read-only observation; the receipt freezes the approved destination for this job.
+                receipt = plan_server_destination(self.settings, manifest)
+            facts = receipt.facts if receipt else None
+            self.factory.policy.check(config, manifest["dataset"], execute=True, approved_transfer=True,
+                                      server_facts=facts)
             if manifest.get("validation_dataset"):
-                self.factory.policy.check(config, manifest["validation_dataset"], execute=True, approved_transfer=True)
-            return self.factory.submit(config, request_key=data.get("request_key"), simulation=False)
+                self.factory.policy.check(config, manifest["validation_dataset"], execute=True,
+                                          approved_transfer=True, server_facts=facts)
+            return self.factory.submit(config, request_key=data.get("request_key"), simulation=False,
+                                       server_receipt=receipt)
         if action == "execute":
             self.require_approval(data)
             from .desktop_runtime import executor_for
+            server = self.is_server()
             job_id = data["job_id"]
             self.job_directory(job_id)
             stage = self.factory.store.get(job_id)["manifest"]["config"].get("training_stage", "sft")
+            receipt = self.factory.store.server_receipt(job_id)
+            if server:
+                if receipt is None:
+                    raise ValueError(UNBOUND_SERVER_JOB)
+                with executor_for(self.settings, self.root, training_stage=stage,
+                                  server_receipt=receipt) as executor:
+                    return self.factory.work(executor=executor, gpu=executor.server_facts.exclusivity_key,
+                                             approved_transfer=True, select_mode=True, target_job_id=job_id)
+            if receipt is not None:
+                raise ValueError(SERVER_BOUND_JOB)
             with executor_for(self.settings, self.root, training_stage=stage) as executor:
                 return self.factory.work(executor=executor, gpu="existing_runpod:" + self.settings["pod_id"],
                                          approved_transfer=True, select_mode=True, target_job_id=job_id)
         if action == "jobs":
-            return self.factory.store.list()[-200:][::-1]
+            jobs = self.factory.store.list()[-200:][::-1]
+            bound = self.factory.store.server_bound_job_ids()
+            for job in jobs:
+                receipt = self.factory.store.server_receipt(job["id"]) if job["id"] in bound else None
+                job["server_destination"] = receipt.profile.transport.model_dump(
+                    mode="json", include=PUBLIC_SERVER_DESTINATION) if receipt else None
+            return jobs
         if action == "logs":
             directory = self.job_directory(data["job_id"])
             name = data.get("name", "train.log")
@@ -232,7 +308,16 @@ class DesktopService:
             return {"recovered": self.factory.store.recover()}
         if action == "reconcile":
             from .desktop_runtime import executor_for
+            server = self.is_server()
             self.job_directory(data["job_id"])
+            if server:
+                receipt = self.factory.store.server_receipt(data["job_id"])
+                if receipt is None:
+                    raise ValueError(UNBOUND_SERVER_JOB)
+                # Recovery binds the original server, transport and attempt record, not current inventory.
+                with executor_for(self.settings, self.root, preflight=False, server_receipt=receipt,
+                                  recovery=True) as executor:
+                    return self.factory.reconcile(data["job_id"], executor)
             with executor_for(self.settings, self.root, preflight=False) as executor:
                 return self.factory.reconcile(data["job_id"], executor)
         if action == "resume":
@@ -243,17 +328,54 @@ class DesktopService:
             return self.factory.store.get(data["job_id"])
         if action == "connection":
             from .diagnostics import check_connections
+            if self.is_server():
+                return check_connections(self.root, server=self.settings)
             return check_connections(self.root, self.settings.get("pod_id"))
         if action == "pod":
+            if self.is_server():
+                raise ValueError("GPU 서버 연결에는 Pod가 없습니다. 선택한 GPU 정보는 server_facts로 확인하세요.")
             return RunPodController(self.settings["RUNPOD_API_KEY"]).status(self.settings["pod_id"])
+        if action == "server_inspect":
+            self.require_server()
+            from .desktop_runtime import inspect_server
+            return inspect_server(self.settings).model_dump(mode="json")
+        if action == "server_facts":
+            self.require_server()
+            from .desktop_runtime import connection
+            with connection(self.settings) as (facts, _):
+                return facts.model_dump(mode="json")
         if action in {"runtime_check", "runtime_prepare"}:
             from .desktop_runtime import runtime
+            server = self.is_server()
             if action == "runtime_prepare" and data.get("approved") is not True:
                 raise ValueError("explicit runtime preparation approval required")
+            if action == "runtime_prepare" and server:
+                if not data.get("inspection"):
+                    raise ValueError("환경 준비 승인 화면에서 확인한 GPU 서버 조회 결과(inspection)가 필요합니다. "
+                                     "GPU 서버를 다시 조회하세요.")
+                inspection = SSHServerInspection.model_validate(data["inspection"])
+                if self.factory.store.gpu_locked("ssh_server:" + inspection.server_id):
+                    raise ValueError("GPU 서버가 작업이나 다른 환경 준비에 예약되어 있습니다. "
+                                     "작업을 재조정하거나 준비 예약을 해제한 뒤 다시 준비하세요.")
+                return runtime(self.settings, self.root, prepare=True,
+                               training_stage=data.get("training_stage", "sft"), inspection=inspection)
             if action == "runtime_prepare" and self.factory.store.gpu_locked("existing_runpod:" + self.settings.get("pod_id", "")):
                 raise ValueError("Pod is reserved by a job; reconcile and finish it before preparing runtime")
             return runtime(self.settings, self.root, prepare=action == "runtime_prepare",
                            training_stage=data.get("training_stage", "sft"))
+        if action == "runtime_reservations":
+            from .desktop_runtime import runtime_reservations
+            return runtime_reservations(self.root)
+        if action == "runtime_release":
+            self.require_server()
+            if data.get("approved") is not True or data.get("confirm_preparation_stopped") is not True:
+                raise ValueError("환경 준비 예약 해제에는 승인과 원래 GPU 서버의 준비 명령 종료 확인이 모두 필요합니다.")
+            reservation_id = data.get("reservation_id")
+            if not isinstance(reservation_id, str) or not re.fullmatch(r"[0-9a-f]{32}", reservation_id):
+                raise ValueError("invalid preparation reservation ID")
+            from .desktop_runtime import release_runtime_reservation
+            return release_runtime_reservation(self.settings, self.root, reservation_id,
+                                               confirm_preparation_stopped=True)
         if action == "live_logs":
             from .desktop_runtime import live_logs
             return live_logs(self.settings, self.root, self.job_directory(data["job_id"]))
