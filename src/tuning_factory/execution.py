@@ -39,7 +39,13 @@ INJECTED_CONNECTION = "v2 operations require an injected SSH connection owned by
 V2_CONTROL_RECORDS = frozenset({"result.json", "result.tmp", "remote-attempt.json", "remote-attempt.json.tmp",
                                 "remote-result.json", "remote-result.json.tmp", "remote-artifacts.json",
                                 "remote-artifacts.json.tmp"})
-PINNED_FILES = (COMMAND, "manifest.json", "model-inputs.json")   # come back from the host byte-identical
+# Top-level names a v2 upload never sends: control-plane records, markers, signals and worker-written files.
+V2_UPLOAD_EXCLUDED = V2_CONTROL_RECORDS | {"cancel", START_MARKER, "artifacts.json", "worker.log"}
+REQUIRED_UPLOADS = (COMMAND, "manifest.json", "model-inputs.json")
+# Names Windows cannot hold as written: reserved characters and control codes (``:`` also selects a drive or
+# an alternate data stream), device names, and a trailing dot or space (Win32 strips both, aliasing the name).
+_WINDOWS_UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]|[. ]$')
+_DEVICE_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", re.IGNORECASE)
 
 
 def _refuse_v2_directory(directory: Path, action: str = "launch", entry: str = "run_operation") -> None:
@@ -275,26 +281,49 @@ class SSHExecutor(ExecutionBackend):
             elif path.is_file():
                 sftp.put(str(path), target)
 
-    def download(self, sftp, remote, local, hashes=None, root=None, skip=()):
-        """Hash-verified copy of a remote tree. ``skip`` names top-level control-plane records that a download
-        must never replace (v2); a name that could leave ``root`` on Windows (``:``, a drive) is refused."""
+    def download(self, sftp, remote, local, hashes=None, root=None, skip=(), protected=None):
+        """Hash-verified copy of a remote tree into ``local``, safe on a case-insensitive Windows filesystem.
+
+        Every name of a remote directory is checked before anything in it is written: no separator, ``:``,
+        reserved character, device name or trailing dot/space, and no two names equal under ``casefold``
+        (NTFS would alias them). At the top level ``cancel`` and ``skip`` (control-plane records) are never
+        taken from the host. ``protected`` (relative path -> SHA256 of what the control plane uploaded) is
+        never replaced; the caller checks the host's inventory against it first. A name equal to a skipped
+        or protected name only under ``casefold`` is refused.
+        """
         root = root or local
         local.mkdir(parents=True, exist_ok=True)
-        # Preserve small top-level evidence before descending into large checkpoints.
-        entries = sorted(sftp.listdir_attr(remote), key=lambda item: (stat.S_ISDIR(item.st_mode), item.filename))
-        for entry in entries:
-            if (entry.filename in {"", ".", ".."} or "/" in entry.filename or "\\" in entry.filename
-                    or ":" in entry.filename):
+        listing = sftp.listdir_attr(remote)
+        folded = [entry.filename.casefold() for entry in listing]
+        if len(set(folded)) != len(folded):
+            raise ValueError("remote artifact names collide on a case-insensitive filesystem")
+        skipped = {name.casefold(): name for name in ("cancel", *skip)} if local == root else {}
+        guarded = {path.casefold(): path for path in (protected or {})}
+        entries = []
+        for entry in listing:
+            name = entry.filename
+            if name in {"", ".", ".."} or _WINDOWS_UNSAFE.search(name) or _DEVICE_NAME.fullmatch(name):
                 raise ValueError("unsafe remote artifact name")
-            if local == root and (entry.filename == "cancel" or entry.filename in skip):
+            if name.casefold() in skipped:
+                if skipped[name.casefold()] != name:
+                    raise ValueError("remote artifact name aliases a control-plane record")
                 continue  # Mutable control signal or a control-plane record, never a model artifact.
-            source, target = remote + "/" + entry.filename, local / entry.filename
+            target = local / name
             if not target.resolve().is_relative_to(Path(root).resolve()):
                 raise ValueError("unsafe remote artifact name")
+            relative = target.relative_to(root).as_posix()
+            if relative.casefold() in guarded:
+                if guarded[relative.casefold()] != relative or not stat.S_ISREG(entry.st_mode):
+                    raise ValueError("remote artifact name aliases an uploaded control-plane input")
+                continue  # An uploaded input is never replaced by host bytes.
             if stat.S_ISLNK(entry.st_mode):
                 raise ValueError("remote symlink artifact rejected")
+            entries.append((entry, target))
+        # Preserve small top-level evidence before descending into large checkpoints.
+        for entry, target in sorted(entries, key=lambda item: (stat.S_ISDIR(item[0].st_mode), item[0].filename)):
+            source = remote + "/" + entry.filename
             if stat.S_ISDIR(entry.st_mode):
-                self.download(sftp, source, target, hashes, root, skip)
+                self.download(sftp, source, target, hashes, root, skip, protected)
             elif stat.S_ISREG(entry.st_mode):
                 expected = (hashes or {}).get(target.relative_to(root).as_posix())
                 if expected and target.is_file() and file_digest(target) == expected:
@@ -482,7 +511,9 @@ class SSHExecutor(ExecutionBackend):
             if self._stored_record(stored) != record:
                 raise ValueError("remote attempt record differs from the persisted launch identity")
         else:
-            _write_json_atomic(stored, {**record, "created": time.time()})
+            # The inventory of what this upload sends: host bytes may never replace these files locally.
+            _write_json_atomic(stored, {**record, "uploaded": self._uploaded_inventory(launch),
+                                        "created": time.time()})
         submitted = finished = False
         try:
             with self.client.open_sftp() as sftp:
@@ -506,7 +537,7 @@ class SSHExecutor(ExecutionBackend):
                     if remote_exists(sftp, remote):
                         raise ExecutionUncertain(LAUNCH_DIRECTORY_EXISTS) from None
                     raise
-                self.upload(sftp, launch, remote, exclude=V2_CONTROL_RECORDS)
+                self.upload(sftp, launch, remote, exclude=V2_UPLOAD_EXCLUDED)
                 command = ["env", *self._environment(), "FACTORY_MODEL_CACHE=" + cache, self.remote_python, "-m",
                            "tuning_factory.worker", remote, "--request", command_sha256]
                 # Append, so a duplicate start (refused by the worker's O_EXCL marker) never truncates the log.
@@ -631,7 +662,24 @@ class SSHExecutor(ExecutionBackend):
 
     @staticmethod
     def _stored_record(path):
-        return {key: value for key, value in json.loads(Path(path).read_bytes()).items() if key != "created"}
+        return {key: value for key, value in json.loads(Path(path).read_bytes()).items()
+                if key not in {"created", "uploaded"}}
+
+    @staticmethod
+    def _uploaded_inventory(launch):
+        """``relative path -> SHA256`` of every file the v2 upload sends (the same exclusions as ``upload``)."""
+        return {path.relative_to(launch).as_posix(): file_digest(path) for path in sorted(launch.rglob("*"))
+                if path.is_file() and not path.is_symlink()
+                and not (path.parent == launch and path.name in V2_UPLOAD_EXCLUDED)}
+
+    @staticmethod
+    def _recorded_uploads(launch):
+        uploaded = json.loads((launch / "remote-attempt.json").read_bytes()).get("uploaded")
+        if (not isinstance(uploaded, dict) or any(name not in uploaded for name in REQUIRED_UPLOADS)
+                or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                       for value in uploaded.values())):
+            raise ValueError("remote attempt record lacks the inventory of uploaded launch inputs")
+        return uploaded
 
     def _remote_launch_state(self, sftp, remote):
         """True when a start marker or a result exists: the attempt started and is reconciled, never relaunched.
@@ -666,10 +714,12 @@ class SSHExecutor(ExecutionBackend):
         if not isinstance(inventory, dict):
             raise ValueError("remote artifact inventory is invalid")
         hashes = {name: value for name, value in inventory.items() if name != "cancel"}
-        # So a download can never replace the attempt's own command, manifest or staged model inputs.
-        if any(hashes.get(name) != file_digest(launch / name) for name in PINNED_FILES):
+        # Every uploaded input (command, manifest, model inputs, YAML, data) must come back unchanged, and the
+        # download never replaces it, so host bytes can never stand in for a control-plane input.
+        uploaded = self._recorded_uploads(launch)
+        if any(hashes.get(name) != sha256 for name, sha256 in uploaded.items()):
             raise ValueError("remote artifact inventory differs from the original attempt files")
-        self.download(sftp, remote, launch, hashes, skip=V2_CONTROL_RECORDS)
+        self.download(sftp, remote, launch, hashes, skip=V2_CONTROL_RECORDS, protected=uploaded)
         for name, expected in hashes.items():
             path = (launch / name).resolve()
             if not path.is_relative_to(launch) or file_digest(path) != expected:

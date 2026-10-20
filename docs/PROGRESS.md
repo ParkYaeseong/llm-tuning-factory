@@ -678,18 +678,20 @@ Verification after the 7.4 review fixes:
 Verification after the follow-up:
 - RED first: 16 tests failed (11 alias forms, engine output names, a case-alias integration test and three
   host-forged inputs with a matching inventory).
-- GREEN: the sub-plan set gave **228 passed**. In a clean detached worktree (HEAD `7115a99` plus only this change; the
-  concurrent 7.5 agent's uncommitted source edits are absent there), `uv run pytest -q` gave **1054 passed, 1 skipped**.
-  The shared tree's `uv run pytest -q --ignore=tests/test_operation_runner.py` also gave **1054 passed, 1 skipped**.
-  One earlier worktree run hit a single failure in the timing-sensitive
+- GREEN: the sub-plan set gave **228 passed**. The code landed on top of the 7.5 commits (`7120193`, then `ced56ed`,
+  which changed docs only). In a clean detached worktree of `7120193` plus only this change, `uv run pytest -q` gave
+  **1090 passed, 1 skipped**, including all 36 `tests/test_operation_runner.py` tests (1054 + 36). The same run on the
+  shared tree (`ced56ed` plus this change, nothing else uncommitted) also gave **1090 passed, 1 skipped**. An earlier
+  run on the pre-7.5 base hit one failure in the timing-sensitive
   `test_cancellation_does_not_wait_for_training_when_taskkill_is_denied` while two suites ran at once. It passed 3/3
-  alone, and the full re-run alone was clean.
+  alone, and every later full run was clean.
 - Ruff is clean, `check_secrets.py` reports 0 findings, and the eol check prints nothing.
-- The CPU acceptance (`-I`, script and sources from the clean worktree) exited 0 twice with byte-identical receipts and
-  all **28** checks passed. Max errors and inventories (`cc5fbab0…b54c`, `e124a915…8682`) are unchanged. Receipt
-  SHA256 `d2d3e6a4839e0a5fba59d8555a10a6bb9d2b817bd7df5feaa61992ec19929943`, source_sha256
-  `9569eb811e42b501e2726029e03eb967c845162ace1b490d708357d5850caa6d` (equal to this commit's tree), lock_sha256
-  `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437` unchanged. This supersedes the receipt above.
+- The CPU acceptance (`-I`, script and sources from that clean worktree) exited 0 twice with byte-identical receipts
+  and all **29** checks passed. Max errors and inventories (`cc5fbab0…b54c`, `e124a915…8682`) are unchanged. Receipt
+  SHA256 `a9bece24ded6e84c0637007e7fe78288d61f9125d944a9add348b13b8c7ee45d`, source_sha256
+  `247003f6a987096bcbee4739a3a4ffb4aeaf2836f3c75622c0b42f5e28b96c7f` (the tree with this commit), lock_sha256
+  `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437` unchanged. This supersedes every earlier Task 7
+  receipt, including 7.5's `811d4177…b673` (source `478e2a41…e5d2` of `7120193`).
 
 Still open for Task 7 GPU work:
 - Hardware and numerics: merge/materialize tolerances at real model sizes on CUDA (TF32 off); memory (FP32 loads;
@@ -814,7 +816,8 @@ Actual verification:
   `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`. `model_downloaded`, `gpu_used`,
   `institution_data_used` and `production_promotable` are false. This supersedes every earlier Task 7 receipt. (The
   first recorded value, `a9bece24…e45d` with source `247003f6…6c7f`, came from the shared working tree while another
-  agent's uncommitted `execution.py` edit was present, so it is void.)
+  agent's uncommitted `execution.py` edit was present, so it is void for `7120193`. A clean checkout reproduces it as
+  the receipt of the tree with the 7.4 follow-up commit; see that section.)
 - No real SSH, GPU, model download or institution data. Every remote action ran on `GPUHost`, which runs the real
   `worker.main_v2` with fixture engines and model operations that write small, well-formed safetensors.
 
@@ -829,7 +832,9 @@ Task 7 is complete in software: 7.1–7.5 and their review fixes. Verified on th
   results.
 - A control-plane runner that freezes outputs with exact lineage, computes evaluation receipts under
   `BenchmarkSpec.fingerprint()` (F11 fixed) and rebuilds idempotently after a crash.
-- Final receipt `811d4177…b673` (29/29 checks, source `478e2a41…e5d2` of commit 7120193).
+- Final receipt `811d4177…b673` (29/29 checks, source `478e2a41…e5d2` of commit 7120193). After the 7.4 follow-up
+  (Windows name aliases and uploaded-input protection on download), the current receipt is `a9bece24…e45d` (29/29 checks,
+  source `247003f6…6c7f`).
 
 Not verified (needs explicit GPU/host authorization):
 - Any real GPU or host.

@@ -1427,6 +1427,106 @@ def test_download_refuses_names_that_escape_the_launch_directory(tmp_path, name,
     assert list(local.iterdir()) == []
 
 
+FILE, DIRECTORY = stat.S_IFREG | 0o644, stat.S_IFDIR | 0o755
+
+
+class RemoteTree:
+    """An SFTP stub holding names a Linux host can create but NTFS cannot: {remote dir: [(name, mode, bytes)]}."""
+
+    def __init__(self, tree):
+        self.tree, self.gets = tree, []
+
+    def listdir_attr(self, path):
+        return [SimpleNamespace(filename=name, st_mode=mode) for name, mode, _ in self.tree[path]]
+
+    def get(self, source, target):
+        self.gets.append(source)
+        directory, name = source.rsplit("/", 1)
+        Path(target).write_bytes(next(data for entry, _, data in self.tree[directory] if entry == name))
+
+
+@pytest.mark.parametrize("tree,message", [
+    ({"/remote": [("REMOTE-ATTEMPT.JSON", FILE, b"forged")]}, "aliases a control-plane record"),
+    ({"/remote": [("Cancel", FILE, b"forged")]}, "aliases a control-plane record"),
+    ({"/remote": [("remote-attempt.json ", FILE, b"forged")]}, "unsafe remote artifact name"),   # trailing space
+    ({"/remote": [("command.json.", FILE, b"forged")]}, "unsafe remote artifact name"),          # trailing dot
+    ({"/remote": [("Command.json", FILE, b"forged")]}, "aliases an uploaded control-plane input"),
+    ({"/remote": [("Data", DIRECTORY, None)], "/remote/Data": [("dataset.json", FILE, b"forged")]},
+     "aliases an uploaded control-plane input"),
+    ({"/remote": [("command.json", DIRECTORY, None)], "/remote/command.json": []},
+     "aliases an uploaded control-plane input"),
+    ({"/remote": [("output", DIRECTORY, None), ("OUTPUT", DIRECTORY, None)], "/remote/output": [],
+      "/remote/OUTPUT": []}, "collide"),
+    ({"/remote": [("trainer_log.jsonl", FILE, b"{}"), ("TRAINER_LOG.JSONL", FILE, b"{}")]}, "collide"),
+    ({"/remote": [("NUL.json", FILE, b"x")]}, "unsafe remote artifact name"),
+    ({"/remote": [("a?b", FILE, b"x")]}, "unsafe remote artifact name"),
+])
+def test_download_refuses_windows_name_aliases(tmp_path, tree, message):
+    local = tmp_path / "launch"
+    (local / "data").mkdir(parents=True)
+    originals = {"remote-attempt.json": b'{"record":"local"}', "command.json": b'{"command":"local"}', "cancel": b"",
+                 "data/dataset.json": b'[{"local":true}]'}
+    for name, data in originals.items():
+        (local / name).write_bytes(data)
+    remote = RemoteTree(tree)
+    executor = SSHExecutor("test-host", 22, "root", "unused", client=FakeSSH(tmp_path / "remote"))
+    with pytest.raises(ValueError, match=message):
+        executor.download(remote, "/remote", local, {}, skip={"remote-attempt.json"},
+                          protected={name: digest(originals[name]) for name in ("command.json", "data/dataset.json")})
+    assert remote.gets == []   # every name of a directory is checked before anything in it is written
+    assert {path.relative_to(local).as_posix(): path.read_bytes() for path in local.rglob("*") if path.is_file()} == (
+        originals)
+
+
+def test_download_accepts_engine_output_names(tmp_path):
+    host = "gpu-node01.lab"
+    run = f"Oct20_12-34-56_{host}"
+    remote = RemoteTree({
+        "/remote": [("trainer_log.jsonl", FILE, b"{}"), ("runs", DIRECTORY, None), ("checkpoint-10", DIRECTORY, None),
+                    ("command.json", FILE, b'{"command":"local"}')],
+        "/remote/runs": [(run, DIRECTORY, None)],
+        f"/remote/runs/{run}": [(f"events.out.tfevents.1729400000.{host}.1234.0", FILE, b"tb")],
+        "/remote/checkpoint-10": [("rng_state.pth", FILE, b"rng"), ("trainer_state.json", FILE, b"{}"),
+                                  ("special_tokens_map.json", FILE, b"{}"), ("training_args.bin", FILE, b"args")]})
+    local = tmp_path / "launch"
+    local.mkdir()
+    (local / "command.json").write_bytes(b'{"command":"local"}')
+    executor = SSHExecutor("test-host", 22, "root", "unused", client=FakeSSH(tmp_path / "remote"))
+    executor.download(remote, "/remote", local, {}, skip={"remote-attempt.json"},
+                      protected={"command.json": digest(b'{"command":"local"}')})
+    assert (local / "runs" / run / f"events.out.tfevents.1729400000.{host}.1234.0").read_bytes() == b"tb"
+    assert (local / "checkpoint-10" / "rng_state.pth").read_bytes() == b"rng"
+    assert "/remote/command.json" not in remote.gets   # an uploaded input is never taken back from the host
+
+
+def test_v2_case_alias_of_a_control_record_never_reaches_the_local_record(tmp_path, monkeypatch):
+    t = v2_transport(tmp_path, monkeypatch)
+    t.host.after_worker = lambda directory: (directory / "REMOTE-ATTEMPT.JSON").write_text('{"forged": true}')
+    record = t.launch.directory / "remote-attempt.json"
+    with pytest.raises(ValueError, match="aliases a control-plane record"):
+        run_v2(t)
+    assert "forged" not in record.read_text() and json.loads(record.read_bytes())["launch_id"] == LAUNCH_ID
+
+
+@pytest.mark.parametrize("name", ["train.yaml", "data/dataset.json", "data/dataset_info.json"])
+def test_v2_host_bytes_never_replace_uploaded_inputs(tmp_path, monkeypatch, name):
+    t = v2_transport(tmp_path, monkeypatch)
+    original = (t.launch.directory / name).read_bytes()
+
+    def consistent_forgery(directory):   # a hostile host also rewrites its own inventory to match
+        (directory / name).write_bytes(original + b"\n")
+        hashes = json.loads((directory / "artifacts.json").read_bytes())
+        hashes[name] = digest(original + b"\n")
+        (directory / "artifacts.json").write_bytes(canonical(hashes))
+    t.host.after_worker = consistent_forgery
+    with pytest.raises(ValueError, match="remote artifact inventory differs from the original attempt files"):
+        run_v2(t)
+    assert (t.launch.directory / name).read_bytes() == original
+    uploaded = json.loads((t.launch.directory / "remote-attempt.json").read_bytes())["uploaded"]
+    assert uploaded[name] == digest(original) and {"command.json", "manifest.json", "model-inputs.json"} <= set(uploaded)
+    assert not {"remote-attempt.json", "start.json", "result.json"} & set(uploaded)
+
+
 def test_v2_methods_require_a_validated_injected_connection(tmp_path, monkeypatch):
     from tuning_factory import execution, remote_model_cache
     t = v2_transport(tmp_path, monkeypatch)
