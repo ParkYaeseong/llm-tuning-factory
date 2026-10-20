@@ -4385,6 +4385,63 @@ Not verified or still open:
   mutant was run on `128f995`; only the leaving-the-page test was added after the rebase.
 - No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
 
+## Task 10.4 review fixes: truthful profile freshness and controller status, 2026-10-21
+
+Commit `fix: keep profile freshness and controller status truthful across edits and re-entry`, written in the worktree
+`D:\llm-tuning-factory-wt104` (branch `codex/task-10.4-fix`) on `0a19c37` (the 10.2 review fixes, on 10.4's
+`4b4c194`) and fast-forwarded onto `f6493a1` (10.3, which changes none of these files). The independent review of
+`4b4c194` was "Ready with fixes" (two Important, nothing Critical); the 10.2 re-reviewer added two Minors. Changed:
+`desktop/src/views/executor-profiles.ts`, `desktop/src/components/controller-bar.ts`,
+`desktop/tests/executor-profiles.spec.ts` and this file.
+
+Required:
+- I1. After a save or delete the stored checks are read again (`observations_list`, through the page queue), this
+  session's inspection of the profile is dropped (so `sessionInspections()` never hands 10.6 a pre-edit one), and a GPU
+  list read with other connection details is dropped.
+- I2. The bar's last read is cleared on attach and on detach: a page shown again says "상태 확인 중" (no signal age,
+  stop disabled) until its own first read answers, and a read that ends after leaving is shown nowhere.
+
+Recommended, all done:
+- M1. Save and delete run through the page queue, so a status poll and the edit-check sidecar never run at once. The
+  10.4 entry's "one call at a time" was not true for them before this fix.
+- M2. A poll patches only `#controller-bar-body`, and only when the read changed apart from the heartbeat age; an
+  age-only change updates the signal text in place. The one live region (`role="status"`, "백그라운드 컨트롤러: …")
+  sits outside the patched markup and changes its text only on a transition. The pill now shows the state alone; the
+  age is a separate non-live span (`#controller-bar-signal`).
+- M3. For `oidc`, an empty token URL or client ID counts as an incomplete credential (auth.py needs the URL, the client
+  ID and the secret), not as a restart.
+- M4. The key field says a re-render clears a typed key; a save that leaves a RunPod profile without a saved key says
+  it cannot be used yet.
+- M5. A spec pins `ROOT_UNUSABLE` to `broker.rs` (and the mocked `PROFILE_IN_USE`/`EDIT_CHECK_FAILED` texts to
+  `profiles.rs`); the dead `"ROOT_UNUSABLE"` branch is gone.
+- M6. One `issueText` (exported by the bar) replaces both `describe`s; the form builds its inputs and the provider
+  select itself instead of patching `field()`/`select()` output; `gib()` guards non-numbers; a 30 s timer re-renders
+  the rows (`#profile-rows`, only when their text changes) so ages and "1시간 이내" stay true on an open page.
+- 10.2 re-review Minors: focus after a save or delete moves only when a render lost it to `body` and the user is still
+  on the page (`stillOn`/`refocus`); `captureForm` skips a form whose fieldset is disabled; the key picker moves the
+  focus only from its own button.
+
+Deviations: the bar's pill text no longer carries the signal age (M2), so test 7 checks the pill and
+`#controller-bar-signal` separately (the plan's "동작 중 · 마지막 신호 N초 전" still reads that way on screen). Test 18 is a pin that passed on `4b4c194` (it failed when the bar's copy of the
+text was changed).
+
+Actual verification:
+- RED first: the nine new behaviour tests failed for their intended reasons (one `observations_list` call instead of
+  two; "동작 중 · 마지막 신호 2초 전" on re-entry; no persistent live region; no OIDC text; no key help line; no
+  freshness re-render; the save ran beside a gated poll; focus taken from a control outside `#app`; a locked form read
+  back as "잠긴 입력"), and test 7 failed on the old pill text.
+- 17 mutations of the fixes: 15 failed a test. The two survivors each removed one of the two I2 resets (attach or
+  detach), which cover each other; the mutation removing both fails test 14.
+- From `desktop/`: `npx playwright test` (scratch config, this worktree's own Vite on port 1470,
+  `reuseExistingServer: false`) **148 passed** on `0a19c37` (138 + 10 new) and **161 passed** on `f6493a1` (with 10.3's 13); the 22 profile tests also passed alone; `npm run build` passes.
+- From the root (main venv, `PYTHONPATH` on this worktree's `src`): `pytest -q` **1715 passed, 1 skipped** on `0a19c37` and again on `f6493a1`; Ruff passes;
+  `scripts/check_secrets.py` reports 0 findings with the change staged; the protected-path `git diff --exit-code` is
+  clean; every changed file is LF only.
+
+Not verified or still open:
+- Real WebView2 screen-reader announcements of the live region, timers and focus: Task 11.
+- A RunPod key rotated with no other change, and MLflow credentials re-saved, still need a restart polling cannot see.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

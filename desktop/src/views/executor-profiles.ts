@@ -7,12 +7,11 @@
 import "./executor-profiles.css";
 import { deleteExecutorProfile, executorProfiles, observationsList, pickFile, planning, profileInventory, saveExecutorProfile,
   type ObservationSummary, type ProfileInventory } from "../api";
-import { attachControllerBar, controllerAction, controllerBarHtml, controllerBarState } from "../components/controller-bar";
-import { localize } from "../issues";
+import { attachControllerBar, controllerAction, controllerBarHtml, controllerBarState, issueText } from "../components/controller-bar";
 import { createQueue } from "../poller";
 import type { View, ViewContext } from "../view-types";
-import { button, errorText, escapeHtml, field, focusKey, openDialog, restoreFocus, select, statusPill } from "../workbench";
-import type { PublicProfile, ResourceFacts, Sha256, WorkflowIssue, WorkflowResult } from "../workflow-types";
+import { button, errorText, escapeHtml, focusKey, openDialog, restoreFocus, statusPill } from "../workbench";
+import type { PublicProfile, ResourceFacts, Sha256, WorkflowResult } from "../workflow-types";
 
 /** = profiles.rs RUNPOD_PROFILE_FIELDS / SERVER_PROFILE_FIELDS: the only fields a save sends or a view shows. */
 export const RUNPOD_FIELDS = ["provider", "name", "pod_id", "ssh_fingerprint", "ssh_key_file"] as const;
@@ -76,6 +75,8 @@ let inspectUnavailable = false;
 let inventoryUnavailable = false;
 const queue = createQueue();                             // one sidecar call at a time on this page (D10)
 let controller: ReturnType<typeof attachControllerBar> | null = null;
+let freshness: ReturnType<typeof setInterval> | null = null;
+let shownRows = "";                                      // the rows as last rendered (the freshness timer compares)
 
 /** Session inspections by profile ID (read by 10.6 for "1시간 이내 확인 필요"). */
 export function sessionInspections(): Readonly<Record<string, InspectionSummary>> {
@@ -89,10 +90,6 @@ const providerOf = (profile: PublicProfile): Provider => profile.fields?.provide
 const find = (profileId: string) => profiles?.find(profile => profile.profile_id === profileId);
 const nameOf = (profile: PublicProfile | undefined, fallback: string) => profile?.fields?.name || fallback;
 const notAvailable = (result: WorkflowResult<unknown>) => result.issues.some(issue => issue.code === "not_available");
-const describe = (issues: WorkflowIssue[]) => issues.map(issue => {
-  const { text, original } = localize(issue);
-  return original ? `${text} (${original})` : text;
-}).join("\n") || "요청을 처리하지 못했습니다.";
 const usd = (value: unknown) => typeof value === "number" && Number.isFinite(value)
   ? `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4 })}` : "—";
 function ago(seconds: number): string {
@@ -101,9 +98,20 @@ function ago(seconds: number): string {
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}시간 전`;
   return `${Math.floor(seconds / 86400)}일 전`;
 }
-const gib = (mib: number) => `${Math.round(mib / 1024)} GiB`;
+const gib = (mib: unknown) => typeof mib === "number" && Number.isFinite(mib) && mib > 0 ? `${Math.round(mib / 1024)} GiB` : "메모리 확인 불가";
 const focusTitle = () => document.getElementById("profile-form-title")?.focus();
 const focusNew = () => document.querySelector<HTMLElement>('[data-action="wf:profiles:new"]')?.focus();
+/** Whether the user is still on the page an action started from (its follow-up may only then move the focus). */
+const stillOn = (ctx: ViewContext) => { const page = ctx.page, arg = ctx.arg; return () => ctx.page === page && ctx.arg === arg; };
+/** Puts the focus on `key` only when a render lost it (to body) and only on the same page: never across pages, never
+ * away from a control outside the page (the tutorial's popover). */
+function refocus(still: () => boolean, key: string | null) {
+  if (key && still() && (!document.activeElement || document.activeElement === document.body)) restoreFocus(document, key);
+}
+/** A labelled text input; every value and text is escaped. */
+function textInput(label: string, key: string, value: unknown, help = "", max = 2048) {
+  return `<label class="field"><span>${escapeHtml(label)}</span><input id="profile-field-${key}" aria-label="${escapeHtml(label)}" data-key="${key}" type="text" maxlength="${max}" spellcheck="false" value="${escapeHtml(value)}">${help ? `<small>${escapeHtml(help)}</small>` : ""}</label>`;
+}
 
 function draftFrom(profile: PublicProfile): ProfileDraft {
   const provider = providerOf(profile);
@@ -166,12 +174,22 @@ function profileRow(profile: PublicProfile): string {
     <td>${escapeHtml(credentialCell(profile))}</td><td class="profile-check">${checkCell(profile)}</td>
     <td class="profile-row-actions"><button type="button" class="quiet" data-action="${escapeHtml(`wf:profiles:edit:${id}`)}" aria-label="${escapeHtml(name)} 편집">편집</button><button type="button" data-action="${escapeHtml(`wf:profiles:inspect:${id}`)}" aria-label="${escapeHtml(name)} 자원 확인"${inspectable ? "" : " disabled"}>자원 확인</button></td></tr>`;
 }
+const rowsHtml = () => (profiles ?? []).map(profileRow).join("");
+/** Ages and "1시간 이내" depend on the clock: an open page re-renders its rows when their text would change. */
+function refreshRows(ctx: ViewContext) {
+  if (ctx.page !== "profiles" || ctx.busy || document.visibilityState !== "visible" || !profiles?.length) return;
+  const html = rowsHtml();
+  if (html !== shownRows) { shownRows = html; ctx.patch("profile-rows", html); }
+}
 function listCard(): string {
   let body: string;
   if (profiles === null) body = listError ? `<div class="wf-banner bad">실행 프로필을 불러오지 못했습니다. ${escapeHtml(listError)}</div>`
     : '<div class="empty">실행 프로필을 불러오는 중입니다.</div>';
   else if (!profiles.length) body = '<div class="empty">아직 저장한 실행 프로필이 없습니다. 배정받은 RunPod Pod나 GPU 서버를 이름 붙여 저장하세요.</div>';
-  else body = `<div class="table-scroll"><table><thead><tr><th>실행 프로필</th><th>연결 대상</th><th>위치</th><th>GPU · 키</th><th>마지막 자원 확인</th><th></th></tr></thead><tbody>${profiles.map(profileRow).join("")}</tbody></table></div>`;
+  else {
+    shownRows = rowsHtml();
+    body = `<div class="table-scroll"><table><thead><tr><th>실행 프로필</th><th>연결 대상</th><th>위치</th><th>GPU · 키</th><th>마지막 자원 확인</th><th></th></tr></thead><tbody id="profile-rows">${shownRows}</tbody></table></div>`;
+  }
   const stale = profiles !== null && listError ? `<div class="wf-banner bad">목록을 다시 읽지 못했습니다. ${escapeHtml(listError)}</div>` : "";
   const replan = affected?.length ? `<div class="wf-banner warn profile-affected" role="status">이 변경 후 다시 계획해야 하는 실행: ${affected.map(escapeHtml).join(", ")}</div>` : "";
   return `<section class="card profile-list" data-tour="executor-profiles" aria-labelledby="profile-list-title">
@@ -198,14 +216,14 @@ function gpuSection(d: ProfileDraft): string {
 function profileForm(ctx: ViewContext, d: ProfileDraft): string {
   const profile = d.isNew ? undefined : find(d.profileId);
   const ssh = d.provider === "ssh_server";
-  const input = (label: string, key: string, help = "", max = 2048) =>
-    field(label, key, d.fields[key] ?? "", "text", escapeHtml(help)).replace("<input ", `<input id="profile-field-${key}" maxlength="${max}" spellcheck="false" `);
+  const input = (label: string, key: string, help = "", max = 2048) => textInput(label, key, d.fields[key] ?? "", help, max);
   const keyFile = (key: string) => `${input("SSH 개인키 파일", key, "이 PC의 전체 경로(예: C:\\Users\\이름\\.ssh\\id_ed25519)로 입력하세요. 키 내용은 입력하지 마세요.")}
     <div class="field"><span>키 파일 선택</span>${button("파일 찾기", "wf:profiles:pick-key")}</div>`;
   const idField = `<label class="field"><span>프로필 ID</span><input id="profile-id" aria-label="프로필 ID" maxlength="64" autocomplete="off" spellcheck="false" value="${escapeHtml(d.profileId)}"${d.isNew ? "" : " disabled"}><small>${d.isNew ? "영문·숫자·_·-·. 64자 이내 · 그래프 단계와 실행 계획이 이 ID로 가리킵니다." : "저장한 뒤에는 바꿀 수 없습니다."}</small></label>`;
-  const provider = select("연결 대상", "provider", d.provider, PROVIDERS).replace("<select ", `<select id="profile-provider"${d.isNew ? "" : " disabled"} `);
+  const provider = `<label class="field"><span>연결 대상</span><select id="profile-provider" aria-label="연결 대상"${d.isNew ? "" : " disabled"}>${PROVIDERS
+    .map(([id, title]) => `<option value="${id}"${id === d.provider ? " selected" : ""}>${escapeHtml(title)}</option>`).join("")}</select></label>`;
   const secretHelp = profile?.RUNPOD_API_KEY_saved ? "보안 저장됨 · 변경할 때만 입력" : "이 프로필 전용으로 Windows 자격 증명 저장소에 보관합니다.";
-  const secret = `<label class="field"><span>RunPod API 키</span><input id="profile-runpod-key" aria-label="RunPod API 키" data-profile-secret type="password" autocomplete="new-password" spellcheck="false" maxlength="2048" value=""><small>${secretHelp}<br>키를 저장하거나 바꾼 뒤에는 컨트롤러를 다시 시작해야 새 키를 씁니다.</small></label>`;
+  const secret = `<label class="field"><span>RunPod API 키</span><input id="profile-runpod-key" aria-label="RunPod API 키" data-profile-secret type="password" autocomplete="new-password" spellcheck="false" maxlength="2048" value=""><small>${secretHelp}<br>키를 저장하거나 바꾼 뒤에는 컨트롤러를 다시 시작해야 새 키를 씁니다.<br>입력한 키는 저장할 때 한 번만 보내고 이 화면에 보관하지 않습니다. 다른 작업으로 화면이 다시 그려지면 입력 중인 키는 지워집니다.</small></label>`;
   const copy = ctx.settings.RUNPOD_API_KEY_saved
     ? `<label class="check"><input type="checkbox" id="profile-copy-legacy" data-profile-copy${d.copyLegacy ? " checked" : ""}> 연결 설정에 저장된 RunPod 키를 이 프로필에도 저장합니다 (키를 입력하지 않을 때만)</label>` : "";
   const runpod = `${input("Pod ID", "pod_id")}${input("SSH 서버 지문", "ssh_fingerprint", "신뢰할 수 있는 경로로 확인한 SHA256:… 지문을 입력하세요.")}${keyFile("ssh_key_file")}${secret}`;
@@ -226,7 +244,8 @@ function profileForm(ctx: ViewContext, d: ProfileDraft): string {
 function captureForm() {
   const form = document.querySelector<HTMLFormElement>("#profile-form");
   const d = draft;
-  if (!form || !d) return;
+  // Controls locked while busy were not edited; reading them back could undo the running task's result.
+  if (!form || !d || form.querySelector("fieldset:disabled")) return;
   if (d.isNew) {
     const id = form.querySelector<HTMLInputElement>("#profile-id");
     if (id) d.profileId = id.value;
@@ -254,7 +273,7 @@ async function reloadObservations() {
     if (result.status === "ok" && result.data && Array.isArray(result.data.observations)) {
       observations = new Map(result.data.observations.map(entry => [entry.profile_id, entry]));
       observationsReadAt = Date.now(); observationsNote = null;
-    } else observationsNote = `자원 확인 기록을 불러오지 못했습니다. ${describe(result.issues)}`;
+    } else observationsNote = `자원 확인 기록을 불러오지 못했습니다. ${issueText(result.issues)}`;
   } catch (error) { observationsNote = `자원 확인 기록을 불러오지 못했습니다. ${errorText(error)}`; }
 }
 
@@ -277,9 +296,12 @@ async function saveProfile(ctx: ViewContext) {
   const copy = d.provider === "existing_runpod" && d.copyLegacy;
   const values = profileValues({ ...d, apiKey });
   const focus = focusKey(document.activeElement);
+  const still = stillOn(ctx);
+  const before = find(profileId)?.fields;
   affected = null;
   await ctx.task("실행 프로필 저장 중", async () => {
-    const result = await saveExecutorProfile(profileId, values, copy);
+    // Through the page queue: the native save runs the edit-check sidecar, never beside a status read (D10).
+    const result = await queue.run(() => saveExecutorProfile(profileId, values, copy));
     ctx.store.markProfilesChanged();
     affected = Array.isArray(result?.affected_runs) && result.affected_runs.length ? result.affected_runs.map(String) : null;
     // A running controller keeps the key it started with (9.4 review): a new key needs a restart polling cannot see.
@@ -288,11 +310,24 @@ async function saveProfile(ctx: ViewContext) {
     await reloadProfiles();
     const reloaded = find(profileId) ?? result?.profile;
     if (draft === d && reloaded) draft = draftFrom(reloaded);
-    ctx.notify(restart ? "실행 프로필을 저장했습니다. 동작 중인 컨트롤러는 시작할 때의 키를 계속 씁니다. 새 키를 쓰려면 컨트롤러를 다시 시작하세요."
+    forgetChecks(profileId, before, reloaded?.fields);
+    await reloadObservations();                          // the backend decides which stored checks still hold
+    const keyless = reloaded && providerOf(reloaded) === "existing_runpod" && !reloaded.RUNPOD_API_KEY_saved;
+    ctx.notify(keyless ? "실행 프로필을 저장했습니다. RunPod API 키가 저장되어 있지 않아 자원 확인과 실행에 아직 쓸 수 없습니다. 키를 입력해 다시 저장하세요."
+      : restart ? "실행 프로필을 저장했습니다. 동작 중인 컨트롤러는 시작할 때의 키를 계속 씁니다. 새 키를 쓰려면 컨트롤러를 다시 시작하세요."
       : "실행 프로필을 저장했습니다.");
   });
-  restoreFocus(document, focus);
-  if (!document.activeElement || document.activeElement === document.body) restoreFocus(document, "profile-save");
+  refocus(still, focus);
+  refocus(still, "profile-save");
+}
+
+/** After a save or delete: this session's inspection no longer describes the profile, and a GPU list read through
+ * other connection details than the saved ones is dropped. */
+function forgetChecks(profileId: string, before: Record<string, string> | undefined, after: Record<string, string> | undefined) {
+  inspections.delete(profileId);
+  const connection = (fields: Record<string, string> | undefined) => JSON.stringify(SERVER_FIELDS
+    .filter(name => !["name", "server_total_hourly_cost_usd", "server_selected_gpu_uuids"].includes(name)).map(name => fields?.[name] ?? ""));
+  if (!after || connection(before) !== connection(after)) inventories.delete(profileId);
 }
 
 async function deleteProfile(ctx: ViewContext) {
@@ -306,18 +341,20 @@ async function deleteProfile(ctx: ViewContext) {
     actions: [{ id: "back", label: "돌아가기" }, { id: "delete", label: "삭제", primary: true }] });
   if (answer?.action !== "delete") return;
   let deleted = false;
+  const still = stillOn(ctx);
   affected = null;
   await ctx.task("실행 프로필 삭제 중", async () => {
-    const result = await deleteExecutorProfile(profileId);
+    const result = await queue.run(() => deleteExecutorProfile(profileId));
     ctx.store.markProfilesChanged();
     affected = Array.isArray(result?.affected_runs) && result.affected_runs.length ? result.affected_runs.map(String) : null;
-    inspections.delete(profileId); inventories.delete(profileId);
+    forgetChecks(profileId, undefined, undefined);
     if (draft === d) draft = null;
     deleted = true;
     await reloadProfiles();
+    await reloadObservations();
     ctx.notify("실행 프로필을 삭제했습니다.");
   });
-  if (deleted) focusNew();
+  if (deleted) refocus(still, "wf:profiles:new");
 }
 
 async function inspectProfile(ctx: ViewContext, profileId: string) {
@@ -339,7 +376,7 @@ async function inspectProfile(ctx: ViewContext, profileId: string) {
       return;
     }
     if (notAvailable(result)) inspectUnavailable = true;
-    throw new Error(describe(result.issues));
+    throw new Error(issueText(result.issues));
   });
 }
 
@@ -360,7 +397,7 @@ async function listGpus(ctx: ViewContext) {
       return;
     }
     if (notAvailable(result)) inventoryUnavailable = true;
-    throw new Error(describe(result.issues));
+    throw new Error(issueText(result.issues));
   });
 }
 
@@ -369,13 +406,17 @@ async function pickKey(ctx: ViewContext) {
   const d = draft;
   if (!d) return;
   const name = d.provider === "ssh_server" ? "server_ssh_key_file" : "ssh_key_file";
+  const still = stillOn(ctx);
   let path: string | null;
   try { path = await pickFile("key"); }
   catch (error) { ctx.fail(errorText(error)); return; }
-  if (!path || draft !== d) return;
+  if (!path || draft !== d || !still()) return;
   d.fields[name] = path;
   const input = document.querySelector<HTMLInputElement>(`#profile-form [data-key="${name}"]`);
-  if (input) { input.value = path; input.focus(); }
+  if (!input || input.disabled) return;
+  input.value = path;
+  const active = document.activeElement;
+  if (!active || active === document.body || (active as HTMLElement).dataset?.action === "wf:profiles:pick-key") input.focus();
 }
 
 export const view: View = {
@@ -406,9 +447,16 @@ export const view: View = {
       await reloadObservations();
       await attached.refresh();
     });
-    if (controller === attached && ctx.page === "profiles") attached.poller.start();
+    if (controller === attached && ctx.page === "profiles") {
+      attached.poller.start();
+      if (freshness !== null) clearInterval(freshness);
+      freshness = setInterval(() => refreshRows(ctx), 30000);
+    }
   },
-  leave() { controller?.detach(); controller = null; },
+  leave() {
+    controller?.detach(); controller = null;
+    if (freshness !== null) { clearInterval(freshness); freshness = null; }
+  },
   async action(ctx, verb, arg) {
     if (await controllerAction(ctx, verb)) return;
     if (verb === "new") openDraft(ctx, newDraft());

@@ -41,15 +41,20 @@ interface Handle {
   poller: Poller; detached: boolean; read(): Promise<"ok" | "failed" | "unavailable">; detach(): void;
 }
 
-// The last status read survives page changes, so a page that shows the bar again starts from what was known.
-let last: Read = { status: null, unavailable: false, error: null, busyRead: null };
+// The last status read of the attached bar. It is cleared on attach and on detach: a bar shown again claims nothing
+// until its own first read answers (never a cached "동작 중" for a controller that may have stopped meanwhile).
+const NONE: Read = { status: null, unavailable: false, error: null, busyRead: null };
+let last: Read = NONE;
 let active: Handle | null = null;
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
-const describe = (issues: WorkflowIssue[]) => issues.map(issue => {
-  const { text, original } = localize(issue);
-  return original ? `${text} (${original})` : text;
-}).join("\n") || "컨트롤러 상태를 확인하지 못했습니다.";
+/** The Korean texts of workflow issues, each with its original when it differs (one line each). */
+export function issueText(issues: WorkflowIssue[], fallback = "요청을 처리하지 못했습니다."): string {
+  return issues.map(issue => {
+    const { text, original } = localize(issue);
+    return original ? `${text} (${original})` : text;
+  }).join("\n") || fallback;
+}
 function since(seconds: unknown): string | null {
   if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return null;
   if (seconds < 60) return `${Math.floor(seconds)}초`;
@@ -65,27 +70,45 @@ export function controllerBarState(): ControllerBarState {
   return { ...last, profiles: active?.profiles() ?? null, settings: active?.ctx.settings };
 }
 
-function statePill(state: ControllerBarState): string {
-  if (state.unavailable) return statusPill("neutral", NOT_AVAILABLE);
+/** The state in words, without the signal age (the pill and the live region; neither changes on an age-only poll). */
+function stateLabel(state: ControllerBarState): { kind: "neutral" | "good" | "warn" | "bad"; text: string } {
+  if (state.unavailable) return { kind: "neutral", text: NOT_AVAILABLE };
   const status = state.status;
-  if (!status) return state.error ? statusPill("bad", "상태를 확인할 수 없음") : statusPill("neutral", "상태 확인 중");
-  const age = since(status.controller.heartbeat_age_seconds);
+  if (!status) return state.error ? { kind: "bad", text: "상태를 확인할 수 없음" } : { kind: "neutral", text: "상태 확인 중" };
   if (status.controller.state === "running")
-    return status.stop_requested ? statusPill("warn", "정지 요청됨 · 진행 중 단계가 끝나면 정지합니다")
-      : statusPill("good", age ? `동작 중 · 마지막 신호 ${age} 전` : "동작 중");
-  if (status.controller.state === "stale")
-    return statusPill("warn", `연결 끊김 · ${age ? `신호 ${age} 전 · ` : ""}PC가 절전·종료되었다면 다시 시작하세요`);
-  return statusPill("neutral", "정지");
+    return status.stop_requested ? { kind: "warn", text: "정지 요청됨 · 진행 중 단계가 끝나면 정지합니다" } : { kind: "good", text: "동작 중" };
+  if (status.controller.state === "stale") return { kind: "warn", text: "연결 끊김" };
+  return { kind: "neutral", text: "정지" };
+}
+/** The signal age beside the pill ("" when there is none); a poll updates it in place. */
+function signalText(state: ControllerBarState): string {
+  const status = state.unavailable ? null : state.status;
+  if (!status) return "";
+  const age = since(status.controller.heartbeat_age_seconds);
+  if (status.controller.state === "running") return age ? `마지막 신호 ${age} 전` : "";
+  if (status.controller.state === "stale") return `${age ? `신호 ${age} 전 · ` : ""}PC가 절전·종료되었다면 다시 시작하세요`;
+  return "";
+}
+const liveText = (state: ControllerBarState) => `백그라운드 컨트롤러: ${stateLabel(state).text}`;
+/** What a poll compares before patching: the read without its heartbeat age (that only updates the signal text). */
+function signature(read: Read): string {
+  const status = read.status && { ...read.status, controller: { ...read.status.controller, heartbeat_age_seconds: null } };
+  return JSON.stringify({ ...read, status });
 }
 
-/** Whether `tracking: true` only reflects an explicit auth mode whose credential is not saved (a restart would not
- * change it until the credential is saved). */
-function trackingCredentialMissing(status: ControllerStatus, settings: Readonly<Record<string, unknown>> | undefined): boolean {
+/** Why `tracking: true` is not a restart yet: the explicit auth mode's credential is not saved completely (the
+ * controller applied "none"; auth.py needs the token, or the OIDC token URL, client ID and secret). Null otherwise. */
+function trackingCredentialMissing(status: ControllerStatus, settings: Readonly<Record<string, unknown>> | undefined): string | null {
   const tracking = isRecord(status.current) ? status.current.tracking : null;
-  if (!isRecord(tracking) || tracking.effective_auth_mode !== "none" || !settings) return false;
-  if (settings.auth_mode === "token") return !settings.MLFLOW_TRACKING_TOKEN_saved;
-  if (settings.auth_mode === "oidc") return !settings.MLFLOW_OIDC_CLIENT_SECRET_saved;
-  return false;
+  if (!isRecord(tracking) || tracking.effective_auth_mode !== "none" || !settings) return null;
+  const blank = (name: string) => !String(settings[name] ?? "").trim();
+  const then = "연결 설정에서 저장한 뒤 컨트롤러를 다시 시작하세요.";
+  if (settings.auth_mode === "token")
+    return settings.MLFLOW_TRACKING_TOKEN_saved ? null : `MLflow 인증값이 저장되어 있지 않습니다. ${then}`;
+  if (settings.auth_mode !== "oidc") return null;
+  if (blank("MLFLOW_OIDC_TOKEN_URL")) return `MLflow 인증 서버 주소(OIDC)가 저장되어 있지 않습니다. ${then}`;
+  if (blank("MLFLOW_OIDC_CLIENT_ID")) return `MLflow OIDC 클라이언트 ID가 저장되어 있지 않습니다. ${then}`;
+  return settings.MLFLOW_OIDC_CLIENT_SECRET_saved ? null : `MLflow 인증값이 저장되어 있지 않습니다. ${then}`;
 }
 
 function notes(state: ControllerBarState): string[] {
@@ -109,7 +132,7 @@ function notes(state: ControllerBarState): string[] {
   const restart: string[] = [];
   const changed = Array.isArray(status.restart_required?.profiles) ? status.restart_required.profiles : [];
   if (changed.length) restart.push(`컨트롤러 시작 후 바뀐 실행 프로필: ${changed.join(", ")}`);
-  const credentialMissing = status.restart_required?.tracking === true && trackingCredentialMissing(status, state.settings);
+  const credentialMissing = status.restart_required?.tracking === true ? trackingCredentialMissing(status, state.settings) : null;
   if (status.restart_required?.tracking === true && !credentialMissing) restart.push("MLflow 설정이 바뀌었습니다");
   // What the running controller left out at its start (current.json of this owner only).
   const skipped = running && current?.ok === true && current.owner_id === status.controller.owner_id && isRecord(current.skipped_profiles)
@@ -119,8 +142,7 @@ function notes(state: ControllerBarState): string[] {
   const others = skipped.filter(entry => !keyed.includes(entry));
   if (keyed.length) restart.push(`키 저장 후 컨트롤러를 다시 시작하세요: ${keyed.map(([id]) => id).join(", ")}`);
   if (restart.length) out.push(note("warn", restart, procedure));
-  if (credentialMissing)
-    out.push(note("warn", "MLflow 인증값이 저장되어 있지 않습니다. 연결 설정에서 인증값을 저장한 뒤 컨트롤러를 다시 시작하세요."));
+  if (credentialMissing) out.push(note("warn", credentialMissing));
   if (others.length)
     out.push(note("", `시작할 때 쓰지 않은 실행 프로필: ${others.map(([id, reason]) => `${id} (${SKIP_REASONS[reason] ?? reason})`).join(", ")}`));
   if (!running && status.runs?.active > 0)
@@ -128,52 +150,50 @@ function notes(state: ControllerBarState): string[] {
   return out;
 }
 
-/** The bar's content (what a poll patches into `#controller-bar`). Every dynamic text is escaped. */
+/** The bar's body (what a poll patches into `#controller-bar-body`). Every dynamic text is escaped. */
 export function controllerBarInner(state: ControllerBarState, busy: boolean, host = "profiles"): string {
   const status = state.unavailable ? null : state.status;
   const running = status?.controller.state === "running";
-  const summary = !status ? "" : running
-    ? [status.stop_requested && since(status.controller.heartbeat_age_seconds) ? `마지막 신호 ${since(status.controller.heartbeat_age_seconds)} 전` : "",
-      `진행 중인 그래프 실행 ${status.runs?.active ?? 0}개`].filter(Boolean).join(" · ") : "";
+  const label = stateLabel(state), signal = signalText(state);
+  const summary = running ? `진행 중인 그래프 실행 ${status!.runs?.active ?? 0}개` : "";
   const startDisabled = busy || state.unavailable || running;
   const stopDisabled = busy || state.unavailable || !running || Boolean(status?.stop_requested);
   const list = notes(state);
   return `<div class="controller-head"><h3 id="controller-bar-title">백그라운드 컨트롤러</h3>
-    <div class="controller-state" role="status">${statePill(state)}${summary ? `<span>${escapeHtml(summary)}</span>` : ""}</div>
+    <div class="controller-state">${statusPill(label.kind, label.text)}${signal ? `<span id="controller-bar-signal" class="controller-signal">${escapeHtml(signal)}</span>` : ""}${summary ? `<span>${escapeHtml(summary)}</span>` : ""}</div>
     <div class="actions">${button("컨트롤러 시작", `wf:${host}:controller-start`, running ? "" : "primary", startDisabled)}${button("컨트롤러 정지", `wf:${host}:controller-stop`, "", stopDisabled)}</div></div>
     ${list.length ? `<div class="controller-notes">${list.join("")}</div>` : ""}
     <p class="muted controller-foot">앱은 컨트롤러를 자동으로 시작하지 않습니다. 실행 프로필의 RunPod 키나 MLflow 인증값을 저장하거나 바꾼 뒤에는 컨트롤러를 다시 시작해야 새 값을 씁니다. 앱을 업데이트하거나 제거하기 전에는 컨트롤러를 정지하세요.</p>`;
 }
 
-/** The whole bar region (`#controller-bar`, a Task 11 selector); `role="status"` sits on the state line only. */
+/** The whole bar region (`#controller-bar`, a Task 11 selector): the patched body and, outside it, the one live region
+ * (`role="status"`), whose text changes only when the state does, so a poll that changes only the age announces nothing. */
 export function controllerBarHtml(state: ControllerBarState, busy: boolean, host = "profiles"): string {
-  return `<section id="controller-bar" class="controller-bar" aria-labelledby="controller-bar-title">${controllerBarInner(state, busy, host)}</section>`;
+  return `<section id="controller-bar" class="controller-bar" aria-labelledby="controller-bar-title"><div id="controller-bar-body">${controllerBarInner(state, busy, host)}</div>
+    <p id="controller-bar-live" class="sr-only" role="status">${escapeHtml(liveText(state))}</p></section>`;
 }
 
-function apply(result: WorkflowResult<ControllerStatus>): "ok" | "failed" | "unavailable" {
-  if (result.status === "ok" && isRecord(result.data) && isRecord(result.data.controller)) {
-    last = { status: result.data, unavailable: false, error: null, busyRead: null };
-    return "ok";
-  }
-  if (result.issues.some(issue => issue.code === "not_available")) {
-    last = { status: null, unavailable: true, error: null, busyRead: null };
-    return "unavailable";
-  }
+function readOf(result: WorkflowResult<ControllerStatus>): [Read, "ok" | "failed" | "unavailable"] {
+  if (result.status === "ok" && isRecord(result.data) && isRecord(result.data.controller))
+    return [{ status: result.data, unavailable: false, error: null, busyRead: null }, "ok"];
+  if (result.issues.some(issue => issue.code === "not_available")) return [{ ...NONE, unavailable: true }, "unavailable"];
+  // `status_busy` is transient: the last status of this visit stays, marked as not current.
   const busy = result.issues.find(issue => issue.code === "status_busy");
-  if (busy) { last = { ...last, error: null, busyRead: busy.message || STATUS_BUSY }; return "failed"; }
+  if (busy) return [{ ...last, error: null, busyRead: busy.message || STATUS_BUSY }, "failed"];
   // Never keep showing an unverified controller as running.
-  last = { status: null, unavailable: false, error: describe(result.issues), busyRead: null };
-  return "failed";
+  return [{ ...NONE, error: issueText(result.issues, "컨트롤러 상태를 확인하지 못했습니다.") }, "failed"];
 }
 
 /**
  * Shows the bar on `host` (default: the current page) and polls `controller_status` there (D10): one call in flight
  * through the page's queue, every 5 s, adaptive spacing and backoff (a `status_busy` answer backs off too), no call
- * while the page is busy, hidden or left; `not_available` stops it. A poll patches the bar only when the read changed.
+ * while the page is busy, hidden or left; `not_available` stops it. A poll patches the bar only when the state changed
+ * (an age-only change updates the signal text in place) and sets the live region's text only on a transition.
  */
 export function attachControllerBar(ctx: ViewContext, options: { host?: string; queue?: Queue; profiles?: () => readonly PublicProfile[] | null } = {}):
     { poller: Poller; refresh(): Promise<void>; detach(): void } {
   active?.detach();                                       // one bar polls at a time
+  last = NONE;                                            // this visit's own first read decides what is shown
   const host = options.host ?? ctx.page;
   const onVisible = () => { if (document.visibilityState === "visible") handle.poller.poke(); };
   const handle: Handle = {
@@ -182,20 +202,32 @@ export function attachControllerBar(ctx: ViewContext, options: { host?: string; 
       handle.detached = true;
       handle.poller.stop();
       document.removeEventListener("visibilitychange", onVisible);
-      if (active === handle) active = null;
+      if (active === handle) { active = null; last = NONE; }
     },
     async read() {
-      try { return apply(await handle.queue.run(() => controllerStatus())); }
-      catch (error) { last = { status: null, unavailable: false, error: errorText(error), busyRead: null }; return "failed"; }
+      let next: Read, outcome: "ok" | "failed" | "unavailable";
+      try { [next, outcome] = readOf(await handle.queue.run(() => controllerStatus())); }
+      catch (error) { [next, outcome] = [{ ...NONE, error: errorText(error) }, "failed"]; }
+      if (!handle.detached) last = next;                  // a read that ends after leaving is shown nowhere
+      return outcome;
     },
     poller: createPoller({
       baseMs: BASE_MS,
       active: () => !handle.detached && ctx.page === host && document.visibilityState === "visible" && !ctx.busy,
       async tick() {
-        const before = JSON.stringify(last);
+        const before = signature(last);
         const outcome = await handle.read();
         if (handle.detached) return "stop";
-        if (JSON.stringify(last) !== before && ctx.page === host) ctx.patch("controller-bar", controllerBarInner(controllerBarState(), ctx.busy, host));
+        if (ctx.page === host) {
+          const state = controllerBarState();
+          if (signature(last) !== before) ctx.patch("controller-bar-body", controllerBarInner(state, ctx.busy, host));
+          else {
+            const signal = document.getElementById("controller-bar-signal");
+            if (signal && signal.textContent !== signalText(state)) signal.textContent = signalText(state);
+          }
+          const live = document.getElementById("controller-bar-live");
+          if (live && live.textContent !== liveText(state)) live.textContent = liveText(state);
+        }
         if (outcome === "unavailable") return "stop";
         if (outcome === "failed") throw new Error("controller status not read");
         return "continue";
@@ -215,7 +247,7 @@ export async function startControllerFlow(ctx: ViewContext): Promise<void> {
     try { result = await (handle?.queue ?? createQueue()).run(() => startController()); }
     catch (error) {
       const text = errorText(error);
-      throw new Error(text.includes(ROOT_UNUSABLE) || text.includes("ROOT_UNUSABLE") ? `${text}\n${REDIRECTED_APPDATA}` : text);
+      throw new Error(text.includes(ROOT_UNUSABLE) ? `${text}\n${REDIRECTED_APPDATA}` : text);
     }
     ctx.notify(result.started ? "컨트롤러를 시작했습니다. 상태가 ‘동작 중’이 되는지 확인하세요."
       : result.reason === "already_running" ? "컨트롤러가 이미 동작 중입니다." : "컨트롤러를 시작하지 않았습니다.");
@@ -233,8 +265,8 @@ export async function stopControllerFlow(ctx: ViewContext): Promise<void> {
   await ctx.task("컨트롤러 정지 요청 중", async () => {
     const result = await (handle?.queue ?? createQueue()).run(() => stopController());
     if (result.status !== "ok" || !result.data) {
-      if (result.issues.some(issue => issue.code === "not_available")) last = { status: null, unavailable: true, error: null, busyRead: null };
-      throw new Error(describe(result.issues));
+      if (result.issues.some(issue => issue.code === "not_available") && handle && !handle.detached) last = { ...NONE, unavailable: true };
+      throw new Error(issueText(result.issues));
     }
     ctx.notify(result.data.requested ? "정지를 요청했습니다. 진행 중인 단계가 끝나면 컨트롤러가 정지합니다."
       : "컨트롤러가 동작 중이 아니어서 정지할 것이 없습니다.");

@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { readFileSync } from "node:fs";
 import { calls, HOSTILE, invalid, issue, NOT_AVAILABLE, ok, openWorkbench } from "./workflow-mock.ts";
 
 // Synthetic values only, built at runtime (the secret scan walks every commit).
@@ -35,6 +36,17 @@ const rows = (page: Page) => list(page).locator("tbody tr");
 const form = (page: Page) => page.locator("#profile-form");
 const bar = (page: Page) => page.locator("#controller-bar");
 const pill = (page: Page) => bar(page).locator(".status-pill").first();
+/** The signal age beside the pill (not a live region: it changes on every poll). */
+const signal = (page: Page) => bar(page).locator("#controller-bar-signal");
+const release = (page: Page, name: string) => page.evaluate(name => (window as any).__release(name), name);
+/** Holds every later `command` call until `window.__openGate()` (the mock's `holds` cannot start later). */
+const gate = (page: Page, command: string) => page.evaluate(command => {
+  const bridge = (window as any).__TAURI_INTERNALS__, inner = bridge.invoke;
+  let open!: () => void;
+  const opened = new Promise<void>(resolve => { open = resolve; });
+  (window as any).__openGate = () => open();
+  bridge.invoke = async (name: string, args: unknown) => { if (name === command) await opened; return inner(name, args); };
+}, command);
 const saveButton = (page: Page) => form(page).getByRole("button", { name: "저장", exact: true });
 const statusCalls = async (page: Page) => (await calls(page, { command: "controller_status" })).length;
 /** Whether the synthetic key appears in the page markup or text (only a boolean leaves the page). */
@@ -303,13 +315,15 @@ test("controller status shows running, stale and stopped without saved-credentia
   await expect(bar(page).locator('[role="status"]')).toHaveCount(1);
   expect(await statusCalls(page)).toBe(1);
   await page.clock.runFor(5000);
-  await expect(pill(page)).toHaveText("동작 중 · 마지막 신호 2초 전");
+  await expect(pill(page)).toHaveText("동작 중");
+  await expect(signal(page)).toHaveText("마지막 신호 2초 전");
   await expect(bar(page)).toContainText("컨트롤러 시작 후 바뀐 실행 프로필: pod-a");
   await expect(bar(page)).toContainText(RESTART_PROCEDURE);
   await expect(bar(page)).not.toContainText("MLflow 설정이 바뀌었습니다");
   await expect(bar(page)).not.toContainText("인증값이 저장되어 있지 않습니다");
   await page.clock.runFor(5000);
-  await expect(pill(page)).toContainText("연결 끊김 · 신호 2분 전");
+  await expect(pill(page)).toHaveText("연결 끊김");
+  await expect(signal(page)).toHaveText("신호 2분 전 · PC가 절전·종료되었다면 다시 시작하세요");
   await expect(bar(page)).not.toContainText("pod-a");
   expect(await statusCalls(page)).toBe(3);
   // Leaving the page stops the poller.
@@ -450,4 +464,193 @@ test("the bar names what a restart changes and what needs a saved credential fir
   await expect(bar(page)).toContainText(`${HOSTILE} 백그라운드 실행기를 시작하지 못했습니다.`);
   await expect(bar(page)).not.toContainText("키 저장 후");
   await expect(page.locator("img")).toHaveCount(0);
+});
+
+// -- review fixes (10.4 review of 4b4c194) --
+const observation = (extra: object = {}) => ({ profile_id: "pod-a", revision: "a".repeat(64), observed_at: "2026-10-21T08:00:00+00:00",
+  age_seconds: 120, provider: "existing_runpod", name: "A100 Pod", resource_id: "existing_runpod:pod-123", gpu_type: "NVIDIA A100 80GB PCIe",
+  gpu_count: 1, total_hourly_cost_usd: 1.89, cost_source: "runpod_api", selected_gpu_uuids: [], profile_current: true, fresh_for_real_plan: true, ...extra });
+
+test("saving or deleting reads the last checks again and drops the session inspection", async ({ page }) => {
+  const moved = { ...runpod, fields: { ...runpod.fields, pod_id: "pod-999" } };
+  const observed = ok({ profile: { provider: "existing_runpod", profile_id: "pod-a", name: "A100 Pod" }, revision: "a".repeat(64),
+    facts: { pod_id: "pod-123", gpu_type: "NVIDIA A100 80GB PCIe", gpu_count: 1, total_hourly_cost_usd: 1.89, observed_at: "2026-10-21T08:00:00+00:00" },
+    observed_at: "2026-10-21T08:00:00+00:00" });
+  await openWorkbench(page, { workflow: { controller_status: controller("absent"), executor_profile_inspect: observed,
+    observations_list: [ok({ observations: [observation()] }), ok({ observations: [observation({ profile_current: false, fresh_for_real_plan: false })] })] },
+    native: { executor_profiles_get: [{ profiles: [runpod] }, { profiles: [moved] }, { profiles: [] }],
+      executor_profile_save: { profile: moved, affected_runs: [] }, executor_profile_delete: { profile_id: "pod-a", affected_runs: [] } } });
+  await openProfiles(page);
+  const row = rows(page).first();
+  await expect(row).toContainText("실제 실행 계획에 사용 가능");
+  await row.getByRole("button", { name: /자원 확인/ }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "읽기 전용으로 확인" }).click();
+  await idle(page);
+  await expect(row).toContainText("방금 확인");
+  await edit(page, 0);
+  await form(page).getByLabel("Pod ID").fill("pod-999");
+  await saveButton(page).click();
+  await idle(page);
+  // The stored checks are read again (the backend decides what still holds) and this session's inspection is gone.
+  expect(await calls(page, { action: "observations_list" })).toHaveLength(2);
+  await expect(row).toContainText("확인 후 프로필이 바뀌어 다시 확인이 필요합니다");
+  await expect(row).not.toContainText("실제 실행 계획에 사용 가능");
+  await expect(row).not.toContainText("방금 확인");
+  await form(page).getByRole("button", { name: "삭제", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "삭제", exact: true }).press("Enter");
+  await idle(page);
+  expect(await calls(page, { action: "observations_list" })).toHaveLength(3);
+  await expect(rows(page)).toHaveCount(0);
+});
+
+test("returning to the page never shows the previous controller status as current", async ({ page }) => {
+  await openWorkbench(page, { clock: true, workflow: { observations_list: noObservations, controller_status: [controller("running"), controller("stale")] } });
+  await pauseClock(page);
+  await openProfiles(page);
+  await expect(pill(page)).toContainText("동작 중");
+  await page.locator('nav [data-action="nav:overview"]').click();
+  await gate(page, "controller_status");
+  await page.locator('nav [data-action="nav:profiles"]').click();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("실행 프로필");
+  await expect(page.locator(".notice.busy")).toHaveCount(1);
+  // Until this visit's own read answers, the bar claims nothing.
+  await expect(pill(page)).toHaveText("상태 확인 중");
+  await expect(bar(page)).not.toContainText("동작 중");
+  await expect(bar(page)).not.toContainText("마지막 신호");
+  await page.evaluate(() => (window as any).__openGate());
+  await idle(page);
+  await expect(pill(page)).toHaveText("연결 끊김");
+});
+
+test("polls patch the bar only when its state changes and announce a transition once", async ({ page }) => {
+  const running = (age: number) => controller("running", { controller: { owner_id: "owner-1", state: "running", heartbeat_age_seconds: age } });
+  await openWorkbench(page, { clock: true, workflow: { observations_list: noObservations, controller_status: [running(2), running(7), controller("stale")] } });
+  await pauseClock(page);
+  await openProfiles(page);
+  const live = bar(page).locator('[role="status"]');
+  await expect(live).toHaveCount(1);
+  await expect(live).toHaveText("백그라운드 컨트롤러: 동작 중");
+  const marked = '#controller-bar .status-pill, #controller-bar [role="status"]';
+  await page.evaluate(selector => document.querySelectorAll(selector).forEach(element => { (element as any).__kept = true; }), marked);
+  await page.clock.runFor(5000);
+  await expect(signal(page)).toHaveText("마지막 신호 7초 전");
+  // Only the age changed: the pill and the live region are the very same nodes, so nothing is announced again.
+  expect(await page.evaluate(selector => [...document.querySelectorAll(selector)].map(element => (element as any).__kept === true), marked)).toEqual([true, true]);
+  await page.clock.runFor(5000);
+  await expect(pill(page)).toHaveText("연결 끊김");
+  await expect(live).toHaveText("백그라운드 컨트롤러: 연결 끊김");
+  expect(await live.evaluate(element => (element as any).__kept === true)).toBe(true);   // the region persists; its text changed once
+});
+
+test("an OIDC mode without its token URL is a missing credential, not a restart", async ({ page }) => {
+  const running = controller("running", { restart_required: { profiles: [], tracking: true },
+    current: { ok: true, owner_id: "owner-1", profiles: {}, skipped_profiles: {}, tracking: { view_sha256: "d".repeat(64), auth_mode: "oidc", effective_auth_mode: "none" } } });
+  const options = { workflow: { observations_list: noObservations, controller_status: running } };
+  await openWorkbench(page, { ...options, settings: { auth_mode: "oidc", MLFLOW_OIDC_CLIENT_ID: "mlflow", MLFLOW_OIDC_CLIENT_SECRET_saved: true } });
+  await openProfiles(page);
+  await expect(bar(page)).toContainText("MLflow 인증 서버 주소(OIDC)가 저장되어 있지 않습니다");
+  await expect(bar(page)).not.toContainText("MLflow 설정이 바뀌었습니다");
+  // With the token URL and the secret saved, the same answer is a restart.
+  const other = await page.context().newPage();
+  await openWorkbench(other, { ...options, settings: { auth_mode: "oidc", MLFLOW_OIDC_TOKEN_URL: "https://sso.example.org/token",
+    MLFLOW_OIDC_CLIENT_ID: "mlflow", MLFLOW_OIDC_CLIENT_SECRET_saved: true } });
+  await openProfiles(other);
+  await expect(bar(other)).toContainText("MLflow 설정이 바뀌었습니다");
+  await expect(bar(other)).toContainText(RESTART_PROCEDURE);
+  await expect(bar(other)).not.toContainText("저장되어 있지 않습니다");
+});
+
+test("a RunPod profile saved without a key says it cannot be used yet", async ({ page }) => {
+  const keyless = { profile_id: "pod-c", RUNPOD_API_KEY_saved: false, fields: { provider: "existing_runpod", name: "키 없는 Pod",
+    pod_id: "pod-c1", ssh_fingerprint: "", ssh_key_file: "" } };
+  await openWorkbench(page, { workflow: { controller_status: controller("absent"), observations_list: noObservations },
+    native: { executor_profiles_get: [{ profiles: [] }, { profiles: [keyless] }], executor_profile_save: { profile: keyless, affected_runs: [] } } });
+  await openProfiles(page);
+  await list(page).getByRole("button", { name: "새 실행 프로필" }).click();
+  const f = form(page);
+  await expect(f).toContainText("화면이 다시 그려지면 입력 중인 키는 지워집니다");
+  await f.getByLabel("프로필 ID").fill("pod-c");
+  await f.getByLabel("이름", { exact: true }).fill("키 없는 Pod");
+  await f.getByLabel("Pod ID").fill("pod-c1");
+  await saveButton(page).click();
+  await idle(page);
+  await expect(page.locator(".notice").filter({ hasText: "실행 프로필을 저장했습니다." })).toContainText("RunPod API 키가 저장되어 있지 않아");
+});
+
+// A pin, passing on 4b4c194: the texts this screen recognizes or mocks are the native ones.
+test("the native texts this screen relies on match broker.rs and profiles.rs", () => {
+  const source = (path: string) => readFileSync(new URL(path, import.meta.url), "utf8");
+  const rust = (file: string, name: string) => new RegExp(`const ${name}: &str = "([^"]*)";`).exec(source(`../src-tauri/src/${file}`))?.[1];
+  expect(rust("broker.rs", "ROOT_UNUSABLE")).toBe(ROOT_UNUSABLE);
+  expect(/const ROOT_UNUSABLE = "([^"]*)";/.exec(source("../src/components/controller-bar.ts"))?.[1]).toBe(ROOT_UNUSABLE);
+  expect(rust("profiles.rs", "PROFILE_IN_USE")).toBe(PROFILE_IN_USE);
+  expect(`${rust("profiles.rs", "EDIT_CHECK_FAILED")} (${NOT_AVAILABLE})`).toBe(EDIT_CHECK_FAILED);
+});
+
+test("the last check stops reading as usable once its hour passes on an open page", async ({ page }) => {
+  await openWorkbench(page, { clock: true, profiles: [runpod], workflow: { controller_status: controller("absent"),
+    observations_list: ok({ observations: [observation({ age_seconds: 3590 })] }) } });
+  await pauseClock(page);
+  await openProfiles(page);
+  await expect(rows(page).first()).toContainText("실제 실행 계획에 사용 가능");
+  await page.clock.runFor(30000);
+  await expect(rows(page).first()).toContainText("1시간이 지나 실제 실행 계획 전에 다시 확인이 필요합니다");
+  await expect(rows(page).first()).toContainText("1시간 전 확인");
+  expect(await calls(page, { action: "observations_list" })).toHaveLength(1);      // a re-render, not a read
+});
+
+test("saving waits for a status read in flight, so one sidecar runs at a time", async ({ page }) => {
+  await openWorkbench(page, { clock: true, profiles: [runpod], workflow: { controller_status: controller("absent"), observations_list: noObservations },
+    native: { executor_profile_save: { profile: runpod, affected_runs: [] } } });
+  await pauseClock(page);
+  await openProfiles(page);
+  await gate(page, "controller_status");
+  await page.clock.runFor(5000);                                    // the poll starts and waits at the gate
+  await edit(page, 0);
+  await saveButton(page).click();
+  await expect(page.locator(".notice.busy")).toHaveCount(1);
+  expect(await calls(page, { command: "executor_profile_save" })).toHaveLength(0);
+  await page.evaluate(() => (window as any).__openGate());
+  await idle(page);
+  expect(await calls(page, { command: "executor_profile_save" })).toHaveLength(1);
+});
+
+test("a finished save or delete never takes the focus from a control outside the page", async ({ page }) => {
+  await openWorkbench(page, { profiles: [runpod], holds: ["executor_profile_save", "executor_profile_delete"],
+    workflow: { controller_status: controller("absent"), observations_list: noObservations },
+    native: { executor_profile_save: { profile: runpod, affected_runs: [] }, executor_profile_delete: { profile_id: "pod-a", affected_runs: [] } } });
+  // A control outside #app that survives renders, as the tutorial's popover does.
+  await page.evaluate(() => { const outside = document.createElement("button"); outside.id = "outside"; outside.textContent = "바깥"; document.body.append(outside); });
+  await openProfiles(page);
+  await edit(page, 0);
+  await saveButton(page).click();
+  await page.locator("#outside").focus();
+  await release(page, "executor_profile_save");
+  await idle(page);
+  await expect(page.getByText("실행 프로필을 저장했습니다.")).toBeVisible();
+  await expect(page.locator("#outside")).toBeFocused();
+  await form(page).getByRole("button", { name: "삭제", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "삭제", exact: true }).click();
+  await page.locator("#outside").focus();
+  await release(page, "executor_profile_delete");
+  await idle(page);
+  await expect(page.getByText("실행 프로필을 삭제했습니다.")).toBeVisible();
+  await expect(page.locator("#outside")).toBeFocused();
+});
+
+test("a form locked by a running save is not read back", async ({ page }) => {
+  // The unscripted save is refused (fail closed), so nothing replaces the draft afterwards.
+  await openWorkbench(page, { profiles: [runpod], holds: ["executor_profile_save"], workflow: { controller_status: controller("absent"), observations_list: noObservations } });
+  await openProfiles(page);
+  await edit(page, 0);
+  await saveButton(page).click();
+  await expect(form(page).getByLabel("Pod ID")).toBeDisabled();                  // its fieldset is disabled while busy
+  // No typing reaches a locked input; a value put there anyway must not become the draft when navigation reads drafts.
+  await form(page).getByLabel("Pod ID").evaluate(input => { (input as HTMLInputElement).value = "잠긴 입력"; });
+  await page.locator('nav [data-action="nav:overview"]').click();
+  await release(page, "executor_profile_save");
+  await idle(page);
+  await page.locator('nav [data-action="nav:profiles"]').click();
+  await idle(page);
+  await expect(form(page).getByLabel("Pod ID")).toHaveValue("pod-123");
 });
