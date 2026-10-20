@@ -569,14 +569,27 @@ def main():
         if not isinstance(request, dict):
             raise ValueError("invalid request")
         with contextlib.redirect_stdout(sys.stderr):
-            service = DesktopService(request["root"], request.get("settings"))
-            response = {"ok": True, "result": service.dispatch(request["action"], request.get("data", {}))}
+            if request.get("channel") == "workflow":
+                # The Task 9 workflow channel: strict models, public settings and scoped secrets only. It never
+                # builds DesktopService and never exports settings to the process environment.
+                from .desktop_workflows import handle
+                response = {"ok": True, "result": handle(request)}
+            else:
+                service = DesktopService(request["root"], request.get("settings"))
+                response = {"ok": True, "result": service.dispatch(request["action"], request.get("data", {}))}
     except Exception as exc:
         # Avoid HTTP/SSH exception details that can contain credentials or request headers. Uncertain
         # execution/preparation and remote timeouts carry fixed operator guidance (e.g. a retained reservation).
         message = str(exc) if isinstance(exc, (ValueError, KeyError, FileNotFoundError, ExecutionUncertain,
                                                TimeoutError)) else type(exc).__name__
-        for value in (request.get("settings", {}) if isinstance(locals().get("request"), dict) else {}).values():
+        sent = locals().get("request")
+        values = list((request.get("settings", {}) if isinstance(sent, dict) else {}).values())
+        if isinstance(sent, dict) and isinstance(sent.get("secrets"), dict):
+            values.extend(sent["secrets"].values())   # workflow channel: the action's scoped secrets
+        if isinstance(sent, dict) and isinstance(sent.get("profiles"), list):
+            values.extend(value for profile in sent["profiles"] if isinstance(profile, dict)
+                          and isinstance(profile.get("fields"), dict) for value in profile["fields"].values())
+        for value in values:
             if isinstance(value, str) and len(value) >= 8:
                 # OS errors quote paths with repr(), doubling Windows backslashes.
                 for form in (repr(value)[1:-1], value):

@@ -2099,6 +2099,89 @@ What Task 9 must wire (plan §7):
   https.
 - Forbid profile edits while an attempt holds its lock (8.4 Minor 5), and keep the 8.4 Minor 4 preflight-order note.
 
+## Task 9.1 workflow channel, projects, recipes and data, 2026-10-20
+
+Commit `feat: add the strict desktop workflow channel for projects, recipes and data`, written on `f75e628` in the
+worktree `codex/task-9.1` while 8.5 was still uncommitted (9.1 touches none of 8.5's files). It implements
+[Task 9 plan](superpowers/plans/2026-10-20-task9-secure-desktop-broker.md) §4 "9.1" with D8, D11 and D12.
+
+What changed:
+- New `desktop_workflows.py`: the closed 32-action table and its module routing (`ACTION_MODULES`, read-only),
+  `SECRET_SCOPES` (`executor_profile_inspect` → `RUNPOD_API_KEY`, `model_root_snapshot` → `HF_TOKEN`), the
+  `WorkflowEnvelope`/`NativeProfile`/`WorkflowContext` models, `WorkflowIssue`/`WorkflowResult`, the
+  `workflow_action` registration decorator, `issues_from_validation`, `refusal` with the 409 table, `local_file`,
+  `dispatch_action` (for the 9.6 CLI) and `handle`. Handlers for the 14 project, recipe, legacy-import, mapped-import
+  and split actions. The reserved practice ID is refused on `dataset_import_register` and on split outputs (preview
+  and, again, commit) with `TUTORIAL_REFUSAL`.
+- `desktop.main`: only the `request["channel"] == "workflow"` branch and the error redaction of the request's
+  `secrets` and profile field values. The legacy branch, its error classes and its output line are unchanged.
+- Actions of 9.2–9.4 resolve their module lazily; until it exists they answer `invalid`/`not_available`
+  (`NOT_AVAILABLE`), never a crash. A module that exists but misses a dependency is not masked.
+
+Deviations from the plan:
+- The legacy allowlist has **34** names, not 35 (F6 miscounts). The test copies the 34 and also parses
+  `allowed()` from `main.rs`.
+- `FORBIDDEN_FIELD` is applied with `fullmatch` to each field name and each of its snake/camel-case words
+  (`command_like_field`). A substring search would flag `RecipeSpec.description` ("script") and 9.3's
+  `approve_execution` ("exec"). Registration also refuses such models, and models that are not frozen `StrictModel`s
+  with `extra="forbid"`.
+- Credential refusal is broader than the seven names: their environment spellings (AWS, `HUGGING_FACE_HUB_TOKEN`,
+  `MLFLOW_TRACKING_PASSWORD`; case-insensitive), a non-boolean `<secret>_saved` flag and pasted private-key markers
+  in settings or profile fields. After model validation, a credential-named key inside free-form JSON (the
+  project's graph draft) is refused as `credential_field`, so it is never stored.
+- Envelope errors raise a fixed `invalid workflow request (<envelope fields>)`, never pydantic's text (it echoes
+  inputs). The root must be absolute; profile IDs are ≤64 characters and unique.
+- `issues_from_validation(..., data=None)` follows the request data to drop pydantic's union-member tags (for example
+  `constrained-str`) from pointers, and escapes `~`/`/` (RFC 6901).
+- `CONFLICTS` adds `immutable version already exists` → `version_exists`. Re-registering a mapped import's ID and
+  version with other bytes fails in `immutable_write` of the provenance pointer, not with the registry's text.
+  `INVALID_CODES` adds `LOCAL_FILE_ONLY` → `local_file_only`.
+- `local_file` also refuses DOS device names (`CON`, `NUL.csv`, `COM1`, `CONOUT$`), mixed `\/` UNC prefixes and NUL
+  bytes. New codes and Korean texts: `file_unreadable`, `source_unknown`, `dataset_unknown`, `preview_unknown`,
+  `legacy_profile_missing`/`legacy_profile_invalid`, warning `legacy_dataset_missing`, `credential_field`.
+- `dispatch_action` scrubs scoped secret values from any result (defence in depth for 9.2's two scoped actions).
+- Reads on an empty state create no definitions database.
+- `project_import_legacy`: project name = `ai_id`, purpose empty, task type = `workflow_id`; train binding plus a
+  validation binding from the evaluation profile. A dataset that is not registered becomes the warning
+  `legacy_dataset_missing` and no binding. A retry returns the current project; a changed profile under the same
+  request ID is `request_reused`.
+- `projects_list[].datasets` is the binding list. Splitting the practice dataset itself is allowed: its outputs
+  inherit `export_allowed: false`, so a real run still refuses them.
+
+Actual verification (worktree `D:\llm-tuning-factory-wt91`, main venv with `PYTHONPATH` on the worktree `src`;
+`tuning_factory.__file__` resolved into the worktree):
+- RED, before any `src` edit: 32 of the 33 new cases failed. 30 failed on the missing module (`pytest.fail`, not
+  collection). Two failed because `desktop.main` had no workflow branch (legacy answered `unsupported desktop
+  action`). The legacy-envelope regression guard passed. The device-name check was added later, test-first: RED
+  (`<tmp>\CON` reached `open()`), then GREEN.
+- Mutations through a pytest plugin in `%TEMP%` (no `src` edit): UNC allowed, scope check removed, credential check
+  removed, reserved guard removed, no secret scrub, pointers without data, no free-JSON credential scan, extra fields
+  relabelled, foreign-module registration allowed, every refusal classified `invalid`, random legacy recipe IDs. Each
+  one fails at least one test.
+- GREEN: the plan's command (`test_desktop_projects`, `test_desktop`, `test_desktop_tutorial`, `test_projects`,
+  `test_recipes`, `test_dataset_import`, `test_dataset_splits`, `test_legacy_migration`) gave **153 passed**.
+  Every desktop test (`tests/test_desktop*.py`, seven files) gave **145 passed**. The full suite gave **1316 passed,
+  1 skipped** (1283 + 33), on the final tree and on a run before the last two test-first edits. The known
+  `test_jobs.py::test_recovery_does_not_release_unknown_remote_execution` flake did not occur.
+- Ruff (`src tests`) is clean. `check_secrets.py` reports 0 findings over 761 file versions (with this change
+  staged). `git diff --exit-code containers/ pyproject.toml uv.lock` is clean.
+  Every changed file is CR-free. A subprocess test shows the channel imports no torch, peft, transformers,
+  safetensors, huggingface_hub or keyring.
+- CPU acceptance (`-I`, the worktree's script and source) exited 0, and all **29** checks passed. Receipt SHA256
+  `dd2dc480b45a5d34cf1d6d05652e203301f417950371fb91251f608817a6ec22`, source_sha256
+  `3915741efe02876d5889b304626e36841b00a64591eedac3289c0ea7b3f232e0` (equal to `source_hash()` of the committed
+  `src`), lock_sha256 `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`. Max errors are
+  unchanged (merge delta 7.78e-9, materialize delta 9.17e-9, parent→child 6.42e-9, logits 3.35e-8/2.98e-8).
+  `model_downloaded`, `gpu_used`, `institution_data_used` and `production_promotable` are false. It supersedes
+  8.4's `2afbd0b8…88f8`; 8.5's commit changes the source hash again, so root reconciles the receipt pointer.
+
+Not verified or still open:
+- No Rust, Playwright or UI run: 9.1 changes no TypeScript or Rust. The native side (9.5) does not send workflow
+  requests yet, so the envelope is exercised only from Python.
+- `local_file` checks strings only. A local symlink or junction to a share, or a mapped network drive letter, is not
+  detected.
+- No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
