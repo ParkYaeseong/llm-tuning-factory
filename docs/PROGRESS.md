@@ -228,6 +228,46 @@ persistent multi-Pod controller/tracking repair, secure desktop API/broker, Wind
 These foundations are not end-to-end workflow, Windows 0.4.0 or live GPU acceptance. Actual serial handoff,
 multi-Pod concurrency and merge/reevaluation on GPU require separate concrete resource/data authorization.
 
+Task 7.1 (2026-10-20, [sub-plan](superpowers/plans/2026-10-20-task7-model-operations.md) §3 7.1 and §4): hash-locked CPU
+model-operation runtime and numerics. `containers/model-ops-cpu-requirements.in`/`.lock` (56 packages, all hashed;
+`torch==2.7.1+cpu` from the PyTorch CPU index via `--torch-backend cpu`; peft 0.18.1, transformers 5.6.0, safetensors
+0.8.0, tokenizers 0.22.2, accelerate 1.11.0, huggingface-hub 1.33.0, numpy 2.5.4, equal to the primary GPU lock; no
+LLaMA-Factory, bitsandbytes, triton or `nvidia-*`). The venv is the git-ignored `.factory/model-ops-cpu-venv`
+(`uv venv --python 3.12` + `uv pip sync --require-hashes --torch-backend cpu`; first sync verified). The old unlocked
+`.factory/model-ops-cpu-env` was not used and is superseded. `runtime_profiles` gains `MODEL_OPS_PINS` and
+`MODEL_OPS_CPU_LOCK`. New `model_ops.py` imports no torch at module level and validates before any heavy import:
+merge inputs reuse `graph_planner._merge_descriptors`/`_materializable`/`_adapter_tensor_shapes` and `MergeNode`
+weights (the real-only rule is relaxable only by `require_real=False`; graph compilation stays real-only), materialize
+refuses an HF root for an artifact effective base and quantized or adapter bases, the local loader `adapter_config.json`
+must equal the descriptor, `fan_in_fan_out` is refused, and a streamed stdlib F16/BF16/F32/F64 NaN/inf scan runs on
+adapters. The numerics are a PEFT `cat` merge in FP32 and `merge_and_unload(safe_merge=True)`, both stored F32 only
+(policy `model-ops-f32-v1`), with delta, reload-logits, non-target identity, base-byte tokenizer and finite checks;
+merged `base_model_name_or_path` is the root repo ID and `README.md` is dropped. Merge saves with
+`save_embedding_layers=False`, because PEFT's `auto` vocabulary probe queried the HF Hub for the provenance repo ID
+(caught by the acceptance `no_hub_lookups` check). Also added: `inspect_target_modules` (meta device, LLaMA-Factory's
+Linear rule), `verify_inspected_targets` and `adapter_metadata_from_config` (a real PEFT 0.18.1 export freezes).
+
+Actual verification: `uv run pytest tests/test_model_ops_contract.py -q` **74 passed** (RED first: 70 failed on the
+missing module). The 7.1 regression set (model_ops_contract, model_artifacts, graph_planner, ppo_profile,
+runtime_profiles) passed, `uv run ruff check src tests` passes, `git diff --exit-code` on both GPU locks exits 0 and the
+main `.venv` lists no torch/peft/transformers/safetensors. CPU acceptance
+`.factory\model-ops-cpu-venv\Scripts\python.exe -I scripts\verify_model_ops_cpu.py --receipt .factory\model-ops-cpu-receipt.json`
+exits 0 with all 18 checks passed on the locally generated tiny Qwen2 (2 layers, hidden 16, 27 tensors) and WordLevel
+tokenizer. `cat` merge r2/α4 + r3/α9 at 0.25/0.75 gives r = α = 5. Max delta errors: merge 7.78e-9, materialize 9.17e-9,
+parent→child 6.42e-9 (atol 1e-6). Max logits errors: merge 3.35e-8, materialize 2.98e-8 (atol 1e-5). F2 differs from
+root + ΔC by 0.187 (> 1e-3). The frozen reference keeps all 27 tensor SHA256s while the policy LoRA updates. NaN-adapter
+and inf-base inputs are refused before output, the stdlib and torch scans agree on 10 files, 14 target modules are exact
+and 4 tampered evidences are refused, and no Hub lookup occurs. Receipt SHA256
+`4508012d781c7e7085f44e3881bda274ae88a52c15920ad5508acf1233bf8f16`; source_sha256
+`81b7369b29045e454b35a92fa8fe2ac3a2bf4fd3deacb7892b5a96bc0f61fd78`; lock_sha256
+`5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`; `model_downloaded`, `gpu_used`,
+`institution_data_used` and `production_promotable` are false. The CPU lock is Windows-only.
+
+Still open for Task 7 GPU work: merge/materialize tolerances at real model sizes on CUDA (TF32 off) and memory
+(FP32 loads; about 3 base loads per merge), BF16 storage policy (none; F32 doubles size), HF-root snapshots with
+symlinks (the local checks refuse links, so 7.2/7.3 must hand over a link-free verified directory), staging/binding
+(7.2, including F10), worker v2 (7.3), SSH cache/single launch (7.4) and the attempt runner (7.5, including F11).
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
