@@ -74,6 +74,8 @@ const stageLabel = (ctx: ViewContext, stage: string) => stagesOf(ctx).find(item 
 const focusEditor = () => document.getElementById("recipe-editor-title")?.focus();
 /** A text as a textarea's value holds it: the HTML parser and `.value` turn CRLF and CR into LF. */
 const lf = (value: unknown) => String(value ?? "").replace(/\r\n?/g, "\n");
+/** A text as a one-line `<input>` holds it: its value sanitization removes every CR and LF. */
+const oneLine = (value: unknown) => String(value ?? "").replace(/[\r\n]/g, "");
 /** Whether the user is still on the page an action started from (its follow-up may only then move the focus). */
 const stillOn = (ctx: ViewContext) => { const page = ctx.page, arg = ctx.arg; return () => ctx.page === page && ctx.arg === arg; };
 /** Puts the focus on `key` only when a render lost it (to body) and only on the same page: never across pages. */
@@ -286,10 +288,12 @@ function captureForm(ctx: ViewContext) {
   const form = document.querySelector<HTMLFormElement>("#recipe-form");
   const draft = form?.dataset.recipeId ? drafts.get(form.dataset.recipeId) : undefined;
   if (!form || !draft || form.querySelector("fieldset:disabled")) return;
-  const description = draft.spec.description;
+  const { description, name } = draft.spec;
   readFields(form, "data-recipe", draft.spec);
-  // A description that differs only in line endings (CRLF from another writer) is the stored one.
+  // A description that differs only in line endings (CRLF from another writer) is the stored one; so is a name that
+  // differs only in line breaks, which its one-line input cannot hold.
   if (lf(draft.spec.description) === lf(description)) draft.spec.description = description;
+  if (oneLine(draft.spec.name) === oneLine(name)) draft.spec.name = name;
   draft.spec.input_kind = inputKindFor(draft.spec.training_stage, stagesOf(ctx));
 }
 

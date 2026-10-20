@@ -10,7 +10,7 @@ export interface ViewContext {
   readonly catalog: Catalog; readonly busy: boolean; readonly store: ProjectStore;
   hasPage(id: string): boolean;
   navigate(page: string, arg?: string): Promise<void>;
-  render(): void;                                                // full render (respects press deferral)
+  render(): void;                                                // full render (waits for a press or an IME composition in the page)
   /** Replaces one region, rebinds its actions and restores the focused control by its focus key (`data-focus-key`,
    * else `data-action`, else `id`), so every focusable control in a region needs a key unique within it. What was typed
    * is kept only when the same single control (same tag and type) comes back; `keepTyping: false` for a patch that is

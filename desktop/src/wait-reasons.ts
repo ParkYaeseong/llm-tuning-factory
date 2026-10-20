@@ -84,8 +84,9 @@ export function localizeWaitReason(reason: string | null, labelOf?: LabelOf): Lo
   if (!reason) return null;
   const name = (nodeId: string) => labelOf?.(nodeId)?.trim() || nodeId;
   if (reason.startsWith(`${UNPRICED}; `)) {
-    const rest = localizeWaitReason(reason.slice(UNPRICED.length + 2), labelOf)!;
-    return { text: `${UNPRICED_TEXT} · ${rest.text}`, original: reason, kind: "budget" };
+    // Nothing after the separator: the notice alone (a null here would throw on every poll of the run).
+    const rest = localizeWaitReason(reason.slice(UNPRICED.length + 2), labelOf);
+    return { text: rest ? `${UNPRICED_TEXT} · ${rest.text}` : UNPRICED_TEXT, original: reason, kind: "budget" };
   }
   for (const [pattern, kind, text] of REASONS) {
     const match = pattern.exec(reason);

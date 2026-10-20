@@ -791,6 +791,9 @@ test("a changed preview is reported once and names keep their direction", async 
   await importFile(page, path);
   await expect(page.locator(".import-source-facts bdi")).toHaveText(path);
   await expect(page.locator("#import-mapping table.import-samples thead th bdi")).toHaveCount(3);
+  // <option> text cannot hold <bdi>: first-strong isolate marks wrap the name (escapes in the source, same characters).
+  await expect(page.locator("#import-mapping").getByLabel("지시문", { exact: true }).locator("option", { hasText: hebrew }))
+    .toHaveJSProperty("text", `\u2068${hebrew}\u2069`);
   await mapColumns(page, { 지시문: hebrew, 입력: "context", 정답: "answer" });
   await preview(page);
   await register(page, "qa", "1");

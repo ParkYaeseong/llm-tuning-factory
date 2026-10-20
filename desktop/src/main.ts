@@ -84,6 +84,9 @@ const gpuServer = serverBridge(api);
 const running: { label: string }[] = [];
 // A view's `enter` that waited for running tasks keeps the notice or error they left (a save's result) visible.
 let keepMessages = false;
+// Every navigation gets the next number: a visit's `enter` that waited for running tasks runs only while it is still the
+// latest navigation (visiting a page again meanwhile would otherwise run each visit's `enter` once the tasks end).
+let navigations = 0;
 let idleWaiters: (() => void)[] = [];
 const idle = () => running.length ? new Promise<void>(resolve => idleWaiters.push(resolve)) : Promise.resolve();
 async function task(label: string, operation: () => Promise<void>) {
@@ -487,19 +490,45 @@ function comparison() {
 const pressable = "button, summary, label.check, input[type=checkbox], input[type=radio]";
 let pressed = false, presses = 0, armed = 0, renderDeferred = false;
 let pressedControl: Element | null = null;
-// While an IME composes (Hangul), replacing the composing input would corrupt the text: patches of its region wait.
+// While an IME composes (Hangul), replacing the composing input would corrupt the text: patches of its region wait, and
+// so does a full render that carries no task result (`renderSoft`) while the composing control is in the page.
 let composing = false;
+let composingTarget: EventTarget | null = null;
+let composeDeferred = false;
 const composedPatches = new Map<string, { html: string; options: { keepTyping?: boolean } }>();
-window.addEventListener("compositionstart", () => { composing = true; }, true);
+window.addEventListener("compositionstart", event => { composing = true; composingTarget = event.target; }, true);
 window.addEventListener("compositionend", () => {
-  composing = false;
+  composing = false; composingTarget = null;
   setTimeout(() => {
     if (composing) return;
     const waiting = [...composedPatches];
     composedPatches.clear();
+    // A full render that waited for the composition covers every patch that waited with it.
+    if (composeDeferred) { renderAfterComposition(); return; }
     for (const [regionId, { html, options }] of waiting) patch(regionId, html, options);
   }, 0);
 }, true);
+/** Whether an IME composes in a control of the page that a full render would replace. The control must still have the
+ * focus, so one that a task's render already replaced (its composition never ended) holds no render back. */
+function composingInPage() {
+  return composing && composingTarget instanceof Element && document.activeElement === composingTarget && root.contains(composingTarget);
+}
+/** A full render that carries no task result (a poll, a view's own render or notice, the history filter). While an IME
+ * composes in the page it waits until the composition ends. A task's render never waits (its result may change the
+ * forms of its page, which a capture during the composition would read back stale) and supersedes a waiting one. */
+function renderSoft() {
+  if (!pressed && composingInPage()) { composeDeferred = true; return; }
+  render();
+}
+/** The render that waited for a composition: the composed text is read into the drafts first, and the focus returns to
+ * the same control with its selection. */
+function renderAfterComposition() {
+  if (!composeDeferred) return;
+  captureDrafts();
+  const keep = focusSpot();
+  render();
+  if (!document.activeElement || document.activeElement === document.body) keep();
+}
 /** Before form values are read back into state: a deferred render means the page still shows values that a
  * finished task has since replaced. During the press itself the page is current and stays as it is. */
 function flushDeferredRender() { if (renderDeferred && !pressed) render(); }
@@ -517,7 +546,7 @@ window.addEventListener("pointerdown", e => {
  * deferred render cannot rebuild the page from older drafts; a task's render already pending keeps precedence. */
 function renderKeepingDrafts() {
   if (pressed && !renderDeferred) captureDrafts();
-  render();
+  renderSoft();
 }
 for (const type of ["pointerup", "pointercancel"]) window.addEventListener(type, releasePress, true);
 // A release the page never saw (outside the window, on a control disabled meanwhile) must not leave it stale.
@@ -530,7 +559,7 @@ function render() {
     if (armed !== presses) { const press = armed = presses; setTimeout(() => { if (pressed && presses === press) releasePress(); }, 1000); }
     return;
   }
-  renderDeferred = false;
+  renderDeferred = false; composeDeferred = false;
   const legacyViews: Obj = { overview, connections, datasets, training, jobs, history };
   const view = viewById(state.page);
   const title = view ? view.title : pages[state.page];
@@ -745,7 +774,10 @@ function bind() {
   document.querySelector<HTMLInputElement | HTMLSelectElement>('[data-key="experiment"]')?.addEventListener("change", e => state.experiment = (e.target as HTMLInputElement).value);
   document.querySelector<HTMLInputElement>("#history-search")?.addEventListener("input", e => {
     const input = e.target as HTMLInputElement; const cursor = input.selectionStart;
-    state.historyQuery = input.value; render();
+    state.historyQuery = input.value;
+    // While an IME composes in the search box, the filter applies once the composition ends (renderSoft waits).
+    if (composingInPage()) { renderSoft(); return; }
+    render();
     const next = document.querySelector<HTMLInputElement>("#history-search")!; next.focus({ preventScroll: true }); next.setSelectionRange(cursor, cursor);
   });
   document.querySelector<HTMLSelectElement>("#history-status")?.addEventListener("change", e => {
@@ -820,14 +852,16 @@ async function action(name: string) {
     if (!Object.hasOwn(pages, page) && !viewById(page)) return;
     captureConfig(); captureDrafts();
     try { viewById(state.page)?.leave?.(ctx); } catch (error) { console.error(error); }
+    const visit = ++navigations;
     state.page = page; state.arg = rest.length ? rest.join(":") : null;
     render();
     const entered = viewById(page);
     if (entered?.enter) {
-      // A view's reads start after the running tasks (a save still in flight), and only if the page is still shown.
+      // A view's reads start after the running tasks (a save still in flight), and only if this visit is still the
+      // latest navigation and its page is still shown.
       const arg = state.arg, waited = running.length > 0;
       await idle();
-      if (state.page === page && state.arg === arg) {
+      if (visit === navigations && state.page === page && state.arg === arg) {
         keepMessages = waited;
         try { await entered.enter(ctx); } catch (error) { state.error = errorText(error); render(); }
         finally { keepMessages = false; }
@@ -1012,6 +1046,6 @@ setInterval(() => {
   polling = true; captureDrafts();
   refresh().then(async () => {
     if (state.liveProgress && state.active) state.progress = await api("job_progress", { job_id: state.active, remote: true });
-    render();
+    renderSoft();
   }).catch(() => { state.liveProgress = false; }).finally(() => polling = false);
 }, 10000);

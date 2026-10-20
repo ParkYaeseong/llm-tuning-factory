@@ -684,6 +684,9 @@ test("wait reasons cover the controller's texts and every status has a Korean na
   expect(reasons.localizeWaitReason("waiting for train-1", id => ({ "train-1": "기본 학습" } as Record<string, string>)[id]).text)
     .toBe("앞 단계 ‘기본 학습’이(가) 끝나기를 기다리는 중입니다");
   expect(reasons.localizeWaitReason(`${UNPRICED}; waiting for destination existing_runpod:pod-a`)!.text).toContain("가격을 알 수 없는 이전 시도");
+  // The unpriced notice with nothing after its separator (10.7 re-review) shows the notice alone instead of throwing.
+  expect(reasons.localizeWaitReason(`${UNPRICED}; `)).toEqual({ text: "가격을 알 수 없는 이전 시도가 승인 예산 전체를 예약했습니다",
+    original: `${UNPRICED}; `, kind: "budget" });
   // Korean texts (desktop_runtime.MISSING_KEY) are shown as received.
   const missingKey = "SSH 개인키 파일을 찾을 수 없습니다. 연결 화면에서 키 파일을 다시 선택하세요.";
   expect(reasons.localizeWaitReason(missingKey)).toEqual({ text: missingKey, original: missingKey, kind: "error" });

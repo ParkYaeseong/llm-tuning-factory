@@ -1,6 +1,8 @@
 // Pure modules of the workflow workbench, tested in Node (no page): bridge parsing, issues, drafts, polling, navigation.
 import { test, expect } from "@playwright/test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 import { NATIVE_PENDING, WORKFLOW_ACTIONS, type PlanSummary, type ProjectRevision, type WorkflowIssue } from "../src/workflow-types.ts";
 import { BridgeError, MALFORMED, parseWorkflowResult } from "../src/api.ts";
 import { issueList, issuesAt, localize, nodeIssues, planSection, rowIssues } from "../src/issues.ts";
@@ -353,4 +355,23 @@ test("the navigation model places workflow views beside the legacy pages", () =>
   const legacy = navModel([]);
   expect(legacy.map(item => [item.group, item.id])).toEqual([["workspace", "overview"], ["workspace", "datasets"],
     ["workspace", "history"], ["single", "training"], ["single", "jobs"], ["settings", "connections"], ["settings", "tutorial"]]);
+});
+
+test("no source or test file holds a literal bidirectional control character", () => {
+  // Invisible embedding, override and isolate controls trigger GitHub's bidi warning and Trojan-Source linters; code that
+  // needs one writes it as an escape (data-import.ts's isolate marks, 10.3 re-review). The pattern is built from code
+  // points so this file holds none either.
+  const controls = new RegExp(`[${String.fromCodePoint(0x202a)}-${String.fromCodePoint(0x202e)}${String.fromCodePoint(0x2066)}-${String.fromCodePoint(0x2069)}]`);
+  const found: string[] = [];
+  for (const folder of ["src", "tests"]) {
+    const base = fileURLToPath(new URL(`../${folder}/`, import.meta.url));
+    for (const entry of readdirSync(base, { recursive: true, withFileTypes: true })) {
+      if (!entry.isFile() || !/\.(ts|css|mjs|json|html)$/.test(entry.name)) continue;
+      const file = join(entry.parentPath, entry.name);
+      readFileSync(file, "utf8").split("\n").forEach((line, index) => {
+        if (controls.test(line)) found.push(`${relative(base, file)}:${index + 1}`);
+      });
+    }
+  }
+  expect(found).toEqual([]);
 });

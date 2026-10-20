@@ -4919,6 +4919,78 @@ Actual verification:
   - `pytest -q` **1716 passed, 1 skipped**, and Ruff passes;
   - `check_secrets.py` reports 0 findings, and the protected-path diff against `d4d81ae` is clean.
 
+## Task 10.8 deferred nits: latest page entry, one-line texts, full renders during an IME, 2026-10-21
+
+Commit `fix: run only the latest page entry and keep imported text stable`, written in the main tree on `d4d81ae` (the
+10.7 review fixes). It lands the deferred UI nits assigned to 10.8 (the [Task 11 plan](superpowers/plans/2026-10-21-task11-release-0-4-0.md)
+§2 "Deferred nit details", items 2, 3, 4, 9 and 10) and root's null guard from the 10.7 re-review. Changed:
+`desktop/src/{main,view-types,wait-reasons}.ts`, `desktop/src/views/{projects,recipes,data-import}.ts`,
+`desktop/tests/{navigation,projects,recipes,data-import,graph-runs,workflow-core}.spec.ts`, two characters of the Task
+11 plan and this file. No Python, Rust, package or lock file changed.
+
+What changed:
+- Navigation sequence number (item 2). Every `nav:` takes the next number. A visit's `enter` that waited for running
+  tasks runs only while it is still the latest navigation and its page and argument are still shown. Projects →
+  기록 비교 → projects → 레시피 → projects while a save is held now reads `projects_list` once (it was three times).
+- One-line texts (item 3). An `<input>` drops CR and LF from its value. The project page now treats a name or task type
+  that differs from the stored one only by line breaks as the stored text. So there is no phantom "저장 안 된 변경",
+  the clean draft is re-read on reopening, and a save without an edit sends the stored text. The purpose (a textarea)
+  keeps the 10.2 rule. Beyond the nit: the recipe name had the same defect and gets the same rule.
+- Full renders during an IME composition (item 4).
+  - A full render that carries no task result waits while an IME composes in a control of the page that still has
+    the focus (`renderSoft`). That covers a view's `ctx.render`/`notify`/`fail`, the legacy 실행 관리 poll and the
+    기록 비교 search filter. When the composition ends, the shell reads the drafts, renders and puts the focus and
+    selection back on the same control. Patches that waited are covered by that render.
+  - A composition outside `#app` (a dialog, the tour popover), a composing control that lost the focus, and one that a
+    render already replaced hold nothing back.
+  - Documented limit, tested: a task's own final render is never deferred. Its result may change the forms of its own
+    page, and a capture during the composition would read the stale page back over it (the training form reads every
+    `[data-config]` field on each `input`). It replaces the composing input as before and supersedes a waiting render.
+    The workflow views lock their forms while busy, so this affects only the unlocked legacy forms of the task's page.
+  - The 기록 비교 search box was replaced on every composing keystroke, which split Hangul syllables. It now filters
+    when the syllable is committed.
+- `isolatedText` (item 9) writes its two isolate marks as escapes: the same characters, pinned by the option text in
+  `data-import.spec.ts`. The Task 11 plan's item 9 held the same literal characters where it meant the escapes; fixed.
+  A Node test fails on any bidi control (U+202A–U+202E, U+2066–U+2069) under `desktop/src` and `desktop/tests`.
+  - Cause found while fixing it: the agent edit tool on this machine turns a typed backslash-u escape into the literal
+    character. Write such escapes through a script that builds the backslash.
+- 10.7 re-review: `localizeWaitReason` threw a `TypeError` for the unpriced notice with nothing after its "; ", which
+  would have broken every poll of that run's detail. It now shows the notice alone; a Node case pins it.
+- Notes (item 10, 10.3 re-review):
+  - The import mapping's 500-choice cap takes the first 500 source columns in alphabetical (code point) order, not
+    file order: `dataset_import` returns `source_fields` sorted. "앞 500개" in the cap note means that order.
+  - A flags-only change (합성 데이터, GPU 전송) to an ID and version already registered on the page is blocked as
+    "이미 등록했습니다": the register key is the preview, ID and version. The server would refuse it anyway
+    (`version_exists`), so a different flag needs a new version.
+
+Actual verification:
+- Against this tree's own Vite on port 1490 through a scratch config under `%TEMP%` (`reuseExistingServer: false`).
+- RED first, before any `src` edit:
+  - the latest-visit test read `projects_list` three times;
+  - the poll-render and history-filter tests found the composing input replaced;
+  - the project test re-read nothing on reopening (a dirty draft was kept);
+  - the recipe test likewise;
+  - the bidi scan found `views/data-import.ts:157` (and the new test line, until it was rewritten with escapes);
+  - the wait-reason case threw "Cannot read properties of null (reading 'text')".
+- The option-text pin and the limit test pass on the old code by design: they pin behaviour that must not change.
+- 14 distinct mutations of the fixes: 11 fail a test against the final specs (the sequence check, both line-break
+  rules, the null guard, the deferral itself, its focus and page conditions, the reset by a task's render, the draft
+  read and focus return after the composition, the history guard).
+  - Two of those survived at first and gained test steps: the focus condition and the reset by a task's render.
+  - The three survivors were redundant code, now removed: an `isConnected` check (the focus check implies it), a
+    history search read in `captureDrafts`, and a draft read at deferral time (the waiting render reads the drafts when
+    it runs).
+  - Not covered by a test: the legacy jobs poll's switch to `renderSoft` (it shares the tested helper).
+- From `desktop/`: `npx playwright test` **211 passed** (the 204 existing plus 7 new; `graph-runs.spec.ts` test 13 and
+  `data-import.spec.ts` "names keep their direction" gained assertions); `npm run build` passes.
+- From the root: `uv run pytest -q` **1716 passed, 1 skipped** (no Python change); `uv run ruff check src tests` passes;
+  `scripts/check_secrets.py` reports 0 findings with the change staged; `git diff --exit-code src/ desktop/src-tauri/
+  containers/ pyproject.toml uv.lock desktop/package.json desktop/package-lock.json` is clean; every changed file is
+  CR-free.
+
+Not verified or still open:
+- A real Windows IME in WebView2: the tests dispatch `compositionstart`/`input`/`compositionend` themselves. Task 11.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

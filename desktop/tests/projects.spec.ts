@@ -378,6 +378,43 @@ test("a purpose with a leading newline or Windows line breaks stays clean", asyn
   expect((await calls(page, { action: "project_save" })).at(-1).args.data.spec.purpose).toBe(purpose);
 });
 
+// -- deferred nit recorded for 10.8 (10.2 re-review): one-line inputs strip line breaks --
+
+test("a name or task type with a line break from another writer stays clean", async ({ page }) => {
+  await openWorkbench(page, { definitions: true });
+  await createProject(page, "줄바꿈 이름");
+  // Another program saves a name and a task type with line breaks, which an <input> cannot show.
+  const listed = await bridge(page, "projects_list", {});
+  const { project_id, revision_sha256 } = listed.data.projects[0];
+  const current = await bridge(page, "project_get", { project_id });
+  const name = "줄바꿈\r\n이름", taskType = "요약\n분류\r";
+  expect((await bridge(page, "project_save", { spec: { ...current.data.project, name, task_type: taskType },
+    expected_revision: revision_sha256 })).status).toBe("ok");
+  const open = async () => {
+    await page.locator('nav [data-action="nav:history"]').click();
+    await page.locator('nav [data-action="nav:projects"]').click();
+    await idle(page);
+    await page.locator(".project-list tbody tr", { hasText: "줄바꿈" }).getByRole("button", { name: /열기/ }).click();
+    await idle(page);
+  };
+  await open();
+  const form = projectForm(page);
+  await expect(form.getByLabel("프로젝트 이름")).toHaveValue("줄바꿈이름");
+  await expect(form.getByLabel("작업 유형")).toHaveValue("요약분류");
+  await expect(form.locator(".status-pill")).toContainText("저장된 버전");
+  // Leaving reads the form back: the draft stays clean, so coming back re-reads it instead of keeping a phantom change.
+  const reads = (await calls(page, { action: "project_get" })).length;
+  await open();
+  expect(await calls(page, { action: "project_get" })).toHaveLength(reads + 1);
+  await expect(form.locator(".status-pill")).toContainText("저장된 버전");
+  // Saving without an edit sends both texts exactly as stored; an edit replaces them as typed.
+  await saveProject(page);
+  expect((await calls(page, { action: "project_save" })).at(-1).args.data.spec).toMatchObject({ name, task_type: taskType });
+  await form.getByLabel("작업 유형").fill("요약 분류");
+  await saveProject(page);
+  expect((await calls(page, { action: "project_save" })).at(-1).args.data.spec).toMatchObject({ name, task_type: "요약 분류" });
+});
+
 test("the project list escapes every value and saving stops once the channel is unavailable", async ({ page }) => {
   const created = { project: { schema_version: 1, project_id: "unavailable-project", name: "설치 전 프로젝트", purpose: "", task_type: "",
     datasets: [], default_executor_profile_id: null, graph: {}, legacy_origin: null }, revision_sha256: "d".repeat(64) };

@@ -154,7 +154,7 @@ function cell(value: unknown) {
 /** A source name (path, column) isolated from the surrounding text's direction: `<bdi>` in markup; first-strong
  * isolate marks in `<option>` text, which cannot hold markup. */
 const isolated = (name: string) => `<bdi>${escapeHtml(name)}</bdi>`;
-const isolatedText = (name: string) => `⁨${name}⁩`;
+const isolatedText = (name: string) => `\u2068${name}\u2069`;
 const flagsText = (flags: { synthetic: boolean; export_allowed: boolean }) =>
   `${flags.synthetic ? "합성 데이터" : "사용자 데이터"} · GPU 전송 ${flags.export_allowed ? "허용" : "미허용"}`;
 /** Column choices: the first COLUMN_CHOICES source columns, plus the chosen one when it lies beyond them. */

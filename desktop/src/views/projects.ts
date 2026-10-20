@@ -54,6 +54,8 @@ const trimmed = (draft: CreateDraft): CreateDraft => ({ name: draft.name.trim(),
 const focusById = (id: string) => document.getElementById(id)?.focus({ preventScroll: false });
 /** A text as a textarea's value holds it: the HTML parser and `.value` turn CRLF and CR into LF. */
 const lf = (value: unknown) => String(value ?? "").replace(/\r\n?/g, "\n");
+/** A text as a one-line `<input>` holds it: its value sanitization removes every CR and LF. */
+const oneLine = (value: unknown) => String(value ?? "").replace(/[\r\n]/g, "");
 /** Whether the user is still on the page an action started from (its follow-up may only then move the focus). */
 const stillOn = (ctx: ViewContext) => { const page = ctx.page, arg = ctx.arg; return () => ctx.page === page && ctx.arg === arg; };
 /** Puts the focus on `key` only when a render lost it (to body) and only on the same page: never across pages. */
@@ -385,10 +387,12 @@ function captureForms(ctx: ViewContext) {
   const projectId = form?.dataset.projectId;
   const draft = projectId ? ctx.store.draft(projectId) : undefined;
   if (form && projectId && draft && !locked(form)) {
-    // A text that differs only in line endings (CRLF from another writer) is the stored one: keep it as it is.
+    // A text that differs only in what its control cannot hold (CRLF in the purpose's textarea; any line break in the
+    // one-line name and task type inputs, from another writer) is the stored one: keep it as it is.
     const text = (key: "name" | "purpose" | "task_type") => {
       const shown = readKey(form, key);
-      return lf(shown) === lf(draft.spec[key]) ? draft.spec[key] : shown;
+      const same = key === "purpose" ? lf(shown) === lf(draft.spec[key]) : oneLine(shown) === oneLine(draft.spec[key]);
+      return same ? draft.spec[key] : shown;
     };
     const values = { name: text("name"), purpose: text("purpose"), task_type: text("task_type"),
       default_executor_profile_id: readKey(form, "default_executor_profile_id") || null };

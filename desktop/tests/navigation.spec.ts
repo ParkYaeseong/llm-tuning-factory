@@ -237,6 +237,7 @@ const drafts = {
 };
 window.__patch = (html, options) => { ticks++; current.patch("draft-region", html ?? region(), options); };
 window.__notify = () => current.notify("폴링 알림");
+window.__render = () => current.render();
 export const views = [drafts];
 export const viewById = id => views.find(view => view.id === id);
 `;
@@ -469,4 +470,138 @@ test("a view render during a press after a task finished keeps the task's result
   await expect(page.locator(".notice.busy")).toHaveCount(0);
   await expect(page.getByLabel("메모", { exact: true })).toHaveValue("서버가 고친 메모");
   await expect(page.getByText("폴링 알림")).toBeVisible();
+});
+
+// -- deferred nits recorded for 10.8 (10.2 re-review): the latest page entry only; full renders during an IME --
+
+test("only the latest visit of a page runs its entry once a held task ends", async ({ page }) => {
+  await openWorkbench(page, { definitions: true, holds: ["project_save"] });
+  const start = page.locator('#app [data-tour="project-start"]');
+  await start.getByLabel("프로젝트 이름").fill("붙잡힌 저장");
+  await start.getByRole("button", { name: "만들기", exact: true }).click();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("붙잡힌 저장");
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+  await page.locator("#project-form").getByRole("button", { name: "저장", exact: true }).click();
+  await expect(page.locator(".notice.busy")).toContainText("프로젝트 저장 중");
+  // Back and forth while the save is held: every visit's entry waits for it.
+  for (const nav of ["projects", "history", "projects", "recipes", "projects"])
+    await page.locator(`nav [data-action="nav:${nav}"]`).click();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("프로젝트");
+  expect(await calls(page, { action: "projects_list" })).toHaveLength(0);
+  await page.evaluate(() => (window as any).__release("project_save"));
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+  await expect(page.locator(".project-list tbody tr", { hasText: "붙잡힌 저장" })).toHaveCount(1);
+  // Only the last visit reads the list; the earlier visits of the same page and the recipes visit read nothing.
+  expect(await calls(page, { action: "projects_list" })).toHaveLength(1);
+  expect(await calls(page, { action: "recipes_list" })).toHaveLength(0);
+});
+
+const compose = {
+  start: (element: HTMLElement | SVGElement) => { element.setAttribute("data-mark", "composing");
+    element.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })); },
+  end: (element: HTMLElement | SVGElement, value: string) => { (element as HTMLInputElement).value = value;
+    element.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: value.slice(-1) })); },
+};
+
+test("a poll render waits while Korean text is composed in the page, then keeps the text and the focus", async ({ page }) => {
+  await page.route(REGISTRY_URL, route => route.fulfill({ contentType: "application/javascript", body: DRAFT_REGISTRY }));
+  await openWorkbench(page);
+  await page.locator('nav [data-action="nav:drafts"]').click();
+  const note = page.getByLabel("메모", { exact: true });
+  await note.fill("한");
+  await note.evaluate(compose.start);
+  // A notice from a poll is a full render: the composing input is not replaced until the composition ends.
+  await page.evaluate(() => (window as any).__notify());
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(1);
+  await expect(page.getByText("폴링 알림")).toHaveCount(0);
+  await note.evaluate(compose.end, "한글");
+  await expect(page.getByText("폴링 알림")).toBeVisible();
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(0);
+  await expect(note).toHaveValue("한글");
+  await expect(note).toBeFocused();
+  // A composing control that lost the focus without ending its composition holds nothing back.
+  await note.evaluate(compose.start);
+  await page.getByRole("button", { name: "밖에서 저장" }).focus();
+  await page.locator("#app h1").evaluate(element => element.setAttribute("data-before", ""));
+  await page.evaluate(() => (window as any).__notify());
+  await expect(page.locator("#app h1[data-before]")).toHaveCount(0);
+  await note.evaluate(compose.end, "한글");
+  // A composition in a dialog outside the page never holds the page back.
+  await page.getByRole("button", { name: "확인 열기" }).click();
+  const dialogHeading = page.getByRole("dialog", { name: "확인" }).getByRole("heading");
+  await expect(dialogHeading).toBeFocused();
+  await dialogHeading.evaluate(compose.start);
+  await page.locator("#app h1").evaluate(element => element.setAttribute("data-before", ""));
+  await page.evaluate(() => (window as any).__notify());
+  await expect(page.locator("#app h1[data-before]")).toHaveCount(0);
+  await dialogHeading.evaluate(element => element.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "" })));
+  await page.keyboard.press("Escape");
+});
+
+test("a task's own result is not held back by a composition (documented limit)", async ({ page }) => {
+  // Characterization of the limit: a task's final render may carry its result into the forms on its page, so it is
+  // never deferred; the composing input is replaced and the task's value wins, as before.
+  await page.route(REGISTRY_URL, route => route.fulfill({ contentType: "application/javascript", body: DRAFT_REGISTRY }));
+  await openWorkbench(page);
+  await page.locator('nav [data-action="nav:drafts"]').click();
+  await page.getByRole("button", { name: "서버 정리" }).click();
+  await expect(page.locator(".notice.busy")).toContainText("서버 정리 중");
+  const note = page.getByLabel("메모", { exact: true });
+  await note.fill("입력 중");
+  await note.evaluate(compose.start);
+  // A view's own render waits for the composition; the task's final render does not, and it replaces the waiting one.
+  await page.evaluate(() => (window as any).__render());
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(1);
+  await page.evaluate(() => (window as any).__finishServer());
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(0);
+  await expect(note).toHaveValue("서버가 고친 메모");
+  // Nothing waits any more: the end of that composition renders nothing again.
+  await page.locator("#app h1").evaluate(element => element.setAttribute("data-before", ""));
+  await note.evaluate(compose.end, "서버가 고친 메모");
+  await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 50)));
+  await expect(page.locator("#app h1[data-before]")).toHaveCount(1);
+  // A later poll render is not held back by an input a task replaced while it composed (its composition never ends).
+  await page.getByRole("button", { name: "서버 정리" }).click();
+  await note.fill("다시 입력 중");
+  await note.evaluate(compose.start);
+  await page.evaluate(() => (window as any).__finishServer());
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(0);
+  await page.locator("#app h1").evaluate(element => element.setAttribute("data-before", ""));
+  await page.evaluate(() => (window as any).__notify());
+  await expect(page.locator("#app h1[data-before]")).toHaveCount(0);
+  await expect(page.getByText("폴링 알림")).toBeVisible();
+});
+
+test("the history filter applies when a Korean composition in its search ends", async ({ page }) => {
+  await openWorkbench(page);
+  const runs = [{ id: "run-a", ai_id: "한글_요약", operator: "tester", status: "FINISHED", metrics: {}, config: {} },
+    { id: "run-b", ai_id: "english_summary", operator: "tester", status: "FINISHED", metrics: {}, config: {} }];
+  await page.evaluate(runs => {
+    const native = (window as any).__TAURI_INTERNALS__, original = native.invoke;
+    native.invoke = async (command: string, args: any) => command === "factory_action" && args.action === "history" && args.data.experiment_id
+      ? (native.__calls = (native.__calls ?? 0) + 1, { runs, next_page_token: null }) : original(command, args);
+  }, runs);
+  await page.locator('nav [data-action="nav:history"]').click();
+  await page.getByRole("button", { name: "기록 불러오기", exact: true }).click();
+  await expect(page.locator("[data-run]")).toHaveCount(2);
+  const search = page.getByLabel("불러온 기록 검색");
+  await search.focus();
+  await search.evaluate(compose.start);
+  // Each composing keystroke is an input event; the search box is not replaced while the syllable is open.
+  for (const text of ["ㅎ", "하", "한"])
+    await search.evaluate((element, text) => { (element as HTMLInputElement).value = text;
+      element.dispatchEvent(new InputEvent("input", { bubbles: true, isComposing: true, data: text })); }, text);
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(1);
+  await expect(page.locator("[data-run]")).toHaveCount(2);
+  await search.evaluate(compose.end, "한");
+  await expect(page.locator("[data-run]")).toHaveCount(1);
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(0);
+  await expect(search).toHaveValue("한");
+  await expect(search).toBeFocused();
+  expect(await search.evaluate(element => (element as HTMLInputElement).selectionStart)).toBe(1);
+  // Typing without an IME still filters on every keystroke.
+  await search.fill("english");
+  await expect(page.locator("[data-run]")).toHaveCount(1);
+  await expect(page.locator("[data-run]")).toHaveAttribute("data-run", "run-b");
 });

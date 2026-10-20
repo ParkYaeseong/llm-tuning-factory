@@ -299,6 +299,33 @@ test("a description with a leading newline or Windows line breaks stays clean", 
   expect((await calls(page, { action: "recipe_save" })).at(-1).args.data.spec.description).toBe(description);
 });
 
+test("a recipe name with a line break from another writer stays clean", async ({ page }) => {
+  // The project page's deferred nit (10.2 re-review), applied to the recipe name: an <input> strips line breaks.
+  await openWorkbench(page, { definitions: true });
+  await openRecipes(page);
+  const form = await newRecipe(page, "한 줄 레시피");
+  await saveRecipe(page);
+  const [{ args }] = await calls(page, { action: "recipe_save" });
+  const current = await bridge(page, "recipe_get", { recipe_id: args.data.spec.recipe_id });
+  const name = "두 줄\r\n레시피";
+  expect((await bridge(page, "recipe_save", { spec: { ...current.data.recipe, name }, expected_revision: current.data.revision_sha256 })).status).toBe("ok");
+  const reopen = async () => {
+    await form.getByRole("button", { name: "닫기", exact: true }).click();
+    // The only recipe (the list keeps the name it read on entering).
+    await page.locator(".recipe-list tbody tr").first().getByRole("button", { name: /열기/ }).click();
+    await expect(page.locator(".notice.busy")).toHaveCount(0);
+  };
+  await reopen();
+  await expect(form.getByLabel("레시피 이름")).toHaveValue("두 줄레시피");
+  await expect(form.locator(".status-pill")).toContainText("저장된 버전");
+  const reads = (await calls(page, { action: "recipe_get" })).length;
+  await reopen();
+  expect(await calls(page, { action: "recipe_get" })).toHaveLength(reads + 1);
+  await expect(form.locator(".status-pill")).toContainText("저장된 버전");
+  await saveRecipe(page);
+  expect((await calls(page, { action: "recipe_save" })).at(-1).args.data.spec.name).toBe(name);
+});
+
 test("the example choice waits while busy and PPO with OFT is refused before saving", async ({ page }) => {
   await openWorkbench(page, { definitions: true, holds: ["recipes_list"] });
   await page.locator('nav [data-action="nav:recipes"]').click();
