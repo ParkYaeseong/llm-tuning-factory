@@ -258,7 +258,8 @@ def server_profile(profile_id="lab", **fields):
     return {"profile_id": profile_id,
             "fields": {"provider": "ssh_server", "name": "Lab server", "server_ssh_host": "gpu.example",
                        "server_ssh_port": "22", "server_ssh_username": "researcher", "server_ssh_fingerprint": PIN,
-                       "server_remote_root": "/home/researcher/factory", "server_ssh_key_file": "test-key",
+                       "server_remote_root": "/home/researcher/factory",
+                       "server_ssh_key_file": str(ROOT / "keys" / "test-key"),
                        "server_total_hourly_cost_usd": "0", "server_selected_gpu_uuids": json.dumps([UUID2]),
                        **fields}}
 
@@ -1149,3 +1150,233 @@ def test_observation_store_is_public_bounded_and_atomic(tmp_path):
     path.write_bytes(path.read_bytes().replace(b'"pod1"', b'"pod2"'))
     with pytest.raises(ValueError):
         wp.load_observation(state, "pod-a")
+
+
+# -- 9.2 review follow-ups (Minor 1, 2, 3, 5, 6 and two nits) ---------------------------------------
+
+def test_d15_walks_through_selections_merges_and_materialize(tmp_path, monkeypatch):
+    """Minor 1: each walker branch decides whether a child needs HF-root evidence."""
+    planning()
+    state = tmp_path / "state"
+    dataset = register_data(state, tmp_path)
+    heldout = register_data(state, tmp_path, "heldout")
+    targeted = save_recipe(state, "targeted", **TARGETED)
+    root = snapshot_root(state, monkeypatch)
+    spec = {**minimal_bodies()["benchmark_save"]["spec"], "dataset": heldout,
+            "tokenizer_fingerprint": root["tokenizer_fingerprint"]}
+    saved = run(state, "benchmark_save", {"spec": spec})
+    assert saved["status"] == "ok", saved
+    datasets = [binding("train", "train", dataset), binding("held", "validation", heldout)]
+
+    def evaluate(node_id, model):
+        return {"kind": "evaluate", "id": node_id, "label": node_id, "model": output(model),
+                "benchmark_revision": saved["data"]["revision_sha256"], "executor_profile_ids": ["estimate-a"]}
+
+    adapters = [train("a", targeted, from_root(root)), train("b", targeted, from_root(root))]
+    select = {"kind": "select", "id": "pick", "label": "선택",
+              "selection": {"metric": "accuracy", "direction": "max"},
+              "evaluations": [{"node_id": "ea", "output_name": "evaluation"},
+                              {"node_id": "eb", "output_name": "evaluation"}]}
+    merge = {"kind": "merge", "id": "merged", "label": "병합", "models": [output("a"), output("b")],
+             "weights": [0.5, 0.5], "executor_profile_ids": ["estimate-a"]}
+    materialize = {"kind": "materialize", "id": "full", "label": "확정", "model": output("a"),
+                   "executor_profile_ids": ["estimate-a"]}
+    cases = {   # continuation through a selection of HF-root adapters, from a merge output, after materialize
+        "selection": ([*adapters, evaluate("ea", "a"), evaluate("eb", "b"), select,
+                       train("child", targeted, output("pick"))], {"child"}),
+        "merge": ([*adapters, merge, train("child", targeted, output("merged"))], {"merged", "child"}),
+        "materialize": ([adapters[0], materialize, train("child", targeted, output("full"))], {"full"}),
+    }
+    for name, (nodes, blocked) in cases.items():
+        project_id, _ = make_project(state, nodes, datasets)
+        result = run(state, "graph_validate", {"project_id": project_id})
+        found = {issue["node_id"] for issue in result["issues"] if issue["code"] == "base_targets_missing"}
+        assert found == blocked, (name, result)
+
+
+def test_real_plan_refuses_an_observation_from_the_future(tmp_path, monkeypatch):
+    planning()
+    state = tmp_path / "state"
+    found = real_scenario(state, tmp_path, monkeypatch)
+    desk.only_issue(real_plan(state, found, clock=NOW - 1), "invalid", "observation_stale", "/profiles/pod-a")
+    assert real_plan(state, found, clock=NOW)["status"] == "ok"
+
+
+@pytest.mark.parametrize("repo", ["CON/model", "Qwen/model.", "aux.cfg/model", "Qwen/NUL.x"])
+def test_model_root_snapshot_refuses_repository_names_windows_would_alter(tmp_path, monkeypatch, repo):
+    wp = planning()
+    state = tmp_path / "state"
+    hub = FakeHub().install(monkeypatch)
+    result = run(state, "model_root_snapshot", {"repo_id": repo, "revision": COMMIT, "download_approved": True})
+    issue = desk.only_issue(result, "invalid", "repository_unsupported", "/repo_id")
+    assert issue["message"] == wp.REPOSITORY_UNSUPPORTED
+    assert hub.requests == [] and not state.exists()
+
+
+def test_model_root_snapshot_reuses_an_existing_directory_only_if_it_is_this_root(tmp_path, monkeypatch):
+    wp = planning()
+    state = tmp_path / "state"
+    directory = wp.root_snapshots_dir(state) / "Qwen" / "Qwen2.5-0.5B-Instruct" / COMMIT
+    directory.mkdir(parents=True)
+    (directory / "config.json").write_bytes(canonical({"model_type": "qwen2", "num_hidden_layers": 2}))
+    before = files(directory)
+    FakeHub().install(monkeypatch)
+    result = run(state, "model_root_snapshot", {"repo_id": REPO, "revision": COMMIT, "download_approved": True})
+    desk.only_issue(result, "invalid", "root_snapshot_conflict", "/repo_id")
+    assert files(directory) == before and not (state / "workflows" / "root-index").exists()
+    assert [path for path in files(wp.root_snapshots_dir(state)) if path.startswith(".")] == []
+
+
+def test_estimate_collision_compares_casefolded_profile_ids(tmp_path, monkeypatch):
+    planning()
+    state = tmp_path / "state"
+    found = scenario(state, tmp_path, monkeypatch)
+    for native_id in ("ESTIMATE-A", "Estimate-a."):
+        collision = run(state, "graph_plan", plan_request(found.project_id),
+                        profiles=[runpod_profile(tmp_path, native_id)])
+        desk.only_issue(collision, "invalid", "estimate_collision", "/estimates/0/profile_id")
+
+
+def test_model_root_snapshot_refuses_tokenizer_names_that_collide_by_case(tmp_path, monkeypatch):
+    wp = planning()
+    state = tmp_path / "state"
+    hub = FakeHub(files={"config.json": CONFIG, **TOKENIZER, "chat_templates/Tool_Use.jinja": b"{{ other }}"})
+    hub.install(monkeypatch)
+    result = run(state, "model_root_snapshot", {"repo_id": REPO, "revision": COMMIT, "download_approved": True})
+    desk.only_issue(result, "invalid", "snapshot_refused", "/repo_id")
+    assert not any("chat_templates" in path for path in hub.paths)
+    assert files(wp.root_snapshots_dir(state)) == []
+
+
+@pytest.mark.parametrize("key", ["keys/pod-key", "pod-key", "./pod-key", "../keys/pod-key"])
+def test_relative_key_paths_are_refused_before_hashing(tmp_path, monkeypatch, key):
+    """Minor 2: a relative key path would hash against the sidecar's working directory, so the controller
+    would refuse the pinned transport forever. ``~`` expands per user and stays allowed."""
+    wp = planning()
+    from test_gpu_servers import FakeServer
+
+    from tuning_factory import desktop_runtime
+    from tuning_factory.gpu_servers import server_settings
+    state = tmp_path / "state"
+    runpod = runpod_profile(tmp_path, ssh_key_file=key)
+    with pytest.raises(ValueError) as refused:
+        wp.public_profile("pod-a", runpod["fields"])
+    assert str(refused.value) == wp.KEY_PATH_RELATIVE
+    native = server_profile()["fields"]
+    facts = FakeServer(tmp_path / "remote").facts(server_settings(native))
+    with pytest.raises(ValueError) as refused:
+        wp.public_profile("lab", {**native, "server_ssh_key_file": key}, facts)
+    assert str(refused.value) == wp.KEY_PATH_RELATIVE
+    assert wp.public_profile("pod-a", {**runpod["fields"], "ssh_key_file": "~/.ssh/pod-key"}).revision
+    inspected, fake = inspect(state, monkeypatch, runpod)
+    issue = desk.only_issue(inspected, "invalid", "executor_profile_invalid", "/profile_id")
+    assert issue["message"] == wp.KEY_PATH_RELATIVE and fake.calls == []
+    monkeypatch.setattr(desktop_runtime, "connection", lambda *a, **kw: pytest.fail("no SSH for a relative key"))
+    result = run(state, "executor_profile_inspect", {"profile_id": "lab"},
+                 profiles=[server_profile(server_ssh_key_file=key)])
+    desk.only_issue(result, "invalid", "executor_profile_invalid", "/profile_id")
+    # Planning with such a profile names the profile, not a stale or changed observation.
+    found = scenario(state, tmp_path, monkeypatch, profiles=("pod-a",))
+    planned = run(state, "graph_plan", plan_request(found.project_id, estimates=()), profiles=[runpod])
+    assert ("executor_profile_invalid", "/profiles/pod-a") in [(item["code"], item["path"])
+                                                             for item in planned["issues"]], planned
+
+
+@pytest.mark.parametrize("config, error", [
+    (canonical({"model_type": "qwen2", "max_position_embeddings": "big"}), "TypeError"),
+    (canonical([{"model_type": "qwen2"}]), "AttributeError")])
+def test_snapshot_errors_stay_in_the_issue_envelope(tmp_path, monkeypatch, config, error):
+    """Minor 3: unexpected metadata shapes are issues with the type name, never an escaping exception."""
+    wp = planning()
+    state = tmp_path / "state"
+    FakeHub(files={"config.json": config, **TOKENIZER}).install(monkeypatch)
+    result = run(state, "model_root_snapshot", {"repo_id": REPO, "revision": COMMIT, "download_approved": True},
+                 secrets={"HF_TOKEN": HF_SECRET})
+    assert desk.only_issue(result, "invalid", "snapshot_failed", "/repo_id")["message"] == error
+    assert files(wp.root_snapshots_dir(state)) == [] and HF_SECRET not in json.dumps(result)
+
+
+@pytest.mark.parametrize("change", [{"semantic_model_kind": "reward_model"}, {"generation_mode": "sample"},
+                                    {"precision": "fp32"}])
+def test_benchmark_save_refuses_what_the_worker_cannot_run(tmp_path, change):
+    """Minor 5: ``check_generation_benchmark`` at save time, with the worker's exact message."""
+    planning()
+    from tuning_factory.benchmarks import BenchmarkSpec
+    from tuning_factory.training import check_generation_benchmark
+    state = tmp_path / "state"
+    dataset = register_data(state, tmp_path, "heldout")
+    spec = {**minimal_bodies()["benchmark_save"]["spec"], "dataset": dataset, **change}
+    with pytest.raises(ValueError) as worker:
+        check_generation_benchmark(BenchmarkSpec.model_validate(spec))
+    result = run(state, "benchmark_save", {"spec": spec})
+    assert desk.only_issue(result, "invalid", "benchmark_unsupported", "/spec")["message"] == str(worker.value)
+    assert files(state / "workflows" / "benchmarks") == []
+
+
+def test_remote_command_output_never_reaches_inspection_issues(tmp_path, monkeypatch):
+    """Minor 6: a failed remote probe is a fixed text and code, never the remote output."""
+    wp = planning()
+    from contextlib import contextmanager
+
+    from tuning_factory import desktop_runtime
+    state = tmp_path / "state"
+    remote = "remote output " + "x" * 64 + " /home/researcher/private"
+
+    @contextmanager
+    def failing(*args, **kwargs):
+        raise desktop_runtime.RemoteCommandFailed("GPU runtime command failed. " + remote)
+        yield
+
+    monkeypatch.setattr(desktop_runtime, "connection", failing)
+    result = run(state, "executor_profile_inspect", {"profile_id": "lab"}, profiles=[server_profile()])
+    issue = desk.only_issue(result, "invalid", "remote_command_failed")
+    assert issue["message"] == wp.REMOTE_COMMAND_FAILED and "remote output" not in json.dumps(result)
+    assert not (state / "workflows" / "observations").exists()
+
+
+class RedirectingHub(FakeHub):
+    """Redirects one tokenizer file to plain HTTP (an https to http downgrade)."""
+
+    def respond(self, request):
+        if unquote(request.url.path).endswith("/tokenizer.json") and request.url.host == "huggingface.co":
+            self.requests.append(request)
+            return httpx.Response(302, headers={"Location": "http://cdn.hf.example/tokenizer.json"}, content=b"x")
+        return super().respond(request)
+
+
+def test_model_root_snapshot_refuses_plain_http_redirects(tmp_path, monkeypatch):
+    wp = planning()
+    state = tmp_path / "state"
+    hub = RedirectingHub().install(monkeypatch)
+    result = run(state, "model_root_snapshot", {"repo_id": REPO, "revision": COMMIT, "download_approved": True},
+                 secrets={"HF_TOKEN": HF_SECRET})
+    assert desk.only_issue(result, "invalid", "insecure_redirect", "/repo_id")["message"] == wp.INSECURE_REDIRECT
+    assert all(request.url.scheme == "https" for request in hub.requests)
+    assert files(wp.root_snapshots_dir(state)) == [] and not (state / "workflows" / "root-index").exists()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_runpod_inspection_closes_its_http_client(tmp_path, monkeypatch, fails):
+    planning()
+    from tuning_factory import execution
+    state = tmp_path / "state"
+    closed = []
+
+    class Client:
+        def close(self):
+            closed.append(True)
+
+    class Controller:
+        def __init__(self, api_key, client=None):
+            self.client = Client()
+
+        def status(self, pod_id):
+            if fails:
+                raise ConnectionError("unreachable")
+            return dict(LIVE_POD)
+
+    monkeypatch.setattr(execution, "RunPodController", Controller)
+    refuse_ssh(monkeypatch)
+    result = run(state, "executor_profile_inspect", {"profile_id": "pod-a"}, profiles=[runpod_profile(tmp_path)],
+                 secrets={"RUNPOD_API_KEY": SECRET})
+    assert result["status"] == ("invalid" if fails else "ok") and closed == [True]

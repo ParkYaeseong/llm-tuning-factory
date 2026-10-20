@@ -40,6 +40,7 @@ from .benchmarks import BenchmarkSpec
 from .config import StrictModel
 from .desktop_workflows import (
     _DEVICE_NAMES,
+    KEY_FILE_FIELDS,
     Empty,
     NativeProfile,
     WorkflowContext,
@@ -99,6 +100,7 @@ from .projects import LocalId, ProjectSpec, Revision, Sha256
 from .recipes import RecipeSpec
 from .registry import canonical, digest, immutable_write
 from .tracking import DEFAULT_EXPERIMENT, public_tracking_settings, tracking_settings_sha256
+from .training import check_generation_benchmark
 
 OBSERVATION_MAX_AGE_SECONDS = 3600
 TRACKING_PROFILE_ID = "mlflow"
@@ -160,6 +162,9 @@ ROOT_SNAPSHOT_CONFLICT = "이 모델 버전의 스냅샷 폴더가 이미 있지
 PLAN_UNKNOWN = "저장된 실행 계획을 찾을 수 없습니다. 다시 계획하세요."
 PLAN_STORED_DIFFERS = "같은 해시로 저장된 실행 계획 파일이 손상되었거나 바뀌었습니다."
 TRACKING_STORED_DIFFERS = "저장된 MLflow 공개 설정 파일이 손상되었거나 바뀌었습니다."
+KEY_PATH_RELATIVE = "SSH 키 파일은 이 PC의 절대 경로로 지정하세요. 상대 경로는 실행 위치에 따라 다른 파일을 가리킵니다."
+REMOTE_COMMAND_FAILED = "서버 확인 명령이 실패했습니다. 서버에 직접 접속해 GPU와 python3 상태를 확인하세요."
+INSECURE_REDIRECT = "모델 파일 서버가 HTTPS가 아닌 주소로 연결을 넘겨 받지 않았습니다."
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _PROFILE_ID = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}")   # NativeProfile.profile_id
@@ -225,6 +230,15 @@ def profile_revision(profile_id: str, fields: Mapping[str, str]) -> str:
     return digest(canonical({"schema": PROFILE_SCHEMA, "profile_id": native.profile_id, "fields": dict(native.fields)}))
 
 
+def check_key_paths(fields: Mapping[str, str]) -> None:
+    """Key paths must be absolute (after ``~``): the D11 transport hashes hash the resolved path, so a relative one
+    would resolve against the working directory and the controller would refuse the pinned transport for good."""
+    for name in KEY_FILE_FIELDS:
+        value = fields.get(name)
+        if isinstance(value, str) and value.strip() and not Path(value).expanduser().is_absolute():
+            raise ValueError(KEY_PATH_RELATIVE)
+
+
 def public_profile(profile_id: str, fields: Mapping[str, str],
                    facts: ResourceObservation | None = None) -> PublicExecutorProfile:
     """The pinned public profile of native fields, with the D11 transport hash; never a key path or a credential.
@@ -233,6 +247,7 @@ def public_profile(profile_id: str, fields: Mapping[str, str],
     observed server facts (``SSHServerSettings.profile``); without facts this raises.
     """
     revision = profile_revision(profile_id, fields)
+    check_key_paths(fields)
     fields = dict(fields)
     try:
         if fields.get("provider") == "existing_runpod":
@@ -700,6 +715,7 @@ def executor_profile_inspect(context: WorkflowContext, request: ProfileInspect) 
     try:   # every public field is checked offline, before any request
         stored = _stored_profile_id(_observation_path(context.state_dir, request.profile_id))
         revision = profile_revision(request.profile_id, fields)
+        check_key_paths(fields)
         offline = public_profile(request.profile_id, fields) if runpod else None
         if not runpod:
             server_settings({"provider": "ssh_server", **fields})
@@ -714,7 +730,13 @@ def executor_profile_inspect(context: WorkflowContext, request: ProfileInspect) 
     from . import desktop_runtime, execution
     try:
         if runpod:
-            pod = execution.RunPodController(key).status(fields["pod_id"])
+            controller = execution.RunPodController(key)
+            try:
+                pod = controller.status(fields["pod_id"])
+            finally:
+                client = getattr(controller, "client", None)
+                if client is not None:
+                    client.close()
             desktop_runtime.validate_pod(pod)
             facts = runpod_facts(pod, observed_at=now)
             profile = offline
@@ -723,6 +745,8 @@ def executor_profile_inspect(context: WorkflowContext, request: ProfileInspect) 
             with desktop_runtime.connection({"provider": "ssh_server", **fields}) as (observed, _):
                 facts = _FACTS.validate_python(observed.model_dump())
             profile = public_profile(request.profile_id, fields, facts)
+    except desktop_runtime.RemoteCommandFailed:   # its text carries remote output: a fixed text only
+        return invalid(issue("remote_command_failed", REMOTE_COMMAND_FAILED))
     except (execution.ExecutionUncertain, TimeoutError, ValueError) as exc:
         return invalid(issue("inspection_failed", _reason(exc)))
     except Exception as exc:   # provider and transport errors: the type name only, never their text
@@ -743,12 +767,19 @@ class _Refused(ValueError):
         self.code = code
 
 
+def https_only(request: httpx.Request) -> None:
+    """An httpx request hook: every hop, redirects included, stays on HTTPS (checked before it is sent)."""
+    if request.url.scheme != "https":
+        raise _Refused("insecure_redirect", INSECURE_REDIRECT)
+
+
 def _hub(token: str | None, *, transport: httpx.BaseTransport | None = None) -> ModelHub:
     """The Hugging Face client; an Authorization header only when ``HF_TOKEN`` was scoped to this request.
 
-    httpx drops the header on redirects to another origin (the CDN)."""
+    httpx drops the header on redirects to another origin (the CDN); a redirect to plain HTTP is refused."""
     headers = {"Authorization": "Bearer " + token} if token else {}
-    return ModelHub(client=httpx.Client(timeout=20, follow_redirects=True, headers=headers, transport=transport))
+    return ModelHub(client=httpx.Client(timeout=20, follow_redirects=True, headers=headers, transport=transport,
+                                        event_hooks={"request": [https_only]}))
 
 
 def _selected_files(info) -> tuple[str, ...]:
@@ -863,7 +894,7 @@ def model_root_snapshot(context: WorkflowContext, request: RootSnapshot) -> Work
         return invalid(issue(exc.code, str(exc), "/repo_id"))
     except ValueError as exc:
         return invalid(issue("snapshot_failed", _reason(exc), "/repo_id"))
-    except OSError as exc:
+    except (OSError, TypeError, AttributeError, KeyError) as exc:   # unexpected metadata shapes: the type only
         return invalid(issue("snapshot_failed", type(exc).__name__, "/repo_id"))
     finally:
         hub.client.close()
@@ -893,6 +924,10 @@ def model_roots_list(context: WorkflowContext, request: Empty) -> WorkflowResult
 @workflow_action("benchmark_save", BenchmarkSave)
 def benchmark_save(context: WorkflowContext, request: BenchmarkSave) -> WorkflowResult:
     spec = request.spec
+    try:   # what the worker (and plan_graph) would refuse later, with the worker's exact text
+        check_generation_benchmark(spec)
+    except ValueError as exc:
+        return invalid(issue("benchmark_unsupported", str(exc), "/spec"))
     try:
         snapshot = snapshot_dataset(context.registry(), spec.dataset)
     except (OSError, ValueError, KeyError):
@@ -1181,6 +1216,11 @@ def _estimate(item: PlanningEstimate, now: datetime) -> tuple[ExecutorProfile, R
 def _native_executor(context: WorkflowContext, profile_id: str, native: NativeProfile, now: datetime, real: bool,
                      analysis: _Analysis):
     path = f"/profiles/{profile_id}"
+    try:
+        check_key_paths(native.fields)
+    except ValueError as exc:
+        analysis.issues.append(issue("executor_profile_invalid", _reason(exc), path))
+        return None
     try:
         observation = load_observation(context.state_dir, profile_id)
     except ValueError as exc:
