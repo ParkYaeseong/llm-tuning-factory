@@ -204,7 +204,8 @@ def ranges(data):
 def test_model_root_targets_is_a_closed_table_action_scoped_to_hf_token(tmp_path):
     targets()
     wf = desk.workflows()
-    assert wf.WORKFLOW_ACTIONS[-1] == "model_root_targets"
+    # 9.7's action follows the 9.4 pair; Task 9.8 appends its own five actions after it.
+    assert wf.WORKFLOW_ACTIONS[wf.WORKFLOW_ACTIONS.index("controller_stop") + 1] == "model_root_targets"
     assert wf.ACTION_MODULES["model_root_targets"] == "tuning_factory.hf_targets"
     assert wf.SECRET_SCOPES["model_root_targets"] == frozenset({"HF_TOKEN"})
     model = wf.registered_requests()["model_root_targets"]

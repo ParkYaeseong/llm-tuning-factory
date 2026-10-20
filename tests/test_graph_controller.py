@@ -755,8 +755,19 @@ def test_late_result_never_retrains(tmp_path, monkeypatch):
     assert w.dispatcher.training_calls == {'a': 1, 'b': 1} and len(attempts(w, 'a')) == 1
 
 
+def desktop_release(w, node_id, attempt_id):
+    """Task 9.8: the desktop operator release (``graph_release_lock``) on this world's ledger and clock."""
+    import tuning_factory.workflow_runs  # noqa: F401  (registers the run actions)
+    from tuning_factory import desktop_workflows as wf
+    context = wf.WorkflowContext(state_dir=w.store.state_dir, clock=w.clock)
+    body = {'run_id': w.run_id, 'node_id': node_id, 'job_id': job_of(w, node_id), 'attempt_id': attempt_id,
+            'confirm_execution_stopped': True}
+    return wf.dispatch_action(context, 'graph_release_lock', body).model_dump(mode='json')
+
+
+@pytest.mark.parametrize('release', ['cli', 'desktop'])
 @pytest.mark.parametrize('record', [True, False])
-def test_ambiguous_launch_waits_for_the_operator(tmp_path, monkeypatch, record):
+def test_ambiguous_launch_waits_for_the_operator(tmp_path, monkeypatch, record, release):
     from typer.testing import CliRunner
 
     from tuning_factory.cli import app
@@ -785,6 +796,10 @@ def test_ambiguous_launch_waits_for_the_operator(tmp_path, monkeypatch, record):
         # nobody is asked to release the lock yet.
         assert (item['awaiting_result'], item['needs_operator'], item['wait_reason']) == (True, False,
                                                                                           gc.AWAITING_RESULT)
+        if release == 'desktop':   # 9.8: the desktop release is refused while a late result is plausible
+            refused = desktop_release(w, 'a', attempts(w, 'a')[0]['attempt_id'])
+            assert [(issue['code'], issue['path']) for issue in refused['issues']] == [('awaiting_result', '/node_id')]
+            assert refused['status'] == 'conflict' and w.store.jobs.gpu_locked('existing_runpod:pod1')
         uncertain_at = max(row['timestamp'] for row in readiness.table(w, 'events', 'WHERE job_id=?', (a,)))
         assert item['result_deadline'] == pytest.approx(uncertain_at + 900 + gc.RESULT_MARGIN_SECONDS)
         controller, owner = restart(w, 'controller-late', advance=900 + gc.RESULT_MARGIN_SECONDS)
@@ -796,9 +811,15 @@ def test_ambiguous_launch_waits_for_the_operator(tmp_path, monkeypatch, record):
                                                                                           gc.OPERATOR_CONFIRMATION)
     assert w.dispatcher.launches == ({'a': 1} if record else Counter()) and len(attempts(w, 'a')) == 1
     attempt = attempts(w, 'a')[0]['attempt_id']
-    result = CliRunner().invoke(app, ['--state-dir', str(w.store.state_dir), 'release-lock', a, attempt,
-                                      '--confirm-execution-stopped'])
-    assert result.exit_code == 0, result.output
+    if release == 'cli':
+        result = CliRunner().invoke(app, ['--state-dir', str(w.store.state_dir), 'release-lock', a, attempt,
+                                          '--confirm-execution-stopped'])
+        assert result.exit_code == 0, result.output
+    else:   # the same store path from the desktop, with the same outcome
+        result = desktop_release(w, 'a', attempt)
+        assert result['status'] == 'ok', result
+        assert result['data']['released'] == {'run_id': w.run_id, 'node_id': 'a', 'job_id': a, 'attempt_id': attempt}
+    assert not w.store.jobs.gpu_locked('existing_runpod:pod1')
     drive(w, controller, owner)
     assert statuses(w) == {'a': 'FAILED', 'b': 'BLOCKED'} and run_row(w)['status'] == 'FAILED'
     assert w.store.attempt_disposition(a)['disposition'] == 'failed_before_submit'   # D4: never retried

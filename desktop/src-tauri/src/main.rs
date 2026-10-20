@@ -22,8 +22,9 @@ const FIELDS: [&str; 28] = [
 // OIDC values first, then the issued token: token mode withholds the first three, "none" all four.
 const MLFLOW_CREDENTIALS: [&str; 4] = ["MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "MLFLOW_OIDC_CLIENT_SECRET",
     "MLFLOW_TRACKING_TOKEN"];
-// The least-privilege workflow channel (Task 9 plan D8): exactly desktop_workflows.WORKFLOW_ACTIONS.
-const WORKFLOW_ACTIONS: [&str; 33] = [
+// The least-privilege workflow channel (Task 9 plan D8): exactly desktop_workflows.WORKFLOW_ACTIONS. Task 9.8 adds
+// the operator release, the observation list, the SSH GPU inventory and the planning inputs; none gets a secret.
+const WORKFLOW_ACTIONS: [&str; 38] = [
     "projects_list", "project_create", "project_get", "project_save", "project_import_legacy",
     "recipes_list", "recipe_get", "recipe_save", "recipe_clone",
     "dataset_import_source", "dataset_import_preview", "dataset_import_register",
@@ -34,6 +35,8 @@ const WORKFLOW_ACTIONS: [&str; 33] = [
     "tracking_rearm", "executor_profile_edit_check",
     "controller_status", "controller_stop",
     "model_root_targets",
+    "graph_release_lock", "observations_list", "executor_profile_inventory", "planning_inputs_get",
+    "planning_inputs_save",
 ];
 // The only workflow actions that receive a credential: that profile's RunPod key, and the legacy HF token (the
 // config/tokenizer snapshot and 9.7's header-only target read).
@@ -620,7 +623,7 @@ mod tests {
     #[test]
     fn workflow_actions_are_a_closed_list_disjoint_from_legacy_actions() {
         let unique: std::collections::BTreeSet<&str> = WORKFLOW_ACTIONS.into_iter().collect();
-        assert_eq!(unique.len(), 33);
+        assert_eq!(unique.len(), 38);
         for action in WORKFLOW_ACTIONS {
             assert!(workflow_allowed(action), "{action}");
             assert!(!allowed(action), "the legacy channel accepts the workflow action {action}");
@@ -668,6 +671,12 @@ mod tests {
         secrets.extend([key_a.clone(), key_b.clone(), "legacy-plaintext-value".into(), stale]);
         let scoped = |action: &str| PROFILE_SCOPED_ACTIONS.contains(&action) || HF_SCOPED_ACTIONS.contains(&action);
         let general = |action: &&str| !scoped(action) && !VAULT_FREE_ACTIONS.contains(action);
+        // Task 9.8: the operator release, observations, the SSH inventory (it reads a key file path, never a key) and
+        // the planning inputs are general requests: public settings and profiles, never a secret.
+        for action in ["graph_release_lock", "observations_list", "executor_profile_inventory", "planning_inputs_get",
+            "planning_inputs_save"] {
+            assert!(WORKFLOW_ACTIONS.contains(&action) && general(&action), "{action}");
+        }
         for action in WORKFLOW_ACTIONS.into_iter().filter(general) {
             let request = build_workflow_request(app.path(), &vault, action, json!({"profile_id": "gpu-a"})).unwrap();
             let text = request.to_string();

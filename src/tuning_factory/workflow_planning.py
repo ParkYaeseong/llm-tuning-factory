@@ -2,13 +2,19 @@
 
 Executor profiles get content-addressed revisions of their public native fields (``profile_revision``), and one
 function turns those fields into the pinned public profile with Task 8's D11 transport hash (``public_profile``).
-Only two actions may touch the network, and only in production (tests use fakes):
+Only three actions may touch the network, and only in production (tests use fakes):
 
 - ``executor_profile_inspect`` (secret scope ``RUNPOD_API_KEY``): one read-only RunPod ``status`` GET, or the fixed
   read-only SSH probe. The public observation is stored in ``state/workflows/observations/``.
+- ``executor_profile_inventory`` (Task 9.8, no secret: SSH reads a local key file path): the 6A inventory probe of
+  the legacy ``server_inspect`` for an SSH profile that may have no GPU selection yet. It stores nothing.
 - ``model_root_snapshot`` (secret scope ``HF_TOKEN``, explicit ``download_approved``): ``config.json`` and the
   tokenizer files of one pinned revision, never weights, published into the ``DirectoryRootSnapshots`` layout
   ``state/workflows/roots/<owner>/<name>/<revision>/`` and indexed in ``state/workflows/root-index/``.
+
+Task 9.8 also lists the stored observations (``observations_list``) and keeps each project's planning inputs (node
+time limits, estimates and the simulation choice, never a secret) in ``state/workflows/planning-inputs/``, with a
+compare-and-swap on the project revision (``planning_inputs_get``/``planning_inputs_save``).
 
 ``graph_validate`` and ``graph_plan`` make no network call. They read the definitions database, the registry, the
 benchmark store, the root index, HF-root target evidence (``state/workflows/root-targets/``, which Task 9.7 fills)
@@ -30,7 +36,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -45,6 +51,7 @@ from .desktop_workflows import (
     NativeProfile,
     WorkflowContext,
     WorkflowResult,
+    conflict,
     invalid,
     issue,
     issues_from_validation,
@@ -167,6 +174,10 @@ KEY_PATH_RELATIVE = ("SSH 키 파일은 이 PC의 로컬 절대 경로로 지정
                      "네트워크(UNC)·장치 경로는 쓸 수 없습니다.")
 REMOTE_COMMAND_FAILED = "서버 확인 명령이 실패했습니다. 서버에 직접 접속해 GPU와 python3 상태를 확인하세요."
 INSECURE_REDIRECT = "모델 파일 서버가 HTTPS가 아닌 주소로 연결을 넘겨 받지 않았습니다."
+INVENTORY_SSH_ONLY = "GPU 목록 확인은 SSH 서버 프로필에서만 할 수 있습니다. RunPod 프로필은 자원 확인을 쓰세요."
+PLANNING_INPUTS_SCHEMA = "planning-inputs/1"
+PLANNING_INPUTS_INVALID = "저장된 계획 입력을 읽을 수 없습니다. 다시 입력해 저장하세요."
+PLANNING_INPUTS_STALE = "계획 입력을 저장하기 전에 프로젝트가 바뀌었습니다. 최신 프로젝트를 불러온 뒤 다시 저장하세요."
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _PROFILE_ID = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}")   # NativeProfile.profile_id
@@ -632,8 +643,32 @@ def _cost_source(resource) -> str:
     return "runpod_api"
 
 
+_RECIPE_FIELDS = ("recipe_id", "version", "name", "training_stage", "training_method")
+
+
+def _node_references(node, recipes: Mapping, bindings: Mapping, benchmarks: Mapping) -> dict:
+    """Task 9.8: what a plan node uses, for the approval view. ``recipe``: a train node's pinned recipe revision
+    (``revision_sha256`` and its public identity), else None. ``datasets``: a train node's bound dataset (with its
+    ``binding_id``) or an evaluate node's benchmark dataset (with its ``benchmark_revision``), else empty."""
+    recipe, datasets = None, []
+    if isinstance(node, TrainNode):
+        spec = recipes.get(node.recipe_revision)
+        recipe = {**{name: getattr(spec, name, None) for name in _RECIPE_FIELDS},
+                  "revision_sha256": node.recipe_revision}
+        ref = bindings.get(node.dataset_binding)
+        if ref is not None:
+            datasets.append({"binding_id": node.dataset_binding, "benchmark_revision": None,
+                             **ref.model_dump(mode="json")})
+    elif isinstance(node, EvaluateNode):
+        ref = benchmarks.get(node.benchmark_revision)
+        if ref is not None:
+            datasets.append({"binding_id": None, "benchmark_revision": node.benchmark_revision,
+                             **ref.model_dump(mode="json")})
+    return {"recipe": recipe, "datasets": datasets}
+
+
 def plan_summary(plan: GraphPlan, state_dir: Path | None = None) -> dict:
-    """The public approval view of a plan (used by 9.3 and the CLI).
+    """The public approval view of a plan (used by 9.3 and the CLI), with each node's recipe and data (9.8).
 
     It never contains a key path, an API key or any setting other than the public tracking settings, which are read
     from the hash-verified store under ``state_dir`` (None without it).
@@ -641,6 +676,9 @@ def plan_summary(plan: GraphPlan, state_dir: Path | None = None) -> dict:
     plan = _check_plan(plan)
     choices = plan.execution_choices
     destination = choices.tracking_destination
+    recipes = {item.revision_sha256: item.spec for item in choices.recipes}
+    bindings = {item.binding_id: item.dataset for item in plan.project_revision.spec.datasets}
+    benchmarks = {item.revision_sha256: item.spec.dataset for item in choices.benchmarks}
     return {
         "plan_sha256": plan.sha256, "simulation": plan.simulation,
         "project_id": plan.project_revision.spec.project_id, "project_revision": plan.project_revision.revision_sha256,
@@ -654,7 +692,8 @@ def plan_summary(plan: GraphPlan, state_dir: Path | None = None) -> dict:
                                 "resource_id": resource.executor.exclusivity_key, "gpu_type": resource.facts.gpu_type,
                                 "gpu_count": resource.facts.gpu_count,
                                 "total_hourly_cost_usd": resource.facts.total_hourly_cost_usd,
-                                "cost_source": _cost_source(resource)} for resource in entry.allowed_resources]}
+                                "cost_source": _cost_source(resource)} for resource in entry.allowed_resources],
+                   **_node_references(entry.node, recipes, bindings, benchmarks)}
                   for entry in plan.nodes],
         "datasets": [{**item.dataset.model_dump(mode="json"), "synthetic": item.synthetic,
                       "export_allowed": item.export_allowed} for item in choices.datasets],
@@ -708,6 +747,33 @@ class GraphPlanRequest(StrictModel):
 
 class PlanRef(StrictModel):
     plan_sha256: Sha256
+
+
+class NodeTimeLimit(StrictModel):
+    node_id: Annotated[LocalId, Field(max_length=128)]
+    timeout_minutes: int = Field(strict=True, ge=1, le=10080)    # graph_plan's 60-604800 s, in whole minutes
+
+
+class PlanningInputsRef(StrictModel):
+    project_id: LocalId
+
+
+class PlanningInputsSave(StrictModel):
+    """What ``graph_plan`` needs beyond the saved project and no backend kept before 9.8: never a secret."""
+    project_id: LocalId
+    project_revision: Sha256                     # compare-and-swap: the project's current revision
+    simulation: bool = Field(default=True, strict=True)
+    node_time_limits: tuple[NodeTimeLimit, ...] = Field(default=(), max_length=64)
+    estimates: tuple[PlanningEstimate, ...] = Field(default=(), max_length=16)
+
+
+class _StoredPlanningInputs(StrictModel):
+    project_id: LocalId
+    project_revision: Sha256
+    simulation: bool = Field(strict=True)
+    node_time_limits: tuple[NodeTimeLimit, ...] = Field(max_length=64)
+    estimates: tuple[PlanningEstimate, ...] = Field(max_length=16)
+    saved_at: datetime
 
 
 # -- executor_profile_inspect ----------------------------------------------------------------------
@@ -1447,3 +1513,180 @@ def graph_plan_get(context: WorkflowContext, request: PlanRef) -> WorkflowResult
         return invalid(issue("plan_unknown" if str(exc) == PLAN_UNKNOWN else "plan_invalid", str(exc),
                              "/plan_sha256"))
     return ok(plan_summary(plan, context.state_dir))
+
+
+# -- 9.8: stored observations, the SSH GPU inventory and planning inputs ----------------------------
+
+def _observation_entry(context: WorkflowContext, path: Path, now: float) -> dict:
+    """One stored observation as public facts; ``{profile_id, error}`` for a record that does not verify."""
+    stored = _stored_profile_id(path)
+    try:
+        if stored is None or profile_key(stored) != path.stem:
+            raise ValueError(OBSERVATION_INVALID)
+        observation = load_observation(context.state_dir, stored)
+        if observation is None:    # removed meanwhile
+            raise ValueError(OBSERVATION_INVALID)
+    except ValueError:
+        return {"profile_id": stored if stored is not None and _PROFILE_ID.fullmatch(stored) else path.stem,
+                "error": OBSERVATION_INVALID}
+    profile, facts = observation["profile"], observation["facts"]
+    native = context.profiles.get(stored)
+    try:   # whether the native profile still has the observed revision (None: no such profile any more)
+        current = None if native is None else profile_revision(stored, native.fields) == observation["revision"]
+    except ValueError:
+        current = False
+    age = now - observation["observed_at"].timestamp()
+    ssh = isinstance(facts, SSHServerFacts)
+    return {"profile_id": stored, "revision": observation["revision"],
+            "observed_at": observation["observed_at"].isoformat(), "age_seconds": round(age, 3),
+            "provider": profile.provider, "name": profile.name, "resource_id": facts.exclusivity_key,
+            "gpu_type": facts.gpu_type, "gpu_count": facts.gpu_count,
+            "total_hourly_cost_usd": facts.total_hourly_cost_usd,
+            "cost_source": facts.cost_source if ssh else "runpod_api",
+            "selected_gpu_uuids": list(facts.selected_gpu_uuids) if ssh else [],
+            "profile_current": current,
+            # What a real plan accepts (D13): the current profile revision, observed at most an hour ago.
+            "fresh_for_real_plan": current is True and 0 <= age <= OBSERVATION_MAX_AGE_SECONDS}
+
+
+@workflow_action("observations_list", Empty)
+def observations_list(context: WorkflowContext, request: Empty) -> WorkflowResult:
+    """Each profile's last stored observation (Task 10 Q-B): public facts only, never a field value, key path or
+    credential. A read: it creates nothing."""
+    directory = observations_dir(context.state_dir)
+    if not directory.is_dir():
+        return ok({"observations": []})
+    now = context.clock()
+    found = [_observation_entry(context, path, now) for path in sorted(directory.glob("*.json")) if path.is_file()]
+    return ok({"observations": sorted(found, key=lambda item: item["profile_id"])})
+
+
+@workflow_action("executor_profile_inventory", ProfileInspect)
+def executor_profile_inventory(context: WorkflowContext, request: ProfileInspect) -> WorkflowResult:
+    """The GPU listing of an SSH profile that may have no GPU selection yet (Task 10 Q-C), for GPU checkboxes.
+
+    It reuses the legacy ``server_inspect`` probe (6A): the fixed Linux identity read, then the restricted
+    ``nvidia-smi --query-gpu=uuid,name,memory.total,mig.mode.current`` query. A saved selection is checked offline
+    and reported, never required (the probe runs without it, so a GPU that is gone never hides the others). Nothing
+    is stored and no secret is needed: SSH reads the local key file path. RunPod profiles are refused."""
+    native = context.profiles.get(request.profile_id)
+    if native is None:
+        return invalid(issue("executor_profile_missing", PROFILE_UNKNOWN, "/profile_id"))
+    fields = dict(native.fields)
+    if fields.get("provider") != "ssh_server":
+        return invalid(issue("inventory_ssh_only", INVENTORY_SSH_ONLY, "/profile_id"))
+    if not fields.get("server_selected_gpu_uuids", "").strip():
+        fields.pop("server_selected_gpu_uuids", None)   # the native store keeps "" before any selection
+    try:   # every public field is checked offline, before any connection
+        revision = profile_revision(request.profile_id, native.fields)
+        check_key_paths(fields)
+        config = server_settings({**fields, "provider": "ssh_server"})
+    except (ValueError, TypeError) as exc:
+        return invalid(issue("executor_profile_invalid", _reason(exc), "/profile_id"))
+    probe = {name: value for name, value in fields.items() if name != "server_selected_gpu_uuids"}
+    from . import desktop_runtime, execution
+    try:
+        inspection = desktop_runtime.inspect_server({**probe, "provider": "ssh_server"})
+    except desktop_runtime.RemoteCommandFailed:   # its text carries remote output: a fixed text only
+        return invalid(issue("remote_command_failed", REMOTE_COMMAND_FAILED))
+    except (execution.ExecutionUncertain, TimeoutError, ValueError) as exc:
+        return invalid(issue("inspection_failed", _reason(exc)))
+    except Exception as exc:   # transport errors: the type name only, never their text
+        return invalid(issue("inspection_failed", type(exc).__name__))
+    return ok({"profile_id": request.profile_id, "revision": revision,
+               "observed_at": inspection.observed_at.isoformat(), "server_id": inspection.server_id,
+               "resource_id": inspection.exclusivity_key,
+               "inventory": [gpu.model_dump(mode="json") for gpu in inspection.inventory],
+               "selected_gpu_uuids": list(config.selected_gpu_uuids)})
+
+
+def planning_inputs_dir(state_dir: Path) -> Path:
+    return Path(state_dir) / "workflows" / "planning-inputs"
+
+
+def _planning_inputs_path(state_dir: Path, project_id: str) -> Path:
+    # Hashed: a file name that neither case-insensitive file systems nor Windows device names can alias.
+    return planning_inputs_dir(state_dir) / f"{digest(project_id.encode())}.json"
+
+
+def load_planning_inputs(state_dir: Path, project_id: str) -> _StoredPlanningInputs | None:
+    """The stored planning inputs of a project, or None; a damaged record raises ``PLANNING_INPUTS_INVALID``."""
+    try:
+        raw = _planning_inputs_path(state_dir, project_id).read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ValueError(PLANNING_INPUTS_INVALID) from None
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict) or data.get("schema") != PLANNING_INPUTS_SCHEMA:
+            raise ValueError(PLANNING_INPUTS_INVALID)
+        stored = _StoredPlanningInputs.model_validate({key: value for key, value in data.items() if key != "schema"})
+    except (ValueError, TypeError):
+        raise ValueError(PLANNING_INPUTS_INVALID) from None
+    if stored.project_id != project_id or stored.saved_at.utcoffset() is None:
+        raise ValueError(PLANNING_INPUTS_INVALID)
+    return stored
+
+
+def _planning_inputs_view(project: Revision[ProjectSpec], stored: _StoredPlanningInputs | None) -> dict:
+    inputs = None if stored is None else {
+        "project_revision": stored.project_revision, "simulation": stored.simulation,
+        "node_time_limits": [item.model_dump(mode="json") for item in stored.node_time_limits],
+        "estimates": [item.model_dump(mode="json") for item in stored.estimates],
+        "saved_at": stored.saved_at.isoformat()}
+    return {"project_id": project.spec.project_id, "current_project_revision": project.revision_sha256,
+            "inputs": inputs}
+
+
+@workflow_action("planning_inputs_get", PlanningInputsRef)
+def planning_inputs_get(context: WorkflowContext, request: PlanningInputsRef) -> WorkflowResult:
+    """A project's stored planning inputs (null before the first save) beside its current revision: inputs saved for
+    an earlier revision are returned as they are, with their own ``project_revision``. A read: it creates nothing."""
+    project, refused = _load_project(context, request.project_id, None, "/project_id")
+    if refused is not None:
+        return refused
+    try:
+        stored = load_planning_inputs(context.state_dir, request.project_id)
+    except ValueError as exc:
+        return invalid(issue("planning_inputs_invalid", str(exc), "/project_id"))
+    return ok(_planning_inputs_view(project, stored))
+
+
+@workflow_action("planning_inputs_save", PlanningInputsSave)
+def planning_inputs_save(context: WorkflowContext, request: PlanningInputsSave) -> WorkflowResult:
+    """Replace a project's planning inputs atomically, only for its current revision (``revision_conflict``
+    otherwise). Time limits name the draft graph's non-select nodes once each; estimates are unique by casefold plus
+    ``rstrip(".")``, as ``graph_plan`` compares them. ``graph_plan`` still checks everything again."""
+    project, refused = _load_project(context, request.project_id, None, "/project_id")
+    if refused is not None:
+        return refused
+    if project.revision_sha256 != request.project_revision:
+        return conflict(issue("revision_conflict", PLANNING_INPUTS_STALE, "/project_revision"))
+    nodes = project.spec.graph.get("nodes")
+    planned = {item.get("id") for item in nodes if isinstance(item, dict) and item.get("kind") != "select"} \
+        if isinstance(nodes, list) else set()
+    found, seen, keys = [], set(), set()
+    for index, item in enumerate(request.node_time_limits):
+        path = f"/node_time_limits/{index}/node_id"
+        if item.node_id not in planned:
+            found.append(issue("node_resource_unknown", NODE_RESOURCE_UNKNOWN, path))
+        elif item.node_id in seen:
+            found.append(issue("node_resource_duplicate", NODE_RESOURCE_DUPLICATE, path))
+        seen.add(item.node_id)
+    for index, item in enumerate(request.estimates):
+        key = item.profile_id.casefold().rstrip(".")
+        if key in keys:
+            found.append(issue("estimate_duplicate", ESTIMATE_DUPLICATE, f"/estimates/{index}/profile_id"))
+        keys.add(key)
+    if found:
+        return invalid(*found)
+    body = {"project_id": request.project_id, "project_revision": request.project_revision,
+            "simulation": request.simulation,
+            "node_time_limits": [item.model_dump(mode="json") for item in request.node_time_limits],
+            "estimates": [item.model_dump(mode="json") for item in request.estimates],
+            "saved_at": _now(context).isoformat()}
+    stored = _StoredPlanningInputs.model_validate(body)
+    _replace(_planning_inputs_path(context.state_dir, request.project_id),
+             canonical({"schema": PLANNING_INPUTS_SCHEMA, **body}))
+    return ok(_planning_inputs_view(project, stored))

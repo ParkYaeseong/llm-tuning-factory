@@ -1049,7 +1049,14 @@ def test_stored_plans_are_verified_and_summaries_are_public(tmp_path, monkeypatc
     assert summary["tracking"] is None and summary["max_concurrent_gpu_count"] == 1
     assert summary["nodes"][0] | {"allowed": None} == {"node_id": "train", "kind": "train", "label": "train 학습",
                                                        "max_estimated_cost_usd": pytest.approx(2.0),
-                                                       "max_duration_seconds": 3600, "allowed": None}
+                                                       "max_duration_seconds": 3600, "allowed": None,
+                                                       # 9.8: the node's recipe and data references
+                                                       "recipe": {"recipe_id": "sft-lora", "version": "1",
+                                                                  "name": "SFT LoRA", "training_stage": "sft",
+                                                                  "training_method": "lora",
+                                                                  "revision_sha256": found.recipe},
+                                                       "datasets": [{"binding_id": "train", "benchmark_revision": None,
+                                                                     **found.dataset}]}
     desk.only_issue(run(state, "graph_plan_get", {"plan_sha256": "0" * 64}), "invalid", "plan_unknown",
                     "/plan_sha256")
     with pytest.raises(ValueError) as refused:

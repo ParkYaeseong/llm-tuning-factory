@@ -36,6 +36,10 @@ ACTIONS_93 = ("graph_submit", "graph_runs_list", "graph_run_get", "graph_pause",
 ACTIONS_94 = ("controller_status", "controller_stop")
 # Task 9.7 adds the header-only HF-root target inspector to the table (root decision Q-A, 2026-10-20).
 ACTIONS_97 = ("model_root_targets",)
+# Task 9.8 adds the desktop operator release, observations, the SSH GPU inventory and stored planning inputs (Task 10
+# plan §2, root decisions of 2026-10-21). The release is a run action; the other four are planning actions.
+ACTIONS_98 = ("graph_release_lock", "observations_list", "executor_profile_inventory", "planning_inputs_get",
+              "planning_inputs_save")
 # Copied from desktop/src-tauri/src/main.rs `allowed()` (plan F6 says 35; the list has 34 names).
 LEGACY_ACTIONS = ("catalog", "save_profile", "dataset", "plan", "submit", "execute", "jobs", "logs", "cancel",
                   "recover", "reconcile", "resume", "connection", "pod", "runtime_check", "runtime_prepare",
@@ -225,13 +229,14 @@ def command_like(name):
 # 1
 def test_workflow_action_table_is_closed_and_partitioned():
     wf = workflows()
-    expected = ACTIONS_91 + ACTIONS_92 + ACTIONS_93 + ACTIONS_94 + ACTIONS_97
+    expected = ACTIONS_91 + ACTIONS_92 + ACTIONS_93 + ACTIONS_94 + ACTIONS_97 + ACTIONS_98
     assert wf.WORKFLOW_ACTIONS == expected
-    assert len(set(wf.WORKFLOW_ACTIONS)) == 33
+    assert len(set(wf.WORKFLOW_ACTIONS)) == 38
     assert set(wf.ACTION_MODULES) == set(wf.WORKFLOW_ACTIONS)
-    owners = {"tuning_factory.desktop_workflows": ACTIONS_91, "tuning_factory.workflow_planning": ACTIONS_92,
-              "tuning_factory.workflow_runs": ACTIONS_93, "tuning_factory.controller_entry": ACTIONS_94,
-              "tuning_factory.hf_targets": ACTIONS_97}
+    owners = {"tuning_factory.desktop_workflows": ACTIONS_91,
+              "tuning_factory.workflow_planning": ACTIONS_92 + ACTIONS_98[1:],
+              "tuning_factory.workflow_runs": ACTIONS_93 + ACTIONS_98[:1],
+              "tuning_factory.controller_entry": ACTIONS_94, "tuning_factory.hf_targets": ACTIONS_97}
     assert {name: module for module, names in owners.items() for name in names} == dict(wf.ACTION_MODULES)
     native = (ROOT / "desktop/src-tauri/src/main.rs").read_text(encoding="utf-8")
     allowed = native[native.index("fn allowed("):]

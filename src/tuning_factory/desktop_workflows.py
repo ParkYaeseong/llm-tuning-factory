@@ -45,12 +45,16 @@ WORKFLOW_ACTIONS: tuple[str, ...] = (
     "controller_status", "controller_stop",
     # 9.7
     "model_root_targets",
+    # 9.8 (Task 10 plan §2, root decisions of 2026-10-21): the operator release is a run action; the observation
+    # list, the SSH GPU inventory and the stored planning inputs are planning actions.
+    "graph_release_lock", "observations_list", "executor_profile_inventory", "planning_inputs_get",
+    "planning_inputs_save",
 )
 _OWNERS = (("tuning_factory.desktop_workflows", WORKFLOW_ACTIONS[:14]),
-           ("tuning_factory.workflow_planning", WORKFLOW_ACTIONS[14:22]),
-           ("tuning_factory.workflow_runs", WORKFLOW_ACTIONS[22:30]),
+           ("tuning_factory.workflow_planning", WORKFLOW_ACTIONS[14:22] + WORKFLOW_ACTIONS[34:38]),
+           ("tuning_factory.workflow_runs", WORKFLOW_ACTIONS[22:30] + WORKFLOW_ACTIONS[33:34]),
            ("tuning_factory.controller_entry", WORKFLOW_ACTIONS[30:32]),
-           ("tuning_factory.hf_targets", WORKFLOW_ACTIONS[32:]))
+           ("tuning_factory.hf_targets", WORKFLOW_ACTIONS[32:33]))
 # Fixed here for every sub-task: an action is served only by the module named for it.
 ACTION_MODULES: Mapping[str, str] = MappingProxyType(
     {name: module for module, names in _OWNERS for name in names})
@@ -89,6 +93,8 @@ LEGACY_PROFILE_MISSING = "저장된 기존 학습 설정 프로필을 찾을 수
 LEGACY_PROFILE_INVALID = "저장된 기존 학습 설정 프로필을 읽을 수 없습니다."
 LEGACY_DATASET_MISSING = ("기존 프로필의 데이터 버전을 프로젝트에 연결하지 못했습니다. "
                           "데이터를 등록한 뒤 프로젝트에서 직접 연결하세요.")
+RECIPE_REF_REQUIRED = ("레시피 ID(recipe_id, 필요하면 revision과 함께)와 레시피 버전 해시(revision_sha256) 중 "
+                       "하나만 지정하세요.")
 SPLIT_PREVIEW_CHANGED = "split preview hash mismatch or dataset origins changed"
 # registry.immutable_write: the same path with other bytes. A version conflict only in dataset_import_register.
 IMMUTABLE_EXISTS = "immutable version already exists"
@@ -553,8 +559,11 @@ class LegacyImport(StrictModel):
 
 
 class RecipeRef(StrictModel):
-    recipe_id: LocalId
+    """Exactly one of ``recipe_id`` (with an optional ``revision``) or, since 9.8, ``revision_sha256`` alone: the
+    revision a graph card pins by hash, also after its recipe moved on (``_RevisionStore.get_by_revision``)."""
+    recipe_id: LocalId | None = None
     revision: Sha256 | None = None
+    revision_sha256: Sha256 | None = None
 
 
 class RecipeSave(StrictModel):
@@ -754,12 +763,21 @@ def recipes_list(context: WorkflowContext, request: Empty) -> WorkflowResult:
 
 @workflow_action("recipe_get", RecipeRef)
 def recipe_get(context: WorkflowContext, request: RecipeRef) -> WorkflowResult:
+    by_hash = request.revision_sha256 is not None
+    if by_hash == (request.recipe_id is not None):
+        return invalid(issue("invalid_value", RECIPE_REF_REQUIRED, "/revision_sha256" if by_hash else "/recipe_id"))
+    if by_hash and request.revision is not None:
+        return invalid(issue("invalid_value", RECIPE_REF_REQUIRED, "/revision"))
     if not context.definitions_exist:
-        return invalid(issue("unknown_definition", "unknown definition", "/recipe_id"))
+        return invalid(issue("unknown_definition", "unknown definition", "/revision_sha256" if by_hash else "/recipe_id"))
     try:
-        revision = context.recipes().get(request.recipe_id, request.revision)
+        if by_hash:
+            revision = context.recipes().get_by_revision(request.revision_sha256)
+        else:
+            revision = context.recipes().get(request.recipe_id, request.revision)
     except ValueError as exc:
-        return _refused(exc, {"unknown_definition": _unknown_path(exc, "/recipe_id", "/revision")})
+        path = "/revision_sha256" if by_hash else _unknown_path(exc, "/recipe_id", "/revision")
+        return _refused(exc, {"unknown_definition": path})
     return ok(_recipe(revision))
 
 

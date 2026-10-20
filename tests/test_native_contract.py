@@ -81,7 +81,7 @@ def test_rust_workflow_allowlist_matches_python():
     main = source("main.rs")
     actions = str_array(main, "WORKFLOW_ACTIONS")
     assert actions == wf.WORKFLOW_ACTIONS
-    assert len(set(actions)) == 33
+    assert len(set(actions)) == 38
     assert not set(actions) & set(legacy_actions())
     profile_scoped = str_array(main, "PROFILE_SCOPED_ACTIONS")
     hf_scoped = str_array(main, "HF_SCOPED_ACTIONS")
@@ -96,6 +96,14 @@ def test_rust_workflow_allowlist_matches_python():
     assert set(lifecycle) == {"controller_status", "controller_stop"}
     assert {wf.ACTION_MODULES[name] for name in lifecycle} == {"tuning_factory.controller_entry"}
     assert not set(lifecycle) & set(native_scopes)
+    # 9.8 (Task 10 plan §2): the operator release, observations, the SSH inventory (a key file path, never a key)
+    # and planning inputs carry no credential and are ordinary vault-reading requests, not lifecycle ones.
+    workbench = ("graph_release_lock", "observations_list", "executor_profile_inventory", "planning_inputs_get",
+                 "planning_inputs_save")
+    assert actions[-5:] == workbench
+    assert not set(workbench) & (set(native_scopes) | set(lifecycle))
+    assert wf.ACTION_MODULES["graph_release_lock"] == "tuning_factory.workflow_runs"
+    assert {wf.ACTION_MODULES[name] for name in workbench[1:]} == {"tuning_factory.workflow_planning"}
     # The profile edit check of D5 is a workflow action served by 9.3's module.
     edit_check = str_const(source("profiles.rs"), "EDIT_CHECK_ACTION")
     assert wf.ACTION_MODULES[edit_check] == "tuning_factory.workflow_runs"

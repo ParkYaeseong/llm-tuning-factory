@@ -13,7 +13,9 @@ export const WORKFLOW_ACTIONS = [
   "tracking_rearm", "executor_profile_edit_check",
   "controller_status", "controller_stop",
   "model_root_targets",
-] as const;                                                    // = desktop_workflows.WORKFLOW_ACTIONS (33)
+  "graph_release_lock", "observations_list", "executor_profile_inventory", "planning_inputs_get",   // 9.8
+  "planning_inputs_save",
+] as const;                                                    // = desktop_workflows.WORKFLOW_ACTIONS (38)
 export type WorkflowAction = (typeof WORKFLOW_ACTIONS)[number];
 /** Actions Python serves but main.rs does not allow yet. Empty since bf9a13b added model_root_targets to main.rs
  * (9.7 native follow-up); a new Python-only action goes here until its native allowlist entry lands. */

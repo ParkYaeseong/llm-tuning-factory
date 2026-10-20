@@ -431,7 +431,11 @@ def test_run_status_is_db_only_and_secret_free(tmp_path, monkeypatch):
     [failure] = data["tracking_failures"]
     assert (failure["event_id"], failure["kind"], failure["node_id"], failure["status"], failure["tries"]) == (
         event_id, "graph_run", None, "FAILED", 9)
+    assert failure["attempt_id"] is None          # 9.3 review (optional): a graph-level event has no attempt
     assert failure["action"] is None and "[path]" in failure["last_error"]
+    execute(state, "UPDATE tracking_events SET attempt_id=? WHERE event_id=?", "a" * 32, event_id)
+    [failure] = run(state, "graph_run_get", {"run_id": run_id})["data"]["tracking_failures"]
+    assert failure["attempt_id"] == "a" * 32
     listed = run(state, "graph_runs_list")
     assert listed["status"] == "ok" and listed["data"]["controller"] == ABSENT
     entries = {entry["run_id"]: entry for entry in listed["data"]["runs"]}
@@ -445,12 +449,14 @@ def test_run_status_is_db_only_and_secret_free(tmp_path, monkeypatch):
     text = json.dumps([result, listed, unreadable])
     assert SECRET not in text and MLFLOW_SECRET not in text and "/home/researcher" not in text
     assert found.profile["fields"]["ssh_key_file"] not in text and "pod-key" not in text
-    # D21: an uncertain lock is shown with its operator reason; no desktop action releases it.
+    # An uncertain lock is shown with its operator reason. 9.8 replaces D21's CLI-only rule: the one action that
+    # releases a lock is graph_release_lock, served by this module (test_workbench_backend).
     execute(state, "UPDATE nodes SET wait_reason=? WHERE run_id=?", OPERATOR_CONFIRMATION, run_id)
     [node] = run(state, "graph_run_get", {"run_id": run_id})["data"]["run"]["nodes"]
     assert node["needs_operator"] is True and node["wait_reason"] == OPERATOR_CONFIRMATION
     names = desk.workflows().WORKFLOW_ACTIONS
-    assert not any("release" in name or "lock" in name for name in names)
+    assert [name for name in names if "release" in name or "lock" in name] == ["graph_release_lock"]
+    assert desk.workflows().ACTION_MODULES["graph_release_lock"] == "tuning_factory.workflow_runs"
     assert calls == []
 
 
@@ -645,3 +651,125 @@ def test_workflow_runs_imports_no_heavy_or_keyring_modules(tmp_path):
     result = json.loads(process.stdout)
     assert result["heavy"] == []
     assert set(ACTIONS_93) <= set(result["actions"])
+
+
+# -- 9.3 review fixes (Minor 1, 2 and 3) ------------------------------------------------------------
+
+def test_a_retried_submit_is_its_existing_run_after_the_basis_changed(tmp_path, monkeypatch):
+    """Minor 1: once the approvals pass, a retry of a submitted request (same request ID, same plan) is that run,
+    read-only, even though the profile, the tracking settings or the project changed since it was approved."""
+    state = tmp_path / "state"
+    found = real_world(state, tmp_path, monkeypatch)
+    first = submit(state, found)
+    assert first["status"] == "ok", first
+    run_id = first["data"]["run_id"]
+    receipts = desk.snapshot(state / "workflows" / "submissions")
+    renamed = [{**found.profile, "fields": {**found.profile["fields"], "name": "Renamed"}}]
+    moved = {**TOKEN_SETTINGS, "MLFLOW_TRACKING_URI": "https://other.invalid"}
+    for options in ({"profiles": renamed}, {"settings": moved}, {"profiles": [], "settings": {}}):
+        again = submit(state, found, clock=SUBMIT_AT + 30, **options)
+        assert again == first, options
+    current = desk.call(state, "project_get", {"project_id": found.project_id})["data"]
+    assert desk.call(state, "project_save", {"spec": {**current["project"], "purpose": "바뀐 목적"},
+                                             "expected_revision": current["revision_sha256"]})["status"] == "ok"
+    assert submit(state, found, profiles=renamed) == first
+    assert [row[1] for row in run_rows(state)] == ["submit-1"]
+    assert desk.snapshot(state / "workflows" / "submissions") == receipts      # read-only: no second receipt
+    # The run as it is now, not as it was submitted.
+    assert run(state, "graph_pause", {"run_id": run_id})["status"] == "ok"
+    paused = submit(state, found, profiles=renamed)
+    assert paused["status"] == "ok" and paused["data"] == {**first["data"], "status": "PAUSED"}
+    # Without both approvals a retry is no shortcut, and a new request ID is a new submission: both are stale.
+    desk.only_issue(submit(state, found, approve=None), "conflict", "plan_stale", "/project")
+    stale = submit(state, found, profiles=renamed, request_id="submit-2")
+    assert [(issue["code"], issue["path"]) for issue in stale["issues"]] == [("plan_stale", "/project"),
+                                                                            ("plan_stale", "/profiles/pod-a")]
+    assert [row[1] for row in run_rows(state)] == ["submit-1"]
+
+
+def test_profile_usage_counts_a_resource_lease_without_its_gpu_lock(tmp_path, monkeypatch):
+    """Minor 2: a job holding only its ``resource_leases`` row (no ``gpu_locks``) still holds the profile."""
+    wp = wpt.planning()
+    state = tmp_path / "state"
+    found = real_world(state, tmp_path, monkeypatch)
+    run_id = submitted(state, found)
+    store = ledger(state)
+    lease = store.acquire_controller(run_id)
+    store.prepare_ready(lease)
+    claimed = store.claim_ready(wp.stored_plan(state, found.plan_sha256).resource_snapshots[0], lease)
+    store.jobs.transition(claimed["lease"], "FAILED")          # final status: only a lock can hold the profile
+    execute(state, "DELETE FROM gpu_locks WHERE job_id=?", claimed["id"])
+    result = run(state, "executor_profile_edit_check", {"profile_id": "pod-a"})
+    desk.only_issue(result, "conflict", "profile_in_use", "/profile_id")
+    assert result["data"] == {"jobs": [{"run_id": run_id, "node_id": "train", "job_id": claimed["id"],
+                                        "status": "FAILED", "locked": True}]}
+    execute(state, "DELETE FROM resource_leases WHERE job_id=?", claimed["id"])
+    assert run(state, "executor_profile_edit_check", {"profile_id": "pod-a"})["status"] == "ok"
+
+
+@pytest.mark.parametrize("column", ["approval", "plan"])
+def test_an_unreadable_run_might_pin_any_profile(tmp_path, monkeypatch, column):
+    """Minor 2: ``_pins`` fails closed, so a RUNNING run whose plan or approval cannot be read is affected."""
+    state = tmp_path / "state"
+    found = real_world(state, tmp_path, monkeypatch)
+    run_id = submitted(state, found)
+    assert run(state, "executor_profile_edit_check", {"profile_id": "q"})["data"] == {"affected_runs": []}
+    execute(state, f"UPDATE graph_runs SET {column}='{{' WHERE id=?", run_id)
+    for profile_id in ("q", "pod-a"):
+        assert run(state, "executor_profile_edit_check", {"profile_id": profile_id}) == {
+            "status": "ok", "issues": [], "data": {"affected_runs": [run_id]}}
+
+
+def test_real_submit_treats_a_missing_data_snapshot_as_not_exportable(tmp_path, monkeypatch):
+    """Minor 2: a verified stored plan whose used dataset has no pinned snapshot is refused, never assumed
+    exportable."""
+    wp = wpt.planning()
+    from tuning_factory.registry import digest, immutable_write
+    state = tmp_path / "state"
+    found = real_world(state, tmp_path, monkeypatch)
+    body = json.loads((wp.plans_dir(state) / f"{found.plan_sha256}.json").read_bytes())
+    assert body["execution_choices"]["datasets"]
+    body["execution_choices"]["datasets"] = []
+    body.pop("sha256")
+    sha = digest(canonical(body))
+    immutable_write(wp.plans_dir(state) / f"{sha}.json", canonical({**body, "sha256": sha}))
+    assert wp.stored_plan(state, sha).execution_choices.datasets == ()       # it verifies: only the data is missing
+    issue = desk.only_issue(submit(state, found, sha=sha, request_id="no-snapshot"), "invalid", "export_not_allowed",
+                            "/plan_sha256")
+    assert issue["node_id"] == "train" and run_rows(state) == []
+
+
+def test_an_unhashable_tracking_destination_makes_the_plan_stale(tmp_path, monkeypatch):
+    """Minor 2: an http MLflow URI with a token cannot be hashed (``AUTHENTICATED_HTTPS``); that is ``plan_stale``
+    at ``/tracking``, never an escaping refusal."""
+    state = tmp_path / "state"
+    found = real_world(state, tmp_path, monkeypatch)
+    settings = {**TOKEN_SETTINGS, "MLFLOW_TRACKING_URI": "http://mlflow.invalid"}
+    issue = desk.only_issue(submit(state, found, settings=settings), "conflict", "plan_stale", "/tracking")
+    assert issue["message"] == runs().PLAN_STALE and run_rows(state) == []
+
+
+def test_profile_in_use_skips_simulated_jobs(tmp_path, monkeypatch):
+    """Minor 3: a simulation never uses the native profile (its claim is ``simulation:``), so its lock-holding jobs
+    do not block an edit, matching ``affected_runs``. An unreadable manifest still fails closed."""
+    wp = wpt.planning()
+    state = tmp_path / "state"
+    found = wpt.real_scenario(state, tmp_path, monkeypatch)
+    planned = wpt.run(state, "graph_plan", wpt.plan_request(found.project_id, estimates=()), profiles=[found.profile])
+    assert planned["status"] == "ok", planned
+    sha = planned["data"]["plan_sha256"]
+    simulated = submitted(state, found, sha=sha, request_id="sim", approve=None)
+    store = ledger(state)
+    lease = store.acquire_controller(simulated)
+    store.prepare_ready(lease)
+    claimed = store.claim_ready(wp.stored_plan(state, sha).resource_snapshots[0], lease)
+    assert claimed is not None and claimed["lease"].resource_id.startswith("simulation:")
+    manifest = store.jobs.get(claimed["id"])["manifest"]      # pinned to pod-a as observed, but simulated
+    assert manifest["operation"]["resources"]["executor"]["profile_id"] == "pod-a"
+    assert manifest["operation"]["lineage"]["simulation"] is True
+    for alias in ("pod-a", "POD-A."):
+        assert run(state, "executor_profile_edit_check", {"profile_id": alias}) == {
+            "status": "ok", "issues": [], "data": {"affected_runs": []}}
+    execute(state, "UPDATE jobs SET manifest=? WHERE id=?", "{", claimed["id"])
+    desk.only_issue(run(state, "executor_profile_edit_check", {"profile_id": "pod-a"}), "conflict", "profile_in_use",
+                    "/profile_id")

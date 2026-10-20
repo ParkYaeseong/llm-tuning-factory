@@ -1174,6 +1174,8 @@ def _node_status(store, plan, entry, node, job, operation, counted, tracking, no
     output, selection = _outputs_summary(json.loads(job["outputs"]) if job and job["outputs"] else None)
     return {
         "node_id": node["node_id"], "label": entry.node.label, "kind": entry.node.kind, "status": status,
+        # Task 9.8: with attempt_id, the IDs an operator release names (graph_release_lock, CLI release-lock).
+        "job_id": node["job_id"],
         "job_status": job["status"] if job else None, "attempt_id": job["active_attempt_id"] if job else None,
         "attempts": job["attempts"] if job else 0, "counted_attempts": counted.get(job["id"], 0) if job else 0,
         "max_attempts": plan.graph.retry_policy.max_attempts,
