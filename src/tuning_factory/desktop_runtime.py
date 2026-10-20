@@ -23,7 +23,7 @@ from .gpu_servers import (
     validate_recovery_identity,
 )
 from .manifest import source_hash
-from .runtime_profiles import engine_profile
+from .runtime_profiles import MODEL_OPS_PINS, MODEL_OPS_RUNTIME, engine_profile
 
 REMOTE = "/workspace/factory-desktop"
 MISSING_KEY = "SSH 개인키 파일을 찾을 수 없습니다. 연결 화면에서 키 파일을 다시 선택하세요."
@@ -144,11 +144,17 @@ def bootstrap_prerequisites(client):
                          "administrator to install pip for python3 (for example the python3-pip package)") from None
 
 
-def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=()):
+def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=(), *, model_ops=False):
+    """Probe the private runtime. ``model_ops=True`` (merge/materialize) also requires the installed
+    MODEL_OPS_PINS versions; the default probe and result are unchanged."""
+    profile = engine_profile(training_stage)
+    if model_ops and profile["profile"] != "primary":
+        raise ValueError(MODEL_OPS_RUNTIME)
     prerequisites(client)
     root = runtime_path(training_stage, remote_root)
-    profile = engine_profile(training_stage)
     lock_name = Path(profile["lock_file"]).name
+    pins = (",model_ops=dict((n,importlib.metadata.version(n).split('+')[0]) for n in "
+            + repr(tuple(MODEL_OPS_PINS)) + ")") if model_ops else ""
     probe = (
         "import json,torch,importlib.metadata;"
         + ("from llamafactory.train.ppo.trainer import CustomPPOTrainer;" if training_stage == "ppo" else "") +
@@ -158,7 +164,7 @@ def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=(
         + ("assert torch.cuda.device_count()==" + str(len(selected_gpu_uuids)) + ";" if selected_gpu_uuids else "") +
         "print(json.dumps(dict(source=source_hash(),engine=importlib.metadata.version('llamafactory'),"
         "cuda=torch.cuda.is_available(),lock=digest(Path(" + repr(root + "/" + lock_name) +
-        ").read_bytes()))))"
+        ").read_bytes())" + pins + ")))"
     )
     argv = [root + "/venv/bin/python", "-c", probe]
     if selected_gpu_uuids:
@@ -166,8 +172,11 @@ def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=(
     result = json.loads(command(client, argv).splitlines()[-1])
     from .desktop import assets_root
     expected = hashlib.sha256((assets_root() / profile["lock_file"]).read_bytes()).hexdigest()
-    if result != {"source": source_hash(), "engine": profile["engine_version"], "cuda": True, "lock": expected}:
+    base = {key: value for key, value in result.items() if key != "model_ops"} if model_ops else result
+    if base != {"source": source_hash(), "engine": profile["engine_version"], "cuda": True, "lock": expected}:
         raise ValueError("GPU runtime source, lock, engine or CUDA preflight mismatch; prepare runtime first")
+    if model_ops and result.get("model_ops") != dict(MODEL_OPS_PINS):
+        raise ValueError(MODEL_OPS_RUNTIME)
     return result
 
 
@@ -288,10 +297,28 @@ def release_runtime_reservation(settings, state_root, reservation_id, *, confirm
     return {"released": reservation_id}
 
 
+def operation_stage(training_stage, runtime_profile):
+    """The engine stage whose private runtime serves a v2 operation's runtime profile (primary or ppo)."""
+    if runtime_profile is None:
+        return training_stage
+    if runtime_profile not in {"primary", "ppo"}:
+        raise ValueError("unsupported runtime profile")
+    if training_stage != "sft" and engine_profile(training_stage)["profile"] != runtime_profile:
+        raise ValueError("training stage runtime differs from the operation runtime profile")
+    return "ppo" if runtime_profile == "ppo" else training_stage
+
+
 @contextmanager
 def executor_for(settings, state_root, preflight=True, training_stage="sft", *, server_receipt=None,
-                 recovery=False):
+                 recovery=False, runtime_profile=None, model_ops=False):
+    """Executor for one destination. ``runtime_profile`` (a v2 operation's runtime) selects the private runtime;
+    ``model_ops`` adds the MODEL_OPS_PINS probe for merge/materialize. Launch executors carry the remote model
+    cache root (``<remote_root>/model-cache``) for v2 operations; v1 runs ignore it."""
     # recovery=True always means the SSH recovery-only executor; RunPod reconciles with preflight=False.
+    training_stage = operation_stage(training_stage, runtime_profile)
+    if model_ops and engine_profile(training_stage)["profile"] != "primary":
+        raise ValueError(MODEL_OPS_RUNTIME)
+    pins = {"model_ops": True} if model_ops else {}
     if recovery:
         if settings.get("provider", "existing_runpod") != "ssh_server":
             raise ValueError("recovery-only executor requires an SSH server destination")
@@ -306,23 +333,25 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
             if server_receipt is not None:
                 server_receipt.validate_destination(server_receipt.manifest_sha256, config.transport, pod)
             if preflight:
-                check(client, training_stage, config.remote_root, config.selected_gpu_uuids)
+                check(client, training_stage, config.remote_root, config.selected_gpu_uuids, **pins)
             root = runtime_path(training_stage, config.remote_root)
             lock_name = Path(engine_profile(training_stage)["lock_file"]).name
             executor = SSHExecutor("", 22, config.ssh_username, "", client=client,
                                    server_profile=server_receipt.profile if server_receipt else config.profile(pod),
                                    server_facts=pod,
                                    remote_root=config.remote_root + "/jobs", remote_python=root + "/venv/bin/python",
-                                   worker_lock_file=root + "/" + lock_name, hf_home=config.remote_root + "/hf-cache")
+                                   worker_lock_file=root + "/" + lock_name, hf_home=config.remote_root + "/hf-cache",
+                                   model_cache_root=config.remote_root + "/model-cache")
             yield executor
             return
         if preflight:
-            check(client, training_stage)
+            check(client, training_stage, **pins)
         root = runtime_path(training_stage)
         lock_name = Path(engine_profile(training_stage)["lock_file"]).name
         executor = SSHExecutor("", 22, "root", "", client=client, pod=pod,
                                remote_root=REMOTE + "/jobs", remote_python=root + "/venv/bin/python",
-                               worker_lock_file=root + "/" + lock_name, hf_home=REMOTE + "/hf-cache")
+                               worker_lock_file=root + "/" + lock_name, hf_home=REMOTE + "/hf-cache",
+                               model_cache_root=REMOTE + "/model-cache")
         yield executor
 
 

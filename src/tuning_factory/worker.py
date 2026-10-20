@@ -30,12 +30,11 @@ from .registry import canonical, digest, file_digest
 from .runtime_profiles import engine_profile, operation_profile
 from .training import CanceledError, LlamaFactoryBackend
 from .worker_protocol import (
-    COMMAND,
     OPERATION_KINDS,
-    START_MARKER,
     OperationResult,
     StartMarker,
     create_start_marker,
+    is_v2_directory,
     read_worker_request,
     write_operation_result,
 )
@@ -156,17 +155,6 @@ def verify_model_cache(root, artifact_id, inventory_sha256):
         print(f"model cache entry failed verification: {exc}", file=sys.stderr)
         return 1
     return 0
-
-
-def _v2_directory(directory):
-    """True when a directory belongs to the v2 protocol, which the v1 entry must never write into."""
-    if any((directory / name).exists() or (directory / name).is_symlink() for name in (COMMAND, START_MARKER)):
-        return True
-    try:
-        manifest = json.loads((directory / "manifest.json").read_bytes())
-    except (OSError, ValueError):
-        return False
-    return isinstance(manifest, dict) and manifest.get("schema_version") == 2
 
 
 def _absolute_setting(name):
@@ -328,7 +316,7 @@ def main():
     if args.directory is None or args.timeout is None:
         parser.error("the following arguments are required: directory, timeout")
     directory = args.directory.resolve()
-    if _v2_directory(directory):
+    if is_v2_directory(directory):
         # Never let a v1 run write (or overwrite) a v2 launch directory's result.json.
         print("v2 operation launch directories require --request; refusing the v1 entry", file=sys.stderr)
         return 2
@@ -408,4 +396,6 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())   # v1 returns None, so its exit status is unchanged (0)
+    # v1 exits 0 after publishing its result, or 2 (nothing written) for a v2 directory; v2 and
+    # --verify-model-cache return their own status; argument errors exit 2.
+    sys.exit(main())

@@ -522,18 +522,109 @@ Verification after the review fixes:
   `070236f1f14c96f28c681d321d6443a2b870b3d0fcbcbd85ef7eb0692541dc71` (equal to the tree), lock_sha256
   `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437` unchanged.
 
+Task 7.4 (2026-10-20, sub-plan §3 7.4): SSH transport for v2 operations, for both an existing RunPod Pod and an
+`ssh_server` (one provider-neutral code path; only the attempt record and `CUDA_VISIBLE_DEVICES` differ).
+- `SSHExecutor.run_operation(job_dir, launch_dir, WorkerRequest, transfers, canceled)` launches at
+  `<root>/<job_id>/<launch_id>` with the persisted launch ID (no uuid). In order:
+  - Local checks: the job directory and launch ID are 32-hex, the launch directory is named by the launch ID,
+    `command.json` is exactly `canonical(request)`, `manifest.json` verifies and matches the request's manifest and
+    operation hashes, and the `CachedTransfer`s are exactly `model-inputs.json`'s `transfers` (HF roots are never
+    uploaded; the worker resolves them). Then it writes the launch directory's `remote-attempt.json` (protocol 2,
+    attempt, launch, command SHA256, Pod ID or server destination; a retry must match it).
+  - A remote `start.json` or `result.json` raises `ExecutionUncertain("remote launch already started for this attempt;
+    reconcile instead of relaunching")` before any other action. It is checked again right before the upload.
+  - A launch directory holding weights (`WEIGHT_SUFFIXES`) or links is refused before any upload.
+  - The cache root and HF_HOME are created or walked over SFTP, with every component required to be an ordinary
+    directory, so neither sits under a symlink.
+  - Each transfer: an existing `<cache>/<id>/<inv>` is reused only after the fixed argv
+    `[python, -m, tuning_factory.worker, --verify-model-cache, <cache>, <id>, <inv>]` exits 0. Exit 1 refuses with
+    `remote model cache entry failed verification; remove it after inspection` (nothing is deleted). Any other exit
+    status means the check could not run and is never reported as corruption. A missing entry is uploaded to an
+    exclusively created `<cache>/.incoming/<launch_id>/<id>/<inv>`, verified there, then renamed with the fixed argv
+    `mv -T -- <incoming> <final>`: real directories, no link, never over a non-empty entry. If another publisher won the
+    race, its entry must verify and ours is left for manual cleanup.
+  - The launch files are uploaded. `start.json` is in the upload exclusions, plus `remote-attempt.json` for v2.
+  - One launch: `nohup env [CUDA_VISIBLE_DEVICES=…] [FACTORY_GPU_LOCK_FILE=…] [HF_HOME=…] FACTORY_MODEL_CACHE=<cache>
+    <python> -m tuning_factory.worker <remote> --request <sha256(command.json)> >> worker.log 2>&1 < /dev/null &`.
+    `submitted` is set before `exec_command`, as in v1.
+  - The wait loop is shared with v1 (`_await_result`; the v1 behaviour is unchanged). Past timeout + 60 s, or on any
+    failure between the launch and a trusted result, the outcome is `ExecutionUncertain`: an overrunning merge or
+    materialize goes to reconcile and is never relaunched.
+- Trust and fencing: only `result.json` is trusted; `start.json` is an existence fact and its claims are never read.
+  `result.launch_id` must equal the request. For COMPLETED, attempt, manifest, operation and the manifest's kind must
+  all match, and other statuses may only omit identities. Otherwise the error is `remote result belongs to a different
+  attempt`, checked before anything is downloaded (inside `run_operation` this is uncertain). Before the hash-verified
+  download, the remote `command.json`/`manifest.json` bytes must equal the local ones, and `artifacts.json` must list
+  the local hashes of `command.json`, `manifest.json` and `model-inputs.json`, so a download can never replace them.
+  Every `result.evidence` file must match after the download. The result dict is returned for any terminal status.
+- `collect_operation_result` never launches and works with the recovery-only executor. It checks the stored
+  attempt record (destination, path and identities) and returns None while there is no result, so a start marker
+  alone stays uncertain.
+- `publish_cached_artifact(transfer, *, source_remote_dir=None, launch_id=None)` seeds an entry from a finished launch's
+  remote output inside this executor's namespace. Payload files present there are copied with the fixed argv
+  `cp -P -- <src> <dst>`; metadata and missing files are uploaded. Then it verifies and renames like above, and a
+  verified entry is reused. Recovery-only executors can neither launch nor publish.
+- `ExecutionBackend.run_operation` raises NotImplementedError. The v1 `collect_result` now refuses v2 directories too.
+- `desktop_runtime`:
+  - `executor_for(..., runtime_profile=, model_ops=)` selects the private runtime by operation profile (`ppo` → the PPO
+    venv and lock). An inconsistent stage, an unknown profile, or model ops on `ppo` are refused before any contact.
+  - Launch executors get `model_cache_root` = `<remote_root>/model-cache` (server) or `/workspace/factory-desktop/
+    model-cache` (Pod).
+  - `check(..., model_ops=True)` also probes the installed torch/peft/transformers/safetensors versions (local suffix
+    stripped), which must equal `MODEL_OPS_PINS`. The default probe string and result dict are byte-identical, and a
+    test pins the legacy probe text.
+- Worker (M1): `execute_operation` refuses a `FACTORY_MODEL_CACHE` or `HF_HOME` under a symlink or reparse point
+  (`<name> must not sit under a symlink or reparse point`); before this change an HF_HOME under a link was accepted.
+- 7.3 review nits: the duplicated v2-directory detection is now one `worker_protocol.is_v2_directory`, used by the v1
+  executor, the v1 collector and the v1 worker entry, with a test that pins its behaviour. The comment on the
+  `worker.py` exit line no longer claims v1 always exits 0.
+
+Deviations from the sub-plan:
+- The incoming directory is `.incoming/<launch_id>/<id>/<inv>`, not `<id>-<inv>`, because the fixed-argv verifier
+  checks `<DIR>/<id>/<inv>`.
+- The identity check runs before `save_remote_evidence` and the download (plan steps 8/9 swapped), so a foreign result
+  is never transferred.
+- `publish_cached_artifact` gains `launch_id=` for the upload case: the incoming name needs a launch identity and
+  no uuid is used.
+- `executor_for` gains `model_ops=` so the new probe has a caller.
+- `operation_dispatch._absolute_root` gains the link check, outside the plan's file list.
+- The v2 methods leave the SSH connection open; v1 `run`/`collect_result` close it. `connection()` owns it, so 7.5 can
+  collect and publish on one executor.
+
+Actual verification:
+- RED: 32 new tests failed (missing transport, cache, collection, desktop selection, probe, shared helper and worker
+  link check). The HF_HOME-link case completed with exit 0 before the fix.
+- GREEN: the sub-plan set (`test_remote_worker`, `test_desktop_runtime`, `test_execution`, `test_gpu_servers`) gave
+  **202 passed**. `uv run pytest -q` gave **1028 passed, 1 skipped**. Both test files are additions-only (537 and 91
+  lines added, 0 removed), so every v1 test runs unmodified.
+- Ruff (`src tests`) is clean, both GPU locks are unchanged, and the main `.venv` has no torch/peft/transformers/
+  safetensors/huggingface_hub.
+- The CPU acceptance (`-I`) exited 0 twice with byte-identical receipts and all **28** checks passed. Max errors are
+  unchanged (merge delta 7.78e-9, materialize delta 9.17e-9, parent→child 6.42e-9, logits 3.35e-8/2.98e-8), and so
+  are the dispatched inventories (merge `cc5fbab0…b54c`, materialize `e124a915…8682`). Receipt SHA256
+  `0ca10069572a1b91bb8d446a5c397d3354410f998d0ff0ac25d9fb4c9f813b0c`, source_sha256
+  `4f54ba904241bc0fd6582bc85f115ab581fc7da9dcd8cedc4c325887ddc0ff4d` (equal to the tree), lock_sha256
+  `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437` unchanged.
+- No real SSH, GPU, download or institution data: every remote action ran against `GPUHost`, a local-tree fake. It runs
+  the real `worker --verify-model-cache` and the real `worker.main_v2` against the published cache.
+
 Still open for Task 7 GPU work:
 - Hardware and numerics: merge/materialize tolerances at real model sizes on CUDA (TF32 off); memory (FP32 loads;
   about 3 base loads per merge); a BF16 storage policy (none yet; F32 doubles size).
 - Worker v2 on a real GPU host: real LF training on `train.bound.yaml`, real `predict_bound` generation, real
   `runtime_preflight_bound`/`evaluation_preflight_bound` facts and `renameat2` on the host filesystem are unverified
   (all tested with fakes). Merge/materialize cannot be interrupted mid-operation; one that overruns its deadline is
-  refused after it returns, but the executor's timeout + 60 s window may already have ended.
-- SSH cache and single launch (7.4): `run_operation`, the remote `start.json`/`result.json` check before upload,
-  `start.json` in the upload exclusions, `>>` log append, and `--verify-model-cache` over fixed argv. Remote cache
-  entries must stay link-free (uploaded directories moved with `mv -T`, never symlinked). HF_HOME and the model cache
-  on the GPU host must not sit under a symlink or junction, and HF roots are resolved on the worker, never uploaded.
-- Attempt runner (7.5, including F11): write `command.json`, upload benchmark bytes with
+  refused after it returns. Since 7.4 an executor whose timeout + 60 s window ends first reports ExecutionUncertain,
+  and the late FAILED result is collected by reconcile.
+- SSH transport on a real host (7.4 is software-only): SFTP `lstat` link semantics, GNU `mv -T`/`cp -P` on the cache
+  filesystem (the incoming copy and the cache must be on one filesystem; `mv` would otherwise copy), the
+  `--verify-model-cache` runtime at multi-GB sizes (the check's timeout is 3600 s), cache publishing on a RunPod
+  network volume and on a lab server, and a real lost launch response. Abandoned `.incoming/<launch_id>` copies and
+  corrupt entries are never removed automatically and need operator cleanup.
+- Attempt runner (7.5, including F11): create `state/jobs/<job_id>/launches/<launch_id>/`, write `command.json`,
+  build `CachedTransfer`s from the approved cache, call `run_operation` (it returns the result for every terminal
+  status; `ExecutionUncertain` keeps the lock) and reconcile with `collect_operation_result`, seed the cache from
+  finished outputs with `publish_cached_artifact(source_remote_dir=…)`, upload benchmark bytes with
   `operation_dispatch.write_benchmark_data`, read
   outputs from `output/` (train) or `model-op/output` (merge/materialize), bind `target-inventory.json` to the frozen
   ref, and compare the frozen `inventory_sha256` with `operation-receipt.json`.

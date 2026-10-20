@@ -10,6 +10,7 @@ Module import touches only the standard library, pydantic and local contracts.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from pathlib import Path
@@ -80,6 +81,19 @@ class OperationResult(StrictModel):
             raise ValueError("a completed result names its attempt, manifest, operation and kind and carries no "
                              "error")
         return self
+
+
+def is_v2_directory(directory: Path) -> bool:
+    """True for a v2 launch directory: ``command.json`` or ``start.json`` (even as a link), or a schema-2
+    ``manifest.json``. The v1 executor, collector and worker entry all refuse such a directory."""
+    directory = Path(directory)
+    if any((directory / name).exists() or (directory / name).is_symlink() for name in (COMMAND, START_MARKER)):
+        return True
+    try:
+        manifest = json.loads((directory / "manifest.json").read_bytes())
+    except (OSError, ValueError):
+        return False
+    return isinstance(manifest, dict) and manifest.get("schema_version") == 2
 
 
 def read_worker_request(directory: Path, command_sha256: str, launch_id: str) -> WorkerRequest:

@@ -299,6 +299,10 @@ def _absolute_root(path, name: str) -> Path | None:
         return None
     if not Path(path).is_absolute():
         raise ValueError(f"{name} must be an absolute path")
+    try:
+        check_link_free(path)   # model readers refuse links, so the cache roots and their ancestors are link-free
+    except ValueError as exc:
+        raise ValueError(f"{name} must not sit under a symlink or reparse point") from exc
     return Path(path)
 
 
