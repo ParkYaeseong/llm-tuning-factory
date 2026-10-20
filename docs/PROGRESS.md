@@ -2204,11 +2204,13 @@ Not verified or still open:
 
 ## Task 9.5 native executor profiles, workflow channel and headless broker, 2026-10-20
 
-Commit `feat: expose secure desktop workflow automation and controller lifecycle`, written on `3d119c6` (9.1, not yet
-pushed) in the worktree `codex/task-9.5`. It implements [Task 9 plan](superpowers/plans/2026-10-20-task9-secure-desktop-broker.md)
-§4 "9.5" with D1, D2, D5, D6, D8, D19 and D20, and the coordinator's 9.1-review notes M4 (key-marker scope) and M9
-(profile-ID identity). Only Rust (`profiles.rs`, `broker.rs`, `main.rs`) and the new `tests/test_native_contract.py`
-changed: no `src/tuning_factory`, TypeScript, crate, `Cargo.lock`, `pyproject.toml` or `uv.lock` change.
+Commit `feat: expose secure desktop workflow automation and controller lifecycle`, written on 9.1's first commit
+(`3d119c6`) in the worktree `codex/task-9.5` and rebased onto `1ca866c` (9.1 with its review fixes, on 8.5), plus
+`test: pin the native contract against the 9.1 review fixes`. It implements
+[Task 9 plan](superpowers/plans/2026-10-20-task9-secure-desktop-broker.md) §4 "9.5" with D1, D2, D5, D6, D8, D19 and
+D20, and the coordinator's 9.1-review notes M4 (key-marker scope) and M9 (profile-ID identity). Only Rust
+(`profiles.rs`, `broker.rs`, `main.rs`) and the new `tests/test_native_contract.py` changed: no `src/tuning_factory`,
+TypeScript, crate, `Cargo.lock`, `pyproject.toml` or `uv.lock` change.
 
 What changed:
 - `profiles.rs` (new): the `Vault` trait (`KeyringVault` for Credential Manager, same service and error texts as the
@@ -2258,9 +2260,15 @@ Deviations and choices to review:
 - 9.5's tests: the plan's 15 Rust tests plus 11 more (pinned contract sample, broker pipe lifetime and exit codes,
   least-privilege vault reads, breakaway fallback, `should_start`, edit check, legacy-key copy, store bounds and
   corruption, ID collisions, settings through the vault, the legacy sidecar's empty argv/env). Python: the plan's 3
-  contract tests became 5. `test_rust_controller_message_follows_the_plan_schema` pins the plan's values and the
+  contract tests became 7. `test_rust_controller_message_follows_the_plan_schema` pins the plan's values and the
   sample now. `test_rust_controller_message_matches_python` skips until `controller_entry` (9.4) exists; it then
-  validates the sample with `ControllerStart`. `test_profile_names_with_key_words_are_not_pasted_keys` covers M4.
+  validates the sample with `ControllerStart`. Against the landed 9.1 fixes, through `desktop.main`:
+  `test_profile_names_with_key_words_are_not_pasted_keys` (M4: `KEY_FILE_FIELDS` equal, a name with marker words
+  reaches the channel, key content in either key-file field is refused),
+  `test_profile_ids_are_one_identity_on_both_sides` (M9: Rust's `profile_id_key` body equals `casefold().rstrip(".")` on every valid ID character; `GPU-A` with
+  `gpu-a.` is refused) and `test_workflow_settings_are_always_an_object` (the fixed `invalid workflow request
+  (settings)`; Rust wraps settings in an object). With 9.1's pre-fix `desktop_workflows.py` overlaid, the M4 and M9
+  assertions fail, so they pin the fixes.
 - Fail closed. A profile save or delete is refused unless `executor_profile_edit_check` answers `ok` with an
   `affected_runs` array. Until 9.3 lands, that action answers `not_available`, so profile edits are refused.
   `controller_start` spawns only for `controller.state` `absent` or `stale`. It returns `already_running` for
@@ -2274,7 +2282,8 @@ Deviations and choices to review:
   with key content instead of sending it, so a legacy stored pasted key cannot break the channel. Non-string or
   unknown keys in `settings.json` are dropped from that view too.
 - `executor-profiles.json` writes keep only what is served (invalid or colliding hand-edited entries are dropped on
-  the next save). A corrupt file or more than 32 served profiles is an error (`실행 프로필 파일이 손상되었습니다.`).
+  the next save). A corrupt file or more than 32 served profiles is an error
+  (`실행 프로필 파일이 손상되었습니다.`).
 - A successful sidecar start removes a stale `broker.json`.
 - `forget_credentials` now takes the `AppHandle`, which Tauri injects, so the TypeScript call is unchanged. It
   deletes the seven legacy entries before it resolves the app folder, as before.
@@ -2299,6 +2308,10 @@ main venv with `PYTHONPATH` on the worktree `src`, where `tuning_factory.__file_
   desktop/src/` is clean. Every changed file is CR-free.
 - From `desktop/` (a copy of the main tree's `node_modules`): `npx playwright test` → **81 passed**; `npm run build`
   passes.
+- After the rebase onto `1ca866c` (no conflict; nothing under `desktop/` changed upstream) and the contract-test
+  follow-up: `cargo test ... --locked --offline --release` → **38 passed**; `tests/test_native_contract.py` →
+  **6 passed, 1 skipped**; full suite → **1385 passed, 2 skipped** (1379 + 6; the same two skips), the known flake did
+  not occur; Ruff clean; `npx playwright test` → **81 passed**; `npm run build` passes; the diff check above is clean.
 - No CPU acceptance run: `src/tuning_factory` is unchanged; only `tests/test_native_contract.py` was added.
 
 Not verified or still open:
@@ -2308,7 +2321,7 @@ Not verified or still open:
   installed-app acceptance.
 - The 9.3 `executor_profile_edit_check` and 9.4 `controller_status`/`controller_stop`/`--controller` contracts are
   coded against the plan. Rust tests cover them with fake answers; the Python parity test runs once 9.4 lands.
-  Rebasing onto the 9.1 review fixes (M4, M9) and 8.5 must re-run the contract test.
+  Until 9.3 and 9.4 land, profile save/delete and `controller_start` refuse with `not_available` (fail closed).
 - No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
 
 ---

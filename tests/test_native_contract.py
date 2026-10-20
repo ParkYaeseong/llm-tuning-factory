@@ -5,12 +5,16 @@ Task 9 plan (§4 "9.4" and "9.5") are pinned here too, so neither side can drift
 is not written yet. Once ``tuning_factory.controller_entry`` exists, the parity test checks it directly.
 """
 import importlib
+import io
 import json
 import re
+import string
+import sys
 from pathlib import Path
 
 import pytest
 
+from tuning_factory import desktop
 from tuning_factory import desktop_workflows as wf
 from tuning_factory.graph_store import OWNER_ID
 
@@ -106,31 +110,73 @@ def test_rust_profile_fields_and_secret_names_match_python():
     assert usize_const(profiles, "MAX_PROFILE_ID") == min(id_limits) == 64
     # The per-profile vault entry name of D6.
     assert re.search(r'format!\("executor-profile/\{id\}/\{name\}"\)', profiles)
-    # The pasted-key markers refused natively are the ones the channel refuses.
+    # The pasted-key markers and the key-file fields they apply to are the channel's.
     assert str_array(main, "KEY_MARKERS") == wf.KEY_MARKERS
+    assert str_array(main, "KEY_FILE_FIELDS") == wf.KEY_FILE_FIELDS == ("ssh_key_file", "server_ssh_key_file")
 
 
-def test_profile_names_with_key_words_are_not_pasted_keys(tmp_path):
-    """9.1 review M4: markers are pasted keys in the key-file fields; a name with KEY words is ordinary data.
+def desktop_main(monkeypatch, capsys, request) -> dict:
+    """One request through ``desktop.main`` exactly as the native side sends it (one stdin line, one stdout line)."""
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request) + "\n"))
+    desktop.main()
+    return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
 
-    Natively, key content is refused in every profile field at save time (stricter); the channel must still accept
-    names that merely contain words such as KEY.
+
+def workflow_request(tmp_path, profiles, settings=None) -> dict:
+    return {"channel": "workflow", "root": str(tmp_path / "state"), "settings": {} if settings is None else settings,
+            "profiles": profiles, "secrets": {}, "action": "projects_list", "data": {}}
+
+
+def test_profile_names_with_key_words_are_not_pasted_keys(tmp_path, monkeypatch, capsys):
+    """9.1 review M4: markers are pasted keys only in ``KEY_FILE_FIELDS``; a display name may say anything.
+
+    Natively, key content is refused in every profile field at save time (stricter, so the channel never sees a
+    marker outside the key-file fields); names with ordinary KEY words are saved and must reach the channel.
     """
-    assert str_array(source("main.rs"), "KEY_FILE_FIELDS") == ("ssh_key_file", "server_ssh_key_file")
     fields = {"provider": "existing_runpod", "name": "API KEY rotation lab", "pod_id": "pod1",
               "ssh_fingerprint": "SHA256:" + "A" * 43, "ssh_key_file": "C:\\keys\\id_ed25519"}
-
-    def request(profile_fields):
-        return {"channel": "workflow", "root": str(tmp_path / "state"), "settings": {}, "secrets": {},
-                "profiles": [{"profile_id": "gpu-a", "fields": profile_fields, "RUNPOD_API_KEY_saved": True}],
-                "action": "projects_list", "data": {}}
-
-    for name in ("API KEY rotation lab", "Private key server", "KEY-1 pod"):
-        assert wf.handle(request({**fields, "name": name}))["status"] == "ok"
-    # Key content in a key-file field never reaches a handler (built at runtime for the history-walking scan).
+    marker_words = "lab " + "PRIVATE" + " KEY rotation"           # built at runtime, like every marker below
+    for name in ("API KEY rotation lab", "Private key server", "KEY-1 pod", marker_words):
+        profiles = [{"profile_id": "gpu-a", "fields": {**fields, "name": name}, "RUNPOD_API_KEY_saved": True}]
+        answer = desktop_main(monkeypatch, capsys, workflow_request(tmp_path, profiles))
+        assert answer == {"ok": True, "result": {"status": "ok", "issues": [], "data": {"projects": []}}}, name
+    # Key content in a key-file field (either provider) never reaches a handler.
     header = "-----BEGIN OPENSSH " + "PRIVATE KEY-----"
-    with pytest.raises(ValueError, match=wf.CREDENTIALS_REFUSED):
-        wf.handle(request({**fields, "ssh_key_file": header + "\nAAAA"}))
+    server = {"provider": "ssh_server", "name": "lab", "server_ssh_key_file": header + "\nAAAA"}
+    for pasted in ({**fields, "ssh_key_file": header + "\nAAAA"}, server):
+        answer = desktop_main(monkeypatch, capsys, workflow_request(tmp_path, [{"profile_id": "p", "fields": pasted}]))
+        assert answer == {"ok": False, "error": wf.CREDENTIALS_REFUSED}
+        assert header not in json.dumps(answer)
+
+
+def test_profile_ids_are_one_identity_on_both_sides(tmp_path, monkeypatch, capsys):
+    """9.1 review M9: Windows file names and Credential Manager entries ignore case and trailing dots.
+
+    Rust's ``profile_id_key`` (collisions refused at save, duplicates never served) must equal the channel's
+    ``casefold().rstrip(".")`` on every valid profile ID, so the channel never sees two IDs for one entry.
+    """
+    body = re.search(r"pub fn profile_id_key\(id: &str\) -> String \{ (.*?) \}", source("profiles.rs"))
+    assert body and body[1] == "id.trim_end_matches('.').to_ascii_lowercase()"
+    alphabet = string.ascii_letters + string.digits + "_-."
+    samples = [*alphabet, "GPU-A", "gpu-a.", "Gpu-A..", "gpu-a.1", "A_b-C.d.", "x" * 63 + "."]
+    for profile_id in samples:
+        assert profile_id.rstrip(".").lower() == profile_id.casefold().rstrip("."), profile_id
+    fields = {"provider": "existing_runpod", "name": "Pod", "pod_id": "pod1"}
+    same = [{"profile_id": "GPU-A", "fields": fields}, {"profile_id": "gpu-a.", "fields": fields}]
+    assert desktop_main(monkeypatch, capsys, workflow_request(tmp_path, same)) == \
+        {"ok": False, "error": wf.INVALID_ENVELOPE}
+    distinct = [{"profile_id": "gpu-a", "fields": fields}, {"profile_id": "gpu-a.1", "fields": fields}]
+    assert desktop_main(monkeypatch, capsys, workflow_request(tmp_path, distinct))["ok"] is True
+
+
+def test_workflow_settings_are_always_an_object(tmp_path, monkeypatch, capsys):
+    """The channel answers a non-object ``settings`` with a fixed envelope error; Rust always sends an object."""
+    for settings in ([], "x", None, 3):
+        request = {**workflow_request(tmp_path, []), "settings": settings}
+        assert desktop_main(monkeypatch, capsys, request) == {"ok": False, "error": wf.INVALID_ENVELOPE + " (settings)"}
+    main = source("main.rs")
+    builder = main[main.index("fn build_workflow_request("):]
+    assert "Value::Object(settings)" in builder[:builder.index("\n}\n")]
 
 
 def test_rust_controller_message_follows_the_plan_schema():
