@@ -90,6 +90,11 @@ def test_rust_workflow_allowlist_matches_python():
     native_scopes = {**{name: frozenset(profile_secrets) for name in profile_scoped},
                      **{name: frozenset({"HF_TOKEN"}) for name in hf_scoped}}
     assert native_scopes == dict(wf.SECRET_SCOPES)
+    # The controller lifecycle actions built without Credential Manager or readable files (9.5 review m1).
+    lifecycle = str_array(main, "VAULT_FREE_ACTIONS")
+    assert set(lifecycle) == {"controller_status", "controller_stop"}
+    assert {wf.ACTION_MODULES[name] for name in lifecycle} == {"tuning_factory.controller_entry"}
+    assert not set(lifecycle) & set(native_scopes)
     # The profile edit check of D5 is a workflow action served by 9.3's module.
     edit_check = str_const(source("profiles.rs"), "EDIT_CHECK_ACTION")
     assert wf.ACTION_MODULES[edit_check] == "tuning_factory.workflow_runs"

@@ -34,6 +34,9 @@ const STATUS_UNKNOWN: &str = "컨트롤러 상태를 확인할 수 없습니다.
 const SETTINGS_FAILED: &str = "백그라운드 실행기가 설정·실행 프로필이나 Windows 자격 증명을 읽지 못해 컨트롤러를 시작하지 않았습니다.";
 const START_TOO_LARGE: &str = "실행 프로필과 MLflow 설정이 너무 커서 컨트롤러를 시작하지 않았습니다.";
 const SPAWN_FAILED: &str = "백그라운드 실행기가 학습 엔진을 실행하지 못했습니다. 설치 파일을 확인해 주세요.";
+const START_REFUSED: &str = "학습 엔진이 컨트롤러 시작 정보를 받아들이지 않아 컨트롤러가 시작되지 않았습니다. 앱을 다시 설치해 주세요.";
+const SETTINGS_REFUSED: &str = "MLflow 설정이 보안 규칙(인증값이 있으면 HTTPS)에 맞지 않아 컨트롤러가 시작되지 않았습니다. 설정을 확인한 뒤 다시 시작하세요.";
+const CONTROLLER_FAILED: &str = "컨트롤러가 예기치 않게 종료되었습니다. 진행 중이던 단계는 컨트롤러를 다시 시작하면 다시 확인합니다.";
 
 /// The started sidecar as the broker sees it: its stdin pipe and a blocking wait for its exit code.
 pub struct Sidecar {
@@ -190,22 +193,24 @@ fn start_message(app_root: &Path, vault: &dyn Vault, owner_id: &str) -> Result<V
 
 fn status_path(app_root: &Path) -> PathBuf { app_root.join("state").join("controller").join("broker.json") }
 
-/// D19: `state/controller/broker.json` `{at, code, error}` with a fixed code and text, only for failures before the
-/// sidecar starts. Best effort: the broker has no other channel to the window.
+/// D19: `state/controller/broker.json` `{at, code, error}` with a fixed code and text, for failures before the sidecar
+/// starts and for a sidecar that exits with an error (`exit_reason`). Best effort: the broker has no other channel
+/// to the window. Written to a temporary file and renamed, so a reader never sees a partial status.
 fn record_failure(app_root: &Path, code: &str, error: &str) {
     let at = SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_secs_f64()).unwrap_or(0.0);
     let path = status_path(app_root);
     let Some(directory) = path.parent() else { return };
     if fs::create_dir_all(directory).is_err() { return; }
     let temporary = directory.join("broker.tmp");
-    if fs::write(&temporary, json!({"at": at, "code": code, "error": error}).to_string()).is_ok() {
-        let _ = fs::copy(&temporary, &path);
+    if fs::write(&temporary, json!({"at": at, "code": code, "error": error}).to_string()).is_err()
+        || fs::rename(&temporary, &path).is_err() {
+        let _ = fs::remove_file(temporary);
     }
-    let _ = fs::remove_file(temporary);
 }
 
 /// The broker's whole life after argv: 10 for a bad start line, 11 when settings, profiles or the vault cannot be
-/// read (or the start message would exceed 1 MiB), 12 when the sidecar cannot start, else the sidecar's exit code.
+/// read (or the start message would exceed 1 MiB), 12 when the sidecar cannot start, else the sidecar's exit code
+/// (with a public reason in `broker.json` unless it is 0 or 3).
 pub fn serve_broker(input: &mut dyn BufRead, vault: &dyn Vault, owner_id: &str,
                     spawn: &mut dyn FnMut() -> Result<Sidecar, String>) -> i32 {
     let Some(app_root) = read_start_line(input).and_then(|line| parse_broker_start(&line).ok()) else {
@@ -232,7 +237,19 @@ pub fn serve_broker(input: &mut dyn BufRead, vault: &dyn Vault, owner_id: &str,
     drop(line);
     let code = wait();
     drop(stdin);
+    if let Some((status, error)) = exit_reason(code) { record_failure(&app_root, status, error); }
     code
+}
+
+/// D19 after the start: the sidecar's output is never read, so an exit other than a drained stop (0) or a duplicate
+/// controller (3, `owner_held`, the other controller keeps running) leaves a fixed public code and text.
+fn exit_reason(code: i32) -> Option<(&'static str, &'static str)> {
+    match code {
+        0 | 3 => None,
+        2 => Some(("controller_start_refused", START_REFUSED)),
+        4 => Some(("controller_settings_refused", SETTINGS_REFUSED)),
+        _ => Some(("controller_failed", CONTROLLER_FAILED)),
+    }
 }
 
 fn spawn_sidecar() -> Result<Sidecar, String> {
@@ -488,7 +505,36 @@ mod tests {
         // Least privilege: the broker read only the MLflow secret its auth mode needs and the profile's own key.
         let reads: BTreeSet<String> = vault.read_names().into_iter().collect();
         assert_eq!(reads, BTreeSet::from(["MLFLOW_TRACKING_TOKEN".to_string(), profile_secret_entry("gpu-a", "RUNPOD_API_KEY")]));
-        assert!(!status_file(app.path()).exists());
+        // The fake sidecar exited with 7, so the window learns why the controller is absent.
+        let status: Value = serde_json::from_slice(&fs::read(status_file(app.path())).unwrap()).unwrap();
+        assert_eq!(status["code"], "controller_failed");
+    }
+
+    #[test]
+    fn a_sidecar_that_stops_with_an_error_leaves_a_public_reason() {
+        let app = TempRoot::new("broker-exit");
+        fs::write(app.path().join("settings.json"), json!({"auth_mode": "token", "MLFLOW_TRACKING_URI": "https://mlflow.invalid"})
+            .to_string()).unwrap();
+        let token = synthetic("token");
+        let vault = MemoryVault::with(&[("MLFLOW_TRACKING_TOKEN", &token)]);
+        let start = broker_start_line(app.path()).unwrap();
+        // 0 is a drained stop and 3 a duplicate controller (`owner_held`, the other one keeps running): no reason.
+        for (exit, expected) in [(2, Some("controller_start_refused")), (0, None), (4, Some("controller_settings_refused")),
+            (3, None), (1, Some("controller_failed")), (7, Some("controller_failed")), (-1, Some("controller_failed"))] {
+            let mut spawn = || -> Result<Sidecar, String> { Ok(Sidecar { stdin: Box::new(io::sink()), wait: Box::new(move || exit) }) };
+            assert_eq!(serve_broker(&mut start.as_bytes(), &vault, "desktop.1.2", &mut spawn), exit);
+            match expected {
+                None => assert!(!status_file(app.path()).exists(), "exit {exit} left a failure status"),
+                Some(code) => {
+                    let status: Value = serde_json::from_slice(&fs::read(status_file(app.path())).unwrap()).unwrap();
+                    let keys: BTreeSet<&str> = status.as_object().unwrap().keys().map(String::as_str).collect();
+                    assert_eq!(keys, BTreeSet::from(["at", "code", "error"]), "exit {exit}");
+                    assert_eq!(status["code"], code, "exit {exit}");
+                    assert!(status["error"].as_str().unwrap().contains("컨트롤러"), "exit {exit}");
+                    assert!(!status.to_string().contains(&token));
+                }
+            }
+        }
     }
 
     #[test]

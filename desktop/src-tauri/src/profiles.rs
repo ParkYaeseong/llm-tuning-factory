@@ -34,7 +34,8 @@ const TOO_LONG: &str = "실행 프로필 값이 너무 깁니다.";
 const PROVIDER: &str = "실행 프로필의 연결 대상은 RunPod 또는 GPU 서버여야 합니다.";
 const PROVIDER_FIXED: &str = "저장된 실행 프로필의 연결 대상은 바꿀 수 없습니다. 새 실행 프로필을 만드세요.";
 const NAME_REQUIRED: &str = "실행 프로필 이름을 200자 이내로 입력하세요.";
-const KEY_CONTENT: &str = "실행 프로필에는 개인키 내용을 입력할 수 없습니다. 키 파일 경로만 입력하세요.";
+const KEY_PATH_RELATIVE: &str = "SSH 키 파일은 이 PC의 전체 경로(예: C:\\Users\\이름\\.ssh\\id_ed25519)로 입력하세요.";
+const KEY_CONTENT: &str ="실행 프로필에는 개인키 내용을 입력할 수 없습니다. 키 파일 경로만 입력하세요.";
 const GPU_SELECTION: &str = "선택한 GPU 목록은 중복 없는 GPU UUID 문자열 최대 8개의 JSON 배열이어야 합니다.";
 const COST: &str = "시간당 비용은 0 이상의 숫자(예: 0, 2.75)로 입력하세요.";
 const PORT: &str = "SSH 포트는 1~65535 사이의 숫자여야 합니다.";
@@ -156,6 +157,11 @@ fn validate_fields(fields: &Map<String, Value>) -> Result<(), String> {
     let valid_port = port.len() <= 5 && port.bytes().all(|byte| byte.is_ascii_digit())
         && port.parse::<u32>().is_ok_and(|number| (1..=65535).contains(&number));
     if !port.is_empty() && !valid_port { return Err(PORT.into()); }
+    // The D11 transport hash resolves the key path, so a relative one would depend on each process's working
+    // directory (planning sidecar versus controller). Profiles only; the legacy connection settings are unchanged.
+    if crate::KEY_FILE_FIELDS.iter().any(|name| !text(name).is_empty() && !Path::new(text(name)).is_absolute()) {
+        return Err(KEY_PATH_RELATIVE.into());
+    }
     Ok(())
 }
 
@@ -193,16 +199,39 @@ fn served(store: &Map<String, Value>) -> Vec<(String, Map<String, Value>)> {
     }).collect()
 }
 
-/// Writes only what `served` keeps, through a temporary copy as `settings_save` does.
+/// A copy of a stored value without any string holding key content (entries the app does not serve).
+fn without_key_content(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(text) if crate::key_content(text) => None,
+        Value::Object(map) => Some(Value::Object(map.iter()
+            .filter_map(|(name, item)| Some((name.clone(), without_key_content(item)?))).collect())),
+        Value::Array(items) => Some(Value::Array(items.iter().filter_map(without_key_content).collect())),
+        other => Some(other.clone()),
+    }
+}
+
+/// Writes served profiles sanitized and keeps every entry the app cannot serve (minus key content), so no save ever
+/// drops an ID whose vault entry `forget_credentials` must still find. The file is written to a temporary file and
+/// renamed over the old one: `std::fs::rename` replaces an existing file atomically on Windows
+/// (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`) and on POSIX, so a reader or a crash sees the old or the new
+/// store, never a partial one. Credentials stay exclusively in Credential Manager.
 fn write_store(root: &Path, store: &Map<String, Value>) -> Result<(), String> {
-    let profiles: Map<String, Value> = served(store).into_iter().map(|(id, fields)| (id, Value::Object(fields))).collect();
+    let served: Map<String, Value> = served(store).into_iter().map(|(id, fields)| (id, Value::Object(fields))).collect();
+    let profiles: Map<String, Value> = store.iter().map(|(id, entry)| (id.clone(), served.get(id).cloned()
+        .unwrap_or_else(|| without_key_content(entry).unwrap_or(Value::Null)))).collect();
     let body = serde_json::to_vec_pretty(&json!({"schema_version": 1, "profiles": profiles})).map_err(|_| SAVE_FAILED)?;
     let temporary = root.join("executor-profiles.tmp");
     fs::write(&temporary, body).map_err(|_| SAVE_FAILED)?;
-    // Windows rename cannot replace an existing file. Credentials stay exclusively in Credential Manager.
-    fs::copy(&temporary, root.join(PROFILES_FILE)).map_err(|_| SAVE_FAILED)?;
-    fs::remove_file(temporary).ok();
+    if fs::rename(&temporary, root.join(PROFILES_FILE)).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return Err(SAVE_FAILED.into());
+    }
     Ok(())
+}
+
+/// Another stored ID (served or not) that Windows treats as the same name, so it shares the vault entry.
+fn colliding_id(store: &Map<String, Value>, id: &str) -> bool {
+    store.keys().any(|stored| stored != id && valid_profile_id(stored) && profile_id_key(stored) == profile_id_key(id))
 }
 
 fn is_runpod(fields: &Map<String, Value>) -> bool { fields.get("provider").and_then(Value::as_str) == Some(RUNPOD) }
@@ -227,6 +256,13 @@ pub fn read_profiles(root: &Path, vault: &dyn Vault, secrets: bool) -> Result<Va
     Ok(json!({"profiles": views}))
 }
 
+/// The served profiles' public fields only, without any vault access (`controller_status`).
+pub fn public_profiles(root: &Path) -> Result<Vec<Value>, String> {
+    let profiles = served(&read_store(root)?);
+    if profiles.len() > MAX_PROFILES { return Err(CORRUPT.into()); }
+    Ok(profiles.into_iter().map(|(id, fields)| json!({"profile_id": id, "fields": fields})).collect())
+}
+
 /// The RunPod key of exactly this stored RunPod profile, for `executor_profile_inspect`; None for anything else.
 pub fn profile_secret(root: &Path, vault: &dyn Vault, id: &str) -> Result<Option<String>, String> {
     if !valid_profile_id(id) { return Ok(None); }
@@ -244,7 +280,7 @@ fn prepare_save(root: &Path, id: &str, input: &Map<String, Value>, legacy_key: O
     let profiles = served(&store);
     let existing = profiles.iter().find(|(stored, _)| stored == id).map(|(_, fields)| fields);
     if existing.is_none() {
-        if profiles.iter().any(|(stored, _)| profile_id_key(stored) == profile_id_key(id)) { return Err(ID_TAKEN.into()); }
+        if colliding_id(&store, id) { return Err(ID_TAKEN.into()); }
         if profiles.len() >= MAX_PROFILES { return Err(TOO_MANY.into()); }
     }
     let mut public = input.clone();
@@ -263,25 +299,39 @@ fn prepare_save(root: &Path, id: &str, input: &Map<String, Value>, legacy_key: O
 }
 
 /// Saves one profile: validates everything first, then writes a non-empty key to that profile's vault entry, then the
-/// public file. Returns the public view.
+/// public file. If the file cannot be written, the vault entry is restored to what it was (removed for a new
+/// profile), so no key is orphaned. Returns the public view.
 pub fn save_profile(root: &Path, vault: &dyn Vault, id: &str, input: &Map<String, Value>,
                     legacy_key: Option<String>) -> Result<Value, String> {
     let PreparedSave { mut store, fields, secret } = prepare_save(root, id, input, legacy_key)?;
-    if let Some(secret) = secret { vault.set(&profile_secret_entry(id, PROFILE_SECRETS[0]), &secret)?; }
+    let entry = profile_secret_entry(id, PROFILE_SECRETS[0]);
+    let previous = match &secret {
+        Some(secret) => {
+            let previous = vault.get(&entry)?;
+            vault.set(&entry, secret)?;
+            Some(previous)
+        }
+        None => None,
+    };
     store.insert(id.to_owned(), Value::Object(fields.clone()));
-    write_store(root, &store)?;
+    if let Err(error) = write_store(root, &store) {
+        match previous {
+            Some(Some(old)) => { let _ = vault.set(&entry, &old); }
+            Some(None) => { let _ = vault.delete(&entry); }
+            None => {}
+        }
+        return Err(error);
+    }
     view(id, &fields, vault, false)
 }
 
 fn prepare_delete(root: &Path, id: &str) -> Result<Map<String, Value>, String> {
     if !valid_profile_id(id) { return Err(INVALID_ID.into()); }
     let store = read_store(root)?;
-    let profiles = served(&store);
-    // Credential Manager would resolve another spelling of a stored ID to that profile's entry.
-    if !profiles.iter().any(|(stored, _)| stored == id)
-        && profiles.iter().any(|(stored, _)| profile_id_key(stored) == profile_id_key(id)) {
-        return Err(ID_NOT_EXACT.into());
-    }
+    // Credential Manager would resolve another spelling of a stored ID (a shadowed hand-edited entry included) to that
+    // profile's entry, so only the served profile itself may delete a shared name.
+    let served_exactly = served(&store).iter().any(|(stored, _)| stored == id);
+    if !served_exactly && colliding_id(&store, id) { return Err(ID_NOT_EXACT.into()); }
     Ok(store)
 }
 
@@ -293,11 +343,18 @@ pub fn delete_profile(root: &Path, vault: &dyn Vault, id: &str) -> Result<(), St
     Ok(())
 }
 
-/// Deletes every stored profile's vault entries (`forget_credentials`); the public profiles stay.
+/// Deletes the vault entries of every profile ID the file names (`forget_credentials`); the public profiles stay. The
+/// IDs are read leniently (any `profiles` object, whatever the schema version), every entry is tried even after a
+/// failure, and the first problem (an unexpected, unreadable or unparsable file, a failed delete) is returned at the
+/// end. A missing file is nothing to forget.
 pub fn forget_profile_secrets(root: &Path, vault: &dyn Vault) -> Result<(), String> {
-    let store = read_store(root)?;
-    let mut result = Ok(());
-    for id in store.keys().filter(|id| valid_profile_id(id)) {
+    let path = root.join(PROFILES_FILE);
+    if !path.exists() { return Ok(()); }
+    let bytes = fs::read(&path).map_err(|_| READ_FAILED)?;
+    let parsed: Value = serde_json::from_slice(&bytes).map_err(|_| CORRUPT)?;
+    let profiles = parsed.get("profiles").and_then(Value::as_object).ok_or(CORRUPT)?;
+    let mut result = if parsed.get("schema_version") == Some(&json!(1)) { Ok(()) } else { Err(CORRUPT.to_owned()) };
+    for id in profiles.keys().filter(|id| valid_profile_id(id)) {
         for name in PROFILE_SECRETS {
             if let Err(error) = vault.delete(&profile_secret_entry(id, name)) { result = result.and(Err(error)); }
         }
@@ -392,6 +449,17 @@ pub(crate) mod testing {
         fn get(&self, _: &str) -> Result<Option<String>, String> { Err("Windows 자격 증명에 접근할 수 없습니다.".into()) }
         fn set(&self, _: &str, _: &str) -> Result<(), String> { Err("인증값 보안 저장 실패".into()) }
         fn delete(&self, _: &str) -> Result<(), String> { Err("인증값 삭제 실패".into()) }
+    }
+
+    /// Delegates to a memory vault but fails to delete one entry, like a single locked credential.
+    pub struct FailingDelete<'a> { pub inner: &'a MemoryVault, pub name: String }
+
+    impl Vault for FailingDelete<'_> {
+        fn get(&self, name: &str) -> Result<Option<String>, String> { self.inner.get(name) }
+        fn set(&self, name: &str, value: &str) -> Result<(), String> { self.inner.set(name, value) }
+        fn delete(&self, name: &str) -> Result<(), String> {
+            if name.eq_ignore_ascii_case(&self.name) { Err("인증값 삭제 실패".into()) } else { self.inner.delete(name) }
+        }
     }
 
     /// A fresh directory under the system temp directory, removed on drop.
@@ -505,11 +573,18 @@ mod tests {
         assert_eq!(key_of(&vault, "GPU-A"), Some(key));
         // A hand-edited file with colliding IDs serves only the first one in ID order.
         fs::write(root.path().join(PROFILES_FILE), json!({"schema_version": 1, "profiles": {
-            "A": runpod("first", "pod-1"), "a.": runpod("second", "pod-2"), "b": runpod("third", "pod-3")}}).to_string()).unwrap();
+            "A": runpod("first", "pod-1"), "a.": runpod("second", "pod-2"), "a": runpod("shadow", "pod-0"),
+            "b": runpod("third", "pod-3")}}).to_string()).unwrap();
         let listed = read_profiles(root.path(), &vault, false).unwrap();
         let ids: Vec<&str> = listed["profiles"].as_array().unwrap().iter().map(|p| p["profile_id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["A", "b"]);
+        // The shadowed "a" names A's Credential Manager entry: only the served "A" may delete it.
+        let owner = synthetic("owner-a");
+        vault.set(&profile_secret_entry("A", "RUNPOD_API_KEY"), &owner).unwrap();
+        for shadow in ["a", "a."] { assert!(delete_profile(root.path(), &vault, shadow).is_err(), "{shadow} was deleted"); }
+        assert_eq!(key_of(&vault, "A"), Some(owner));
         delete_profile(root.path(), &vault, "A").unwrap();
+        assert_eq!(key_of(&vault, "A"), None);
     }
 
     #[test]
@@ -671,6 +746,38 @@ mod tests {
     }
 
     #[test]
+    fn profile_key_paths_must_be_absolute() {
+        // The D11 transport hash resolves the key path: a relative path would resolve against different working
+        // directories in the planning sidecar and in the controller, and every real run would be refused for good.
+        for (fields, name) in [(runpod("p", "pod"), "ssh_key_file"), (server("lab"), "server_ssh_key_file")] {
+            for path in ["id_ed25519", ".ssh\\id_ed25519", "..\\keys\\id", "./id", "\\keys\\id_ed25519", "C:keys\\id",
+                " C:\\keys\\id_ed25519"] {
+                let mut input = fields.clone();
+                input.insert(name.into(), json!(path));
+                let error = merge_profile(None, &input).expect_err("a relative key path was accepted");
+                assert!(error.contains("전체 경로"), "{path}: {error}");
+            }
+            for path in ["C:\\Users\\researcher\\.ssh\\id_ed25519", "D:/keys/id_rsa", ""] {
+                let mut input = fields.clone();
+                input.insert(name.into(), json!(path));
+                assert!(merge_profile(None, &input).is_ok(), "{path:?} was refused");
+            }
+        }
+        // A stored relative path (hand-edited) must be replaced on the next save of that profile.
+        let root = TempRoot::new("relative-key");
+        let vault = MemoryVault::default();
+        let mut edited = runpod("h", "pod");
+        edited.insert("ssh_key_file".into(), json!("id_ed25519"));
+        fs::write(root.path().join(PROFILES_FILE), json!({"schema_version": 1, "profiles": {"h": edited}}).to_string()).unwrap();
+        assert!(save_profile(root.path(), &vault, "h", &obj(json!({"name": "renamed"})), None).is_err());
+        assert!(save_profile(root.path(), &vault, "h", &obj(json!({"ssh_key_file": "C:\\keys\\id_ed25519"})), None).is_ok());
+        // The legacy connection settings keep accepting any key path, as before.
+        for name in ["ssh_key_file", "server_ssh_key_file"] {
+            assert!(crate::merge_public_settings(json!({}), json!({name: "id_ed25519"}).as_object().unwrap()).is_ok());
+        }
+    }
+
+    #[test]
     fn profile_gpu_selection_and_cost_are_validated() {
         let gpus = |count: usize| format!("[{}]", (0..count).map(|i| format!("\"GPU-{i}\"")).collect::<Vec<_>>().join(","));
         let (eight, nine) = (gpus(8), gpus(9));
@@ -739,6 +846,132 @@ mod tests {
         let vault = MemoryVault::with(&entries);
         crate::forget_all_credentials(|| Ok(empty.path().to_path_buf()), &vault).unwrap();
         assert!(vault.names().is_empty());
+    }
+
+    #[test]
+    fn profile_store_writes_replace_the_file_atomically() {
+        // A concurrent reader or a crash must see the old or the new store, never a partial file: the store is written
+        // to a temporary file and renamed over the old one, so a second link to the old file keeps its bytes.
+        let root = TempRoot::new("atomic");
+        let vault = MemoryVault::default();
+        save_profile(root.path(), &vault, "a", &runpod("A", "pod-a"), None).unwrap();
+        let file = root.path().join(PROFILES_FILE);
+        let before = fs::read(&file).unwrap();
+        let reader = root.path().join("reader-view.json");
+        fs::hard_link(&file, &reader).unwrap();
+        save_profile(root.path(), &vault, "b", &runpod("B", "pod-b"), None).unwrap();
+        assert_eq!(fs::read(&reader).unwrap(), before, "the store was rewritten in place instead of replaced");
+        let stored: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        assert_eq!(stored["profiles"].as_object().unwrap().len(), 2);
+        assert!(!root.path().join("executor-profiles.tmp").exists());
+    }
+
+    #[test]
+    fn a_failed_store_write_restores_the_previous_vault_state() {
+        let root = TempRoot::new("rollback");
+        let vault = MemoryVault::default();
+        let (first, second) = (synthetic("first"), synthetic("second"));
+        save_profile(root.path(), &vault, "b", &with_key(runpod("B", "pod-b"), &first), None).unwrap();
+        let before = file_bytes(root.path());
+        // A directory where the temporary file belongs makes every store write fail after the vault write.
+        fs::create_dir(root.path().join("executor-profiles.tmp")).unwrap();
+        assert!(save_profile(root.path(), &vault, "a", &with_key(runpod("A", "pod-a"), &synthetic("new")), None).is_err());
+        assert_eq!(key_of(&vault, "a"), None, "a new profile's key was orphaned");
+        assert!(save_profile(root.path(), &vault, "b", &with_key(Map::new(), &second), None).is_err());
+        assert_eq!(key_of(&vault, "b"), Some(first), "an existing profile's key no longer matches its file");
+        assert_eq!(file_bytes(root.path()), before);
+    }
+
+    #[test]
+    fn store_writes_keep_entries_they_cannot_serve_so_no_key_is_orphaned() {
+        let root = TempRoot::new("keep-unserved");
+        let (bad_key, shadow_key) = (synthetic("bad"), synthetic("shadow"));
+        let (bad_entry, shadow_entry) = (profile_secret_entry("bad", "RUNPOD_API_KEY"), profile_secret_entry("ok.", "RUNPOD_API_KEY"));
+        let vault = MemoryVault::with(&[(&bad_entry, &bad_key), (&shadow_entry, &shadow_key)]);
+        let mut pasted = runpod("x", "pod");
+        pasted.insert("ssh_key_file".into(), json!(fake_key_header("OPENSSH ")));
+        fs::write(root.path().join(PROFILES_FILE), json!({"schema_version": 1, "profiles": {"ok": runpod("ok", "pod-ok"),
+            "ok.": runpod("shadowed", "pod-s"), "bad": {"provider": "runpod", "name": "b"}, "estimate-x": pasted,
+            "list": [1]}}).to_string()).unwrap();
+        save_profile(root.path(), &vault, "new", &runpod("N", "pod-n"), None).unwrap();
+        let stored: Value = serde_json::from_slice(&fs::read(root.path().join(PROFILES_FILE)).unwrap()).unwrap();
+        let profiles = stored["profiles"].as_object().unwrap();
+        // Entries the app cannot serve stay, so forget_credentials still finds their keys; key content is not kept.
+        assert_eq!(profiles["bad"], json!({"provider": "runpod", "name": "b"}));
+        assert_eq!(profiles["ok."], json!(runpod("shadowed", "pod-s")));
+        assert_eq!(profiles["list"], json!([1]));
+        assert_eq!(profiles["estimate-x"]["name"], "x");
+        assert!(profiles["estimate-x"].get("ssh_key_file").is_none() && !stored.to_string().contains("PRIVATE KEY"));
+        let listed = read_profiles(root.path(), &vault, false).unwrap();
+        let ids: Vec<&str> = listed["profiles"].as_array().unwrap().iter().map(|p| p["profile_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["new", "ok"]);
+        // IDs that Windows would treat as an unserved entry's name are refused too (they share its vault entry).
+        assert!(save_profile(root.path(), &vault, "BAD", &runpod("B", "pod-b"), None).is_err());
+        assert!(delete_profile(root.path(), &vault, "Bad").is_err());
+        assert_eq!(vault.value(&bad_entry), Some(bad_key));
+        forget_profile_secrets(root.path(), &vault).unwrap();
+        assert_eq!(vault.value(&bad_entry), None);
+        assert_eq!(vault.value(&shadow_entry), None);
+    }
+
+    #[test]
+    fn forgetting_profile_keys_continues_past_a_failing_entry() {
+        let root = TempRoot::new("forget-continue");
+        let vault = MemoryVault::default();
+        for id in ["a", "b", "c"] {
+            save_profile(root.path(), &vault, id, &with_key(runpod(id, "pod"), &synthetic(id)), None).unwrap();
+        }
+        let flaky = FailingDelete { inner: &vault, name: profile_secret_entry("b", "RUNPOD_API_KEY") };
+        assert!(forget_profile_secrets(root.path(), &flaky).is_err());
+        assert_eq!(key_of(&vault, "a"), None);
+        assert_eq!(key_of(&vault, "c"), None);
+        assert_eq!(key_of(&vault, "b"), Some(synthetic("b")));
+    }
+
+    #[test]
+    fn stale_vault_entries_never_reach_ssh_profiles() {
+        let root = TempRoot::new("stale-ssh");
+        let stale = synthetic("stale");
+        let vault = MemoryVault::with(&[(&profile_secret_entry("lab", "RUNPOD_API_KEY"), &stale)]);
+        save_profile(root.path(), &vault, "lab", &server("lab"), None).unwrap();
+        assert_eq!(profile_secret(root.path(), &vault, "lab").unwrap(), None, "a stale key reached an SSH profile");
+        let listed = read_profiles(root.path(), &vault, true).unwrap();
+        assert_eq!(listed["profiles"][0]["secrets"], json!({}));
+        assert_eq!(listed["profiles"][0]["RUNPOD_API_KEY_saved"], false);
+        assert!(!listed.to_string().contains(&stale));
+    }
+
+    #[test]
+    fn legacy_forget_succeeds_whatever_the_profile_file_holds() {
+        let legacy: Vec<(String, String)> = crate::SECRETS.iter().map(|name| (name.to_string(), synthetic(name))).collect();
+        let a_entry = profile_secret_entry("a", "RUNPOD_API_KEY");
+        let mut entries: Vec<(&str, &str)> = legacy.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        let a_key = synthetic("a");
+        entries.push((&a_entry, &a_key));
+        let unexpected = json!({"schema_version": 2, "profiles": {"a": runpod("A", "pod-a")}}).to_string();
+        for (text, enumerable) in [("not json", false), ("[]", false), (unexpected.as_str(), true)] {
+            let root = TempRoot::new("forget-corrupt");
+            fs::write(root.path().join(PROFILES_FILE), text).unwrap();
+            let vault = MemoryVault::with(&entries);
+            let outcome = crate::forget_all_credentials(|| Ok(root.path().to_path_buf()), &vault).unwrap();
+            assert_eq!(outcome["profile_credentials_forgotten"], false, "{text}");
+            assert!(outcome["profile_warning"].as_str().unwrap().contains("실행 프로필"), "{outcome}");
+            for name in crate::SECRETS { assert_eq!(vault.value(name), None, "{text}: {name} was kept"); }
+            assert_eq!(vault.value(&a_entry).is_none(), enumerable, "{text}");
+        }
+        // An app folder that does not exist yet has nothing more to forget and is not created.
+        let missing = std::env::temp_dir().join(format!("factory-native-missing-{}", std::process::id()));
+        let vault = MemoryVault::with(&entries);
+        assert_eq!(crate::forget_all_credentials(|| Ok(missing.clone()), &vault).unwrap(),
+            json!({"profile_credentials_forgotten": true}));
+        assert!(!missing.exists());
+        // An app folder that cannot be resolved still forgets the legacy credentials and reports the rest.
+        let vault = MemoryVault::with(&entries);
+        let outcome = crate::forget_all_credentials(|| Err("앱 저장 폴더를 찾을 수 없습니다.".into()), &vault).unwrap();
+        assert_eq!(outcome["profile_credentials_forgotten"], false);
+        assert!(crate::SECRETS.iter().all(|name| vault.value(name).is_none()));
+        // A legacy delete failure is still an error, as before.
+        assert!(crate::forget_all_credentials(|| Ok(missing.clone()), &FailingVault).is_err());
     }
 
     #[test]

@@ -37,6 +37,9 @@ const WORKFLOW_ACTIONS: [&str; 32] = [
 // The only workflow actions that receive a credential: that profile's RunPod key, and the legacy HF token.
 const PROFILE_SCOPED_ACTIONS: [&str; 1] = ["executor_profile_inspect"];
 const HF_SCOPED_ACTIONS: [&str; 1] = ["model_root_snapshot"];
+// Controller lifecycle requests never touch Credential Manager and survive unreadable settings or profile files, so a
+// broken vault or file can never block stopping (or polling) the background controller.
+const VAULT_FREE_ACTIONS: [&str; 2] = ["controller_status", "controller_stop"];
 struct SaveLock(Mutex<()>);
 
 fn app_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -198,14 +201,27 @@ fn settings_save(app: tauri::AppHandle, values: Value, lock: tauri::State<SaveLo
 }
 
 #[tauri::command]
-fn forget_credentials(app: tauri::AppHandle) -> Result<(), String> {
-    forget_all_credentials(|| app_root(&app), &KeyringVault)
+fn forget_credentials(app: tauri::AppHandle) -> Result<Value, String> {
+    // Resolve the app folder without creating it: forgetting never creates files or folders.
+    forget_all_credentials(|| app.path().app_data_dir().map_err(|_| "앱 저장 폴더를 찾을 수 없습니다.".to_owned()),
+        &KeyringVault)
 }
 
-/// The seven connection credentials first (as before), then every executor profile's own entry.
-fn forget_all_credentials(root: impl FnOnce() -> Result<PathBuf, String>, vault: &dyn Vault) -> Result<(), String> {
+/// The seven connection credentials first, failing as before; then, best effort, every executor profile key the
+/// profile file names. A profile-side problem is reported in the result and never fails the legacy part, so the
+/// window still refreshes after "인증값 삭제".
+fn forget_all_credentials(root: impl FnOnce() -> Result<PathBuf, String>, vault: &dyn Vault) -> Result<Value, String> {
     for name in SECRETS { vault.delete(name)?; }
-    profiles::forget_profile_secrets(&root()?, vault)
+    Ok(match root().and_then(|root| profiles::forget_profile_secrets(&root, vault)) {
+        Ok(()) => json!({"profile_credentials_forgotten": true}),
+        Err(error) => json!({"profile_credentials_forgotten": false,
+            "profile_warning": format!("연결 인증값은 삭제했지만 실행 프로필 인증값을 모두 삭제했는지 확인하지 못했습니다. ({error})")}),
+    })
+}
+
+/// The legacy one-request envelope, exactly as `factory_action` always built it.
+fn legacy_request(root: &Path, settings: Value, action: &str, data: Value) -> Value {
+    json!({"root": root.join("state"), "settings": settings, "action": action, "data": data})
 }
 
 #[tauri::command]
@@ -232,7 +248,7 @@ async fn factory_action(app: tauri::AppHandle, action: String, data: Value) -> R
     let root = app_root(&app)?;
     let settings = read_settings(&root, true)?;
     tauri::async_runtime::spawn_blocking(move || {
-        run_sidecar(&json!({"root": root.join("state"), "settings": settings, "action": action, "data": data}))
+        run_sidecar(&legacy_request(&root, settings, &action, data))
     }).await.map_err(|_| "엔진 작업 오류")?
 }
 
@@ -299,6 +315,15 @@ fn workflow_request(root: &Path, public_settings: Value, public_profiles: Value,
 fn build_workflow_request(root: &Path, vault: &dyn Vault, action: &str, data: Value) -> Result<Value, String> {
     if !workflow_allowed(action) { return Err("허용하지 않은 작업".into()); }
     if !data.is_object() { return Err("잘못된 작업 요청".into()); }
+    if VAULT_FREE_ACTIONS.contains(&action) {
+        // Stopping needs nothing; polling sends the public files as far as they are readable, without credential flags.
+        let (settings, profiles) = match action {
+            "controller_status" => (read_settings_file(root).map(|public| workflow_settings(&public)).unwrap_or_default(),
+                                    profiles::public_profiles(root).unwrap_or_default()),
+            _ => (Map::new(), Vec::new()),
+        };
+        return Ok(workflow_request(root, Value::Object(settings), Value::Array(profiles), Map::new(), action, data));
+    }
     let settings = workflow_settings(&read_settings_from(root, vault, false)?);
     let mut listed = profiles::read_profiles(root, vault, false)?;
     let secrets = scoped_secrets(root, vault, action, &data)?;
@@ -635,9 +660,13 @@ mod tests {
         profiles::save_profile(app.path(), &vault, "gpu-a", &runpod("A", &key_a), None).unwrap();
         profiles::save_profile(app.path(), &vault, "gpu-b", &runpod("B", &key_b), None).unwrap();
         profiles::save_profile(app.path(), &vault, "lab", json!({"provider": "ssh_server", "name": "Lab"}).as_object().unwrap(), None).unwrap();
-        secrets.extend([key_a.clone(), key_b.clone(), "legacy-plaintext-value".into()]);
+        // A stale RunPod entry under the SSH profile's ID (an earlier profile of that name) is never sent.
+        let stale = synthetic("stale-lab");
+        vault.set(&profiles::profile_secret_entry("lab", "RUNPOD_API_KEY"), &stale).unwrap();
+        secrets.extend([key_a.clone(), key_b.clone(), "legacy-plaintext-value".into(), stale]);
         let scoped = |action: &str| PROFILE_SCOPED_ACTIONS.contains(&action) || HF_SCOPED_ACTIONS.contains(&action);
-        for action in WORKFLOW_ACTIONS.into_iter().filter(|action| !scoped(action)) {
+        let general = |action: &&str| !scoped(action) && !VAULT_FREE_ACTIONS.contains(action);
+        for action in WORKFLOW_ACTIONS.into_iter().filter(general) {
             let request = build_workflow_request(app.path(), &vault, action, json!({"profile_id": "gpu-a"})).unwrap();
             let text = request.to_string();
             for secret in &secrets { assert!(!text.contains(secret.as_str()), "{action} carried a credential"); }
@@ -706,6 +735,59 @@ mod tests {
         fs::write(empty.path().join("settings.json"), "[]").unwrap();
         assert!(read_settings_from(empty.path(), &MemoryVault::default(), false).is_err());
         assert!(read_settings_from(app.path(), &FailingVault, false).is_err());
+    }
+    #[test]
+    fn legacy_requests_keep_exactly_their_bytes() {
+        let settings = json!({"MLFLOW_TRACKING_URI": "https://mlflow.invalid", "RUNPOD_API_KEY_saved": true});
+        let request = legacy_request(Path::new("C:\\app"), settings, "jobs", json!({"limit": 2}));
+        // `json!({"root", "settings", "action", "data"})` as factory_action always built it; serde_json is built
+        // without preserve_order (Cargo.lock), so the wire order is sorted, exactly as before.
+        let keys: Vec<&str> = request.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["action", "data", "root", "settings"]);
+        assert_eq!(request.to_string(), r#"{"action":"jobs","data":{"limit":2},"root":"C:\\app\\state","settings":{"MLFLOW_TRACKING_URI":"https://mlflow.invalid","RUNPOD_API_KEY_saved":true}}"#);
+        // factory_action sends exactly this envelope and nothing else.
+        let source = include_str!("main.rs");
+        let action = &source[source.find("async fn factory_action(").unwrap()..];
+        let action = &action[..action.find("\n}\n").unwrap()];
+        assert!(action.contains("run_sidecar(&legacy_request(&root, settings, &action, data))"), "{action}");
+    }
+    #[test]
+    fn controller_stop_and_status_need_no_vault_and_survive_broken_files() {
+        use profiles::testing::{synthetic, FailingVault, MemoryVault, TempRoot};
+        let app = TempRoot::new("lifecycle");
+        fs::write(app.path().join("settings.json"), json!({"MLFLOW_TRACKING_URI": "https://mlflow.invalid",
+            "auth_mode": "token", "pod_id": "legacy-pod"}).to_string()).unwrap();
+        let values: Vec<String> = SECRETS.iter().map(|name| synthetic(name)).collect();
+        let entries: Vec<(&str, &str)> = SECRETS.iter().copied().zip(values.iter().map(String::as_str)).collect();
+        let vault = MemoryVault::with(&entries);
+        let key = synthetic("profile-a");
+        let runpod = json!({"provider": "existing_runpod", "name": "A", "pod_id": "pod", "RUNPOD_API_KEY": key});
+        profiles::save_profile(app.path(), &vault, "gpu-a", runpod.as_object().unwrap(), None).unwrap();
+        profiles::save_profile(app.path(), &vault, "lab", json!({"provider": "ssh_server", "name": "Lab"}).as_object().unwrap(), None).unwrap();
+        vault.clear_reads();
+        let status = build_workflow_request(app.path(), &vault, "controller_status", json!({})).unwrap();
+        let stop = build_workflow_request(app.path(), &vault, "controller_stop", json!({})).unwrap();
+        assert!(vault.read_names().is_empty(), "lifecycle requests read {:?}", vault.read_names());
+        // Status carries the public files without credential flags (no Credential Manager access per poll).
+        assert_eq!(status["settings"], json!({"MLFLOW_TRACKING_URI": "https://mlflow.invalid", "auth_mode": "token",
+            "pod_id": "legacy-pod"}));
+        assert_eq!(status["profiles"], json!([
+            {"profile_id": "gpu-a", "fields": {"provider": "existing_runpod", "name": "A", "pod_id": "pod"}},
+            {"profile_id": "lab", "fields": {"provider": "ssh_server", "name": "Lab"}}]));
+        assert_eq!((&status["secrets"], &status["action"]), (&json!({}), &json!("controller_status")));
+        assert_eq!((&stop["settings"], &stop["profiles"], &stop["secrets"]), (&json!({}), &json!([]), &json!({})));
+        for request in [&status, &stop] {
+            for value in values.iter().chain([&key]) { assert!(!request.to_string().contains(value.as_str())); }
+        }
+        // Unreadable settings and profile files and an unavailable Credential Manager block neither.
+        fs::write(app.path().join("settings.json"), "{broken").unwrap();
+        fs::write(app.path().join(profiles::PROFILES_FILE), "not json").unwrap();
+        for action in VAULT_FREE_ACTIONS {
+            let request = build_workflow_request(app.path(), &FailingVault, action, json!({})).unwrap();
+            assert_eq!((&request["settings"], &request["profiles"]), (&json!({}), &json!([])), "{action}");
+        }
+        // Every other action still needs readable settings and profiles.
+        assert!(build_workflow_request(app.path(), &vault, "projects_list", json!({})).is_err());
     }
     #[test]
     fn the_one_request_sidecar_keeps_no_arguments_and_no_environment() {

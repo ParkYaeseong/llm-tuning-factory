@@ -2442,6 +2442,102 @@ Not verified or still open:
 - No Rust, Playwright or UI run: 9.2 changes no TypeScript or Rust.
 - No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
 
+## Task 9.5 review fixes, 2026-10-21
+
+Commit `fix: make executor profile storage atomic and keep credential cleanup complete`, on `a308949`. The independent
+review of `7e44cc6` and `a308949` was "Ready with fixes" with nothing Critical or Important (legacy freeze, secret
+boundary, pipe lifetime and no-arbitrary-execution hold; a replica confirmed EOF on kill). Changed: `profiles.rs`,
+`broker.rs`, `main.rs`, `tests/test_native_contract.py`, the plan's F6 count and this file.
+
+What changed:
+- m1, atomic store and vault-free lifecycle requests.
+  - `write_store` writes `executor-profiles.tmp`, then `fs::rename`s it over `executor-profiles.json`.
+  - `std::fs::rename` replaces an existing file atomically on Windows (`MoveFileExW` with
+    `MOVEFILE_REPLACE_EXISTING`) and on POSIX. The copied comment that said otherwise was wrong.
+  - A failed rename removes the temporary file. `broker.json` is written the same way.
+  - `controller_stop` sends `settings: {}`, `profiles: []`, `secrets: {}`. It reads no file and no vault.
+  - `controller_status` sends the public settings strings and the served profiles' public fields, as far as those
+    files are readable (otherwise `{}`/`[]`). It sends no `<secret>_saved` or `RUNPOD_API_KEY_saved` flag and never
+    touches Credential Manager (`VAULT_FREE_ACTIONS`).
+  - All other workflow actions are unchanged.
+- m2, no orphaned profile keys.
+  - (a) `save_profile` restores the profile's previous vault state when the file write fails: a new profile's key is
+    deleted, an existing profile's old key is put back.
+  - (b) Chosen: writes never drop an entry. Entries the app cannot serve stay as they are, minus any string with key
+    content: an invalid provider or ID, a non-object, or a case/trailing-dot twin of a served ID. `forget_credentials`
+    therefore still finds their IDs.
+  - ID collisions are checked against every stored ID, served or not: a new ID that collides is refused, and only the
+    served profile may delete a shared name. A shadowed hand-edited `a` can no longer delete `A`'s Credential Manager
+    entry, which is the same entry because Credential Manager ignores case.
+  - (c) `forget_credentials` deletes the seven legacy entries first (failing as before). Then, best effort, it deletes
+    every profile key the file names: IDs come from any `profiles` object whatever its `schema_version`, and a failed
+    delete does not stop the rest.
+  - It returns `{"profile_credentials_forgotten": bool, "profile_warning"?: "<Korean text> (<reason>)"}` instead of
+    failing, so the window refreshes after "인증값 삭제". It resolves the app folder without creating it.
+  - The command's result changed from `null` to that object; `main.ts` only awaits it.
+- m3, test gaps.
+  - `legacy_request(root, settings, action, data)` builds `factory_action`'s envelope. A test pins its exact bytes
+    (`{"action","data","root","settings"}`: serde_json is built without `preserve_order`, so keys go out sorted,
+    exactly as before) and that `factory_action` sends nothing else.
+  - New tests: a stale vault entry under an SSH profile's ID is never sent or flagged; forgetting continues past a
+    failing entry.
+- m5, a reason after a failed exit.
+  - After the sidecar exits, `broker.json` `{at, code, error}` gets a fixed code and a fixed Korean text:
+    `controller_start_refused` for exit 2, `controller_settings_refused` for 4, and `controller_failed` for any other
+    non-zero code except 3.
+  - Exit 0 (a drained stop) and exit 3 (`owner_held`; the other controller keeps running) write nothing.
+  - The child's output is still never read.
+- m6: the plan's F6 and the 9.1 test-1 text now say 34 legacy actions.
+- 9.2 review: a profile's `ssh_key_file`/`server_ssh_key_file` must be absolute (`Path::is_absolute`, empty allowed
+  for a draft), checked on the merged fields at save time with a fixed Korean text. The D11 transport hash resolves
+  the key path against the working directory, so a relative path could hash differently in the planning sidecar
+  and in the controller and every real run would be refused with `TRANSPORT_CHANGED`. The legacy connection
+  settings are unchanged (neither `merge_public_settings` nor the legacy sidecar requires absolute key paths). The
+  matching Python refusal (`executor_profile_invalid`) comes with 9.7 and is not pinned in the contract test yet.
+
+Records for Tasks 9.4, 10 and 11 (no code):
+- m4: with redirected AppData (`%APPDATA%` on `\\server\…`), `controller_start` always fails with
+  "앱 저장 폴더 경로를 백그라운드 실행기에 전달할 수 없습니다." while the legacy flows keep working. This is the no-UNC
+  rule of `factory-broker/1`, a known limitation.
+- m7: `controller_status` polls no longer read Credential Manager; before this fix, a poll read up to 39 secrets just
+  for the flags.
+  - Consequence for 9.4: the status envelope has no `*_saved` flags, so `restart_required.tracking` must compare
+    public fields (for example, `current.json` also records the public tracking fields and the saved `auth_mode`).
+    `public_auth_mode(settings)` would read the missing flags as "none".
+  - `restart_required.profiles` can use the public fields sent, because a profile revision does not include the key.
+  - The detached broker and sidecar keep `llm-tuning-factory-desktop.exe` and `factory-bridge.exe` open. NSIS update
+    and uninstall (Task 11) must stop the controller first (`controller_stop`, then wait for `absent`).
+  - Python's `NativeProfile` accepts `estimate-*` and DOS device-name IDs; Rust never sends them.
+- Ordering: profile save and delete fail closed until 9.3's `executor_profile_edit_check` lands, and
+  `controller_start` until 9.4's `controller_status`. Task 10 comes after 9.3 and 9.4.
+
+Actual verification (worktree `D:\llm-tuning-factory-wt95`; cargo with `CARGO_TARGET_DIR` on the main tree's cache;
+main venv with `PYTHONPATH` on the worktree `src`):
+- RED first: 9 of the 10 new or changed Rust tests failed for the intended reason. The reasons: the store was rewritten
+  in place (shown by a hard link to the old file); a new profile's key was orphaned; unserved entries were dropped;
+  forget failed on a corrupt file; `legacy_request` was a stub; lifecycle requests read 9+ vault entries; no
+  `broker.json` was written after exit 7 (twice); and a relative key path was accepted. The two gap tests went RED
+  against the reviewer's surviving mutations: M2 (`profile_secret` without `is_runpod`) and M5 (forget stopping at
+  the first failed delete). The legacy bytes test went RED against M3 (a `profiles` key added to the legacy
+  request).
+- Mutations, each restored and checked by SHA256. Reviewer M2, M3 and M5, plus: copy instead of rename, lifecycle
+  requests reading the vault, no rollback, unserved entries dropped, key content kept in unserved entries, a shadowed
+  ID deleting the shared entry, forget failing on a profile-file problem, and no reason after a failed exit. All 11
+  failed at least one test.
+- GREEN: `cargo test ... --locked --offline --release` → **48 passed** (38 + 10). `cargo check --release` has no
+  warning. `tests/test_native_contract.py` with
+  `tests/test_desktop_projects.py` → **42 passed, 1 skipped**. Full suite → **1385 passed, 2 skipped** (the same two
+  skips; the known `test_jobs` flake did not occur). Ruff clean; `npx playwright test` → **81 passed**;
+  `npm run build` passes; the diff check (no `Cargo.toml`, `Cargo.lock`, `containers/`, `pyproject.toml`, `uv.lock`
+  or `desktop/src` change) is clean; every changed file is LF only.
+- After the rebase onto 9.2 (`7f3a4bc`, PROGRESS conflict resolved by keeping 9.2's entry and adding this one last)
+  and the 9.2-review key-path rule: `cargo test` → **48 passed**; contract and desktop-project tests → **43 passed,
+  1 skipped**; full suite → **1442 passed, 2 skipped** (9.2's own count on `a308949`); `npx playwright test` →
+  **81 passed**; `npm run build` passes; Ruff clean.
+
+Not verified or still open: as in the 9.5 entry (real Credential Manager from the broker, real detached spawn and
+job breakaway, the PyInstaller child and the EOF stop: Task 11).
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
