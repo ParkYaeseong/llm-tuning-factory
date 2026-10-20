@@ -4090,6 +4090,61 @@ Not verified:
 - On Windows a console Ctrl+C also reaches child processes in the same console (for example a `git` child of the
   manifest), as before.
 
+## Task 9.8 review follow-ups, 2026-10-21
+
+Commit `fix: tighten workbench planning inputs, freshness hints and release tests`, on `b040533` (the 9.6 review
+fixes, on 9.8's `128f995`) in the worktree `D:\llm-tuning-factory-wt96`. The 9.8 review was "ready to merge" with
+Minors only. Changed: `src/tuning_factory/workflow_planning.py`, `src/tuning_factory/workflow_runs.py`,
+`tests/test_workbench_backend.py` and this file.
+
+The fixes:
+1. `planning_inputs_save` no longer crashes on a draft node whose `id` is a list or an object. `ProjectSpec.graph`
+   is free JSON, and the set of planned IDs raised `TypeError: unhashable` (the sidecar answered
+   `{"ok": false, "error": "TypeError"}`). Only string IDs are collected, so such nodes are nodes no time limit can
+   name.
+2. `observations_list`'s `fresh_for_real_plan` now says what `graph_plan` will decide.
+   - New `pin_observation(profile_id, fields, observation)`: the key paths check, the revision is the observed one,
+     and `public_profile` rebuilds from the current fields with the observed facts.
+   - New `observation_fresh(age)`: at most an hour, and not from the future.
+   - `_native_executor` and the list both use these two functions. Before, the list compared only the revision.
+   - The probe: an SSH key path `~/keys/...` whose home directory changed after the observation. The list said
+     fresh, while `graph_plan` said `observation_revision_differs`.
+   - `profile_current` keeps its meaning (the revision only).
+3. The `graph_submit` replay shortcut now heals a missing approval receipt. `_submitted` also returns the run's
+   `created`, and the shortcut calls `_write_receipt`. `immutable_write` of identical bytes changes nothing, so a
+   further retry writes no second receipt and leaves the state bytes unchanged (tested).
+4. Test gap: a forged `attempt_id` on a RUNNING node gives `attempt_stale`, not `operator_not_needed` (identity is
+   checked before state).
+5. Nits:
+   - The `graph_release_lock` docstring now says that a takeover makes the release fail as stale only when it
+     rotates the token between `current_lease` and `release_gpu`. One before `current_lease` keeps the attempt ID,
+     and the release goes ahead as the CLI's would.
+   - The legacy recover test uses a 100 s heartbeat (it said 119 while this file said 100; this file's 9.8 entry now
+     matches the test).
+   - New test: a canceled uncertain attempt is released, then `classify_attempt('canceled')` settles the node and
+     the job CANCELED, with disposition `canceled`.
+
+Actual verification (main venv with `PYTHONPATH` on the worktree `src`; `--basetemp` under `%TEMP%`):
+- RED first, with the new tests against 9.8's code: 3 failed, 21 passed.
+  - `TypeError: unhashable type: 'list'` in `planning_inputs_save`.
+  - `fresh_for_real_plan` was `True` while the real plan reported `observation_revision_differs` for the profile.
+  - The receipt file was missing after the retry (`FileNotFoundError`).
+- The forged-attempt and canceled-release tests passed at once: they pin behaviour that was already correct (test
+  gaps).
+- GREEN: `test_workbench_backend`, `test_workflow_planning` and `test_workflow_runs`: 24 + 84 + 36 = **144 passed**.
+- Full suite: **1713 passed, 1 skipped** (the 9.6 review fixes' 1709 plus the 4 new tests). The one skip is the
+  real-GPU test.
+- Ruff is clean. `check_secrets.py` reports 0 findings with the change staged. Every changed file is LF only.
+- CPU acceptance (`-I`, into wt96's `.factory`): exit 0, **29/29**.
+  - Receipt SHA256 `f035bcc9e339da623f8a31adf67d9fc7adef0ff763ba9ed36c1d27cca39383be`.
+  - `source_sha256 0849b47eddb852af7c333a84a5baa440c4bd661009a3e438ae8386723c6bd56c`, equal to `source_hash()`.
+- No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
+
+Not changed: `controller_entry._observed_profile` (9.4), which `controller_status` and the controller start use,
+keeps its own rule. It compares the rebuilt profile with the stored one (`observation_invalid`) rather than calling
+`pin_observation`. On the home-directory probe the rebuild raises, so the controller skips the profile
+(`invalid_fields`) as planning refuses it, but the two are not one function.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

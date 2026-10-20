@@ -87,7 +87,7 @@ def claimed_world(state, tmp_path, monkeypatch):
     launch_id = store.jobs.begin_launch(attempt)
     store.jobs.transition(attempt, "RUNNING")
     return SimpleNamespace(found=found, run_id=run_id, store=store, job_id=claimed["id"], lease=attempt,
-                           attempt_id=attempt.attempt_id, launch_id=launch_id)
+                           attempt_id=attempt.attempt_id, launch_id=launch_id, controller=lease)
 
 
 def lose(state, w, *, record=False):
@@ -155,6 +155,9 @@ def test_release_lock_only_for_the_current_attempt_that_needs_the_operator(tmp_p
     before = tables(state)
     issue = desk.only_issue(release(state, w), "conflict", "operator_not_needed", "/node_id")
     assert issue["message"] == wr.OPERATOR_NOT_NEEDED and issue["node_id"] == "train"
+    # A forged attempt ID on the running node is stale first: identity is checked before the state (9.8 review 4).
+    issue = desk.only_issue(release(state, w, attempt_id="0" * 32), "conflict", "attempt_stale", "/attempt_id")
+    assert issue["message"] == wr.ATTEMPT_STALE and issue["node_id"] == "train"
     assert tables(state) == before and held(w)
     lose(state, w, record=True)
     before = tables(state)
@@ -624,7 +627,7 @@ def test_legacy_recover_never_fails_a_graph_attempt_with_a_fresh_heartbeat(tmp_p
     w = claimed_world(state, tmp_path, monkeypatch)
     w.store.jobs.heartbeat(w.lease)
     legacy = {"root": str(state), "settings": {}, "action": "recover", "data": {}}
-    for age in (0, 60, 119):     # the desktop's "연결 끊긴 작업 확인" uses the legacy 120 s threshold
+    for age in (0, 60, 100):     # the desktop's "연결 끊긴 작업 확인" uses the legacy 120 s threshold
         wrt.execute(state, "UPDATE jobs SET updated=? WHERE id=?", time.time() - age, w.job_id)
         response, _ = desk.sidecar(monkeypatch, capsys, legacy)
         assert response == {"ok": True, "result": {"recovered": 0}}, age
@@ -703,3 +706,103 @@ def test_synthetic_secrets_never_reach_workbench_responses_files_or_environment(
     stored = wpt.state_bytes(state)
     assert SECRET.encode() not in stored and MLFLOW_SECRET.encode() not in stored
     assert dict(os.environ) == environment
+
+
+# -- 9.8 review follow-ups ------------------------------------------------------------------------
+
+def test_release_then_canceled_classification_settles_a_canceled_uncertain_attempt(tmp_path, monkeypatch):
+    """A canceled attempt left uncertain (launched, its lock kept) is released by the operator; the controller's
+    ``classify_attempt('canceled')`` then settles the node CANCELED, as after CLI ``release-lock``."""
+    state = tmp_path / "state"
+    w = claimed_world(state, tmp_path, monkeypatch)
+    w.store.jobs.transition(w.lease, "CANCELED")
+    node = node_status(state, w)
+    assert (node["job_status"], node["uncertain"], node["needs_operator"]) == ("CANCELED", True, True) and held(w)
+    result = release(state, w)
+    assert result["status"] == "ok", result
+    assert not held(w)
+    assert w.store.classify_attempt(w.controller, w.job_id, "canceled") == "canceled"
+    node = node_status(state, w)
+    assert (node["status"], node["job_status"], node["uncertain"]) == ("CANCELED", "CANCELED", False)
+    assert w.store.attempt_disposition(w.job_id)["disposition"] == "canceled"
+
+
+def test_planning_inputs_save_ignores_draft_nodes_without_a_string_id(tmp_path):
+    """``ProjectSpec.graph`` is free JSON: a draft node whose ``id`` is a list or an object is no node a time limit
+    can name, and it never crashes the save (9.8 review 1)."""
+    state = tmp_path / "state"
+    nodes = [{"kind": "train", "id": "a", "label": "학습"}, {"kind": "train", "id": ["a"], "label": "목록"},
+             {"kind": "evaluate", "id": {"a": 1}, "label": "객체"}, {"kind": "train", "label": "ID 없음"}]
+    project_id, revision = wpt.make_project(state, nodes, [])
+    body = {"project_id": project_id, "project_revision": revision, "simulation": True,
+            "node_time_limits": [{"node_id": "a", "timeout_minutes": 90}], "estimates": []}
+    saved = run(state, "planning_inputs_save", body)
+    assert saved["status"] == "ok", saved
+    refused = run(state, "planning_inputs_save",
+                  {**body, "node_time_limits": [{"node_id": "a", "timeout_minutes": 90},
+                                                {"node_id": "b", "timeout_minutes": 90}]})
+    desk.only_issue(refused, "invalid", "node_resource_unknown", "/node_time_limits/1/node_id")
+
+
+def test_fresh_for_real_plan_says_what_graph_plan_decides(tmp_path, monkeypatch):
+    """``observations_list``'s ``fresh_for_real_plan`` uses the same rule as ``graph_plan``: the key paths still
+    check, the revision is the observed one, and the profile still rebuilds from the current fields. Probe: an SSH key
+    path under ``~`` whose home directory changed after the observation (9.8 review 2)."""
+    from test_gpu_servers import FakeServer
+    state = tmp_path / "state"
+    homes = [tmp_path / "home-a", tmp_path / "home-b"]
+    for home in homes:
+        (home / "keys").mkdir(parents=True)
+    for name in ("USERPROFILE", "HOME"):
+        monkeypatch.setenv(name, str(homes[0]))
+    lab = wpt.server_profile(server_ssh_key_file="~/keys/lab-key")
+    found = wpt.scenario(state, tmp_path, monkeypatch, profiles=("lab",))
+    FakeServer(tmp_path / "remote").install(monkeypatch)
+    inspected = run(state, "executor_profile_inspect", {"profile_id": "lab"}, profiles=[lab], clock=NOW)
+    assert inspected["status"] == "ok", inspected
+
+    def decisions():
+        listed = run(state, "observations_list", profiles=[lab], clock=NOW + 60)
+        [entry] = listed["data"]["observations"]
+        planned = wpt.real_plan(state, found, profile=lab, clock=NOW + 60)
+        profile_issues = [item["code"] for item in planned["issues"] if item["path"] == "/profiles/lab"]
+        return entry, planned, profile_issues
+
+    entry, planned, profile_issues = decisions()
+    assert entry["fresh_for_real_plan"] is True and profile_issues == [], planned
+    for name in ("USERPROFILE", "HOME"):   # the same fields and revision, but "~" now names another key file
+        monkeypatch.setenv(name, str(homes[1]))
+    entry, planned, profile_issues = decisions()
+    assert entry["profile_current"] is True                        # the revision still matches
+    assert profile_issues == ["observation_revision_differs"], planned
+    assert entry["fresh_for_real_plan"] is False                    # and the list now says so too
+
+
+def test_a_retried_submission_heals_a_missing_approval_receipt(tmp_path, monkeypatch):
+    """A crash after ``GraphStore.submit`` and before the receipt leaves a run without its approval receipt; the
+    retry takes the replay shortcut and writes it then. A further retry writes nothing new (9.8 review 3)."""
+    wr = wrt.runs()
+    from tuning_factory.registry import canonical
+    state = tmp_path / "state"
+    found = wrt.real_world(state, tmp_path, monkeypatch)
+    write_receipt = wr._write_receipt
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("the sidecar stopped before the receipt")
+
+    monkeypatch.setattr(wr, "_write_receipt", crash)
+    with pytest.raises(RuntimeError):
+        wrt.submit(state, found)
+    [(run_id, request_id, status)] = wrt.run_rows(state)
+    receipt = wr.submissions_dir(state) / f"{run_id}.json"
+    assert (request_id, status) == ("submit-1", "RUNNING") and not receipt.exists()
+    monkeypatch.setattr(wr, "_write_receipt", write_receipt)
+    retried = wrt.submit(state, found)
+    assert retried["status"] == "ok" and retried["data"]["run_id"] == run_id, retried
+    created = wrt.ledger(state).get_run(run_id)["created"]
+    assert receipt.read_bytes() == canonical({
+        "run_id": run_id, "plan_sha256": found.plan_sha256, "request_id": "submit-1", "simulation": False,
+        "approve_execution": True, "approve_data_transfer": True, "created": created})
+    before = desk.snapshot(state)
+    assert wrt.submit(state, found)["data"]["run_id"] == run_id
+    assert desk.snapshot(state) == before and len(wpt.files(wr.submissions_dir(state))) == 1

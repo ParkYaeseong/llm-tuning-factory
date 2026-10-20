@@ -1287,10 +1287,30 @@ def _estimate(item: PlanningEstimate, now: datetime) -> tuple[ExecutorProfile, R
     return profile, facts
 
 
+def pin_observation(profile_id: str, fields: Mapping[str, str], observation: dict) -> PublicExecutorProfile | None:
+    """The profile a plan pins from a stored observation of these native fields, or None when it cannot: the
+    observation is of another revision, or the profile no longer rebuilds from the current fields with the observed
+    facts (for example a ``~`` key path whose home directory changed). Fields a plan refuses raise ``ValueError``
+    (``check_key_paths``, ``profile_revision``). ``graph_plan`` and ``observations_list`` decide with this one
+    function, so a list's ``fresh_for_real_plan`` is what the plan will decide (9.8 review 2)."""
+    check_key_paths(fields)
+    if observation["revision"] != profile_revision(profile_id, fields):
+        return None
+    try:   # rebuilt from the current fields: the D11 transport hash the provider will check
+        return public_profile(profile_id, fields, observation["facts"])
+    except ValueError:
+        return None
+
+
+def observation_fresh(age_seconds: float) -> bool:
+    """Whether a real plan accepts an observation this old (D13): at most an hour, and not from the future."""
+    return 0 <= age_seconds <= OBSERVATION_MAX_AGE_SECONDS
+
+
 def _native_executor(context: WorkflowContext, profile_id: str, native: NativeProfile, now: datetime, real: bool,
                      analysis: _Analysis):
     path = f"/profiles/{profile_id}"
-    try:
+    try:   # before the observation, so a bad key path is reported even when nothing was observed yet
         check_key_paths(native.fields)
     except ValueError as exc:
         analysis.issues.append(issue("executor_profile_invalid", _reason(exc), path))
@@ -1304,27 +1324,19 @@ def _native_executor(context: WorkflowContext, profile_id: str, native: NativePr
         analysis.issues.append(issue("observation_missing", OBSERVATION_MISSING, path))
         return None
     try:
-        current = profile_revision(profile_id, native.fields)
+        pinned = pin_observation(profile_id, native.fields, observation)
     except ValueError as exc:
         analysis.issues.append(issue("executor_profile_invalid", _reason(exc), path))
         return None
-    pinned = None
-    if observation["revision"] == current:
-        try:   # rebuilt from the current fields: the D11 transport hash the provider will check
-            pinned = public_profile(profile_id, native.fields, observation["facts"])
-        except ValueError:
-            pinned = None
     if pinned is None:
         if real:
             analysis.issues.append(issue("observation_revision_differs", OBSERVATION_REVISION_DIFFERS, path))
             return None
         analysis.warnings.append(issue("observation_revision_differs", OBSERVATION_REVISION_DIFFERS, path))
         pinned = observation["profile"]   # simulation: the destination as it was observed
-    if real:
-        age = (now - observation["observed_at"]).total_seconds()
-        if age > OBSERVATION_MAX_AGE_SECONDS or age < 0:
-            analysis.issues.append(issue("observation_stale", OBSERVATION_STALE, path))
-            return None
+    if real and not observation_fresh((now - observation["observed_at"]).total_seconds()):
+        analysis.issues.append(issue("observation_stale", OBSERVATION_STALE, path))
+        return None
     return pinned, observation["facts"]
 
 
@@ -1535,6 +1547,10 @@ def _observation_entry(context: WorkflowContext, path: Path, now: float) -> dict
         current = None if native is None else profile_revision(stored, native.fields) == observation["revision"]
     except ValueError:
         current = False
+    try:   # graph_plan's own rule (pin_observation), so the flag below is what a real plan will decide
+        pinned = None if native is None else pin_observation(stored, native.fields, observation)
+    except ValueError:
+        pinned = None
     age = now - observation["observed_at"].timestamp()
     ssh = isinstance(facts, SSHServerFacts)
     return {"profile_id": stored, "revision": observation["revision"],
@@ -1545,8 +1561,8 @@ def _observation_entry(context: WorkflowContext, path: Path, now: float) -> dict
             "cost_source": facts.cost_source if ssh else "runpod_api",
             "selected_gpu_uuids": list(facts.selected_gpu_uuids) if ssh else [],
             "profile_current": current,
-            # What a real plan accepts (D13): the current profile revision, observed at most an hour ago.
-            "fresh_for_real_plan": current is True and 0 <= age <= OBSERVATION_MAX_AGE_SECONDS}
+            # What a real plan accepts (D13): an observation it can pin for the current fields, at most an hour old.
+            "fresh_for_real_plan": pinned is not None and observation_fresh(age)}
 
 
 @workflow_action("observations_list", Empty)
@@ -1664,8 +1680,9 @@ def planning_inputs_save(context: WorkflowContext, request: PlanningInputsSave) 
     if project.revision_sha256 != request.project_revision:
         return conflict(issue("revision_conflict", PLANNING_INPUTS_STALE, "/project_revision"))
     nodes = project.spec.graph.get("nodes")
-    planned = {item.get("id") for item in nodes if isinstance(item, dict) and item.get("kind") != "select"} \
-        if isinstance(nodes, list) else set()
+    # The draft graph is free JSON: only string IDs can be named (a list or object ID is unhashable; 9.8 review 1).
+    planned = {item["id"] for item in nodes if isinstance(item, dict) and isinstance(item.get("id"), str)
+               and item.get("kind") != "select"} if isinstance(nodes, list) else set()
     found, seen, keys = [], set(), set()
     for index, item in enumerate(request.node_time_limits):
         path = f"/node_time_limits/{index}/node_id"

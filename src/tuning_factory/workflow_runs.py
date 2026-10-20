@@ -304,8 +304,9 @@ def profile_usage(store: GraphStore, profile_id: str) -> dict:
 
 # -- graph_submit ------------------------------------------------------------------------------------
 
-def _submitted(context: WorkflowContext, request_id: str, plan: GraphPlan) -> dict | None:
-    """``graph_submit``'s answer for a run this request ID already made from this plan, read-only; else None.
+def _submitted(context: WorkflowContext, request_id: str, plan: GraphPlan) -> tuple[dict, dict] | None:
+    """``(graph_submit's answer, {id, created})`` for a run this request ID already made from this plan, read from
+    the ledger; else None.
 
     9.3 review Minor 1: such a run was fresh and approved when it was made, so a retry (a lost response, a double
     click) must find it, not ``plan_stale``, after the project, a pinned profile or the tracking settings changed."""
@@ -313,15 +314,17 @@ def _submitted(context: WorkflowContext, request_id: str, plan: GraphPlan) -> di
     if store is None:
         return None
     with store.jobs.connection() as db:
-        row = db.execute("SELECT id,status,plan FROM graph_runs WHERE request_id=?", (request_id,)).fetchone()
+        row = db.execute("SELECT id,status,plan,created FROM graph_runs WHERE request_id=?",
+                         (request_id,)).fetchone()
     try:
         same = row is not None and json.loads(row["plan"])["sha256"] == plan.sha256
     except (TypeError, KeyError, ValueError):
         same = False   # unreadable: the normal path decides (GraphStore.submit refuses a different plan)
     if not same:
         return None
-    return {"run_id": row["id"], "status": row["status"], "simulation": plan.simulation, "plan_sha256": plan.sha256,
-            "controller": graph_status(store, row["id"], now=context.clock())["controller"]}
+    answer = {"run_id": row["id"], "status": row["status"], "simulation": plan.simulation,
+              "plan_sha256": plan.sha256, "controller": graph_status(store, row["id"], now=context.clock())["controller"]}
+    return answer, {"id": row["id"], "created": row["created"]}
 
 
 @workflow_action("graph_submit", GraphSubmit)
@@ -337,7 +340,10 @@ def graph_submit(context: WorkflowContext, request: GraphSubmit) -> WorkflowResu
     if not missing:
         existing = _submitted(context, request.request_id, plan)
         if existing is not None:
-            return ok(existing)
+            answer, run = existing
+            # A crash after GraphStore.submit left no receipt: the retry writes it (identical bytes: a no-op).
+            _write_receipt(context, run, plan, request)
+            return ok(answer)
     stale = staleness(context, plan)
     if stale:
         return conflict(*stale)
@@ -461,10 +467,11 @@ def graph_release_lock(context: WorkflowContext, request: ReleaseLock) -> Workfl
     holding its lock) with ``needs_operator`` and no plausible late result. Then exactly CLI ``release-lock
     --confirm-execution-stopped``: a final job status, the current lease, its attempt ID, one
     ``JobStore.release_gpu(lease, execution_stopped=True)``. The only extra step is a read: the lease must still
-    hold its lock, so nothing is ever "released" twice. A controller that took the attempt over meanwhile rotated
-    its token, so the release then fails as stale. The controller settles the node at its next tick exactly as after
-    the CLI release: without a result FAILED (``failed_before_submit``, counted) and never retried (D4); a canceled
-    attempt CANCELED."""
+    hold its lock, so nothing is ever "released" twice. A takeover makes the release fail as stale only when it
+    rotates the attempt token between ``current_lease`` and ``release_gpu``; one before ``current_lease`` keeps the
+    attempt ID, so the release goes ahead on the new token, as the CLI's would (9.8 review). The controller settles
+    the node at its next tick exactly as after the CLI release: without a result FAILED (``failed_before_submit``,
+    counted) and never retried (D4); a canceled attempt CANCELED."""
     if request.confirm_execution_stopped is not True:
         return invalid(issue("confirmation_required", RELEASE_CONFIRMATION_REQUIRED, "/confirm_execution_stopped"))
     store = _ledger(context)
