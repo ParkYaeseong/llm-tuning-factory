@@ -3529,14 +3529,17 @@ What it does:
   - `--executor-profiles` without the approval flag is refused (exit 2) rather than ignored.
   - One controller per process: a process lock refuses a second `graph-work` in the same process (exit 2), and the
     owner lease refuses a second controller on the state directory (exit 3, `owner_held`).
-  - The main thread waits. The first Ctrl+C sets the stop event: `run_forever` drains (D14) and releases the owner. A
-    note goes to stderr. A second Ctrl+C exits at once (`os._exit(130)`); the owner lease then expires after its TTL
-    and the next controller reconciles without relaunching.
+  - **Corrected by the 9.6 review fixes below.** As committed here, Ctrl+C did not work. The main thread caught
+    `KeyboardInterrupt` around `Thread.join`, and a real Ctrl+C lands inside the join, where CPython 3.12 marks the
+    thread stopped while it still runs. One real Ctrl+C therefore ended the process mid-drain: exit 1, the final line
+    lost, the owner lease held and no `stopped_at`. The intended behaviour (first Ctrl+C drains, second exits with
+    130) is implemented and tested in the review fixes.
   - Stdout is JSON lines: `serve`'s ready line (or `{"ok": false, "code": "owner_held"|"settings_refused"}`), then
     `{"ok", "exit_code", "code", "message", "controller"}`, where `controller` is this owner's `current.json` (public
-    IDs, revisions and hashes).
+    IDs, revisions and hashes). The review fixes print this final line for every outcome, exit 2 included.
   - Exit codes are `serve`'s: 0 drained stop, 1 lost owner or internal error, 3 `owner_held` ("controller already
-    running"), 4 settings refused (before any owner lease).
+    running"), 4 settings refused (before any owner lease). The review fixes add 2 (refused before the start) and
+    130 (a second Ctrl+C).
 - `release-lock --confirm-execution-stopped` is unchanged and already works for graph jobs:
   `tests/test_graph_controller.py::test_ambiguous_launch_waits_for_the_operator` runs it through the CLI on a graph
   job, and it passed in the runs below.
@@ -3547,7 +3550,8 @@ Actual verification (main venv with `PYTHONPATH` on the worktree `src`; `--baset
   reason: `No such command 'project-list'` (and `graph-validate`, `executor-profile-inspect`, `graph-submit`,
   `graph-work`), exit 2, and the command set lacked the D10 names.
 - GREEN: `tests/test_cli_graph.py` **23 passed**: the plan's 10 tests, plus the D11 parity table (6 cases), the
-  synthetic-secret spy test, Ctrl+C (two moments) and a second Ctrl+C, exit 4 before the owner lease, an import check
+  synthetic-secret spy test, Ctrl+C (two moments) and a second Ctrl+C (seam-based, so they missed the real defect;
+  replaced in the review fixes), exit 4 before the owner lease, an import check
   (no torch, peft, transformers, safetensors, huggingface_hub or keyring), and `--tracking-uri`. Four items were added
   after the first GREEN (19 passed) and were not RED first: exit 4, the import check, the "as soon as running" Ctrl+C
   moment and `--tracking-uri`. The last two were then checked against mutations (below).
@@ -3591,10 +3595,11 @@ Actual verification (main venv with `PYTHONPATH` on the worktree `src`; `--baset
 
 Not verified:
 - Real RunPod, SSH and MLflow from the CLI controller; only fakes were used.
-- A real terminal Ctrl+C. The tests raise `KeyboardInterrupt` through the `_join` seam, and the second Ctrl+C's
-  `os._exit` is replaced by a stand-in.
+- A real terminal Ctrl+C. The tests raised `KeyboardInterrupt` through the `_join` seam, before `Thread.join`, and the
+  second Ctrl+C's `os._exit` was replaced by a stand-in. That is why they passed while a real Ctrl+C failed; see the
+  9.6 review fixes below.
 - The Linux CI run (only Windows was run here).
-- Korean issue messages on a console with a legacy code page (the v1 `output` behaviour, unchanged).
+- Korean issue messages on a console with a legacy code page (fixed for the new commands in the review fixes).
 
 Deviations:
 - `graph-work --executor-profiles` without `--approve-execution-and-transfer` is refused (exit 2). The plan ignored
@@ -3976,6 +3981,114 @@ Not verified or still open:
 - No controller ran outside the existing fakes, and no real SSH, RunPod, HF or MLflow was contacted: the inventory
   used `test_gpu_servers.FakeServer` behind the socket guard. No network, GPU, SSH, model download, MLflow write,
   provider call or institution data was used.
+
+## Task 9.6 review fixes, 2026-10-21
+
+Commit `fix: drain graph-work on a real Ctrl+C and keep CLI output encodable`, written on `d227b7d` (the 9.4 review
+fixes) in the worktree `D:\llm-tuning-factory-wt96` and rebased onto `128f995` (10.1 review fixes and 9.8; no
+conflict). It answers the independent review of `7291742`, which was "Ready with fixes" with one Critical. Changed:
+`src/tuning_factory/cli.py` (the 9.6 part only), `tests/test_cli_graph.py` and this file.
+
+Critical 1, a real Ctrl+C killed the controller instead of draining it:
+- Cause: a CPython 3.12 bug in `Thread._wait_for_tstate_lock`. When `KeyboardInterrupt` lands inside `join()`, the
+  thread is marked stopped while it still runs. The main thread waited in `worker.join(0.2)`, so a real Ctrl+C almost
+  always landed there.
+- The reviewer saw this in 6 of 6 probes. `_wait_for_controller` returned after the first press with exit 1. The final
+  line went to the controller's null stdout. The process left mid-`run_forever` with the owner lease held and no
+  `stopped_at`, and a restart got `owner_held`. The 130 path was unreachable.
+- The 9.6 tests passed because they raised `KeyboardInterrupt` in the `_join` seam, before `Thread.join`.
+- Fix:
+  - `graph-work` installs its own SIGINT handler (`_CtrlC`) in the main thread before it takes the process lock and
+    starts the controller thread, and restores the previous handler afterwards.
+  - A press never raises. The first sets the stop event (`run_forever` drains, D14) and prints the note; the second
+    calls `_exit_now(130)`.
+  - The main thread waits on a `done` event that the thread sets after `serve` returned, so stdout is restored before
+    the final line. It never calls `Thread.join` or `is_alive` while a press can arrive; it joins only after `done`.
+  - This also closes Minor 2: a press right after `worker.start()` could release a lock the running worker held, and
+    a press between `presses += 1` and `stop_event.set()` escaped. Outside the main thread no handler is installed;
+    Python delivers SIGINT only to the main thread.
+- Tests, which press through the real interrupt path rather than a seam:
+  - `_thread.interrupt_main(SIGINT)` trips Python's SIGINT handling the way the C-level handler does for a console
+    Ctrl+C, on Windows and POSIX alike. It is used on both.
+  - `signal.raise_signal` is not used: on Windows it runs the C handler on the calling thread.
+  - `test_a_real_ctrl_c_drains_then_releases_the_owner`, in process, pressed as soon as the controller runs and again
+    after the run completed: exit 0, the `stopped` final line, the owner released, `current.json` `stopped_at`, the
+    handler restored, nothing locked or active, and a restart runs at once.
+  - `test_a_second_real_ctrl_c_exits_at_once_and_keeps_the_owner_until_its_ttl`, as a subprocess. The child holds
+    the drain open for at most 20 s and presses twice. It exits 130 with only the ready line, the owner lease is
+    still held, there is no `stopped_at`, and a restart gets exit 3 `owner_held`.
+  - Both are bounded. A controller that ignores Ctrl+C is stopped through its stop request after 30 s, and the test
+    then fails; the child process has a 30 s limit and is killed in `finally`.
+
+Minors:
+- 3, encoding of redirected output:
+  - The new commands print the v1 `output` text (readable UTF-8 JSON) when stdout can encode it, and ASCII-escaped
+    JSON otherwise. Before, `project-list` on cp949 crashed on é, an em dash or an emoji.
+  - `graph-work`'s final line is ASCII JSON, like the ready line. Before, exit 4 on cp1252 crashed and gave exit 1.
+  - The v1 `output` function and every v1 command are unchanged.
+- 4, unknown keys echoed in issue pointers:
+  - Profiles-file and plan-request-file refusals now point at the object holding an unknown key (`extra_field`), and
+    a pointer stops at the first segment that is neither a field name nor a list index (a dict key). Values were never
+    echoed.
+  - The request file is validated with `GraphPlanRequest` in the CLI before the action, so this applies there too.
+  - The workflow channel itself, `desktop_workflows._pointer` (9.1), still keeps the key for desktop requests. A fix
+    for the app belongs there; it was not edited here, because 9.8 may be editing that file.
+- 5, uniform `graph-work` output: every outcome now ends with the final line `{"ok", "exit_code", "code", "message",
+  "controller"}`, plus `issues` for a refused profiles file. Exit 2 means refused before the start:
+  - `approval_required`: `--executor-profiles` without the approval flag;
+  - `controller_in_process`: the process lock;
+  - `invalid_start`: a refused profiles file (it was exit 1 with a `WorkflowResult`), MLflow settings that form no
+    scope, or invalid start settings.
+  - Option-parsing errors (for example `--tick-seconds 0.01`) are still Click usage errors. `--help` documents the
+    shapes and the exit codes 0, 1, 2, 3, 4 and 130.
+- 6: the Ctrl+C note and `--help` say that after a second Ctrl+C a restart is refused (exit 3) until the 60 s owner
+  TTL passes, and that a step left in flight may need `release-lock --confirm-execution-stopped`.
+- 7: the `graph-work` help no longer has hard line breaks (`GRAPH_WORK_HELP`, joined paragraphs).
+
+Actual verification (main venv with `PYTHONPATH` on the worktree `src`; `--basetemp` under `%TEMP%`):
+- RED first, with the new tests against the unchanged `7291742` CLI: 10 failed, 15 passed.
+  - Both real-Ctrl+C cases: exit 1, stdout holding only the ready line (`assert 1 == 0`).
+  - The second press: `assert 1 == 130`.
+  - Exit 4 on cp1252 and `project-list` on cp949: `UnicodeEncodeError`.
+  - Pointers `/command` and `/profiles/0/RUNPOD_API_KEY` echoed the keys.
+  - The exit-2 refusals printed no final line.
+- GREEN: `tests/test_cli_graph.py` **25 passed**, three runs in a row (16.8 s, 17.8 s, 16.2 s).
+- Mutations of the fix, each restored and checked by SHA256. All 8 were killed:
+  - the first press not setting the stop event;
+  - the second press ignored;
+  - no handler installed;
+  - no ASCII fallback;
+  - a non-ASCII final line;
+  - the unknown key kept;
+  - a dict key kept;
+  - an exit-2 refusal without a final line.
+  - The unknown-key mutation first survived, because the truncation alone already hid keys that are not field
+    names. A case was added for an unknown key spelled like a nested field (`profile_id` at the top level).
+- `test_runner_cli`, `test_controller_entry` and `test_workflow_runs`: 10 + 54 + 29 = **93 passed**, unchanged.
+- Full suite: **1680 passed, 1 skipped** (the baseline 1678 plus 2 tests; the 3 Ctrl+C items were replaced one for
+  one). The one skip is the real-GPU test.
+- Ruff is clean. `check_secrets.py` reports 0 findings with the change staged. Every changed file is LF only.
+  `git diff --exit-code containers/ pyproject.toml uv.lock desktop/` is clean.
+- CPU acceptance (`-I`, into wt96's `.factory`): exit 0, **29/29**.
+  - Receipt SHA256 `4cce7785542d20a6032f20c0fafe201d5664175cb3ebc7fa982b42d478c71880`.
+  - `source_sha256 6c48384efbe715c337e338544b2759d7142cf0228dad455cb401cc4e4660c068`, equal to `source_hash()` of the
+    tree.
+  - `lock_sha256 5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`.
+- After the rebase onto `128f995` (9.8 changed `workflow_runs`, `workflow_planning` and `desktop_workflows`):
+  - `tests/test_cli_graph.py` **25 passed** three times.
+  - `test_runner_cli`, `test_controller_entry` and `test_workflow_runs`: 10 + 54 + 36 = **100 passed**.
+  - Full suite: **1709 passed, 1 skipped** (the upstream tree plus the 2 new tests).
+  - CPU acceptance: exit 0, **29/29**.
+    - Receipt SHA256 `674d493a5d2e9becf64a4543921dc3b51b778eea73638562197275e24854588d`.
+    - `source_sha256 5bb65fd9d56a68447d87b3d121267cdb636b26b0c2cc9d36215f3b343c690982`, equal to `source_hash()`.
+- No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
+
+Not verified:
+- A Ctrl+C typed into a real console, and Ctrl+Break. The tests trip Python's SIGINT handling with
+  `_thread.interrupt_main`, which is the same Python-level path but not the console's `CTRL_C_EVENT`.
+- The Linux CI run (only Windows was run here).
+- On Windows a console Ctrl+C also reaches child processes in the same console (for example a `git` child of the
+  manifest), as before.
 
 ---
 

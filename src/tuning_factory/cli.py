@@ -1,6 +1,7 @@
 import contextlib
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -435,11 +436,16 @@ def guard(ctx: typer.Context, watch: bool = False, interval_seconds: int = 15):
 
 PROFILES_MAX_BYTES = REQUEST_MAX_BYTES = 1024 * 1024
 CREDENTIAL_FILE_MAX_BYTES = 64 * 1024
+EXIT_INVALID_START = 2   # = controller_entry.EXIT_INVALID_START: refused before the controller starts
 EXIT_INTERRUPTED = 130   # a second Ctrl+C: the conventional SIGINT exit status
 ONE_CONTROLLER = "a graph controller already runs in this process"
 PROFILES_REQUIRE_APPROVAL = "--approve-execution-and-transfer is required to use executor profiles for real jobs"
+PROFILES_REFUSED = "the executor profiles file was refused; see issues"
 DRAINING = ("Stop requested: no new step starts; steps in flight finish, then the controller releases its owner "
-            "lease. Press Ctrl+C again to exit at once (the next controller reconciles what was in flight).")
+            "lease. Press Ctrl+C again to exit at once: the owner lease then stays held until its 60 s TTL passes "
+            "(a restart is refused with exit 3 until then), and a step that was in flight is reconciled by the next "
+            "controller or may need release-lock --confirm-execution-stopped.")
+UNKNOWN_KEY_HIDDEN = " (the unknown key is not shown)"
 PROFILES_FILE_INVALID = "the executor profiles file must be a readable JSON object of at most 1 MiB"
 REQUEST_FILE_INVALID = "the plan request file must be a readable JSON object of at most 1 MiB"
 CREDENTIAL_FILE_UNREADABLE = "the credential file of this executor profile cannot be read"
@@ -545,20 +551,45 @@ def _json_object(path: Path, limit: int, code: str, message: str) -> dict:
     return data
 
 
+def _file_issues(exc: ValidationError, data: dict, model) -> tuple:
+    """Validation issues of a file the user wrote (profiles or plan request), with pointers that never echo a key
+    the user chose: an unknown key (``extra_field``) points at the object holding it, and a pointer stops at the
+    first segment that is neither a field name of ``model`` nor a list index (a dict key). Messages are pydantic's
+    and never echo a value. (The workflow channel's own ``desktop_workflows._pointer`` still keeps the key.)"""
+    from .desktop_workflows import (
+        CREDENTIALS_REFUSED,
+        _pointer_part,
+        issues_from_validation,
+        model_field_names,
+    )
+    names = model_field_names(model)
+    found = []
+    for item in issues_from_validation(exc, data=data):
+        parts = [part.replace("~1", "/").replace("~0", "~") for part in item.path.split("/")[1:]] if item.path else []
+        if item.code == "extra_field" and parts:
+            parts = parts[:-1]   # the unknown key itself
+        kept = []
+        for part in parts:
+            if part not in names and not (part.isdigit() and len(part) <= 6):
+                break
+            kept.append(part)
+        message = item.message.removeprefix("Value error, ")
+        code = "credential_field" if CREDENTIALS_REFUSED in message else item.code
+        if code == "extra_field":
+            message += UNKNOWN_KEY_HIDDEN
+        found.append(item.model_copy(update={"code": code, "message": message,
+                                             "path": "".join("/" + _pointer_part(part) for part in kept)}))
+    return tuple(found)
+
+
 def load_profiles(path: Path) -> tuple[Path, CliProfiles]:
     """``(absolute path, profiles)`` of an ``--executor-profiles`` file; refusals point into the file."""
-    from .desktop_workflows import CREDENTIALS_REFUSED, issues_from_validation
     source = Path(os.path.abspath(path))
     data = _json_object(source, PROFILES_MAX_BYTES, "profiles_file_invalid", PROFILES_FILE_INVALID)
     try:
         return source, CliProfiles.model_validate(data)
     except ValidationError as exc:
-        found = []
-        for item in issues_from_validation(exc, data=data):
-            message = item.message.removeprefix("Value error, ")
-            code = "credential_field" if CREDENTIALS_REFUSED in message else item.code
-            found.append(item.model_copy(update={"code": code, "message": message}))
-        raise CliRefused(*found) from None
+        raise CliRefused(*_file_issues(exc, data, CliProfiles)) from None
 
 
 def _profile_key(source: Path, index: int, item: CliProfile) -> str:
@@ -636,9 +667,21 @@ def cli_context(ctx: typer.Context, profiles_file: Path | None, *, scope_secret:
                            profiles=MappingProxyType(profiles), secrets=MappingProxyType(secrets), clock=time.time)
 
 
+def _encodable_json(value) -> str:
+    """The v1 ``output`` text (readable UTF-8 JSON) when stdout can encode it; otherwise the same JSON with ASCII
+    escapes, so output redirected in a legacy code page (cp949, cp1252) never fails on a name."""
+    text = json.dumps(value, ensure_ascii=False, indent=2)
+    try:
+        text.encode(getattr(sys.stdout, "encoding", None) or "utf-8")
+    except (UnicodeError, LookupError):
+        text = json.dumps(value, ensure_ascii=True, indent=2)
+    return text
+
+
 def emit(result) -> None:
-    """A ``WorkflowResult`` as JSON on stdout (the v1 ``output`` format); exit 0 for ``ok``, 1 otherwise."""
-    output(result.model_dump(mode="json"))
+    """A ``WorkflowResult`` as JSON on stdout (the v1 ``output`` format, ASCII-escaped only where stdout cannot
+    encode it); exit 0 for ``ok``, 1 otherwise."""
+    typer.echo(_encodable_json(result.model_dump(mode="json")))
     if result.status != "ok":
         raise typer.Exit(1)
 
@@ -686,14 +729,22 @@ def graph_validate(ctx: typer.Context, project_id: str, revision: str | None = N
     _workflow(ctx, "graph_validate", data)
 
 
-def _plan_request(path: Path) -> dict:
+def _plan_request(path: Path, project_id: str, real: bool) -> dict:
+    """The ``graph_plan`` request: the file's body, the PROJECT_ID argument and ``--real``. It is validated here first,
+    so a refusal points into the file without echoing an unknown key (``_file_issues``)."""
+    from .workflow_planning import GraphPlanRequest
     data = _json_object(Path(os.path.abspath(path)), REQUEST_MAX_BYTES, "request_file_invalid", REQUEST_FILE_INVALID)
     found = [_issue("extra_field", PROJECT_FROM_ARGUMENT, "/project_id")] if "project_id" in data else []
     if "simulation" in data:
         found.append(_issue("extra_field", REAL_FROM_FLAG, "/simulation"))
     if found:
         raise CliRefused(*found)
-    return data
+    request = {**data, "project_id": project_id, "simulation": not real}
+    try:
+        GraphPlanRequest.model_validate(request)
+    except ValidationError as exc:
+        raise CliRefused(*_file_issues(exc, request, GraphPlanRequest)) from None
+    return request
 
 
 @app.command("graph-plan")
@@ -701,12 +752,11 @@ def graph_plan(ctx: typer.Context, project_id: str, request: Annotated[Path, typ
                executor_profiles: Path | None = None, real: bool = False):
     """Plan a project's graph offline and store the plan. A dry run unless --real."""
     try:
-        body = _plan_request(request)
+        body = _plan_request(request, project_id, real)
     except CliRefused as refusal:
         _refused(refusal)
         return
-    _workflow(ctx, "graph_plan", {**body, "project_id": project_id, "simulation": not real},
-              profiles_file=executor_profiles)
+    _workflow(ctx, "graph_plan", body, profiles_file=executor_profiles)
 
 
 @app.command("graph-submit")
@@ -772,45 +822,81 @@ def _profile_starts(profiles_file: Path | None) -> tuple:
     return tuple(starts)
 
 
-def _join(worker: threading.Thread, timeout: float) -> None:
-    worker.join(timeout)
-
-
 def _exit_now(code: int) -> None:
-    """The second Ctrl+C: leave at once, without draining. The owner lease expires after its TTL, and the next
-    controller reconciles what was in flight without relaunching it (Task 8)."""
+    """The second Ctrl+C: leave at once, without draining. The owner lease stays held until its TTL passes (a restart
+    gets exit 3 until then), and the next controller reconciles what was in flight without relaunching it (Task 8);
+    a step left uncertain may need ``release-lock --confirm-execution-stopped``."""
     for stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(Exception):
             stream.flush()
     os._exit(code)
 
 
-def _wait_for_controller(worker: threading.Thread, stop_event: threading.Event) -> int:
-    """The main thread waits for the controller thread. The first Ctrl+C asks it to drain (D14) and the second exits
-    at once. Returns the number of Ctrl+C presses."""
-    presses, announced = 0, False
-    while True:
+class _CtrlC:
+    """The SIGINT handler of ``graph-work``, installed in the main thread for the controller's lifetime.
+
+    A Ctrl+C never raises ``KeyboardInterrupt`` here. Raising it inside ``Thread.join`` would hit the CPython 3.12 bug
+    in ``Thread._wait_for_tstate_lock``: the thread is marked stopped while it still runs (9.6 review Critical 1). The
+    first press sets the stop event (``run_forever`` drains, D14); the second exits at once (``_exit_now(130)``).
+    Outside the main thread nothing is installed: Python delivers SIGINT to the main thread only."""
+
+    def __init__(self, stop_event: threading.Event):
+        self.stop_event, self.presses, self.previous, self.installed = stop_event, 0, None, False
+
+    def __call__(self, signum, frame) -> None:
+        self.stop_event.set()
+        self.presses += 1
+        if self.presses > 1:
+            _exit_now(EXIT_INTERRUPTED)
+
+    def __enter__(self):
         try:
-            if presses and not announced:
-                announced = True
-                typer.echo(DRAINING, err=True)
-            if not worker.is_alive():
-                return presses
-            _join(worker, 0.2)
-        except KeyboardInterrupt:
-            presses += 1
-            stop_event.set()
-            if presses > 1:
-                _exit_now(EXIT_INTERRUPTED)
+            self.previous = signal.signal(signal.SIGINT, self)
+            self.installed = True
+        except ValueError:   # not the main thread
+            pass
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self.installed:
+            signal.signal(signal.SIGINT, self.previous if self.previous is not None else signal.default_int_handler)
 
 
-@app.command("graph-work")
+def _final_line(exit_code: int, code: str, message: str, controller=None, issues=None) -> None:
+    """``graph-work``'s last stdout line, for every outcome: ``{"ok", "exit_code", "code", "message", "controller"}``
+    (``controller`` is this owner's ``current.json`` or null), plus ``issues`` for a refused profiles file. ASCII JSON,
+    like ``serve``'s ready line, so redirected output in any code page can print it. Then exits with ``exit_code``."""
+    body = {"ok": exit_code == 0, "exit_code": exit_code, "code": code, "message": message, "controller": controller}
+    if issues is not None:
+        body["issues"] = [item.model_dump(mode="json") for item in issues]
+    typer.echo(json.dumps(body, ensure_ascii=True))
+    if exit_code:
+        raise typer.Exit(exit_code)
+
+
+# Paragraphs without hard line breaks: rich help keeps every newline after the first paragraph.
+GRAPH_WORK_HELP = "\n\n".join((
+    "Run the graph controller in the foreground until Ctrl+C or --max-ticks.",
+    "Simulation runs proceed. Real runs need --executor-profiles and --approve-execution-and-transfer; without "
+    "them they wait.",
+    "The first Ctrl+C drains: no new step starts, steps in flight finish, then the owner lease is released. A "
+    "second Ctrl+C exits at once with 130: the owner lease stays held until its 60 s TTL passes (a restart gets "
+    "exit 3 until then), and a step left in flight may need release-lock --confirm-execution-stopped.",
+    'Output is JSON lines: the controller\'s ready line {"ok": true, "owner_id", "pid"} or {"ok": false, "code": '
+    '"owner_held" or "settings_refused"}, then always a final line {"ok", "exit_code", "code", "message", '
+    '"controller"}, with "issues" for a refused profiles file.',
+    "Exit codes: 0 drained stop; 1 lost owner lease or controller error; 2 refused before the start; 3 another "
+    "controller owns the state directory; 4 MLflow settings refused; 130 a second Ctrl+C.",
+))
+
+
+@app.command("graph-work", help=GRAPH_WORK_HELP)
 def graph_work(ctx: typer.Context, executor_profiles: Path | None = None,
                approve_execution_and_transfer: bool = False,
                max_ticks: Annotated[int | None, typer.Option(min=1)] = None,
                tick_seconds: Annotated[float, typer.Option(min=0.05, max=60.0)] = 5.0):
-    """Run the graph controller in the foreground until Ctrl+C (drains first) or --max-ticks. Simulation runs proceed;
-    real runs need --executor-profiles and --approve-execution-and-transfer, otherwise they wait."""
+    """``GRAPH_WORK_HELP``: the Task 9.4 controller in the foreground (``controller_entry.serve`` on a worker
+    thread), with ``_CtrlC`` for Ctrl+C and ``_final_line`` for every outcome."""
     from .controller_entry import (
         EXIT_INTERNAL,
         EXIT_OK,
@@ -826,23 +912,23 @@ def graph_work(ctx: typer.Context, executor_profiles: Path | None = None,
     )
     from .graph_store import OWNER_HELD
     if executor_profiles is not None and not approve_execution_and_transfer:
-        raise typer.BadParameter(PROFILES_REQUIRE_APPROVAL, param_hint="--executor-profiles")
+        _final_line(EXIT_INVALID_START, "approval_required", PROFILES_REQUIRE_APPROVAL)
     try:
         profiles = _profile_starts(executor_profiles) if approve_execution_and_transfer else ()
     except CliRefused as refusal:
-        _refused(refusal)
-        return
-    tracking = _tracking_scope(ctx) if approve_execution_and_transfer else TrackingScope()
+        _final_line(EXIT_INVALID_START, "invalid_start", PROFILES_REFUSED, issues=refusal.issues)
+    try:
+        tracking = _tracking_scope(ctx) if approve_execution_and_transfer else TrackingScope()
+    except typer.BadParameter:
+        _final_line(EXIT_INVALID_START, "invalid_start", TRACKING_INVALID)
     owner_id = f"cli.{os.getpid()}.{time.time_ns()}"
     try:
         start = ControllerStart(schema=START_SCHEMA, state_root=str(ctx.obj.root), owner_id=owner_id,
                                 tracking=tracking, profiles=profiles,
                                 settings=StartSettings(tick_seconds=float(tick_seconds)))
     except ValidationError:
-        raise typer.BadParameter(START_INVALID) from None
-    if not _CONTROLLER.acquire(blocking=False):
-        raise typer.BadParameter(ONE_CONTROLLER)
-    stop_event, box = threading.Event(), {}
+        _final_line(EXIT_INVALID_START, "invalid_start", START_INVALID)
+    stop_event, done, box = threading.Event(), threading.Event(), {}
 
     def run():
         try:
@@ -851,31 +937,41 @@ def graph_work(ctx: typer.Context, executor_profiles: Path | None = None,
             box["code"] = EXIT_INTERNAL
         finally:
             _CONTROLLER.release()
+            done.set()   # serve has returned: its quiet stdout is restored
 
-    try:
+    # The handler is in place before the lock and the thread, so no Ctrl+C can leave either half-done.
+    with _CtrlC(stop_event) as ctrl_c:
+        if not _CONTROLLER.acquire(blocking=False):
+            _final_line(EXIT_INVALID_START, "controller_in_process", ONE_CONTROLLER)
         worker = threading.Thread(target=run, name="cli-graph-controller", daemon=True)
-        worker.start()
-    except BaseException:
-        _CONTROLLER.release()
-        raise
-    _wait_for_controller(worker, stop_event)
-    code = box.get("code", EXIT_INTERNAL)
-    current = read_current(ctx.obj.root)
-    mine = current if isinstance(current, dict) and current.get("owner_id") == owner_id else None
-    recorded = (mine or {}).get("code")
-    if code == EXIT_OWNER_HELD:
-        name, message = "owner_held", OWNER_HELD
-    elif code == EXIT_SETTINGS_REFUSED:
-        name, message = "settings_refused", (mine or {}).get("error") or SETTINGS_REFUSED
-    elif code == EXIT_OK:
-        name, message = recorded or "stopped", STOPPED
-    else:
-        name = recorded if recorded in ("owner_lost", "controller_failed") else "controller_failed"
-        message = OWNER_LOST if name == "owner_lost" else CONTROLLER_FAILED
-    typer.echo(json.dumps({"ok": code == EXIT_OK, "exit_code": code, "code": name, "message": message,
-                           "controller": mine}, ensure_ascii=False))
-    if code != EXIT_OK:
-        raise typer.Exit(code)
+        try:
+            worker.start()
+        except BaseException:
+            _CONTROLLER.release()
+            raise
+        announced = False
+        while True:   # an Event wait, never Thread.join or is_alive, while a Ctrl+C may arrive
+            finished = done.wait(0.2)
+            if ctrl_c.presses and not announced:
+                announced = True
+                typer.echo(DRAINING, err=True)
+            if finished:
+                break
+        worker.join()
+        code = box.get("code", EXIT_INTERNAL)
+        current = read_current(ctx.obj.root)
+        mine = current if isinstance(current, dict) and current.get("owner_id") == owner_id else None
+        recorded = (mine or {}).get("code")
+        if code == EXIT_OWNER_HELD:
+            name, message = "owner_held", OWNER_HELD
+        elif code == EXIT_SETTINGS_REFUSED:
+            name, message = "settings_refused", (mine or {}).get("error") or SETTINGS_REFUSED
+        elif code == EXIT_OK:
+            name, message = recorded or "stopped", STOPPED
+        else:
+            name = recorded if recorded in ("owner_lost", "controller_failed") else "controller_failed"
+            message = OWNER_LOST if name == "owner_lost" else CONTROLLER_FAILED
+        _final_line(code, name, message, mine)
 
 
 if __name__ == "__main__":

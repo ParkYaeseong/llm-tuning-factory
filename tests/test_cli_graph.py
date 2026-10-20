@@ -6,16 +6,19 @@ controller for the read-only inspection, Hugging Face over ``httpx.MockTransport
 every provider, SSH and MLflow entry point. Every wait is bounded (``WAIT``). Synthetic secrets are built at runtime,
 never committed as literals. No GPU, SSH, network, model download, MLflow write or provider call.
 """
+import _thread
 import contextlib
 import importlib
 import json
 import os
 import pathlib
+import signal
 import socket
 import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -170,12 +173,12 @@ class Cli:
     """``factory --state-dir STATE --env-file ENV ...`` through ``CliRunner``; every argv and result is kept for the
     secret scans."""
 
-    def __init__(self, state, env):
-        self.state, self.env, self.calls = Path(state), Path(env), []
+    def __init__(self, state, env, charset="utf-8"):
+        self.state, self.env, self.charset, self.calls = Path(state), Path(env), charset, []
 
     def __call__(self, *args):
         argv = ["--state-dir", str(self.state), "--env-file", str(self.env), *map(str, args)]
-        result = CliRunner().invoke(app, argv)
+        result = CliRunner(charset=self.charset).invoke(app, argv)
         self.calls.append((argv, result))
         return result
 
@@ -192,6 +195,16 @@ def env_file(tmp_path, name="factory.env", **values):
 def parsed(result):
     assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
     return json.loads(result.stdout)
+
+
+def final_line(result, exit_code):
+    """``graph-work``'s last stdout line, which every outcome prints (ASCII JSON)."""
+    assert result.exit_code == exit_code, result.output
+    assert result.stdout_bytes.isascii(), result.stdout
+    last = lines(result)[-1]
+    assert set(last) - {"issues"} == {"ok", "exit_code", "code", "message", "controller"}, last
+    assert last["exit_code"] == exit_code and last["ok"] is (exit_code == 0)
+    return last
 
 
 def lines(result):
@@ -388,7 +401,13 @@ def test_cli_graph_plan_defaults_to_a_dry_run_and_stores_the_plan(tmp_path, monk
         refused(cli("graph-plan", found.project_id, "--request", request_file(tmp_path, {**REQUEST, **extra})),
                 "extra_field", path)
     refused(cli("graph-plan", found.project_id, "--request", request_file(tmp_path, {**REQUEST, "command": "x"})),
-            "extra_field", "/command")
+            "extra_field", "")
+    # An unknown key is never echoed, not even in a pointer: the issue points at the object that holds it.
+    hidden = {"node_resources": [{**REQUEST["node_resources"][0], RUNPOD_KEY: 1}], MLFLOW_TOKEN: 2}
+    result = cli("graph-plan", found.project_id, "--request", request_file(tmp_path, hidden))
+    body = refused(result, "extra_field")
+    assert sorted(item["path"] for item in body["issues"]) == ["", "/node_resources/0"], body
+    assert RUNPOD_KEY not in result.output and MLFLOW_TOKEN not in result.output
     for raw in ("[1, 2]", "{not json", ""):
         path = tmp_path / "broken-request.json"
         path.write_text(raw, encoding="utf-8")
@@ -505,7 +524,9 @@ def test_cli_graph_work_refuses_a_second_controller(tmp_path, monkeypatch):
         busy = Cli(tmp_path / "other", factory.env)("graph-work", "--max-ticks", "1", "--tick-seconds", "0.05")
     finally:
         cli._CONTROLLER.release()
-    assert busy.exit_code == 2 and cli.ONE_CONTROLLER in flat(busy.output)
+    final = final_line(busy, 2)
+    assert (final["code"], final["message"], final["controller"]) == ("controller_in_process", cli.ONE_CONTROLLER,
+                                                                      None)
     assert not (tmp_path / "other" / "controller").exists()
 
 
@@ -517,7 +538,8 @@ def test_cli_graph_work_without_approval_leaves_real_runs_waiting(tmp_path, monk
     calls = provider_spies(monkeypatch)
     # Executor profiles are used only with the approval flag; alone they are refused, not silently ignored.
     alone = found.cli("graph-work", "--executor-profiles", found.profiles, "--max-ticks", "1")
-    assert alone.exit_code == 2 and cli.PROFILES_REQUIRE_APPROVAL in flat(alone.output)
+    final = final_line(alone, 2)
+    assert (final["code"], final["message"]) == ("approval_required", cli.PROFILES_REQUIRE_APPROVAL)
     assert owner_row(found.state) is None
     result = found.cli("graph-work", "--max-ticks", "4", "--tick-seconds", "0.05")
     assert result.exit_code == 0, result.output
@@ -563,8 +585,16 @@ def test_cli_profiles_file_refuses_inline_secrets(tmp_path, monkeypatch):
     server.pop("RUNPOD_API_KEY_saved", None)
     cases = [
         (profiles_file(tmp_path, inline, name="inline.json"), "credential_field", "/profiles/0"),
-        (profiles_file(tmp_path, nested, name="nested.json"), "extra_field", "/profiles/0/RUNPOD_API_KEY"),
-        (profiles_file(tmp_path, secrets, name="secrets.json"), "extra_field", "/profiles/0/secrets"),
+        (profiles_file(tmp_path, nested, name="nested.json"), "extra_field", "/profiles/0"),
+        (profiles_file(tmp_path, secrets, name="secrets.json"), "extra_field", "/profiles/0"),
+        (profiles_file(tmp_path, {**runpod_entry(tmp_path, credential_file=None), RUNPOD_KEY: "x"}, name="key.json"),
+         "extra_field", "/profiles/0"),
+        (profiles_file(tmp_path, {"profile_id": "pod-a", "fields": {RUNPOD_KEY: 1}}, name="value.json"),
+         "invalid_value", "/profiles/0/fields"),
+        (profiles_file(tmp_path, name="top.json", raw=json.dumps({"profiles": [], RUNPOD_KEY: 1})), "extra_field", ""),
+        # An unknown key spelled like a field of a nested model still points at the object holding it.
+        (profiles_file(tmp_path, name="misplaced.json", raw=json.dumps({"profiles": [], "profile_id": "x"})),
+         "extra_field", ""),
         (profiles_file(tmp_path, server, name="server.json"), "invalid_value", "/profiles/0"),
         (profiles_file(tmp_path, runpod_entry(tmp_path), runpod_entry(tmp_path, "POD-A.", name="Other"),
                        name="duplicate.json"), "invalid_value", ""),
@@ -593,9 +623,13 @@ def test_cli_profiles_file_refuses_inline_secrets(tmp_path, monkeypatch):
             if code in ("credential_file_unreadable", "credential_missing", "local_file_only"):
                 break   # only the inspection reads a credential file; planning needs public fields only
     assert fake.calls == [] and wrt.run_rows(state) == []
-    absent = cases[9][0]
-    refused(factory("graph-work", "--executor-profiles", absent, "--approve-execution-and-transfer", "--max-ticks",
-                    "1"), "credential_file_unreadable", "/profiles/0/credential_file")
+    absent = next(path for path, code, _ in cases if code == "credential_file_unreadable")
+    result = factory("graph-work", "--executor-profiles", absent, "--approve-execution-and-transfer", "--max-ticks",
+                     "1")
+    final = final_line(result, 2)   # refused before the start, as the sidecar's invalid start (exit 2)
+    assert (final["code"], final["controller"]) == ("invalid_start", None)
+    assert [(item["code"], item["path"]) for item in final["issues"]] == [
+        ("credential_file_unreadable", "/profiles/0/credential_file")]
     assert owner_row(state) is None and not (state / "controller").exists()   # refused before any controller
     for value in SECRETS:
         assert value.encode() not in factory.captured()
@@ -762,89 +796,171 @@ def held_or_active(state, run_id):
             "OR EXISTS (SELECT 1 FROM resource_leases r WHERE r.job_id=j.id))", (run_id,)).fetchall()
 
 
-# 13 (D14: Ctrl+C drains, then releases the owner)
+class CtrlC:
+    """Presses Ctrl+C from a helper thread through the real interrupt path. ``_thread.interrupt_main(SIGINT)`` trips
+    Python's SIGINT handling exactly as the C-level handler does for a console Ctrl+C, on Windows and POSIX alike, so
+    the press lands wherever the main thread is: almost always inside its wait for the controller (9.6 review
+    Critical 1). ``signal.raise_signal`` is not used: on Windows it runs the C handler on the calling thread.
+
+    Bounded: it presses only while the command runs and ``ready()`` holds (or at the deadline), and a controller still
+    running ``WAIT`` seconds after the last press is stopped through its stop request (``controller_stop``), which the
+    test then reports as a failure."""
+
+    def __init__(self, state, ready, presses=1, gap=1.0):
+        self.state, self.ready, self.presses, self.gap = state, ready, presses, gap
+        self.pressed, self.fallback, self.finished = [], [], threading.Event()
+        self.thread = threading.Thread(target=self._run, name="ctrl-c", daemon=True)
+
+    def _run(self):
+        deadline = time.monotonic() + WAIT
+        while not self.finished.is_set():
+            try:
+                ready = self.ready()
+            except Exception:
+                ready = False
+            if ready or time.monotonic() > deadline:
+                break
+            time.sleep(0.05)
+        for index in range(self.presses):
+            if self.finished.is_set():
+                return
+            if index:
+                time.sleep(self.gap)
+            self.pressed.append(time.monotonic())
+            _thread.interrupt_main(signal.SIGINT)
+        if not self.finished.wait(WAIT):
+            self.fallback.append(True)
+            stop_through_request(self.state)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.finished.set()
+        self.thread.join(WAIT)
+
+
+def settle(cli, saved_stdout):
+    """After the command: wait (bounded) until no controller thread runs in this process, and restore the test's
+    stdout should a controller that outlived its command have swapped it."""
+    if cli._CONTROLLER.acquire(timeout=WAIT):
+        cli._CONTROLLER.release()
+    sys.stdout = saved_stdout
+
+
+def owner_running(state):
+    owner = owner_row(state)
+    return bool(owner) and owner["expires"] > time.time()
+
+
+# 13 (D14 and 9.6 review Critical 1: a real Ctrl+C drains, then releases the owner)
 @pytest.mark.parametrize("moment", ["as_soon_as_running", "after_the_run_completed"])
-def test_ctrl_c_drains_then_releases_the_owner(tmp_path, monkeypatch, moment):
+def test_a_real_ctrl_c_drains_then_releases_the_owner(tmp_path, monkeypatch, moment):
     cli = cli_module()
     found = submitted_simulation(tmp_path, monkeypatch)
     provider_spies(monkeypatch)
-    real_join = cli._join
-    deadline = time.monotonic() + WAIT
-    pressed, fallback = [], []
 
-    def ctrl_c_once(worker, timeout):
-        """One Ctrl+C once the controller owns the state directory (and, later, has finished the run), or at the
-        deadline. Bounded: a controller still running ``WAIT`` seconds after it is stopped through its stop
-        request (``controller_stop``), and the test fails."""
-        if not pressed:
-            owner = owner_row(found.state)
-            ready = bool(owner) and owner["expires"] > time.time() and (
-                moment == "as_soon_as_running"
-                or wrt.ledger(found.state).get_run(found.run_id)["status"] == "COMPLETED")
-            if ready or time.monotonic() > deadline:
-                pressed.append(time.monotonic())
-                raise KeyboardInterrupt
-        elif not fallback and time.monotonic() > pressed[0] + WAIT:
-            fallback.append(True)
-            stop_through_request(found.state)
-        return real_join(worker, timeout)
+    def ready():
+        return owner_running(found.state) and (
+            moment == "as_soon_as_running"
+            or wrt.ledger(found.state).get_run(found.run_id)["status"] == "COMPLETED")
 
-    monkeypatch.setattr(cli, "_join", ctrl_c_once)
-    result = found.cli("graph-work", "--tick-seconds", "0.05")   # no --max-ticks: it runs until Ctrl+C
-    assert fallback == [], "Ctrl+C did not stop the controller"
-    assert result.exit_code == 0, result.output
-    assert len(pressed) == 1 and pressed[0] <= deadline and cli.DRAINING in result.stderr
-    final = lines(result)[-1]
-    assert (final["ok"], final["code"]) == (True, "stopped")
-    assert owner_row(found.state)["expires"] == 0 and current_json(found.state)["code"] == "stopped"
+    handler, saved = signal.getsignal(signal.SIGINT), sys.stdout
+    try:
+        with CtrlC(found.state, ready) as press:
+            result = found.cli("graph-work", "--tick-seconds", "0.05")   # no --max-ticks: it runs until Ctrl+C
+    finally:
+        settle(cli, saved)
+    assert press.fallback == [], "Ctrl+C did not stop the controller"
+    assert len(press.pressed) == 1 and signal.getsignal(signal.SIGINT) is handler   # the handler is restored
+    final = final_line(result, 0)   # not lost to the controller's null stdout
+    assert final["code"] == "stopped" and cli.DRAINING in result.stderr
+    assert lines(result)[0]["ok"] is True   # the ready line, then the final line
+    current = current_json(found.state)
+    assert owner_row(found.state)["expires"] == 0 and current["code"] == "stopped" and current["stopped_at"]
+    assert final["controller"] == current
     # Drained: whatever was in flight finished; nothing holds a lock or is still active; nothing failed.
     assert held_or_active(found.state, found.run_id) == []
     status = wrt.ledger(found.state).get_run(found.run_id)["status"]
     assert status == "COMPLETED" if moment == "after_the_run_completed" else status in ("RUNNING", "COMPLETED")
-    # The next controller adopts the run and finishes it, without relaunching a finished step.
+    # The next controller starts at once (no owner_held), adopts the run and finishes it without a relaunch.
     again = found.cli("graph-work", "--max-ticks", "40", "--tick-seconds", "0.05")
-    assert again.exit_code == 0, again.output
+    assert final_line(again, 0)["code"] == "stopped"
     assert wrt.ledger(found.state).get_run(found.run_id)["status"] == "COMPLETED"
     with contextlib.closing(sqlite3.connect(found.state / "jobs.db")) as db:
         assert db.execute("SELECT COUNT(*) FROM job_attempts a JOIN jobs j ON j.id=a.job_id "
                           "WHERE j.graph_run_id=?", (found.run_id,)).fetchone()[0] == 1
 
 
-def test_a_second_ctrl_c_exits_at_once(tmp_path, monkeypatch):
+# The child of the second-press test. It holds the drain open (bounded) so the second Ctrl+C lands while the controller
+# is stopping, and presses twice through the real interrupt path once the controller owns the state directory.
+SECOND_PRESS = textwrap.dedent('''\
+    import _thread, os, signal, socket, sqlite3, sys, threading, time
+
+    def refuse(*args, **kwargs):
+        raise OSError("network disabled in CLI graph tests")
+
+    socket.socket.connect = refuse
+    state = sys.argv[1]
+    from tuning_factory import graph_controller
+    drain = graph_controller.GraphController.run_forever
+
+    def slow_drain(self, stop_event):
+        stop_event.wait(25)
+        time.sleep(20)
+        return drain(self, stop_event)
+
+    graph_controller.GraphController.run_forever = slow_drain
+
+    def owner_running():
+        try:
+            path = os.path.join(state, "jobs.db").replace(os.sep, "/")
+            db = sqlite3.connect("file:" + path + "?mode=ro", uri=True)
+            try:
+                row = db.execute("SELECT expires FROM controller_owner WHERE id=1").fetchone()
+            finally:
+                db.close()
+            return bool(row) and row[0] > time.time()
+        except Exception:
+            return False
+
+    def press_twice():
+        deadline = time.monotonic() + 20
+        while not owner_running() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        _thread.interrupt_main(signal.SIGINT)
+        time.sleep(1.0)
+        _thread.interrupt_main(signal.SIGINT)
+
+    threading.Thread(target=press_twice, daemon=True).start()
+    from tuning_factory.cli import app
+    app(args=["--state-dir", state, "graph-work", "--tick-seconds", "0.05"], prog_name="factory")
+''')
+
+
+def test_a_second_real_ctrl_c_exits_at_once_and_keeps_the_owner_until_its_ttl(tmp_path):
+    """A child process presses Ctrl+C twice through the real interrupt path while the controller drains: it exits at
+    once with 130 (``os._exit``), the owner lease stays held until its TTL, and a restart is refused (exit 3)."""
     cli = cli_module()
-    found = submitted_simulation(tmp_path, monkeypatch)
-    provider_spies(monkeypatch)
-    real_join = cli._join
-    deadline = time.monotonic() + WAIT
-    pressed, exits = [], []
-
-    def ctrl_c_twice(worker, timeout):
-        owner = owner_row(found.state)
-        if len(pressed) < 2 and ((owner and owner["expires"] > time.time()) or time.monotonic() > deadline):
-            pressed.append(time.monotonic())
-            raise KeyboardInterrupt
-        return real_join(worker, timeout)
-
-    def exit_now(code):
-        """Stands in for ``os._exit``: records the code and leaves once the worker (asked to drain by the first
-        Ctrl+C) has ended, so nothing runs on after the test. Bounded: otherwise it is stopped through its stop
-        request and the test fails."""
-        exits.append(code)
-        drained.append(cli._CONTROLLER.acquire(timeout=WAIT))
-        if not drained[-1]:
-            stop_through_request(found.state)
-            if not cli._CONTROLLER.acquire(timeout=WAIT):
-                raise SystemExit(code)
-        cli._CONTROLLER.release()
-        raise SystemExit(code)
-
-    drained = []
-    monkeypatch.setattr(cli, "_join", ctrl_c_twice)
-    monkeypatch.setattr(cli, "_exit_now", exit_now)
-    result = found.cli("graph-work", "--tick-seconds", "0.05")
-    assert result.exit_code == cli.EXIT_INTERRUPTED == 130, result.output
-    assert len(pressed) == 2 and exits == [130] and cli.DRAINING in result.stderr
-    assert drained == [True], "the first Ctrl+C did not make the controller drain"
+    state = tmp_path / "state"
+    process = subprocess.Popen([sys.executable, "-c", SECOND_PRESS, str(state)], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, cwd=tmp_path)
+    try:
+        stdout, stderr = process.communicate(timeout=WAIT)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=WAIT)
+    assert process.returncode == cli.EXIT_INTERRUPTED == 130, (stdout, stderr)
+    assert " ".join(cli.DRAINING.split()) in " ".join(stderr.decode("utf-8", "replace").split())
+    output = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+    assert len(output) == 1 and output[0]["ok"] is True   # the ready line only: no drain, no final line
+    owner = owner_row(state)
+    assert owner["owner_id"] == output[0]["owner_id"] and owner["expires"] > time.time() + 5   # held until its TTL
+    assert "stopped_at" not in current_json(state)
+    restart = Cli(state, env_file(tmp_path))("graph-work", "--max-ticks", "1", "--tick-seconds", "0.05")
+    assert final_line(restart, 3)["code"] == "owner_held"   # refused until the owner lease expires
 
 
 def test_graph_work_refuses_insecure_tracking_before_the_owner_lease(tmp_path, monkeypatch):
@@ -853,13 +969,12 @@ def test_graph_work_refuses_insecure_tracking_before_the_owner_lease(tmp_path, m
     from tuning_factory.auth import INSECURE_TRACKING
     state = tmp_path / "state"
     factory = Cli(state, env_file(tmp_path, MLFLOW_TRACKING_URI="http://mlflow.invalid",
-                                  MLFLOW_TRACKING_TOKEN=MLFLOW_TOKEN))
+                                  MLFLOW_TRACKING_TOKEN=MLFLOW_TOKEN), charset="cp1252")   # Korean text, cp1252
     result = factory("graph-work", "--approve-execution-and-transfer", "--max-ticks", "1", "--tick-seconds", "0.05")
     assert result.exit_code == 4, result.output
     assert lines(result)[0] == {"ok": False, "code": "settings_refused"}
-    final = lines(result)[-1]
-    assert (final["ok"], final["exit_code"], final["code"], final["message"]) == (False, 4, "settings_refused",
-                                                                                  INSECURE_TRACKING)
+    final = final_line(result, 4)
+    assert (final["code"], final["message"]) == ("settings_refused", INSECURE_TRACKING)
     assert owner_row(state) is None and final["controller"]["code"] == "settings_refused"
     assert "MLFLOW_TRACKING_TOKEN" not in os.environ   # the refusal leaves no credential variable set
     assert MLFLOW_TOKEN.encode() not in factory.captured()
@@ -921,3 +1036,37 @@ def test_tracking_uri_option_applies_to_graph_plans_submissions_and_the_controll
                        "--approve-execution-and-transfer", "--max-ticks", "2", "--tick-seconds", "0.05")
     assert worked.exit_code == 0, worked.output
     assert current_json(found.state)["tracking_settings_sha256"] == expected and calls == []
+
+
+def test_graph_work_refusals_before_the_start_print_a_final_line(tmp_path):
+    """Exit 2 (the sidecar's invalid start) with the uniform final line: here MLflow settings that cannot form a
+    tracking scope (an over-long URI)."""
+    cli = cli_module()
+    state = tmp_path / "state"
+    factory = Cli(state, env_file(tmp_path, MLFLOW_TRACKING_URI="https://mlflow.invalid/" + "a" * 3000))
+    result = factory("graph-work", "--approve-execution-and-transfer", "--max-ticks", "1")
+    final = final_line(result, 2)
+    assert (final["code"], final["message"], final["controller"]) == ("invalid_start", cli.TRACKING_INVALID, None)
+    assert owner_row(state) is None
+    # --help documents the output shapes, the exit codes and what a second Ctrl+C leaves behind (9.6 review Minor 5, 6).
+    shown = flat(CliRunner().invoke(app, ["graph-work", "--help"]).output)
+    for fragment in ("always a final line", "2 refused before the start", "130 a second Ctrl+C",
+                     "a restart gets exit 3", "release-lock --confirm-execution-stopped"):
+        assert fragment in shown, fragment
+
+
+def test_new_commands_stay_encodable_on_a_legacy_code_page(tmp_path):
+    """Redirected output in a legacy code page (cp949) cannot encode every name: the new commands fall back to
+    ASCII-escaped JSON instead of crashing, and keep readable UTF-8 JSON otherwise (9.6 review Minor 3)."""
+    cli_module()
+    state = tmp_path / "state"
+    name = "café — \U0001F600 요약"
+    created = desk.call(state, "project_create", {"request_id": "enc-1", "name": name})
+    assert created["status"] == "ok", created
+    legacy = Cli(state, env_file(tmp_path), charset="cp949")("project-list")
+    assert legacy.exit_code == 0, legacy.output
+    assert legacy.stdout_bytes.isascii() and parsed(legacy)["data"]["projects"][0]["name"] == name
+    readable = Cli(state, env_file(tmp_path))("project-list")
+    assert name in readable.stdout   # UTF-8 output keeps the v1 format (no escapes)
+    korean = Cli(state, env_file(tmp_path), charset="cp949")("graph-status")
+    assert korean.exit_code == 0, korean.output
