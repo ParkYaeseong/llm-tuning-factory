@@ -247,21 +247,47 @@ merged `base_model_name_or_path` is the root repo ID and `README.md` is dropped.
 (caught by the acceptance `no_hub_lookups` check). Also added: `inspect_target_modules` (meta device, LLaMA-Factory's
 Linear rule), `verify_inspected_targets` and `adapter_metadata_from_config` (a real PEFT 0.18.1 export freezes).
 
-Actual verification: `uv run pytest tests/test_model_ops_contract.py -q` **74 passed** (RED first: 70 failed on the
-missing module). The 7.1 regression set (model_ops_contract, model_artifacts, graph_planner, ppo_profile,
-runtime_profiles) passed, `uv run ruff check src tests` passes, `git diff --exit-code` on both GPU locks exits 0 and the
-main `.venv` lists no torch/peft/transformers/safetensors. CPU acceptance
+7.1 review fixes (commit `fix: make model-operation outputs deterministic and tighten 7.1 checks`). Important: PEFT writes
+`target_modules` from a set, so adapter and merged-adapter bytes, and therefore `inventory_sha256`, depended on
+`PYTHONHASHSEED`. Seeds 1 and 3 gave `["v_proj","q_proj"]` and `["q_proj","v_proj"]`. `model_ops.write_adapter_config`
+now writes sorted set-valued lists with LF line endings and sorted keys, for the merge output and the acceptance
+fixtures. A new acceptance check, `deterministic_output`, merges in two fresh processes with seeds 1 and 3. It failed
+before the fix and now gets identical adapter/merged identities and inventory hashes, while PEFT's raw orders still
+differ. Minor fixes:
+- Policy `model-ops-f32-v1` accepts only F16/BF16/F32 inputs. F64 (a lossy narrowing) and integer tensors are refused
+  with `<merge|materialization> requires F16, BF16 or F32 tensors under policy model-ops-f32-v1`. Quantized bases are
+  refused with `<merge|materialization> requires unquantized effective base weights`.
+- `verify_inspected_targets` requires `ref.artifact_id == sha256(canonical(descriptor))`.
+- The scanner bounds its second header read by `JSON_LIMIT`.
+- With `model.safetensors.index.json`, only the indexed shards are read and they must match the index. Otherwise only
+  `model.safetensors` is read, so a Mistral-style `consolidated.safetensors` copy is ignored.
+- Each acceptance operation is a recorded check, and the receipt has top-level `passed` and `stopped_after`. An injected
+  materialize failure gave exit 1 and a receipt with `materialize_operation` failed and `stopped_after` set.
+- The tiny tokenizer vocabulary (still 32: 4 special, 23 `t<i>`, 5 probe words) now encodes the default probe without
+  `<unk>`.
+- Module split: `safetensors_scan.py` (stdlib finite scan) and `target_inspection.py` (inspector and verifier), both
+  re-exported by `model_ops`. The pinned-runtime loader is `runtime_profiles.model_ops_runtime()`. The tokenizer-file
+  rule is the single `model_artifacts.is_tokenizer_file`.
+
+Actual verification after the review fixes: `uv run pytest tests/test_model_ops_contract.py -q` **91 passed** (initial
+RED: 70 failed on the missing module; each review fix was RED first). `uv run pytest -q` **845 passed, 1 skipped**,
+`uv run ruff check src tests` passes, `scripts/check_secrets.py` reports 0 findings, `git diff --exit-code` on both GPU
+locks exits 0 and the main `.venv` lists no torch/peft/transformers/safetensors. CPU acceptance
 `.factory\model-ops-cpu-venv\Scripts\python.exe -I scripts\verify_model_ops_cpu.py --receipt .factory\model-ops-cpu-receipt.json`
-exits 0 with all 18 checks passed on the locally generated tiny Qwen2 (2 layers, hidden 16, 27 tensors) and WordLevel
+exits 0 with all 25 checks passed on the locally generated tiny Qwen2 (2 layers, hidden 16, 27 tensors) and WordLevel
 tokenizer. `cat` merge r2/α4 + r3/α9 at 0.25/0.75 gives r = α = 5. Max delta errors: merge 7.78e-9, materialize 9.17e-9,
 parent→child 6.42e-9 (atol 1e-6). Max logits errors: merge 3.35e-8, materialize 2.98e-8 (atol 1e-5). F2 differs from
 root + ΔC by 0.187 (> 1e-3). The frozen reference keeps all 27 tensor SHA256s while the policy LoRA updates. NaN-adapter
 and inf-base inputs are refused before output, the stdlib and torch scans agree on 10 files, 14 target modules are exact
-and 4 tampered evidences are refused, and no Hub lookup occurs. Receipt SHA256
-`4508012d781c7e7085f44e3881bda274ae88a52c15920ad5508acf1233bf8f16`; source_sha256
-`81b7369b29045e454b35a92fa8fe2ac3a2bf4fd3deacb7892b5a96bc0f61fd78`; lock_sha256
-`5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`; `model_downloaded`, `gpu_used`,
-`institution_data_used` and `production_promotable` are false. The CPU lock is Windows-only.
+and 4 tampered evidences are refused, no Hub lookup occurs, and outputs are identical under hash seeds 1 and 3. Receipt
+SHA256 `e07c52969951d8efd9b8bbde58247752118aada07805c8b0fdb3c19aa1255774`; source_sha256
+`94e9f99f3cc63d7600d3b8f6969a1737ac7be9bd7acbeb82119678478227d956`; lock_sha256
+`5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`; `passed` is true and `model_downloaded`, `gpu_used`,
+`institution_data_used` and `production_promotable` are false. Receipts are now reproducible across hash seeds: four runs
+gave byte-identical receipts. Two used `-I`, where Python picks a random hash seed, and two used `-s -P` with
+`PYTHONHASHSEED` 1 and 3. The superseded pre-fix receipt `4508012d…8f16` was not reproducible. The CPU lock is Windows-only.
+Transformers writes `config.json`/`generation_config.json` with platform newlines, so materialized bytes from Windows and
+Linux may differ.
 
 Still open for Task 7 GPU work: merge/materialize tolerances at real model sizes on CUDA (TF32 off) and memory
 (FP32 loads; about 3 base loads per merge), BF16 storage policy (none; F32 doubles size), HF-root snapshots with

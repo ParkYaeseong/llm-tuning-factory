@@ -16,6 +16,7 @@ import importlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from importlib import metadata
@@ -34,6 +35,8 @@ EXPECTED_VERSIONS = {
 REQUIRED_MODULES = ("torch", "peft", "transformers", "safetensors", "tokenizers", "accelerate",
                     "huggingface_hub", "numpy")
 SPECIAL_TOKENS = {"<unk>": 0, "<pad>": 1, "<s>": 2, "</s>": 3}
+# 4 special + 23 "t<i>" + the 5 words of model_ops.PROBE_TEXT = vocabulary 32, so the default probe has no <unk>.
+PROBE_WORDS = ("factory", "model", "operations", "numerical", "probe")
 QWEN2 = dict(num_hidden_layers=2, hidden_size=16, intermediate_size=32, num_attention_heads=2,
              num_key_value_heads=2, vocab_size=32, max_position_embeddings=64, tie_word_embeddings=False,
              bos_token_id=2, eos_token_id=3, pad_token_id=1)
@@ -56,6 +59,47 @@ def sha256_file(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+class PrerequisiteFailed(Exception):
+    """A recorded operation failed; later phases that need its outputs are not run."""
+
+
+def determinism_probe(work: Path) -> dict:
+    """Build the fixtures and merge in this process; the caller compares runs under different hash seeds."""
+    from tuning_factory.model_artifacts import _inventory, _inventory_bytes
+    acceptance = Acceptance(work)
+    acceptance.build_base()
+    first = acceptance.make_adapter("adapter-r2", 2, 4, 1, base_dir=acceptance.base_dir, effective_base=acceptance.root)
+    second = acceptance.make_adapter("adapter-r3", 3, 9, 2, base_dir=acceptance.base_dir,
+                                     effective_base=acceptance.root)
+    merged = work / "merged"
+    acceptance.ops.merge_adapters((first, second), (0.25, 0.75), merged, base=acceptance.base, require_real=False,
+                                  probe_ids=PROBE)
+    return {"adapters": [model.identity.model_dump(mode="json") for model in (first, second)],
+            "merged_adapter_config_sha256": sha256_file(merged / "adapter_config.json"),
+            "merged_inventory_sha256": hashlib.sha256(_inventory_bytes(_inventory(merged))).hexdigest(),
+            "raw_target_orders": acceptance.raw_target_orders}
+
+
+def deterministic_output():
+    """Merge in two fresh processes whose PYTHONHASHSEED differs; artifact bytes must not change."""
+    runs = {}
+    for seed in ("1", "3"):
+        with tempfile.TemporaryDirectory(prefix="model-ops-seed-") as work:
+            # -I would ignore PYTHONHASHSEED; -s -P plus a PYTHON*-free environment keep the same isolation.
+            environment = {key: value for key, value in os.environ.items() if not key.upper().startswith("PYTHON")}
+            environment.update(PYTHONHASHSEED=seed, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+            completed = subprocess.run([sys.executable, "-s", "-P", str(Path(__file__).resolve()),
+                                        "--determinism-probe", work], env=environment, capture_output=True,
+                                       text=True, timeout=1800)
+            if completed.returncode:
+                raise RuntimeError(f"hash seed {seed} probe failed: {completed.stderr[-2000:]}")
+            runs[seed] = json.loads(completed.stdout.strip().splitlines()[-1])
+    outputs = [{key: value for key, value in run.items() if key != "raw_target_orders"} for run in runs.values()]
+    orders = {seed: run["raw_target_orders"] for seed, run in runs.items()}
+    return {"passed": outputs[0] == outputs[1] and orders["1"] != orders["3"], "hash_seeds": sorted(runs),
+            "raw_peft_target_orders": orders, "outputs": {seed: output for seed, output in zip(runs, outputs)}}
+
+
 class Acceptance:
     """Builds the synthetic fixtures and runs each check; heavy modules are passed in from main()."""
 
@@ -75,6 +119,7 @@ class Acceptance:
         self.store = model_artifacts.ModelArtifactStore(work / "store")
         self.checks: dict[str, dict] = {}
         self.receipts: dict[str, dict] = {}
+        self.raw_target_orders: list[list[str]] = []
 
     # -- helpers ---------------------------------------------------------------------------------
 
@@ -87,6 +132,12 @@ class Acceptance:
         result["passed"] = bool(result["passed"])
         self.checks[name] = result
         return result
+
+    def operation(self, name, function):
+        """Run a step later checks depend on; its failure is recorded and stops the dependent phases."""
+        result = self.record(name, lambda: {"passed": True, **(function() or {})})
+        if not result["passed"]:
+            raise PrerequisiteFailed(name)
 
     def load(self, path):
         model = self.transformers.AutoModelForCausalLM.from_pretrained(
@@ -131,7 +182,7 @@ class Acceptance:
 
     def copy_snapshot(self, source, target, *, config):
         for file in sorted(Path(source).iterdir()):
-            if file.name in self.artifacts.TOKENIZER_FILES or config and file.name == "config.json":
+            if self.artifacts.is_tokenizer_file(file.name) or config and file.name == "config.json":
                 shutil.copyfile(file, Path(target) / file.name)
 
     def local(self, ref):
@@ -151,11 +202,23 @@ class Acceptance:
 
     # -- fixtures --------------------------------------------------------------------------------
 
+    def check_fixtures(self):
+        self.operation("fixture_generation", self.build_base)
+
+        def probe():
+            tokenizer = self.transformers.AutoTokenizer.from_pretrained(str(self.base_dir), local_files_only=True)
+            ids = tokenizer.encode(self.ops.PROBE_TEXT, add_special_tokens=False)
+            return {"passed": ids == [27, 28, 29, 30, 31] and tokenizer.unk_token_id not in ids, "probe_ids": ids}
+
+        self.record("tokenizer_probe_has_no_unknown_tokens", probe)
+
     def build_base(self):
         from tokenizers import Tokenizer, models, pre_tokenizers
         torch, transformers = self.torch, self.transformers
         self.base_dir = self.work / "base"
-        vocab = {**SPECIAL_TOKENS, **{f"t{index}": 4 + index for index in range(28)}}
+        vocab = {**SPECIAL_TOKENS, **{f"t{index}": 4 + index for index in range(23)},
+                 **{word: 27 + index for index, word in enumerate(PROBE_WORDS)}}
+        assert len(vocab) == QWEN2["vocab_size"]
         tokenizer = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<unk>"))
         tokenizer.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
         transformers.PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="<unk>", pad_token="<pad>",
@@ -189,8 +252,8 @@ class Acceptance:
         model.save_pretrained(str(export))
         (export / "README.md").unlink(missing_ok=True)
         config = json.loads((export / "adapter_config.json").read_text(encoding="utf-8"))
-        config["base_model_name_or_path"] = self.root.repo_id
-        (export / "adapter_config.json").write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
+        self.raw_target_orders.append(list(config["target_modules"]))   # PEFT writes them from a set
+        self.ops.write_adapter_config(export / "adapter_config.json", config, self.root.repo_id)
         self.copy_snapshot(base_dir, export, config=True)
         adapter = self.ops.adapter_metadata_from_config(config, method="lora")
         ref = self.store.freeze(export, self.descriptor(export, marker=marker, storage_kind="adapter",
@@ -202,12 +265,17 @@ class Acceptance:
 
     def check_merge(self):
         ops, torch = self.ops, self.torch
-        self.a1 = self.make_adapter("adapter-r2", 2, 4, 1, base_dir=self.base_dir, effective_base=self.root)
-        self.a2 = self.make_adapter("adapter-r3", 3, 9, 2, base_dir=self.base_dir, effective_base=self.root)
         merged_dir = self.work / "merged"
-        receipt = ops.merge_adapters((self.a1, self.a2), (0.25, 0.75), merged_dir, base=self.base,
-                                     require_real=False, probe_ids=PROBE)
-        self.receipts["merge"] = receipt.model_dump(mode="json")
+
+        def merge():
+            self.a1 = self.make_adapter("adapter-r2", 2, 4, 1, base_dir=self.base_dir, effective_base=self.root)
+            self.a2 = self.make_adapter("adapter-r3", 3, 9, 2, base_dir=self.base_dir, effective_base=self.root)
+            self.merge_receipt = ops.merge_adapters((self.a1, self.a2), (0.25, 0.75), merged_dir, base=self.base,
+                                                    require_real=False, probe_ids=PROBE)
+            self.receipts["merge"] = self.merge_receipt.model_dump(mode="json")
+
+        self.operation("merge_operation", merge)
+        receipt = self.merge_receipt
         self.merged_dir = merged_dir
         config = json.loads((merged_dir / "adapter_config.json").read_text(encoding="utf-8"))
 
@@ -255,8 +323,14 @@ class Acceptance:
     def check_materialize(self):
         ops, torch = self.ops, self.torch
         out = self.work / "materialized"
-        receipt = ops.materialize_model(ops.StagedLoad(base=self.base, adapter=self.a1), out, probe_ids=PROBE)
-        self.receipts["materialize"] = receipt.model_dump(mode="json")
+
+        def materialize():
+            self.materialize_receipt = ops.materialize_model(ops.StagedLoad(base=self.base, adapter=self.a1), out,
+                                                             probe_ids=PROBE)
+            self.receipts["materialize"] = self.materialize_receipt.model_dump(mode="json")
+
+        self.operation("materialize_operation", materialize)
+        receipt = self.materialize_receipt
         self.materialized = out
         base, result = self.tensors(self.base_dir), self.tensors(out)
         targets = {module + ".weight": value for module, value in self.lora_delta(self.a1.path, 4 / 2).items()}
@@ -274,7 +348,7 @@ class Acceptance:
                     and all(torch.equal(result[name], base[name]) for name in others), "tensors": len(others)}
 
         def tokenizer():
-            files = [path.name for path in self.base_dir.iterdir() if path.name in self.artifacts.TOKENIZER_FILES]
+            files = [path.name for path in self.base_dir.iterdir() if self.artifacts.is_tokenizer_file(path.name)]
             return {"passed": sorted(files) == ["tokenizer.json", "tokenizer_config.json"] and all(
                 (out / name).read_bytes() == (self.base_dir / name).read_bytes() for name in files)
                 and self.artifacts.tokenizer_fingerprint(out) == self.root.tokenizer_fingerprint, "files": files}
@@ -297,15 +371,19 @@ class Acceptance:
 
     def check_parent_child(self):
         ops, torch = self.ops, self.torch
-        f1_ref = self.store.freeze(self.materialized, self.descriptor(
-            self.materialized, marker="materialized-f1", storage_kind="full_model", effective_base=self.root,
-            parents=(self.a1.identity,)))
-        self.f1 = self.local(f1_ref)
-        self.child = self.make_adapter("child-on-f1", 2, 4, 7, base_dir=self.f1.path, effective_base=f1_ref,
-                                       parents=(f1_ref,))
         out = self.work / "materialized-f2"
-        receipt = ops.materialize_model(ops.StagedLoad(base=self.f1, adapter=self.child), out)  # tokenizer probe
-        self.receipts["materialize_child"] = receipt.model_dump(mode="json")
+
+        def materialize_child():
+            f1_ref = self.store.freeze(self.materialized, self.descriptor(
+                self.materialized, marker="materialized-f1", storage_kind="full_model", effective_base=self.root,
+                parents=(self.a1.identity,)))
+            self.f1 = self.local(f1_ref)
+            self.child = self.make_adapter("child-on-f1", 2, 4, 7, base_dir=self.f1.path, effective_base=f1_ref,
+                                           parents=(f1_ref,))
+            receipt = ops.materialize_model(ops.StagedLoad(base=self.f1, adapter=self.child), out)  # tokenizer probe
+            self.receipts["materialize_child"] = receipt.model_dump(mode="json")
+
+        self.operation("materialize_child_operation", materialize_child)
         root, f1, f2 = self.tensors(self.base_dir), self.tensors(self.f1.path), self.tensors(out)
         child = {module + ".weight": value for module, value in self.lora_delta(self.child.path, 4 / 2).items()}
 
@@ -380,18 +458,22 @@ class Acceptance:
     def check_nonfinite(self):
         ops, torch = self.ops, self.torch
         self.nan_dir = self.work / "nan-adapter"
-        shutil.copytree(self.a2.path, self.nan_dir)
-        file = self.nan_dir / "adapter_model.safetensors"
-        tensors = self.load_file(str(file))
-        name = sorted(key for key in tensors if ".lora_B." in key)[0]
-        tensors[name][0, 0] = float("nan")
-        self.save_file(tensors, str(file), metadata={"format": "pt"})
         self.inf_dir = self.work / "inf-base"
-        shutil.copytree(self.base_dir, self.inf_dir)
-        file = self.inf_dir / "model.safetensors"
-        tensors = self.load_file(str(file))
-        tensors["model.norm.weight"][0] = float("inf")
-        self.save_file(tensors, str(file), metadata={"format": "pt"})
+
+        def fixtures():
+            shutil.copytree(self.a2.path, self.nan_dir)
+            file = self.nan_dir / "adapter_model.safetensors"
+            tensors = self.load_file(str(file))
+            name = sorted(key for key in tensors if ".lora_B." in key)[0]
+            tensors[name][0, 0] = float("nan")
+            self.save_file(tensors, str(file), metadata={"format": "pt"})
+            shutil.copytree(self.base_dir, self.inf_dir)
+            file = self.inf_dir / "model.safetensors"
+            tensors = self.load_file(str(file))
+            tensors["model.norm.weight"][0] = float("inf")
+            self.save_file(tensors, str(file), metadata={"format": "pt"})
+
+        self.operation("nonfinite_fixture_generation", fixtures)
 
         def nan_merge():
             tampered = ops.LocalModel(path=self.nan_dir, identity=self.a2.identity, descriptor=self.a2.descriptor,
@@ -492,21 +574,23 @@ class Acceptance:
             lookups.append(f"{repo_id}/{filename}")
             return None
 
+        self.stopped_after = None
         with mock.patch.object(peft_save, "check_file_exists_on_hf_hub", hub_lookup):
-            self.build_base()
-            self.check_merge()
-            self.check_materialize()
-            self.check_parent_child()
-            self.check_frozen_reference()
-            self.check_nonfinite()
-            self.check_targets()
+            try:
+                for phase in (self.check_fixtures, self.check_merge, self.check_materialize, self.check_parent_child,
+                              self.check_frozen_reference, self.check_nonfinite, self.check_targets):
+                    phase()
+            except PrerequisiteFailed as exc:
+                self.stopped_after = str(exc)   # dependent checks did not run; the receipt says so
         self.record("no_hub_lookups", lambda: {"passed": not lookups, "lookups": lookups})
+        self.record("deterministic_output", deterministic_output)
         return self.checks
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--receipt", type=Path, help="write the canonical JSON acceptance receipt here")
+    parser.add_argument("--determinism-probe", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -530,11 +614,16 @@ def main(argv=None) -> int:
         raise RuntimeError("CPU acceptance requires the CPU-only torch build")
     if {name: versions[name].split("+")[0] for name in MODEL_OPS_PINS} != dict(MODEL_OPS_PINS):
         raise RuntimeError("acceptance pins differ from runtime_profiles.MODEL_OPS_PINS")
+    if args.determinism_probe:
+        print(json.dumps(determinism_probe(args.determinism_probe.absolute()), sort_keys=True))
+        return 0
     with tempfile.TemporaryDirectory(prefix="model-ops-cpu-") as work:
         acceptance = Acceptance(Path(work))
         checks = acceptance.run()
+    passed = bool(checks) and acceptance.stopped_after is None and all(check["passed"] for check in checks.values())
     receipt = {
-        "schema_version": SCHEMA_VERSION, "versions": versions, "lock_sha256": sha256_file(LOCK),
+        "schema_version": SCHEMA_VERSION, "passed": passed, "stopped_after": acceptance.stopped_after,
+        "versions": versions, "lock_sha256": sha256_file(LOCK),
         "source_sha256": source_hash(), "tolerance_policy": acceptance.policy.model_dump(mode="json"),
         "checks": checks, "operation_receipts": acceptance.receipts, "model_downloaded": False,
         "gpu_used": False, "institution_data_used": False, "synthetic_fixture": True,
@@ -546,7 +635,7 @@ def main(argv=None) -> int:
         args.receipt.write_bytes(body)
     print(json.dumps({name: {key: value for key, value in check.items() if key in {"passed", "max_abs_error", "error"}}
                       for name, check in checks.items()}, indent=2, sort_keys=True))
-    return 0 if checks and all(check["passed"] for check in checks.values()) else 1
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":

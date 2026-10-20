@@ -1,9 +1,10 @@
 """Exact model operations: compatible LoRA ``cat`` merge and full-model materialization.
 
-Importing this module touches only the standard library, pydantic, ``.config`` and
-``.model_artifacts``. torch, PEFT, Transformers and safetensors are imported inside the
-numerical functions, after every input refusal and after the stdlib finite scan of the
-(small) adapter inputs. Policy ``model-ops-f32-v1`` computes in FP32 from an exact upcast of
+Importing this module touches only the standard library, pydantic and local contracts. torch,
+PEFT, Transformers and safetensors are imported inside the numerical functions, after every input
+refusal and after the stdlib finite scan of the (small) adapter inputs. The scanner lives in
+``safetensors_scan`` and the target-module inspector/verifier in ``target_inspection``; both are
+re-exported here. Policy ``model-ops-f32-v1`` computes in FP32 from an exact upcast of
 the inputs and stores every output tensor as F32. Inputs are ``LocalModel`` directories that the
 caller has already verified against their identity; the checks here repeat the cheap ones.
 """
@@ -20,14 +21,12 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from pydantic import ValidationError
 
 from .config import StrictModel
 from .model_artifacts import (
-    DTYPE_BYTES,
-    TOKENIZER_FILES,
     AdapterMetadata,
     AlphaPattern,
     BaseRef,
@@ -38,25 +37,41 @@ from .model_artifacts import (
     _check_ancestors,
     _FileEntry,
     _files,
-    _json,
     _open_regular,
     _read_json,
     _tensor_header,
     _tokenizer_hash,
     _validate_adapter,
+    is_tokenizer_file,
 )
+from .runtime_profiles import model_ops_runtime
+from .safetensors_scan import scan_finite_safetensors
+from .target_inspection import inspect_target_modules, verify_inspected_targets
 
-if TYPE_CHECKING:
-    from .graph_planner import ModelTargetEvidence
+__all__ = [
+    "POLICY_F32_V1", "TOLERANCE_POLICIES", "LocalModel", "MaterializeReceipt", "MergePlan", "MergeReceipt",
+    "StagedLoad", "TolerancePolicy", "adapter_metadata_from_config", "inspect_target_modules",
+    "materialize_model", "merge_adapters", "scan_finite_safetensors", "validate_materialize_input",
+    "validate_merge_inputs", "verify_inspected_targets", "write_adapter_config",
+]
 
 POLICY_F32_V1 = "model-ops-f32-v1"
 PEFT_PREFIX = "base_model.model."
 PROBE_TEXT = "factory model operations numerical probe"
-QUANTIZED_BASE = "materialization requires unquantized effective base weights"
 VARIANT = "unsupported adapter conversion variant"
 DELTA_FAILED = "model-operation output failed delta verification"
 LOGITS_FAILED = "reloaded logits differ beyond tolerance policy"
-FLOAT_DTYPES = frozenset({"F16", "BF16", "F32", "F64"})
+# Input dtypes with an exact FP32 upcast; F64 would be narrowed and integers are not weights to merge.
+POLICY_DTYPES = frozenset({"F16", "BF16", "F32"})
+SHARD_INDEX = "model.safetensors.index.json"
+
+
+def _quantized(operation: str) -> str:
+    return f"{operation} requires unquantized effective base weights"
+
+
+def _dtype_refusal(operation: str) -> str:
+    return f"{operation} requires F16, BF16 or F32 tensors under policy {POLICY_F32_V1}"
 
 
 class TolerancePolicy(StrictModel):
@@ -185,31 +200,54 @@ def _local_tokenizer_fingerprint(directory: Path) -> str:
     # Same algorithm as model_artifacts.tokenizer_fingerprint, hashing only tokenizer files.
     entries = []
     for relative, file in _files(directory):
-        if relative in TOKENIZER_FILES or relative.startswith("chat_templates/"):
+        if is_tokenizer_file(relative):
             with _open_regular(file) as stream:
                 checksum = hashlib.file_digest(stream, "sha256").hexdigest()
             entries.append(_FileEntry(path=relative, size=file.stat().st_size, sha256=checksum))
     return _tokenizer_hash(tuple(entries))
 
 
+def _weight_layout(directory: Path) -> tuple[tuple[str, ...], dict | None]:
+    """The safetensors files a loader reads: the indexed shards, else model.safetensors, else all.
+
+    Other top-level copies (for example Mistral's consolidated.safetensors) are ignored, as loaders do.
+    """
+    names = {relative for relative, _ in _files(directory) if "/" not in relative}
+    if SHARD_INDEX in names:
+        index = _read_json(directory / SHARD_INDEX)
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if (not isinstance(weight_map, dict) or not weight_map
+                or any(not isinstance(shard, str) for shard in weight_map.values())):
+            raise ValueError("invalid model shard index")
+        shards = tuple(sorted(set(weight_map.values())))
+        if any(shard not in names or not shard.endswith(".safetensors") for shard in shards):
+            raise ValueError("missing or mismatched model shard")
+        return shards, weight_map
+    if "model.safetensors" in names:
+        return ("model.safetensors",), None
+    return tuple(sorted(name for name in names if name.endswith(".safetensors"))), None
+
+
 def _weight_files(directory: Path) -> tuple[str, ...]:
-    return tuple(relative for relative, _ in _files(directory)
-                 if "/" not in relative and relative.endswith(".safetensors"))
+    return _weight_layout(directory)[0]
 
 
 def _header_inventory(directory: Path) -> dict:
+    files, weight_map = _weight_layout(directory)
     inventory = {}
-    for relative in _weight_files(directory):
+    for relative in files:
         for tensor in _tensor_header(directory / relative, relative):
             if tensor.name in inventory:
                 raise ValueError("duplicate tensor names in local weights")
             inventory[tensor.name] = tensor
     if not inventory:
         raise ValueError("model operations require inspectable safetensors weights")
+    if weight_map is not None and {name: tensor.file for name, tensor in inventory.items()} != weight_map:
+        raise ValueError("model shard index does not cover tensor inventory")
     return inventory
 
 
-def _verified_base(base: LocalModel) -> dict:
+def _verified_base(base: LocalModel, operation: str) -> dict:
     """Check the base's identity, local config/tokenizer and dtypes; return its tensor headers."""
     base = LocalModel(Path(base.path).absolute(), base.identity, base.descriptor, base.config_sha256,
                       base.tokenizer_fingerprint)
@@ -224,13 +262,13 @@ def _verified_base(base: LocalModel) -> dict:
         if descriptor.storage_kind != "full_model":
             raise ValueError("effective base must be a full model")
         if descriptor.quantization_bit is not None:
-            raise ValueError(QUANTIZED_BASE)
+            raise ValueError(_quantized(operation))
         expected = (descriptor.config_sha256, descriptor.tokenizer_fingerprint)
     if (base.config_sha256, base.tokenizer_fingerprint) != expected:
         raise ValueError("local model identity differs from its verified descriptor")
     config = _read_json(base.path / "config.json")
     if not isinstance(config, dict) or "quantization_config" in config:
-        raise ValueError(QUANTIZED_BASE)
+        raise ValueError(_quantized(operation))
     with _open_regular(base.path / "config.json") as stream:
         if hashlib.file_digest(stream, "sha256").hexdigest() != base.config_sha256:
             raise ValueError("model config snapshot fingerprint mismatch")
@@ -239,9 +277,14 @@ def _verified_base(base: LocalModel) -> dict:
     inventory = _header_inventory(base.path)
     if base.descriptor is not None and set(inventory.values()) != set(base.descriptor.tensors):
         raise ValueError("tensor inventory geometry does not match snapshot")
-    if any(tensor.dtype not in FLOAT_DTYPES for tensor in inventory.values()):
-        raise ValueError(QUANTIZED_BASE)
+    if any(tensor.dtype not in POLICY_DTYPES for tensor in inventory.values()):
+        raise ValueError(_dtype_refusal(operation))
     return inventory
+
+
+def _check_policy_dtypes(descriptor: ModelDescriptor, operation: str) -> None:
+    if any(tensor.dtype not in POLICY_DTYPES for tensor in descriptor.tensors):
+        raise ValueError(_dtype_refusal(operation))
 
 
 def _adapter_pairs(descriptor: ModelDescriptor) -> dict:
@@ -275,76 +318,12 @@ def validate_materialize_input(load: StagedLoad) -> None:
         raise ValueError("materialize base differs from adapter effective base")
     _materializable(descriptor)
     _linear_layout(descriptor)
-    inventory = _verified_base(base)
+    _check_policy_dtypes(descriptor, "materialization")
+    inventory = _verified_base(base, "materialization")
     if (base.config_sha256, base.tokenizer_fingerprint) != (descriptor.config_sha256,
                                                              descriptor.tokenizer_fingerprint):
         raise ValueError("adapter/base config or tokenizer differs")
     _check_base_dimensions(descriptor, inventory, "adapter dimensions differ from inspected effective base")
-
-
-# -- stdlib finite scan --------------------------------------------------------------------------
-
-# dtype: (width, high byte, high exponent mask, low byte, low exponent mask). A value is NaN/inf
-# exactly when every exponent bit is set; little-endian byte order as stored by safetensors.
-_EXPONENT_LAYOUT = {
-    "F16": (2, 1, 0x7C, 0, 0x00),
-    "BF16": (2, 1, 0x7F, 0, 0x80),
-    "F32": (4, 3, 0x7F, 2, 0x80),
-    "F64": (8, 7, 0x7F, 6, 0xF0),
-}
-_INTEGER_DTYPES = frozenset({"BOOL", "U8", "I8", "I16", "U16", "I32", "U32", "I64", "U64"})
-_SCAN_CHUNK = 8 * 1024 * 1024  # bytes; a multiple of every float width
-_CANDIDATES = {mask: bytes(1 if byte & mask == mask else 0 for byte in range(256))
-               for mask in {layout[2] for layout in _EXPONENT_LAYOUT.values()}}
-
-
-def scan_finite_safetensors(path: Path) -> int:
-    """Stream a safetensors file and refuse NaN/inf; return the number of float elements scanned.
-
-    Integer tensors are finite by construction and are skipped; FP8 and unknown dtypes are refused.
-    """
-    path = Path(path)
-    validated = {tensor.name: tensor for tensor in _tensor_header(path, path.name)}
-    if any(tensor.dtype not in _EXPONENT_LAYOUT and tensor.dtype not in _INTEGER_DTYPES
-           for tensor in validated.values()):
-        raise ValueError("unsupported tensor dtype for finite scan")
-    scanned = 0
-    with _open_regular(path) as stream:
-        length = int.from_bytes(stream.read(8), "little")
-        header = _json(stream.read(length))
-        try:   # the validated geometry must still describe the bytes opened here
-            entries = sorted((header[name]["data_offsets"][0], header[name]["data_offsets"][1], name)
-                             for name in validated)
-            if set(header) - {"__metadata__"} != set(validated) or any(
-                    (header[name]["dtype"], tuple(header[name]["shape"]))
-                    != (validated[name].dtype, validated[name].shape) for name in validated) or any(
-                    not 0 <= start <= end or end - start
-                    != math.prod(validated[name].shape) * DTYPE_BYTES[validated[name].dtype]
-                    for start, end, name in entries):
-                raise ValueError
-        except (KeyError, TypeError, IndexError, ValueError):
-            raise ValueError("safetensors header changed while scanning") from None
-        for start, end, name in entries:
-            dtype = validated[name].dtype
-            if dtype in _INTEGER_DTYPES:
-                continue
-            width, high, high_mask, low, low_mask = _EXPONENT_LAYOUT[dtype]
-            table = _CANDIDATES[high_mask]
-            stream.seek(8 + length + start)
-            remaining = end - start
-            while remaining:
-                chunk = stream.read(min(_SCAN_CHUNK, remaining))
-                if not chunk or len(chunk) % width:
-                    raise ValueError("truncated safetensors payload")
-                marks = chunk[high::width].translate(table)
-                position = marks.find(1)
-                while position != -1:
-                    if not low_mask or chunk[position * width + low] & low_mask == low_mask:
-                        raise ValueError(f"non-finite tensor values in {path.name}: {name}")
-                    position = marks.find(1, position + 1)
-                remaining -= len(chunk)
-            scanned += math.prod(validated[name].shape)
-    return scanned
 
 
 def _check_adapter_files(model: LocalModel) -> int:
@@ -365,6 +344,23 @@ def _check_adapter_files(model: LocalModel) -> int:
 
 
 # -- adapter metadata from a PEFT export ---------------------------------------------------------
+
+# PEFT keeps these as sets and serializes them in PYTHONHASHSEED-dependent order.
+_SET_VALUED_ADAPTER_FIELDS = ("target_modules", "modules_to_save", "exclude_modules", "target_parameters")
+
+
+def write_adapter_config(path: Path, config: Mapping, repo_id: str) -> None:
+    """Write a PEFT adapter config with deterministic bytes (sorted set-valued lists, LF, sorted keys).
+
+    ``base_model_name_or_path`` becomes the root repository ID: provenance only, never a host path.
+    """
+    config = dict(config)
+    for key in _SET_VALUED_ADAPTER_FIELDS:
+        if isinstance(config.get(key), (list, tuple)):
+            config[key] = sorted(config[key])
+    config["base_model_name_or_path"] = repo_id
+    Path(path).write_bytes(json.dumps(config, indent=2, sort_keys=True).encode("utf-8"))
+
 
 def adapter_metadata_from_config(config: Mapping, *, method: Literal["lora", "qlora"],
                                  quantization_bit: Literal[4, 8] | None = None,
@@ -403,79 +399,7 @@ def adapter_metadata_from_config(config: Mapping, *, method: Literal["lora", "ql
         loraplus_lr_ratio=loraplus_lr_ratio, loraplus_lr_embedding=loraplus_lr_embedding)
 
 
-# -- inspected target evidence -------------------------------------------------------------------
-
-def _not_a_target(name: str) -> bool:
-    module = name[:-len(".weight")]
-    return ("lm_head" in module or module.startswith(("v_head.", "value_head.", "score."))
-            or any("embed" in part or "norm" in part for part in module.split(".")))
-
-
-def verify_inspected_targets(evidence, descriptor: ModelDescriptor, ref: ModelArtifactRef) -> ModelTargetEvidence:
-    """Accept inspector evidence only if it is the complete linear inventory of the verified full model."""
-    from .graph_planner import ModelTargetEvidence
-    evidence = ModelTargetEvidence.model_validate(evidence)
-    descriptor = ModelDescriptor.model_validate(descriptor)
-    if evidence.base != ModelArtifactRef.model_validate(ref):
-        raise ValueError("inspected target evidence belongs to another base")
-    if descriptor.storage_kind != "full_model":
-        raise ValueError("inspected targets require a full-model inventory")
-    weights = {tensor.name: tensor.shape for tensor in descriptor.tensors}
-    for module in evidence.modules:
-        if weights.get(module.name + ".weight") != (module.output_dimension, module.input_dimension):
-            raise ValueError("inspected base dimensions differ from verified tensor inventory")
-    expected = {name[:-len(".weight")] for name, shape in weights.items()
-                if name.endswith(".weight") and len(shape) == 2 and not _not_a_target(name)}
-    if expected != {module.name for module in evidence.modules}:
-        raise ValueError("inspected target modules differ from verified tensor inventory")
-    return evidence
-
-
-def inspect_target_modules(model_dir: Path, base: BaseRef) -> ModelTargetEvidence:
-    """Meta-device inventory of every LoRA-targetable Linear module (LLaMA-Factory's rule)."""
-    from .graph_planner import ModelTargetEvidence, TargetModuleEvidence
-    model_dir = Path(model_dir).absolute()
-    if isinstance(base, HFRootRef):
-        with _open_regular(model_dir / "config.json") as stream:
-            if hashlib.file_digest(stream, "sha256").hexdigest() != base.config_sha256:
-                raise ValueError("model config snapshot fingerprint mismatch")
-    torch, _, _, transformers = _runtime()
-    config = transformers.AutoConfig.from_pretrained(str(model_dir), local_files_only=True)
-    with torch.device("meta"):
-        model = transformers.AutoModelForCausalLM.from_config(config)
-    excluded = {"lm_head"}
-    if config.model_type == "chatglm":
-        excluded.add("output_layer")
-    elif config.model_type == "internlm2":
-        excluded.add("output")
-    modules = sorted(
-        (TargetModuleEvidence(name=name, input_dimension=module.in_features, output_dimension=module.out_features)
-         for name, module in model.named_modules()
-         if "Linear" in type(module).__name__ and "Embedding" not in type(module).__name__
-         and not any(item in name for item in excluded)), key=lambda item: item.name)
-    return ModelTargetEvidence(base=base, modules=tuple(modules))
-
-
 # -- numerics (heavy imports only below this line, inside functions) ------------------------------
-
-def _runtime():
-    from importlib import metadata
-
-    from .runtime_profiles import MODEL_OPS_PINS
-    try:
-        import peft
-        import safetensors
-        import torch
-        import transformers
-    except ImportError as exc:
-        raise RuntimeError("model-operation runtime is missing; use the pinned primary or CPU acceptance "
-                           "runtime") from exc
-    drift = sorted(name for name, pinned in MODEL_OPS_PINS.items()
-                   if metadata.version(name).split("+")[0] != pinned)
-    if drift:
-        raise RuntimeError(f"model-operation runtime differs from pinned versions: {', '.join(drift)}")
-    return torch, peft, safetensors, transformers
-
 
 def _device(torch, device: str):
     if device != "cpu" and not re.fullmatch(r"cuda(:[0-9]+)?", device):
@@ -559,7 +483,7 @@ def _check_output(output) -> Path:
 def _copy_snapshot_files(source: Path, target: Path, *, config: bool) -> None:
     """Copy tokenizer files (and the adapter's config.json) byte-for-byte from the effective base."""
     for relative, file in _files(source):
-        if relative in TOKENIZER_FILES or relative.startswith("chat_templates/") or config and relative == "config.json":
+        if is_tokenizer_file(relative) or config and relative == "config.json":
             destination = target / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.unlink(missing_ok=True)
@@ -593,9 +517,11 @@ def merge_adapters(inputs: Sequence[LocalModel], weights: Sequence[float], outpu
     plan = validate_merge_inputs([model.identity for model in inputs], [model.descriptor for model in inputs],
                                  weights, require_real=require_real)
     first = inputs[0].descriptor
+    for model in inputs:
+        _check_policy_dtypes(model.descriptor, "merge")
     if base.identity != plan.effective_base:
         raise ValueError("merge input effective bases/tokenizers/targets differ")
-    inventory = _verified_base(base)
+    inventory = _verified_base(base, "merge")
     if (base.config_sha256, base.tokenizer_fingerprint) != (first.config_sha256, first.tokenizer_fingerprint):
         raise ValueError("merge input effective bases/tokenizers/targets differ")
     for model in inputs:
@@ -603,7 +529,7 @@ def merge_adapters(inputs: Sequence[LocalModel], weights: Sequence[float], outpu
     output = _check_output(output)
     checked = sum(_check_adapter_files(model) for model in inputs)
 
-    torch, peft, safetensors, transformers = _runtime()
+    torch, peft, safetensors, transformers = model_ops_runtime()
     target = _device(torch, device)
     base_path = Path(base.path).absolute()
     checked += _torch_scan(torch, base_path)
@@ -625,9 +551,9 @@ def merge_adapters(inputs: Sequence[LocalModel], weights: Sequence[float], outpu
         for file in sorted((staging / "export" / "merged").iterdir()):
             if file.name != "README.md":
                 file.rename(payload / file.name)
+        write_adapter_config(payload / "adapter_config.json", _read_json(payload / "adapter_config.json"),
+                             first.root.repo_id)
         config = _read_json(payload / "adapter_config.json")
-        config["base_model_name_or_path"] = first.root.repo_id   # provenance only, never a host path
-        (payload / "adapter_config.json").write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
         _copy_snapshot_files(base_path, payload, config=True)
         _require_f32(payload)
         if (config.get("r"), config.get("lora_alpha"), sorted(config.get("target_modules") or ())) != (
@@ -684,7 +610,7 @@ def materialize_model(input: StagedLoad, output: Path, *, policy: str = POLICY_F
     output = _check_output(output)
     checked = _check_adapter_files(load.adapter)
 
-    torch, peft, safetensors, transformers = _runtime()
+    torch, peft, safetensors, transformers = model_ops_runtime()
     target = _device(torch, device)
     base_path = Path(load.base.path).absolute()
     adapter_path = Path(load.adapter.path).absolute()

@@ -107,21 +107,21 @@ def ref_for(descriptor, marker="inventory"):
                             inventory_sha256=sha(marker.encode()))
 
 
-def adapter_tensors(rank, *, modules=MODULES, in_dim=16, out_dim=16):
+def adapter_tensors(rank, *, modules=MODULES, in_dim=16, out_dim=16, dtype="F32"):
     from tuning_factory.model_artifacts import TensorMetadata
     tensors = []
     for module in modules:
         tensors.append(TensorMetadata(file="adapter_model.safetensors", name=f"base_model.model.{module}.lora_A.weight",
-                                      shape=(rank, in_dim), dtype="F32"))
+                                      shape=(rank, in_dim), dtype=dtype))
         tensors.append(TensorMetadata(file="adapter_model.safetensors", name=f"base_model.model.{module}.lora_B.weight",
-                                      shape=(out_dim, rank), dtype="F32"))
+                                      shape=(out_dim, rank), dtype=dtype))
     return tuple(tensors)
 
 
 def lora_descriptor(rank=2, alpha=4.0, *, targets=("q_proj", "v_proj"), modules=MODULES, in_dim=16, out_dim=16,
                     effective_base=None, parents=(), config_sha256=None, tokenizer_fingerprint=None,
                     synthetic=False, simulation=False, method="lora", semantic_kind="causal_lm",
-                    has_value_head=False, extra_tensors=(), marker="adapter", **adapter_changes):
+                    has_value_head=False, extra_tensors=(), marker="adapter", dtype="F32", **adapter_changes):
     from tuning_factory.model_artifacts import AdapterMetadata, ModelDescriptor
     root = root_ref()
     adapter_changes = {"task_type": "CAUSAL_LM", "inference_mode": True, **adapter_changes}  # PEFT export state
@@ -133,7 +133,8 @@ def lora_descriptor(rank=2, alpha=4.0, *, targets=("q_proj", "v_proj"), modules=
         effective_base=effective_base or root, parents=parents,
         config_sha256=config_sha256 or root.config_sha256,
         tokenizer_fingerprint=tokenizer_fingerprint or root.tokenizer_fingerprint, adapter=adapter,
-        tensors=(*adapter_tensors(rank, modules=modules, in_dim=in_dim, out_dim=out_dim), *extra_tensors),
+        tensors=(*adapter_tensors(rank, modules=modules, in_dim=in_dim, out_dim=out_dim, dtype=dtype),
+                 *extra_tensors),
         synthetic=synthetic, simulation=simulation)
 
 
@@ -192,7 +193,9 @@ def adapter_on_disk(tmp_path, marker, descriptor, *, special=None, config_change
     (directory / "adapter_config.json").write_text(json.dumps(exported, indent=2, sort_keys=True), encoding="utf-8")
     tensors = {}
     for item in descriptor.tensors:
-        tensors[item.name] = f32(item.shape, special=special if "lora_B" in item.name else None)
+        values = f32(item.shape, special=special if "lora_B" in item.name else None)
+        tensors[item.name] = (item.dtype, item.shape, values[2] if item.dtype == "F32" else encode(
+            item.dtype, struct.unpack(f"<{math.prod(item.shape)}f", values[2])))
     write_safetensors(directory / "adapter_model.safetensors", tensors)
     return local(directory, ref_for(descriptor, marker), descriptor)
 
@@ -209,9 +212,14 @@ def hf_base_on_disk(tmp_path, marker="base", tensors=None, config=CONFIG):
 def test_model_ops_import_is_lightweight(monkeypatch):
     module = api()
     block_heavy_imports(monkeypatch)
+    for name in ("safetensors_scan", "target_inspection", "runtime_profiles"):
+        importlib.reload(importlib.import_module(f"tuning_factory.{name}"))
     reloaded = importlib.reload(module)
     assert reloaded.POLICY_F32_V1 == "model-ops-f32-v1"
     assert set(reloaded.TOLERANCE_POLICIES) == {"model-ops-f32-v1"}
+    assert reloaded.scan_finite_safetensors.__module__ == "tuning_factory.safetensors_scan"
+    assert reloaded.inspect_target_modules.__module__ == "tuning_factory.target_inspection"
+    assert reloaded.verify_inspected_targets.__module__ == "tuning_factory.target_inspection"
 
 
 # -- 2-10. merge input refusals ------------------------------------------------------------------
@@ -397,6 +405,29 @@ def test_finite_scan_streams_large_tensors_and_refuses_unscannable_dtypes(tmp_pa
         module.scan_finite_safetensors(fp8)
 
 
+def test_finite_scan_refuses_header_that_changed_after_validation(tmp_path, monkeypatch):
+    from tuning_factory import safetensors_scan
+    validated_file, swapped = tmp_path / "validated.safetensors", tmp_path / "swapped.safetensors"
+    write_safetensors(validated_file, {"w": f32((4,))})
+    write_safetensors(swapped, {"w": f32((2, 2))})
+    validated = safetensors_scan._tensor_header(validated_file, validated_file.name)
+    monkeypatch.setattr(safetensors_scan, "_tensor_header", lambda path, name: validated)
+    with pytest.raises(ValueError, match="safetensors header changed while scanning"):
+        safetensors_scan.scan_finite_safetensors(swapped)
+
+
+def test_finite_scan_bounds_the_header_it_rereads(tmp_path, monkeypatch):
+    from tuning_factory import safetensors_scan
+    from tuning_factory.model_artifacts import JSON_LIMIT
+    validated_file, oversized = tmp_path / "validated.safetensors", tmp_path / "oversized.safetensors"
+    write_safetensors(validated_file, {"w": f32((4,))})
+    oversized.write_bytes(struct.pack("<Q", JSON_LIMIT + 1) + b"{}")
+    validated = safetensors_scan._tensor_header(validated_file, validated_file.name)
+    monkeypatch.setattr(safetensors_scan, "_tensor_header", lambda path, name: validated)
+    with pytest.raises(ValueError, match="invalid safetensors header length"):
+        safetensors_scan.scan_finite_safetensors(oversized)
+
+
 def test_merge_refuses_nonfinite_adapter_before_any_output(tmp_path, monkeypatch):
     module = api()
     first = lora_descriptor(rank=2, alpha=4, synthetic=True)
@@ -438,6 +469,140 @@ def test_merge_refuses_base_dimension_mismatch_before_heavy_import(tmp_path, mon
     with pytest.raises(ValueError, match="merge base tensor dimensions differ"):
         module.merge_adapters(inputs, (0.25, 0.75), tmp_path / "merged", base=base, require_real=False)
     assert not (tmp_path / "merged").exists()
+
+
+def valid_merge(tmp_path, base=None):
+    first = lora_descriptor(rank=2, alpha=4, synthetic=True)
+    second = lora_descriptor(rank=3, alpha=9, marker="other", synthetic=True)
+    inputs = (adapter_on_disk(tmp_path, "a", first), adapter_on_disk(tmp_path, "b", second))
+    return inputs, base or hf_base_on_disk(tmp_path)
+
+
+@pytest.mark.parametrize("operation", ["merge", "materialize"])
+def test_valid_inputs_stop_at_the_runtime_gate_without_output_or_staging(tmp_path, monkeypatch, operation):
+    module = api()
+    inputs, base = valid_merge(tmp_path)
+    parent = tmp_path / "outputs"
+    parent.mkdir()
+    block_heavy_imports(monkeypatch)
+    with pytest.raises(RuntimeError, match="model-operation runtime is missing"):
+        if operation == "merge":
+            module.merge_adapters(inputs, (0.25, 0.75), parent / "out", base=base, require_real=False)
+        else:
+            module.materialize_model(module.StagedLoad(base=base, adapter=inputs[0]), parent / "out")
+    assert list(parent.iterdir()) == []
+
+
+def test_model_ops_runtime_refuses_version_drift(monkeypatch):
+    import types
+    from importlib import metadata
+
+    from tuning_factory.runtime_profiles import MODEL_OPS_PINS, model_ops_runtime
+    for name in ("torch", "peft", "safetensors", "transformers"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    installed = {**MODEL_OPS_PINS, "torch": "2.7.1+cu126"}
+    monkeypatch.setattr(metadata, "version", lambda name: installed[name])
+    assert [item.__name__ for item in model_ops_runtime()] == ["torch", "peft", "safetensors", "transformers"]
+    installed["peft"] = "0.18.0"
+    with pytest.raises(RuntimeError, match="model-operation runtime differs from pinned versions: peft"):
+        model_ops_runtime()
+
+
+@pytest.mark.parametrize("operation", ["merge", "materialize"])
+def test_existing_output_is_refused_before_heavy_import(tmp_path, monkeypatch, operation):
+    module = api()
+    inputs, base = valid_merge(tmp_path)
+    output = tmp_path / "out"
+    output.mkdir()
+    (output / "keep.txt").write_text("existing", encoding="utf-8")
+    block_heavy_imports(monkeypatch)
+    with pytest.raises(ValueError, match="model-operation output already exists"):
+        if operation == "merge":
+            module.merge_adapters(inputs, (0.25, 0.75), output, base=base, require_real=False)
+        else:
+            module.materialize_model(module.StagedLoad(base=base, adapter=inputs[0]), output)
+    assert [item.name for item in output.iterdir()] == ["keep.txt"]
+
+
+@pytest.mark.parametrize("operation", ["merge", "materialization"])
+@pytest.mark.parametrize("dtype,values", [("F64", (1.0, 2.0)), ("I64", (0, 1))], ids=["F64", "I64"])
+def test_policy_refuses_base_tensors_without_exact_f32_upcast(tmp_path, monkeypatch, operation, dtype, values):
+    module = api()
+    tensors = {**base_tensors(), "model.layers.0.extra.weight": (dtype, (2,), encode(dtype, values))}
+    inputs, base = valid_merge(tmp_path, hf_base_on_disk(tmp_path, tensors=tensors))
+    block_heavy_imports(monkeypatch)
+    message = f"{operation} requires F16, BF16 or F32 tensors under policy model-ops-f32-v1"
+    with pytest.raises(ValueError, match=message):
+        if operation == "merge":
+            module.merge_adapters(inputs, (0.25, 0.75), tmp_path / "out", base=base, require_real=False)
+        else:
+            module.validate_materialize_input(module.StagedLoad(base=base, adapter=inputs[0]))
+
+
+@pytest.mark.parametrize("operation", ["merge", "materialization"])
+def test_policy_refuses_f64_adapter_tensors(tmp_path, monkeypatch, operation):
+    module = api()
+    first = lora_descriptor(rank=2, alpha=4, synthetic=True, dtype="F64")
+    second = lora_descriptor(rank=3, alpha=9, marker="other", synthetic=True, dtype="F64")
+    inputs = (adapter_on_disk(tmp_path, "a", first), adapter_on_disk(tmp_path, "b", second))
+    base = hf_base_on_disk(tmp_path)
+    block_heavy_imports(monkeypatch)
+    with pytest.raises(ValueError, match=f"{operation} requires F16, BF16 or F32 tensors"):
+        if operation == "merge":
+            module.merge_adapters(inputs, (0.25, 0.75), tmp_path / "out", base=base, require_real=False)
+        else:
+            module.materialize_model(module.StagedLoad(base=base, adapter=inputs[0]), tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_merge_names_its_own_operation_for_a_quantized_base(tmp_path, monkeypatch):
+    module = api()
+    config = canonical({"model_type": "qwen2", "hidden_size": 16, "quantization_config": {"load_in_4bit": True}})
+    inputs, base = valid_merge(tmp_path, hf_base_on_disk(tmp_path, config=config))
+    block_heavy_imports(monkeypatch)
+    with pytest.raises(ValueError, match="^merge requires unquantized effective base weights$"):
+        module.merge_adapters(inputs, (0.25, 0.75), tmp_path / "out", base=base, require_real=False)
+
+
+def write_sharded_base(directory, *, index_shards=None):
+    write_snapshot_files(directory)
+    shards = {}
+    for number, (name, tensor) in enumerate(base_tensors().items(), start=1):
+        shard = f"model-0000{number}-of-00002.safetensors"
+        write_safetensors(directory / shard, {name: tensor})
+        shards[name] = shard
+    (directory / "model.safetensors.index.json").write_bytes(canonical(
+        {"metadata": {"total_size": 2048}, "weight_map": index_shards or shards}))
+    # Mistral-style repositories also ship a consolidated copy that the loader ignores.
+    write_safetensors(directory / "consolidated.safetensors", base_tensors())
+
+
+def test_sharded_base_uses_only_the_indexed_shards(tmp_path):
+    module = api()
+    write_sharded_base(tmp_path / "base")
+    load = module.StagedLoad(base=local(tmp_path / "base", root_ref(), None),
+                             adapter=adapter_on_disk(tmp_path, "adapter", lora_descriptor()))
+    module.validate_materialize_input(load)
+    missing = tmp_path / "missing"
+    write_sharded_base(missing, index_shards={f"{MODULES[0]}.weight": "model-00001-of-00002.safetensors",
+                                              f"{MODULES[1]}.weight": "model-00003-of-00002.safetensors"})
+    with pytest.raises(ValueError, match="missing or mismatched model shard"):
+        module.validate_materialize_input(module.StagedLoad(base=local(missing, root_ref(), None),
+                                                            adapter=load.adapter))
+    swapped = tmp_path / "swapped"
+    write_sharded_base(swapped, index_shards={f"{MODULES[0]}.weight": "model-00002-of-00002.safetensors",
+                                              f"{MODULES[1]}.weight": "model-00001-of-00002.safetensors"})
+    with pytest.raises(ValueError, match="model shard index does not cover tensor inventory"):
+        module.validate_materialize_input(module.StagedLoad(base=local(swapped, root_ref(), None),
+                                                            adapter=load.adapter))
+
+
+def test_single_file_base_ignores_a_consolidated_copy(tmp_path):
+    module = api()
+    base = hf_base_on_disk(tmp_path)
+    write_safetensors(base.path / "consolidated.safetensors", base_tensors())
+    module.validate_materialize_input(module.StagedLoad(
+        base=base, adapter=adapter_on_disk(tmp_path, "adapter", lora_descriptor())))
 
 
 def test_merge_refuses_base_that_is_not_the_shared_effective_base(tmp_path, monkeypatch):
@@ -598,6 +763,10 @@ def test_verify_inspected_targets_requires_complete_matching_inventory():
     adapter = lora_descriptor()
     with pytest.raises(ValueError, match="inspected targets require a full-model inventory"):
         module.verify_inspected_targets(evidence_for(module, ref_for(adapter), inventory), adapter, ref_for(adapter))
+    from tuning_factory.model_artifacts import ModelArtifactRef
+    foreign = ModelArtifactRef(artifact_id="e" * 64, inventory_sha256=ref.inventory_sha256)
+    with pytest.raises(ValueError, match="inspected target descriptor differs from the artifact identity"):
+        module.verify_inspected_targets(evidence_for(module, foreign, inventory), descriptor, foreign)
 
 
 # -- 18. adapter metadata from a real PEFT 0.18.1 export -----------------------------------------
@@ -642,6 +811,23 @@ def test_adapter_metadata_from_real_peft_export_freezes(tmp_path):
                                      dtype="F32") for item in adapter_tensors(2)))
     store = ModelArtifactStore(tmp_path / "store")
     assert store.verify(store.freeze(directory, descriptor)).adapter == metadata
+
+
+def test_written_adapter_config_is_canonical_whatever_the_set_order(tmp_path):
+    # PEFT serializes target_modules from a set, so its order follows PYTHONHASHSEED.
+    module = api()
+    path = tmp_path / "adapter_config.json"
+    written = []
+    for order in (["v_proj", "q_proj"], ["q_proj", "v_proj"]):
+        module.write_adapter_config(path, {**PEFT_0181_EXPORT, "target_modules": order,
+                                           "base_model_name_or_path": "C:\\Users\\someone\\base"}, "test/tiny")
+        written.append(path.read_bytes())
+    assert written[0] == written[1]
+    assert b"\r\n" not in written[0] and written[0] == json.dumps(json.loads(written[0]), indent=2,
+                                                                     sort_keys=True).encode()
+    config = json.loads(written[0])
+    assert config["target_modules"] == ["q_proj", "v_proj"]
+    assert config["base_model_name_or_path"] == "test/tiny"
 
 
 def test_adapter_metadata_maps_variants_and_refuses_unknown_initialization():

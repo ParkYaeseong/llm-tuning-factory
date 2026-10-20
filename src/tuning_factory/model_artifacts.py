@@ -296,9 +296,13 @@ def _read_json(path: Path):
     return _json(raw)
 
 
+def is_tokenizer_file(relative: str) -> bool:
+    """A file of the tokenizer snapshot: fingerprinted, and copied byte-for-byte into derived models."""
+    return relative in TOKENIZER_FILES or relative.startswith("chat_templates/")
+
+
 def _tokenizer_hash(inventory) -> str:
-    selected = tuple(entry for entry in inventory
-                     if entry.path in TOKENIZER_FILES or entry.path.startswith("chat_templates/"))
+    selected = tuple(entry for entry in inventory if is_tokenizer_file(entry.path))
     names = {entry.path for entry in selected}
     if "tokenizer_config.json" not in names or not names.intersection({
             "tokenizer.json", "tokenizer.model", "spiece.model", "vocab.json", "vocab.txt"}):
