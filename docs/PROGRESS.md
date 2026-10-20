@@ -4442,6 +4442,96 @@ Not verified or still open:
 - Real WebView2 screen-reader announcements of the live region, timers and focus: Task 11.
 - A RunPod key rotated with no other change, and MLflow credentials re-saved, still need a restart polling cannot see.
 
+## Task 10.7 graph runs (polling), 2026-10-21
+
+Commit `feat: follow graph runs by polling with operator guidance`, written in the main tree on `4b4c194` (10.4),
+fast-forwarded onto `0a19c37` (the 10.2 review fixes) before the implementation, then rebased onto `f6493a1` (10.3)
+and `ca63dbe` (the 10.4 review fixes; only this file conflicted, both entries kept). It implements [Task 10
+plan](superpowers/plans/2026-10-21-task10-workflow-workbench-ui.md) §4 "10.7" with D10, D12, D15 and the root decision
+that replaces D11 (the desktop operator release through 9.8's `graph_release_lock`). Changed: new
+`desktop/src/views/graph-runs.{ts,css}`, `desktop/src/wait-reasons.ts`, `desktop/tests/graph-runs.spec.ts`;
+`desktop/src/api.ts` (one wrapper, see deviations) and this file. No Python, Rust, package or lock file changed.
+
+What changed:
+- 그래프 실행 (워크스페이스, order 50; `data-tour="graph-runs"` once, on the list card) with 10.4's controller bar
+  (`attachControllerBar(ctx, {host: "runs", queue})`, `controllerAction`). Entering reads `graph_runs_list` and
+  `controller_status` only; `nav:runs:<run_id>` adds `graph_run_get` and, once per opened run, `project_get` at the
+  plan's project revision (the merge relation of the selection texts; a failure leaves them generic).
+- Polling per D10: detail every 3 s, list every 10 s, bar every 5 s, all through one page queue (one sidecar call at a
+  time); next delay `max(base, 2 × last)`, backoff to 60 s; nothing while busy, hidden or left; showing the window
+  again reads at once; the detail stops when the run is settled (final status, graph tracking
+  `saved`/`failed`/`uncertain`, no node unfinished, holding an uncertain attempt or with tracking or registration
+  `pending`/`retrying`); a region is patched only when its HTML changed, keeping focus and open "원문 보기".
+- Detail: status, 모의/실제, plan hash, created, approved and reserved cost, graph tracking with its action; the
+  budget texts ("승인 예산 소진: 예약 $R / 승인 $A — …", "가격을 알 수 없는 이전 시도 n개가 …"); a node table with
+  label, kind, status, counted/max attempts, destination, the Korean wait reason (kind in `data-reason`, original in
+  "원문 보기"), error, retry time, tracking and registration, output (artifact 8자 or metrics with the text-metric and
+  format-metric notes), the selection text (no winner, 병합 모델 선택, 원본 최상 모델 유지, simulated) and the cache-seed
+  note. `wait-reasons.ts` maps every fixed controller prefix (waiting, operator, replan, budget, error; unknown texts as
+  received) plus the tracking actions and the `run_state` refusals.
+- Operator states: `awaiting_result` → "결과 대기 · <현지 시각>까지는 다시 실행하지 않습니다", no action.
+  `needs_operator && uncertain && !awaiting_result` → "운영자 확인 필요", the reason, "실행 잠금 해제" and the CLI
+  alternative (`factory … status --job-id` and `release-lock <job> <attempt> --confirm-execution-stopped`, IDs filled,
+  with a note that the installed app ships no `factory`). Other `needs_operator` nodes (outputs refused, ledger check)
+  say the desktop cannot resolve them and point to `factory status` and the operator. The release dialog explains the
+  risk (same GPU, a discarded late result, FAILED and never retried), shows the job, attempt and CLI alternative, and
+  enables "잠금 해제" only while "원격 서버/Pod에서 해당 실행이 멈춘 것을 확인했습니다" is ticked and the node label is
+  typed exactly (trimmed, NFC); it sends the IDs it showed with `confirm_execution_stopped: true`. Afterwards the
+  node says the release was recorded until the controller settles it; refusals are shown in Korean and the run is read
+  again.
+- Steering: 일시정지 / 다시 진행 (one focus key, so focus moves from one to the other) and 취소 behind a dialog
+  ("진행 중인 단계에 취소를 요청합니다. …"; Esc sends nothing). Tracking failures list kind, node, status, tries and
+  last error; an action text sits above "기록 다시 시도"; a `tracking_evidence_changed` warning stays shown after the
+  re-arm; a re-arm or release follows the run again. Every dynamic text is escaped.
+
+Deviations:
+- `desktop/src/api.ts` gained `releaseLock()` with `LockRelease`/`LockReleased` (and three type imports), declared
+  there because `workflow-types.ts` stays unchanged (9.8's wrapper was missing). The caller must pass
+  `confirm_execution_stopped: true` explicitly. Additive only.
+- §4 "10.7" lists the lock release as a non-goal and test 4 as "no button whose name contains 잠금 해제"; the root
+  decision replaces that: test 4 now expects exactly one release button (the uncertain node), none for the awaiting
+  node and none for the outputs-refused node. Thirteen tests instead of ten: 11 (release dialog gating, Esc and
+  돌아가기 send nothing, payload, double activation), 12 (refusals `attempt_stale`, `release_not_applicable` refresh
+  the run), 13 (Node: every wait-reason prefix and status table).
+- Test 1 runs "three calls over 9 s" as three 3 s steps (the page clock settles the async tick after each step), moves
+  the paused clock 1 ms for the visibility poke's zero delay, and checks the slow answer by measuring the hold on the
+  page clock (next poll after exactly 2 × it). It also covers three unsettled finals (PAUSED with all steps done,
+  graph tracking pending, node tracking retrying). Test 12 activates the second confirm by keyboard: the shell's
+  400 ms guard swallows a click at the spot of the last dialog's button.
+- D10's "no node pending/retrying/uncertain" is read as: no unfinished node, no node holding an uncertain attempt, no
+  node tracking or registration `pending`/`retrying`; node tracking `uncertain`/`failed` waits for a re-arm like graph
+  tracking. A finished pre-outbox run (graph tracking `not_started`) is never settled and is polled while shown.
+- Beyond the plan: any refusal of a steer, re-arm or release reads the run again (D5 names `run_state`); an answer
+  whose `run_id` is not the shown run is never displayed; the open run's detail sits above the list.
+- Shell rules of the 10.2 review fixes are followed (no navigation inside a task, focus moves only from `body`); no
+  limitation of the shell was hit. `controller-bar.ts` is used unchanged, with the 10.4 review fixes (status before the
+  first read, age-only updates in place, the live region outside the patched body); no test depends on a cached status
+  on entry, and test 9's no-patch check observes only the runs page's own regions.
+
+Actual verification:
+- Against this tree's own Vite on port 1450 through a scratch config under `%TEMP%` (`reuseExistingServer: false`).
+- RED first: the 12 page tests failed waiting for `nav [data-action="nav:runs"]`, and the Node test on the missing
+  `src/wait-reasons.ts`.
+- 29 mutations of the new view: 23 failed a test in the first pass; a 24th (an answer for another run shown) fails
+  since test 10 gained a check. The 5 survivors are equivalent: the release without `!awaiting_result` (the awaiting
+  branch renders first, so no button exists), `settled` without the uncertain-node clause (an uncertain node is
+  always unfinished in `graph_status`), the post-dialog label and checkbox re-checks (the button gate already holds),
+  and a list poller left running on leave (its `active()` checks the attachment).
+- From `desktop/`: `npx playwright test` **151 passed** on `0a19c37` (138 existing, unchanged, plus 13 new), **164
+  passed** on `f6493a1` (151 + 13) and **174 passed** on `ca63dbe` (161 + 13); the new spec passed `--repeat-each=3`
+  (39 of 39) on the first and last; `npm run build` passes on each.
+- From the root: `uv run pytest -q` **1715 passed, 1 skipped** on `0a19c37`, `f6493a1` and `ca63dbe` (no Python
+  changed since the 10.2 review fixes); `uv run ruff check src tests` passes; `scripts/check_secrets.py` reports 0
+  findings with the change staged; `git diff --exit-code src/
+  desktop/src-tauri/ containers/ pyproject.toml uv.lock desktop/package.json desktop/package-lock.json` is clean;
+  every changed file is CR-free.
+
+Not verified or still open:
+- Real WebView2 (dialogs, focus, IME typing of a Korean label, `visibilitychange`, timers), a real sidecar, controller
+  and ledger: Task 11. No network, GPU, SSH, RunPod, MLflow, model download or institution data was used.
+- 10.6 navigates here after a submit (`ctx.navigate("runs", runId)`, outside its task); 10.8 adds the `graph-runs`
+  tutorial step. Wait reasons are matched by English prefixes: a backend wording change shows the original text.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

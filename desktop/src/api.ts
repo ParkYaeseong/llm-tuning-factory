@@ -2,11 +2,11 @@
 // It never logs request data; native `Err` strings (Korean) become BridgeErrors shown verbatim.
 import { invoke } from "@tauri-apps/api/core";
 import { WORKFLOW_ACTIONS, type BenchmarkRevision, type BenchmarkSpec, type ControllerStatus, type ControllerStopResult,
-  type GraphValidation, type ImportMapping, type ImportPreview, type ImportRegistered, type ImportSource,
+  type ControllerView, type GraphRun, type GraphValidation, type ImportMapping, type ImportPreview, type ImportRegistered, type ImportSource,
   type LegacyImport, type ModelRoot, type Observation, type PlanRequest, type PlanSummary, type ProjectRevision,
   type ProjectSpec, type ProjectSummary, type PublicProfile, type RecipeRevision, type RecipeSpec, type RecipeSummary,
   type RootSnapshot, type RootTargets, type RunDetail, type RunList, type RunSteered, type Sha256, type SplitCommitted,
-  type SplitPlan, type SplitPreview, type SubmitResult, type TrackingRearmed, type WorkflowAction,
+  type SplitPlan, type SplitPreview, type SubmitResult, type TrackingRearmed, type UnreadableRun, type WorkflowAction,
   type WorkflowResult } from "./workflow-types";
 
 export class BridgeError extends Error {
@@ -92,6 +92,15 @@ export const runs = {
   cancel: (run_id: string) => workflow<RunSteered>("graph_cancel", { run_id }),
   rearm: (event_id: Sha256) => workflow<TrackingRearmed>("tracking_rearm", { event_id }),
 };
+// 9.8 graph_release_lock, used by the graph runs page (10.7). Its shapes are declared here because workflow-types.ts
+// stays as it is for that sub-task (workflow_runs.graph_release_lock).
+export interface LockRelease { run_id: string; node_id: string; job_id: string; attempt_id: string }
+export interface LockReleased { released: LockRelease; run: GraphRun | UnreadableRun; controller: ControllerView }
+/** The desktop operator release of one uncertain attempt the operator confirmed stopped on the server or Pod (the CLI's
+ * `release-lock --confirm-execution-stopped`). The caller passes the confirmation explicitly; the backend refuses
+ * anything but the node's current attempt while it needs the operator and no late result is plausible. */
+export const releaseLock = (request: LockRelease & { confirm_execution_stopped: true }) =>
+  workflow<LockReleased>("graph_release_lock", request);
 
 // Native commands (Tauri converts the camelCase argument keys to snake_case parameters).
 export const executorProfiles = () => invoke<{ profiles: PublicProfile[] }>("executor_profiles_get").catch(toBridgeError);
