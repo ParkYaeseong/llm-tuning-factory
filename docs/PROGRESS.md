@@ -4712,6 +4712,12 @@ Actual verification:
   tests` passes; `scripts/check_secrets.py` reports 0 findings with the change staged; `git diff --exit-code src/
   desktop/src-tauri/ containers/ pyproject.toml uv.lock desktop/package.json desktop/package-lock.json` is clean;
   every changed file is CR-free.
+- Rebased onto `ca63dbe` (10.3 and the 10.4 review fixes), `2b98a4c` (10.7) and `6c8780f` (the 10.3 review fixes);
+  only this file conflicted each time, every entry kept, this one last:
+  - on `ca63dbe`: `npx playwright test` **180 passed** (161 + the 19 new), `pytest -q` **1716 passed, 1 skipped**;
+  - on `2b98a4c`: **193 passed** (174 + 19), `pytest -q` **1716 passed, 1 skipped**;
+  - on `6c8780f`: **202 passed** (183 + 19), `npm run build` passes, `pytest -q` **1716 passed, 1 skipped**, Ruff
+    passes, `check_secrets.py` 0 findings, and the protected-path diff against `6c8780f` is clean.
 
 Not verified or still open:
 - Real WebView2 (focus, dialogs, `<select>` keyboard changes, wide previews), a real sidecar, HF metadata, snapshots
