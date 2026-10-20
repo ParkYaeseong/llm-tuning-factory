@@ -4616,6 +4616,109 @@ Still open:
   anywhere in the UI yet. That includes ShareGPT data, which only the legacy JSON form registers.
 - Real WebView2 bidirectional rendering and the real `rfd` dialog: Task 11.
 
+## Task 10.5 graph editor, 2026-10-21
+
+Commit `feat: edit training graphs with cards, preview and keyboard connections`, written in the worktree
+`D:\llm-tuning-factory-wt102` (branch `codex/task-10.5`) on `0a19c37`. It implements
+[Task 10 plan](superpowers/plans/2026-10-21-task10-workflow-workbench-ui.md) §4 "10.5" with D4–D7 and D13. Changed:
+new `desktop/src/graph-model.ts`, `desktop/src/views/graph-editor.{ts,css}`,
+`desktop/src/components/{model-roots,benchmark-form}.ts`, `desktop/tests/{graph-model,graph-editor}.spec.ts`,
+`tests/test_desktop_ui_contract.py` and this file. No `src/` Python, Rust, package or lock file changed.
+
+What changed:
+- `graph-model.ts` (pure, types only): draft read/serialize (`{}` ↔ empty graph; unknown node keys such as `overrides`
+  and `depends_on` kept; missing fields omitted, never `""`), generated IDs (`train-1`, `eval-1`, `select-1`,
+  `merge-1`, `model-1`), serial and parallel adds, removal with its references, `connect`, the four starting shapes,
+  `layout` (columns by longest path, each edge once, dependencies as `order`), `previewSvg` (escaped, one
+  `g[data-node]` per card), `waitingOnSharedProfile`, local reasons (D7: cycle, port type, OFT parent and recipe, a
+  method change that needs a materialize step, PPO routes, merge sources, count and exact decimal weights, different
+  benchmarks under one selection, an evaluator without metrics, train-role data, missing fields), `metricChoices`
+  with the text and format notes, and `EVALUATOR_METRICS`, pinned to `evaluation.metric_schema` by
+  `tests/test_desktop_ui_contract.py`.
+- 학습 그래프 page (`graph`, a child of 프로젝트, reached by the project page's "학습 그래프";
+  `data-tour="graph-editor"` once, also in its empty state). Entering reads `project_get` (a dirty draft is kept),
+  `recipes_list`, `recipe_get {revision_sha256}` for pinned older revisions only, `model_roots_list`,
+  `benchmarks_list` and `executor_profiles_get`. Cards and the SVG preview come from the same draft. The card list is
+  one tab stop (roving tabindex; ArrowUp/ArrowDown/Home/End move, Enter selects). "다음 단계 추가" opens a kind choice
+  with reasons; also "나란히 추가", "새 학습 단계" and "단계 삭제". The add actions disable at 64 cards with "단계는 최대
+  64개입니다"; after an add the focus is in the new card's label.
+- The card form per kind follows §4:
+  - train: recipe ("고정된 이전 버전 · <8자>" with "현재 버전으로 바꾸기"), a root or parent input with the derived
+    initialization, train-role data only, a PPO reward, profiles and session estimates;
+  - evaluate: model and benchmark with "새 평가 기준";
+  - select: evaluations, metric, direction, optional threshold, partial success, minimum ≥ 2, merge tolerance and the
+    help text;
+  - merge: models with weights in % (exactly 100) and the real-only note; materialize: its input.
+  Unusable sources are disabled in the selects and listed under "연결할 수 없는 단계". Applying a recipe changes only
+  `recipe_revision` (and a root input's initialization when the method family changes).
+- "저장" saves the draft (CAS), then validates the saved revision. Issues map to cards (`nodeIssues` with the saved
+  graph's indexes) and fields (`issuesAt`); the rest go to a summary, with "프로젝트에서 데이터 연결 확인" for
+  `/datasets`. A `revision_conflict` keeps the draft with the D5 choices and validates nothing.
+- 기반 모델 panel (D13): indexed roots with their snapshot and module-structure state. "모델 검색"/"버전 확인" (legacy
+  `model_search`/`model_inspect`, metadata only, inline note) pin a 40-hex revision. "설정·토크나이저 받기" and "모듈 구조
+  확인" each run after their own notice dialog; a native refusal is shown verbatim. Train cards on a root without module
+  evidence, and cards with `base_targets_missing`/`simulated_execution_needs_targets`, link to "모듈 구조 확인".
+- Inline benchmark: a sibling `#benchmark-form` (held-out bindings only, rows from the catalog, `row:0…`, the root's
+  tokenizer fingerprint and template, greedy causal-LM, bf16/fp16). `benchmark_unsupported` shows the worker's text
+  under "원문 보기"; the new revision is selected on the card.
+
+Deviations:
+- Planning inputs are not edited here: §4 gives them to 10.6's plan panel. The profile choice lists native profiles
+  and the store's session estimates (`draft.planning.estimates`), which stay empty until 10.6 loads and edits them
+  through 9.8's `planning_inputs_get`/`planning_inputs_save`; 10.5 calls neither. Removing a card leaves its time
+  limit in stored planning inputs, so 10.6 must drop unknown node IDs before `planning_inputs_save`.
+- Exports beyond the §4 interfaces:
+  - `graph-model.ts`: `graphToJson`, `serialKinds`, `findNode`, `refsOf`, `labelOf`, `outputRef`, `isRef`,
+    `rootInput`, `initializationFor`, `weightsValid`, `percentText`, `weightFromPercent`, `selectionEvaluators`,
+    `upstreamRoot`, `sameRoot`, `REASONS`, `NOTES`, `KIND_LABELS`, `METRIC_LABELS`.
+  - `model-roots.ts` keeps its state in a module-level `rootsState` (with the pin form's drafts) and also exports
+    `loadRoots`, `searchModels`, `pickModel`, `inspectModel` and `captureRootsForm`.
+  - `benchmark-form.ts` also exports `newBenchmarkDraft`, `benchmarkProblems`, `benchmarkFormHtml` and
+    `readBenchmarkForm`.
+- `metricChoices` with no usable metric returns its metrics all disabled with the reason; an evaluator without metrics
+  returns one placeholder `{metric: ""}` carrying it, and with `pipeline` among mixed kinds the no-metrics reason
+  wins. `equalWeights` uses whole percents ([0.34, 0.33, 0.33]), as in the interface's example.
+- Card-form edits reach the draft on `input`/`change` as they happen. A change that leaves the graph as it is never
+  reaches the store, so it drops no plan. The view's `capture` reads only the pin and benchmark forms.
+- A card is a wrapper (its button plus a status area), because a button cannot hold "원문 보기" details. Those summaries
+  and the in-card "모듈 구조 확인" are `tabindex="-1"` so the list stays one tab stop; the card form repeats them,
+  focusable.
+- `recipe_get {revision_sha256}` goes through `api.workflow`: no new `api.ts` wrapper, because `api.ts` is not a 10.5
+  file.
+- Tests:
+  - `<option disabled>` is asserted with `toHaveJSProperty("disabled", …)`: Playwright 1.64's `toBeDisabled`
+    reported a disabled option as enabled.
+  - Test 15 confirms dialogs with the keyboard. The shell swallows a pointer click at the same spot within 400 ms of
+    the previous dialog's.
+  - Legacy `model_search`/`model_inspect` (test 15) and `recipe_get {revision_sha256}` (test 12) are answered by a
+    per-test invoke wrapper, because the shared mock (10.1, not edited) has no option for them.
+  - Test 8 also pins the entering reads; test 19 also covers the four starting shapes.
+
+Actual verification:
+- RED first:
+  - `graph-model.spec.ts` failed to load (`Cannot find module …/src/graph-model.ts`);
+  - all 12 `graph-editor.spec.ts` tests failed waiting for the project page's "학습 그래프" button (no `graph` view);
+  - `test_desktop_ui_contract.py` failed with `FileNotFoundError` for `desktop/src/graph-model.ts`.
+- 26 mutations of the new code each failed a test. They covered the cycle, port, materialize and merge-limit
+  reasons, mixed evaluators, `{}` serialization, the 64 guard, waiting ancestry, the equal-weight remainder, SVG
+  escaping, roving tabindex, arrow keys, focus after an add, the in-card tab stop, the live label patch, validation
+  after a save, no validation on a conflict, field issue mapping, a recipe change keeping the binding, the limit
+  disabling adds, both notice dialogs, sample IDs, the train-role refusal in the benchmark form, waiting on cards and
+  disabled metrics. The targets-dialog mutant survived the first run, so test 15 gained an Escape check.
+- Playwright ran against this worktree's own Vite (a scratch config under `%TEMP%`, port 1460,
+  `reuseExistingServer: false`; mutation runs used its own server on 1461). `npx playwright test` **157 passed** (138
+  existing, unchanged, plus 19 new); `npm run build` passes.
+- From the root (main venv, `PYTHONPATH` = the worktree's `src`): `pytest -q` **1716 passed, 1 skipped** (1715 + the parity test; the skip is the real-GPU test); `ruff check src
+  tests` passes; `scripts/check_secrets.py` reports 0 findings with the change staged; `git diff --exit-code src/
+  desktop/src-tauri/ containers/ pyproject.toml uv.lock desktop/package.json desktop/package-lock.json` is clean;
+  every changed file is CR-free.
+
+Not verified or still open:
+- Real WebView2 (focus, dialogs, `<select>` keyboard changes, wide previews), a real sidecar, HF metadata, snapshots
+  and header reads: Task 11. No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
+- Planning, approval and submission are 10.6: it mounts its panel on this page and passes plan resources to
+  `waitingOnSharedProfile`. Recipe overrides and `depends_on` are kept but not editable here.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
