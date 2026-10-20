@@ -5,7 +5,6 @@ runs the hash-verified ``command.json`` at most once per launch directory. ``wor
 DIR ARTIFACT_ID INVENTORY_SHA256`` verifies one model-cache entry (exit 0/1). No other command is accepted.
 """
 import argparse
-import hashlib
 import importlib.metadata
 import json
 import os
@@ -24,26 +23,27 @@ from .capabilities import compatibility
 from .config import AIConfig
 from .manifest import source_hash, verify_manifest
 from .model_artifacts import ModelArtifactRef, check_link_free
-from .operation_runner import (
-    COMMAND,
-    OPERATION_KINDS,
-    OperationResult,
-    StartMarker,
-    WorkerRequest,
-    create_start_marker,
-    execute_operation,
-    verify_cached_artifact,
-    write_operation_result,
-)
+from .operation_dispatch import execute_operation
+from .operation_runner import verify_cached_artifact
 from .operations import EvaluateOperation, OperationSpec, TrainOperation
 from .registry import canonical, digest, file_digest
 from .runtime_profiles import engine_profile, operation_profile
 from .training import CanceledError, LlamaFactoryBackend
+from .worker_protocol import (
+    COMMAND,
+    OPERATION_KINDS,
+    START_MARKER,
+    OperationResult,
+    StartMarker,
+    create_start_marker,
+    read_worker_request,
+    write_operation_result,
+)
 
 HEX32 = re.compile(r"^[0-9a-f]{32}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-COMMAND_LIMIT = 64 * 1024
 LOCAL_ONLY = {"local_files_only": True, "trust_remote_code": False}
+_clock = time.monotonic   # the attempt deadline's clock (replaced in tests)
 TOKEN_IDS = ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id")
 
 
@@ -158,19 +158,22 @@ def verify_model_cache(root, artifact_id, inventory_sha256):
     return 0
 
 
-def _read_request(directory, command_sha256, launch_id):
-    path = directory / COMMAND
-    check_link_free(path)
-    with path.open("rb") as stream:
-        raw = stream.read(COMMAND_LIMIT + 1)
-    if len(raw) > COMMAND_LIMIT or hashlib.sha256(raw).hexdigest() != command_sha256:
-        raise ValueError("worker request hash mismatch")
-    request = WorkerRequest.model_validate_json(raw)
-    if canonical(request.model_dump(mode="json")) != raw:
-        raise ValueError("worker request is not canonical")
-    if request.launch_id != launch_id:
-        raise ValueError("worker request launch identity differs from launch directory")
-    return request
+def _v2_directory(directory):
+    """True when a directory belongs to the v2 protocol, which the v1 entry must never write into."""
+    if any((directory / name).exists() or (directory / name).is_symlink() for name in (COMMAND, START_MARKER)):
+        return True
+    try:
+        manifest = json.loads((directory / "manifest.json").read_bytes())
+    except (OSError, ValueError):
+        return False
+    return isinstance(manifest, dict) and manifest.get("schema_version") == 2
+
+
+def _absolute_setting(name):
+    value = os.environ.get(name)
+    if value and not Path(value).is_absolute():
+        raise ValueError(f"{name} must be an absolute path")
+    return Path(value) if value else None
 
 
 def _runtime_versions():
@@ -205,7 +208,8 @@ def main_v2(directory, command_sha256):
     Only the process that creates ``start.json`` (O_CREAT|O_EXCL) writes anything else in the
     directory: a second start, for example after a lost start response, exits 3 and touches nothing.
     Exit 2: not a 32-hex job/launch directory (nothing written). Otherwise ``artifacts.json`` and then
-    ``result.json`` are always published, with identities only as far as they were verified.
+    ``result.json`` are always published, with identities only as far as they were verified. One
+    monotonic deadline (start + request timeout) bounds the attempt; dispatch gets what is left of it.
     """
     directory = Path(directory).absolute()
     launch_id = directory.name
@@ -219,10 +223,10 @@ def main_v2(directory, command_sha256):
     except (OSError, ValueError) as exc:
         print(f"invalid launch directory: {exc}", file=sys.stderr)
         return 2
-    started = time.monotonic()
+    started = _clock()
     request = failure = None
     try:
-        request = _read_request(directory, command_sha256, launch_id)
+        request = read_worker_request(directory, command_sha256, launch_id)
     except Exception as exc:  # recorded in the result, but only by the start marker's creator
         failure = exc
     marker = StartMarker(launch_id=launch_id, command_sha256=command_sha256, pid=os.getpid(),
@@ -273,18 +277,19 @@ def main_v2(directory, command_sha256):
             raise ValueError("worker engine version differs from manifest")
         (directory / "runtime.json").write_bytes(canonical(_runtime_versions()))
         _check_manifest_datasets(manifest, operation)
-        model_cache, hf_home = os.environ.get("FACTORY_MODEL_CACHE"), os.environ.get("HF_HOME")
-        if not model_cache:
+        model_cache, hf_home = _absolute_setting("FACTORY_MODEL_CACHE"), _absolute_setting("HF_HOME")
+        if model_cache is None:
             raise ValueError("FACTORY_MODEL_CACHE must name the worker's approved model cache")
         identity["kind"] = operation.kind
-        remaining = request.timeout_seconds - (time.monotonic() - started)
+        remaining = started + request.timeout_seconds - _clock()   # the one attempt deadline
         if remaining <= 0:
-            raise TimeoutError("job budget exhausted before the operation started")
+            raise TimeoutError("attempt deadline exceeded before the operation started")
 
         def canceled():
             return (directory / "cancel").exists()
-        completed = execute_operation(operation, directory, remaining, canceled, backend=backend,
-                                      model_cache=Path(model_cache), hf_home=Path(hf_home) if hf_home else None)
+        completed = execute_operation(operation, directory, remaining, canceled, request=request, backend=backend,
+                                      model_cache=model_cache, hf_home=hf_home, preflight=runtime_preflight_bound,
+                                      evaluation_preflight=evaluation_preflight_bound)
         result = OperationResult.model_validate({**completed.model_dump(mode="json"), **identity})
     except CanceledError as exc:
         result = OperationResult(status="CANCELED", launch_id=launch_id, error=str(exc), **identity)
@@ -323,6 +328,10 @@ def main():
     if args.directory is None or args.timeout is None:
         parser.error("the following arguments are required: directory, timeout")
     directory = args.directory.resolve()
+    if _v2_directory(directory):
+        # Never let a v1 run write (or overwrite) a v2 launch directory's result.json.
+        print("v2 operation launch directories require --request; refusing the v1 entry", file=sys.stderr)
+        return 2
     backend = LlamaFactoryBackend()
     result = {"status": "FAILED"}
     started = time.monotonic()

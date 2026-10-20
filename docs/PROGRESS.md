@@ -470,19 +470,71 @@ Actual verification:
   `cc5fbab0…b54c`, materialize `e124a915…8682`). Receipt SHA256
   `3890086443760e87afd03bfee924c42fabbba120c94cf8c51de6ee16f6c0cee3` (byte-identical on a second run), source_sha256
   `c58b9786fc27bed0fc5fe8024eadf9cf6479c10d6e737cd98e3be0e4363793fe`, lock_sha256 `5883aae6…1437` unchanged;
-  `model_downloaded`, `gpu_used`, `institution_data_used` and `production_promotable` are false.
+  `model_downloaded`, `gpu_used`, `institution_data_used` and `production_promotable` are false. (Superseded by the
+  review-fix receipt below.)
+
+7.3 review fixes (commit `fix: enforce one worker deadline and split worker protocol from dispatch`):
+- One deadline: `main_v2` derives a single monotonic deadline (start + request timeout) and hands dispatch what is
+  left. `execute_operation` keeps that one deadline: cancel and the deadline are checked before and after model
+  verification (cache hashing, HF snapshots), and `run_config`/`predict_bound` receive `deadline - now`, so
+  verification time comes out of the engine budget. Merge/materialize cannot be interrupted, so they are checked again
+  after they return: past the deadline or after cancellation they raise before `operation-receipt.json` is written and
+  are never COMPLETED.
+- Module split (the names above moved; no behaviour change):
+  - `worker_protocol.py` holds `WorkerRequest`, `StartMarker`, `OperationResult`, `read_worker_request`,
+    `create_start_marker` and `write_operation_result`.
+  - `operation_dispatch.py` holds `execute_operation`, its helpers and `write_benchmark_data`.
+  - `operation_runner.py` keeps staging and binding, with three helpers made public for dispatch
+    (`validated_operation`, `approved_model_path`, `WEIGHT_SUFFIXES`).
+  - The worker passes `preflight=`/`evaluation_preflight=` in, so no module imports `worker`; a test checks the
+    layering. Dispatch refuses to train or evaluate without them.
+- `execute_operation(..., request=WorkerRequest)` must match the launch directory and the operation hash. Its result
+  carries the request's attempt and manifest identities, and `OperationResult` now requires attempt, manifest,
+  operation and kind for COMPLETED.
+- Durability and safety:
+  - The parent directory is fsynced after `start.json` and after `result.json` (shared
+    `model_artifacts.fsync_directory`).
+  - A failed hard-link fallback in `publish_output` removes the partial output it created.
+  - `model.safetensors.index.json` is newline-normalized too.
+  - The receipt's file list is compared order-independently (`sorted` on both sides; the set and count stay exact).
+    Note: `_files` already returned paths in global sort order, so `model_ops`' own receipts never hit the reported
+    false refusal; the new test covers a depth-first receipt.
+- Relative `FACTORY_MODEL_CACHE`/`HF_HOME` are refused, by both the worker and dispatch.
+- Cross-protocol guard: `SSHExecutor.run` (v1) refuses a directory with `command.json`/`start.json` or a schema-2
+  manifest before writing or uploading anything, and the v1 worker entry exits 2 for such a directory without
+  writing. So a v1 run can never overwrite a v2 `result.json`.
+- Tests: a real "start.json exists, no result" test (exit 3, nothing written); the misleading comment is fixed; a
+  continuation through `execute_operation` proves `inspect_target_modules` is wired (and an incomplete worker
+  inspection is refused before the engine runs).
+
+Verification after the review fixes:
+- RED: 50 tests failed (new modules missing, plus each new rule).
+- GREEN: the sub-plan set gave **248 passed**; `uv run pytest -q` gave **995 passed, 1 skipped**. Ruff (`src tests`) is
+  clean, `check_secrets.py` reports 0 findings (678 file versions, new modules staged), both GPU locks are unchanged,
+  the eol check prints nothing, and `test_remote_worker.py` is still additions-only against f80e316 (488 added, 0
+  removed).
+- Module sizes: `operation_runner.py` 611 lines (staging and binding), `operation_dispatch.py` 358,
+  `worker_protocol.py` 126, `worker.py` 411.
+- The CPU acceptance (`-I`) exited 0 twice, with all 28 checks passed and byte-identical receipts. Max errors are
+  unchanged, and the dispatched outputs keep the same inventories (merge `cc5fbab0…b54c`, materialize
+  `e124a915…8682`), so the split changed no behaviour. Receipt SHA256
+  `a757507a5b4e1399c5cca5a3afcef1e81e4c75b79fa7b4948dab55a58e02d519`, source_sha256
+  `070236f1f14c96f28c681d321d6443a2b870b3d0fcbcbd85ef7eb0692541dc71` (equal to the tree), lock_sha256
+  `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437` unchanged.
 
 Still open for Task 7 GPU work:
 - Hardware and numerics: merge/materialize tolerances at real model sizes on CUDA (TF32 off); memory (FP32 loads;
   about 3 base loads per merge); a BF16 storage policy (none yet; F32 doubles size).
 - Worker v2 on a real GPU host: real LF training on `train.bound.yaml`, real `predict_bound` generation, real
   `runtime_preflight_bound`/`evaluation_preflight_bound` facts and `renameat2` on the host filesystem are unverified
-  (all tested with fakes). Merge/materialize cannot be interrupted mid-operation; the executor deadline applies.
+  (all tested with fakes). Merge/materialize cannot be interrupted mid-operation; one that overruns its deadline is
+  refused after it returns, but the executor's timeout + 60 s window may already have ended.
 - SSH cache and single launch (7.4): `run_operation`, the remote `start.json`/`result.json` check before upload,
   `start.json` in the upload exclusions, `>>` log append, and `--verify-model-cache` over fixed argv. Remote cache
   entries must stay link-free (uploaded directories moved with `mv -T`, never symlinked). HF_HOME and the model cache
   on the GPU host must not sit under a symlink or junction, and HF roots are resolved on the worker, never uploaded.
-- Attempt runner (7.5, including F11): write `command.json`, upload benchmark bytes with `write_benchmark_data`, read
+- Attempt runner (7.5, including F11): write `command.json`, upload benchmark bytes with
+  `operation_dispatch.write_benchmark_data`, read
   outputs from `output/` (train) or `model-op/output` (merge/materialize), bind `target-inventory.json` to the frozen
   ref, and compare the frozen `inventory_sha256` with `operation-receipt.json`.
 - Real DPO/KTO references and PPO remain unverified.

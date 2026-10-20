@@ -569,7 +569,8 @@ class Acceptance:
         from datetime import datetime, timezone
 
         from tuning_factory.executor_profiles import ExecutorProfile, ResourceFacts
-        from tuning_factory.operation_runner import execute_operation, stage_model_inputs
+        from tuning_factory.operation_dispatch import execute_operation
+        from tuning_factory.operation_runner import operation_sha256, stage_model_inputs
         from tuning_factory.operations import (
             MaterializeOperation,
             MergeOperation,
@@ -577,6 +578,7 @@ class Acceptance:
             OperationResources,
             RuntimeProfile,
         )
+        from tuning_factory.worker_protocol import WorkerRequest
         inventory = self.artifacts.directory_inventory_sha256
         lock = REPO / "containers" / "gpu-requirements.lock"
         resources = OperationResources(
@@ -594,7 +596,11 @@ class Acceptance:
         def run(operation, launch_id):
             directory = launches / launch_id
             stage_model_inputs(operation, self.store, directory)
-            result = execute_operation(operation, directory, 1800, lambda: False, model_cache=self.store.root)
+            # No manifest exists in this acceptance; the request still fences launch and operation identity.
+            request = WorkerRequest(attempt_id="d" * 32, launch_id=launch_id, manifest_sha256="0" * 64,
+                                    operation_sha256=operation_sha256(operation), timeout_seconds=1800)
+            result = execute_operation(operation, directory, 1800, lambda: False, request=request,
+                                       model_cache=self.store.root)
             self.receipts[f"execute_{operation.kind}"] = json.loads(
                 (directory / "operation-receipt.json").read_text(encoding="utf-8"))
             return directory, result

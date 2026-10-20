@@ -320,6 +320,20 @@ def tokenizer_fingerprint(directory: str | Path) -> str:
     return _tokenizer_hash(_inventory(Path(directory).absolute()))
 
 
+def fsync_directory(path: str | Path) -> None:
+    """Make a directory's entries (a created or renamed file) durable; a no-op on Windows.
+
+    Windows cannot open a directory for fsync; NTFS journals the metadata.
+    """
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def directory_inventory_sha256(directory: str | Path) -> str:
     """The ``inventory_sha256`` that ``ModelArtifactStore.freeze`` records for these exact file bytes."""
     return digest(_inventory_bytes(_inventory(Path(directory).absolute())))

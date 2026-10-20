@@ -53,6 +53,7 @@ from .model_artifacts import (
     _tensor_header,
     _tokenizer_hash,
     _validate_adapter,
+    fsync_directory,
     is_tokenizer_file,
 )
 from .runtime_profiles import model_ops_runtime
@@ -83,7 +84,7 @@ SINGLE_WEIGHTS = "model.safetensors"
 WEIGHT_REDIRECT = "config.json transformers_weights redirects the weight loader; refusing"
 OUTPUT_EXISTS = "model-operation output already exists"
 # JSON that transformers writes in text mode, i.e. with platform newlines (CRLF on Windows).
-TRANSFORMERS_JSON = ("config.json", "generation_config.json")
+TRANSFORMERS_JSON = ("config.json", "generation_config.json", "model.safetensors.index.json")
 AT_FDCWD, RENAME_NOREPLACE = -100, 1   # Linux renameat2(2)
 
 
@@ -565,14 +566,7 @@ def _fsync_file(path: Path) -> None:
         os.fsync(stream.fileno())
 
 
-def _fsync_directory(path: Path) -> None:
-    if os.name == "nt":   # Windows cannot open a directory for fsync; NTFS journals the metadata
-        return
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+_fsync_directory = fsync_directory   # module-level name, so tests can observe the order of fsyncs
 
 
 def _renameat2_noreplace(source: Path, destination: Path, *, function=None) -> bool:
@@ -597,13 +591,26 @@ def _renameat2_noreplace(source: Path, destination: Path, *, function=None) -> b
 
 
 def _move_tree_noreplace(source: Path, destination: Path) -> None:
-    """Portable no-replace move: create each directory exclusively and hard-link each file, then unlink."""
+    """Portable no-replace move: create each directory exclusively and hard-link each file, then unlink.
+
+    ``destination`` is created here (FileExistsError for any existing path, even an empty directory), so
+    on any failure it is ours to remove: a half-filled output is never left behind.
+    """
     source, destination = Path(source), Path(destination)
-    os.mkdir(destination)   # FileExistsError for any existing path, even an empty directory
+    os.mkdir(destination)
+    try:
+        _link_tree(source, destination)
+    except BaseException:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+
+
+def _link_tree(source: Path, destination: Path) -> None:
     for child in sorted(source.iterdir()):
         target = destination / child.name
         if stat.S_ISDIR(_not_link(child).st_mode):
-            _move_tree_noreplace(child, target)
+            os.mkdir(target)
+            _link_tree(child, target)
         else:
             os.link(child, target)   # refuses an existing target, unlike rename
             os.unlink(child)

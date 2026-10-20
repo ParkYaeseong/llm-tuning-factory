@@ -320,9 +320,10 @@ def v2_launch(tmp_path, monkeypatch, *, simulation=False, method="lora"):
 
     from tuning_factory.manifest import resolve_operation
     from tuning_factory.model_artifacts import ModelArtifactStore
-    from tuning_factory.operation_runner import WorkerRequest, stage_model_inputs
+    from tuning_factory.operation_runner import stage_model_inputs
     from tuning_factory.operations import OperationLineage, OperationResources, RuntimeProfile, TrainOperation
     from tuning_factory.projects import DatasetRef
+    from tuning_factory.worker_protocol import WorkerRequest
     monkeypatch.setenv("PATH", worker.os.environ.get("PATH", ""))   # main() prepends the venv; restore it after
     registry = Registry(tmp_path / "registry")
     record = registry.register_dataset("data", "1", "examples/dummy.json", export_allowed=True)
@@ -476,7 +477,7 @@ def test_v2_second_start_is_refused_without_touching_result(tmp_path, monkeypatc
     assert launch.calls == ["train.bound.yaml"]
     assert {path.relative_to(launch.directory).as_posix(): path.read_bytes()
             for path in launch.directory.rglob("*") if path.is_file()} == files
-    # A foreign start marker without any result is equally final: nothing at all is written.
+    # A foreign start marker next to an existing result: the result bytes are never touched.
     other = v2_launch(tmp_path / "other", monkeypatch)
     (other.directory / "start.json").write_bytes(b'{"pid":1}')
     (other.directory / "result.json").write_bytes(b'{"status":"COMPLETED"}')
@@ -485,6 +486,102 @@ def test_v2_second_start_is_refused_without_touching_result(tmp_path, monkeypatc
     assert sorted(path.name for path in other.directory.iterdir()) == before
     assert (other.directory / "result.json").read_bytes() == b'{"status":"COMPLETED"}'
     assert other.calls == []
+
+
+def test_v2_start_marker_without_a_result_is_final(tmp_path, monkeypatch):
+    # The first worker may still be running (or died without a result): a duplicate start writes nothing at all,
+    # not even a FAILED result, so the attempt stays uncertain for reconcile instead of being overwritten.
+    launch = v2_launch(tmp_path, monkeypatch)
+    (launch.directory / "start.json").write_bytes(b'{"pid":1}')
+    before = {path.relative_to(launch.directory).as_posix(): path.read_bytes()
+              for path in launch.directory.rglob("*") if path.is_file()}
+    assert worker.main_v2(launch.directory, launch.sha) == 3
+    assert {path.relative_to(launch.directory).as_posix(): path.read_bytes()
+            for path in launch.directory.rglob("*") if path.is_file()} == before
+    assert not (launch.directory / "result.json").exists() and launch.calls == []
+
+
+def test_v2_start_marker_and_result_are_made_durable(tmp_path, monkeypatch):
+    from tuning_factory import worker_protocol
+    launch = v2_launch(tmp_path, monkeypatch)
+    synced = []
+    monkeypatch.setattr(worker_protocol, "fsync_directory", lambda path: synced.append(
+        (Path(path), sorted(item.name for item in Path(path).iterdir()))))
+    assert worker.main_v2(launch.directory, launch.sha) == 0
+    directories = [path for path, _ in synced]
+    assert directories == [launch.directory, launch.directory]   # after start.json, then after result.json
+    assert "start.json" in synced[0][1] and "result.json" not in synced[0][1]
+    assert "result.json" in synced[1][1] and "result.tmp" not in synced[1][1]
+
+
+def test_v2_worker_derives_one_deadline_and_passes_its_preflights(tmp_path, monkeypatch):
+    launch = v2_launch(tmp_path, monkeypatch)
+    readings = [1000.0, 1250.0]   # main_v2 starts; then, after its own checks, dispatch begins
+
+    def clock():
+        return readings.pop(0) if len(readings) > 1 else readings[0]
+
+    monkeypatch.setattr(worker, "_clock", clock)
+    seen = []
+
+    def dispatch(operation, directory, timeout, canceled, **kwargs):
+        seen.append((timeout, kwargs["request"].attempt_id, kwargs["preflight"] is worker.runtime_preflight_bound,
+                     kwargs["evaluation_preflight"] is worker.evaluation_preflight_bound))
+        raise RuntimeError("stopped after recording the budget")
+
+    monkeypatch.setattr(worker, "execute_operation", dispatch)
+    assert worker.main_v2(launch.directory, launch.sha) == 1
+    assert seen == [(650.0, ATTEMPT_ID, True, True)]   # 900 s budget minus the 250 s already spent
+    expired = v2_launch(tmp_path / "expired", monkeypatch)
+    readings[:] = [1000.0, 1900.0]
+    assert worker.main_v2(expired.directory, expired.sha) == 1
+    assert "deadline" in v2_result(expired.directory)["error"] and len(seen) == 1
+
+
+@pytest.mark.parametrize("variable", ["FACTORY_MODEL_CACHE", "HF_HOME"])
+def test_v2_worker_refuses_relative_cache_roots(tmp_path, monkeypatch, variable):
+    launch = v2_launch(tmp_path, monkeypatch)
+    monkeypatch.setenv(variable, "relative/cache")
+    assert worker.main_v2(launch.directory, launch.sha) == 1
+    result = v2_result(launch.directory)
+    assert result["status"] == "FAILED" and result["error"] == f"{variable} must be an absolute path"
+    assert launch.calls == []
+
+
+def test_completed_result_requires_every_identity():
+    from pydantic import ValidationError
+
+    from tuning_factory.worker_protocol import OperationResult
+    complete = dict(status="COMPLETED", launch_id=LAUNCH_ID, attempt_id=ATTEMPT_ID, manifest_sha256="1" * 64,
+                    operation_sha256="2" * 64, kind="train")
+    assert OperationResult(**complete).status == "COMPLETED"
+    for missing in ("attempt_id", "manifest_sha256", "operation_sha256", "kind"):
+        with pytest.raises(ValidationError, match="completed result"):
+            OperationResult(**{**complete, missing: None})
+    assert OperationResult(status="FAILED", launch_id=LAUNCH_ID, error="refused").attempt_id is None
+
+
+def test_v1_paths_refuse_a_v2_launch_directory(tmp_path, monkeypatch):
+    launch = v2_launch(tmp_path, monkeypatch)
+    assert worker.main_v2(launch.directory, launch.sha) == 0
+    result = (launch.directory / "result.json").read_bytes()
+    # The v1 executor never uploads or launches a v2 directory, so it can never overwrite a v2 result.json.
+    client = FakeSSH(tmp_path / "remote")
+    client.sftp.root.mkdir()
+    executor = SSHExecutor("test-host", 22, "root", "unused", client=client)
+    with pytest.raises(ValueError, match="run_operation"):
+        executor.run(LlamaFactoryBackend(), launch.directory, 5, lambda: False)
+    assert client.commands == [] and not (launch.directory / "remote-attempt.json").exists()
+    # A schema-2 manifest alone is enough to refuse the v1 launch path.
+    bare = tmp_path / ("9" * 32)
+    bare.mkdir()
+    (bare / "manifest.json").write_bytes(canonical({"schema_version": 2}))
+    with pytest.raises(ValueError, match="run_operation"):
+        executor.run(LlamaFactoryBackend(), bare, 5, lambda: False)
+    # The v1 worker entry refuses it too, before writing anything.
+    monkeypatch.setattr("sys.argv", ["worker", str(launch.directory), "5"])
+    assert worker.main() == 2
+    assert (launch.directory / "result.json").read_bytes() == result
 
 
 @pytest.mark.parametrize("case,message", [
@@ -547,7 +644,8 @@ def test_v2_worker_completes_evaluate_with_predictions_only(tmp_path, monkeypatc
     from test_model_inputs import EXECUTOR, FACTS, ROOT, benchmark, frozen, peft_adapter
 
     from tuning_factory.manifest import resolve_operation
-    from tuning_factory.operation_runner import WorkerRequest, stage_model_inputs, write_benchmark_data
+    from tuning_factory.operation_dispatch import write_benchmark_data
+    from tuning_factory.operation_runner import stage_model_inputs
     from tuning_factory.operations import (
         EvaluateOperation,
         OperationLineage,
@@ -555,6 +653,7 @@ def test_v2_worker_completes_evaluate_with_predictions_only(tmp_path, monkeypatc
         RuntimeProfile,
     )
     from tuning_factory.projects import DatasetRef
+    from tuning_factory.worker_protocol import WorkerRequest
     launch = v2_launch(tmp_path, monkeypatch)
     record = Registry(tmp_path / "registry").register_dataset("bench", "1", "examples/dummy.json", export_allowed=True)
     adapter_ref, _ = frozen(launch.store, peft_adapter(tmp_path, "evaluated", base=launch.sft_ref,

@@ -26,6 +26,22 @@ class ExecutionUncertain(RuntimeError):
     """Remote process termination could not be established; retain its GPU lease."""
 
 
+V2_LAUNCH_MARKERS = ("command.json", "start.json")
+
+
+def _refuse_v2_directory(directory: Path) -> None:
+    """The v1 launch path never uploads or launches a v2 directory (and so never overwrites its result)."""
+    v2 = any((directory / name).exists() or (directory / name).is_symlink() for name in V2_LAUNCH_MARKERS)
+    if not v2:
+        try:
+            manifest = json.loads((directory / "manifest.json").read_bytes())
+        except (OSError, ValueError):
+            manifest = None
+        v2 = isinstance(manifest, dict) and manifest.get("schema_version") == 2
+    if v2:
+        raise ValueError("v2 operation directories launch only through run_operation; refusing the v1 launch path")
+
+
 class Policy(StrictModel):
     max_gpus: int = Field(default=1, ge=1, le=8)
     max_concurrent: int = Field(default=1, ge=1)
@@ -258,6 +274,7 @@ class SSHExecutor(ExecutionBackend):
         directory = Path(directory).resolve()
         if not re.fullmatch(r"[0-9a-f]{32}", directory.name):
             raise ValueError("invalid remote job directory")
+        _refuse_v2_directory(directory)
         # Fresh remote attempt namespace prevents stale completion markers after resume/retry.
         if launch_id is not None and not re.fullmatch(r"[0-9a-f]{32}", launch_id):
             raise ValueError("invalid persisted launch ID")
