@@ -3476,7 +3476,6 @@ Actual verification:
 Not verified or still open:
 - Real WebView2 (dialogs, focus, the views in the `import.meta.glob` bundle) and a real sidecar: Task 11.
 - Deleting projects or recipes has no action; graph editing (10.5) and data import (10.3) are separate sub-tasks.
-- No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
 
 ## Task 9.6 CLI: project and graph commands, 2026-10-21
 
@@ -3612,6 +3611,128 @@ Deviations:
 - 13 tests beyond the plan's 10 (above).
 - No CLI command creates projects, recipes, data or HF-root snapshots: D10 lists none, so those come from the app
   (or the workflow actions).
+
+## Task 9.4 review fixes, 2026-10-21
+
+Commit `fix: keep controller status readable after crashes and tighten restart reporting`, written on `6c4b877` and
+rebased onto `7291742` (Task 10.2 changed only `desktop/` and this file; Task 9.6 added the CLI on `serve`) in
+`D:\llm-tuning-factory-wt94b`. The independent review of `1a9ae29` was "Ready with one fix" with nothing Critical. It
+reproduced the claims, the parity test and the lifeline (12 stop and 12 EOF exits, no `0xC0000005`). Changed:
+`src/tuning_factory/controller_entry.py`, `src/tuning_factory/manifest.py` (the git child's environment),
+`tests/test_controller_entry.py` and this file.
+
+Required:
+1. **A hot journal blocked `controller_status`, and so `controller_start`.**
+   - `jobs.db` uses a rollback journal. After a controller is killed mid-write, `jobs.db-journal` stays hot, and the
+     `?mode=ro` connection failed every poll with `attempt to write a readonly database`. Rust `controller_start`
+     polls first, so the user could not start a controller.
+   - Fix: the `is_file()` guard stays. The poll connects with `?mode=rw`, which opens an existing file and never
+     creates one, issues SELECTs only and never migrates. SQLite then rolls the journal back.
+   - Test: `test_controller_status_survives_a_hot_journal`. A writer is killed in an open transaction that has
+     already spilled an uncommitted owner expiry into `jobs.db`. The poll succeeds, the owner is `absent` (rolled
+     back, not read), the journal is gone, and a poll of a fresh directory creates nothing.
+
+Recommended, all done:
+
+2. **One bound per status read.** The three SELECTs share one deferred read transaction, with a single
+   `STATUS_TIMEOUT_SECONDS = 5` busy bound. Once the first SELECT holds the shared lock, the others cannot wait.
+   - A lock held longer answers `invalid`/`status_busy` with a fixed Korean text, for `controller_status` and
+     `controller_stop` alike, instead of hanging.
+   - The native `should_start` treats any non-`ok` status as an error, so no broker starts blind.
+   - `_record_unowned` writes nothing when the database is busy.
+   - Test: `test_controller_status_is_bounded_while_the_database_is_locked`: an `EXCLUSIVE` holder, a 0.5 s bound,
+     an answer within 4 s.
+3. **`restart_required.profiles` now also names a profile that was skipped at the start for its observation**
+   (`observation_missing`, `_revision_differs` or `_invalid`) once an observation of the same revision builds it. It
+   uses the start's own rule (`_observed_profile`). Test: `test_restart_required_names_profiles_a_restart_would_now_serve`.
+   - Not detectable from a poll, which carries no `*_saved` flag or vault data:
+     - A RunPod key saved for a `credential_missing` profile. Task 10 has what it needs to show it:
+       `current.skipped_profiles` against `executor_profiles_get`'s `RUNPOD_API_KEY_saved`.
+     - A rotated key. The old docstring said a rotation needs no restart; that was wrong. The running controller
+       keeps its start key in `ProfileSecrets`, so a rotation needs a restart that polling cannot report. Task 10
+       should say "restart after saving or rotating a key".
+4. **Stale `broker`.** While the running owner's `current.json` is present, `broker` is `null`.
+   - The review's condition was `broker.at < current.started_at`. It does not cover its own scenario: the broker of
+     a fenced predecessor that lingered after a sleep writes `controller_failed` after the new start (`at` >
+     `started_at`).
+   - The new broker removes `broker.json` at its own spawn, so any failure seen while this owner runs describes
+     another start.
+   - With `stale` or `absent` it is shown as before. Test 13 covers both orders and both states.
+5. **Leftover stop request.** At the start, a `stop-request.json` written before this owner lease was acquired, or
+   naming another owner, is removed. That covers a killed run under the same fixed CLI owner ID. A request for this
+   owner after the acquisition still stops it. Test: `test_a_leftover_stop_request_never_stops_a_new_controller`, for
+   the same and for another owner ID.
+6. **Owner lease held until its TTL when `outbox.backfill` raised inside `acquire_controller`.**
+   - The failure path now takes the lease `acquire_controller` recorded (`controller._owner`), releases it, and
+     writes `{ok: false, code: "controller_failed", error_type, owner_id, at}`.
+   - A `recorded` flag replaces a stale `current.json` of the same owner ID instead of merging into it.
+   - Test: `test_a_failed_outbox_backfill_releases_the_owner`.
+7. **The MLflow token reached the `git rev-parse` child** in non-frozen runs: dev runs and 9.6's foreground
+   controller.
+   - `manifest.code_revision` now passes `env=child_environment()` and `stdin=DEVNULL`.
+   - `child_environment()` drops every name in `manifest.CREDENTIAL_ENV`, which `controller_entry.CREDENTIAL_ENV` now
+     reuses.
+   - Test: `test_the_git_revision_child_inherits_no_credentials`, a subprocess with synthetic values that also runs
+     the real git.
+8. **CI margin.** The subprocess tests use a 6 s lease and a 1.5 s heartbeat (tick 0.2 s). Test 8 still waits at
+   most 30 s for any one condition.
+9. **Nits:**
+   - The unreachable `invalid_fields` branch around `profile_revision` is gone (`ProfileStart` already holds the
+     allowlist).
+   - `_drained` is true only when `run_forever` released this owner lease. `_OwnedStore`, the controller's
+     `GraphStore` subclass, records the release, so a drain fenced while a successor holds the owner row exits 1
+     with `owner_lost`. Test: `test_a_drain_fenced_by_a_successor_is_not_a_clean_stop`.
+
+Also from the record list: the popped list, and the git child's dropped list, now include the ambient credential
+variables: `AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CONFIG_FILE`, the
+web-identity, role and container-credential variables, `AZURE_STORAGE_*` keys, `AZURE_CLIENT_SECRET`,
+`AZURE_CLIENT_CERTIFICATE_PATH`, `GOOGLE_APPLICATION_CREDENTIALS`, `HUGGINGFACE_HUB_TOKEN`,
+`MLFLOW_TRACKING_INSECURE_TLS` and `MLFLOW_TRACKING_CLIENT_CERT_PATH`. `MLFLOW_TRACKING_SERVER_CERT_PATH` (a CA
+bundle) is kept, because a corporate MLflow server may need it.
+
+Records for Tasks 10 and 11 (no code):
+- A fenced controller lingers until its in-flight dispatch threads return, because `ThreadPoolExecutor` joins its
+  threads at interpreter exit. Its broker status is written only after that; item 4 keeps it out of a running
+  owner's status.
+- `restart_required.tracking` can be `null` (the TypeScript type is already nullable). An explicit mode with no
+  credential (`tracking: true` with `current.tracking.effective_auth_mode` `none`) should be shown as "credential
+  missing", not "restart".
+- Ambient credentials that are files or profiles outside the environment (the shared AWS credentials file, the
+  Azure CLI cache, gcloud's default credentials) are still readable by the controller process. Only the variables
+  are popped.
+
+Actual verification (main venv, `PYTHONPATH` on the worktree `src`, `--basetemp` under `%TEMP%`):
+- RED first: the 7 new tests and 2 changed tests failed for the intended reasons:
+  - `attempt to write a readonly database`;
+  - no `STATUS_TIMEOUT_SECONDS`;
+  - no restart for the observed profile;
+  - the leftover stop request was not removed (the controller stopped at once);
+  - the backfill failure left the owner lease unexpired;
+  - the fenced drain exited 0;
+  - `code_revision` passed no environment;
+  - the ambient names were missing from `CREDENTIAL_ENV`;
+  - test 13 saw the stale broker while running.
+- GREEN: `tests/test_controller_entry.py` **54 passed** three times in a row (47 + 7). With `test_native_contract`,
+  `test_desktop_projects`, `test_workflow_runs`, `test_graph_controller`, `test_config_registry`,
+  `test_runtime_profiles`, `test_operation_schema` and `test_simulated_dispatch`: **175 passed**.
+- Full suite: **1655 passed, 1 skipped** (the baseline at `6c4b877` was 1648 passed, 1 skipped; plus 7; the skip is
+  the real-GPU test). After the rebase onto `0c38b3f` the full suite and the CPU acceptance gave the same numbers and
+  the same receipt.
+- On the final tree `7291742` (with 9.6):
+  - `test_cli_graph`, `test_runner_cli`, `test_controller_entry` and `test_native_contract`: **94 passed**. 9.6's
+    owner IDs are unique per run, and its stop requests come after the start, so the leftover rule keeps them.
+  - Full suite: **1678 passed, 1 skipped** (9.6's 1671 plus 7).
+  - CPU acceptance: exit 0, **29/29**. Receipt SHA256
+    `aef4e29473f2ff9055f80bd8e29c446f33af6c240a6dd1759024d29dbe125e07`, `source_sha256
+    2c1956d55a62b2a0eb8ec1631fe71e52a21c6782744bfecfd1284f11389f52e8`, equal to `source_hash()` of the tree.
+- Ruff is clean. `check_secrets.py` reports 0 findings with the change staged. Every changed file is LF only.
+  `git diff --exit-code desktop/ containers/ pyproject.toml uv.lock` is clean.
+- CPU acceptance (`-I`, wt94b's script and receipt): exit 0, **29/29**.
+  - Receipt SHA256 `e1d07227a2c426e6122db546b61e9ba671bfcc6d768706b0d7c75bb7808c58b8`.
+  - `source_sha256 b0f24bdf6100ba09de7633217ee509f0c0beca4b6d9959dc72a94eac0fbec53f`, equal to `source_hash()` of the
+    tree.
+  - `lock_sha256 5883aae6…1437`.
+- No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
 
 ---
 

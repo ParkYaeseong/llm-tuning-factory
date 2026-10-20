@@ -14,6 +14,7 @@ import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -40,13 +41,21 @@ MLFLOW_TOKEN = "synthetic-" + "mlflow-token-" + "t" * 12
 OIDC_SECRET = "synthetic-" + "oidc-" + "s" * 12
 INHERITED = "synthetic-" + "inherited-" + "x" * 12
 SECRETS = (RUNPOD_KEY, RUNPOD_KEY_B, MLFLOW_TOKEN, OIDC_SECRET, INHERITED)
-FAST = {"lease_ttl_seconds": 2, "tick_seconds": 0.2, "lease_heartbeat_seconds": 0.5}
-# Independent of the implementation: every inherited credential variable the controller must pop (D7).
+# Subprocess timing (review 8): a 6 s owner lease leaves windows-latest a 4.5 s margin over a 1.5 s heartbeat.
+FAST = {"lease_ttl_seconds": 6, "tick_seconds": 0.2, "lease_heartbeat_seconds": 1.5}
+# Independent of the implementation: every inherited credential variable the controller must pop (D7), including the
+# ambient cloud credentials and MLflow TLS overrides of the review's record list.
 CREDENTIAL_NAMES = ("RUNPOD_API_KEY", "MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_TOKEN", "MLFLOW_TRACKING_USERNAME",
                     "MLFLOW_TRACKING_PASSWORD", "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID",
                     "MLFLOW_OIDC_CLIENT_SECRET", "FACTORY_MLFLOW_ARTIFACT_LOCATION", "FACTORY_OPERATOR",
                     "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN", "AWS_ACCESS_KEY_ID",
-                    "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+                    "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN",
+                    "HUGGINGFACE_HUB_TOKEN", "AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_SHARED_CREDENTIALS_FILE",
+                    "AWS_CONFIG_FILE", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN",
+                    "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AZURE_STORAGE_CONNECTION_STRING", "AZURE_STORAGE_ACCESS_KEY",
+                    "AZURE_STORAGE_SAS_TOKEN", "AZURE_CLIENT_SECRET", "AZURE_CLIENT_CERTIFICATE_PATH",
+                    "GOOGLE_APPLICATION_CREDENTIALS", "MLFLOW_TRACKING_INSECURE_TLS", "MLFLOW_TRACKING_CLIENT_CERT_PATH")
 TRACKING_FIELDS = ("MLFLOW_TRACKING_URI", "FACTORY_MLFLOW_ARTIFACT_LOCATION", "FACTORY_OPERATOR", "auth_mode",
                    "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "MLFLOW_OIDC_CLIENT_SECRET",
                    "MLFLOW_TRACKING_TOKEN")
@@ -932,15 +941,22 @@ def test_controller_status_reports_state_and_restart_required(tmp_path):
     for change in ({"MLFLOW_OIDC_TOKEN_URL": "https://other.invalid/token"}, {"pod_id": "y"}):
         assert status(settings={**saved, **change})["restart_required"]["tracking"] is False, change
     ce.request_stop(state, "desktop.13.1")
-    (state / "controller" / "broker.json").write_text(json.dumps({"at": now, "code": "controller_failed",
-                                                                  "error": "fixed"}), encoding="utf-8")
-    data = status()
-    assert data["stop_requested"] is True and data["broker"]["code"] == "controller_failed"
+    assert status()["stop_requested"] is True
+    # A broker failure never describes the controller that runs now: older than its start, or written later by the
+    # broker of a fenced predecessor that lingered after a sleep (review 4). Hidden while this owner runs.
+    started = current_json(state)["started_at"]
+    for at in (started - 30, now + 5):
+        (state / "controller" / "broker.json").write_text(json.dumps({"at": at, "code": "controller_failed",
+                                                                      "error": "fixed"}), encoding="utf-8")
+        assert status()["broker"] is None, at
     stale = status(at=now + 61)
     assert stale["controller"]["state"] == "stale" and stale["restart_required"] == {"profiles": [], "tracking": False}
+    assert stale["broker"]["code"] == "controller_failed"   # no running controller: the failure is shown
     assert status(profiles=(pod_a,), at=now + 61)["restart_required"]["profiles"] == []
     w.store.release_owner(owner)
     assert status()["controller"]["state"] == "absent" and status()["restart_required"]["profiles"] == []
+    assert status()["broker"]["code"] == "controller_failed"
+    (state / "controller" / "broker.json").unlink()
 
     # Token mode whose token was saved only after the start: the applied scope is "none", so a restart is required.
     controller, owner = running(broker_tracking(saved, {}), "desktop.13.2")
@@ -1141,3 +1157,214 @@ def test_destination_opening_is_bounded_and_redacted(tmp_path):
         assert RUNPOD_KEY not in controller.store.jobs.filtered(f"remote said {RUNPOD_KEY}")
     finally:
         controller.pool.shutdown()
+
+
+# -- review fixes (9.4 review of 1a9ae29) -------------------------------------------------------
+
+HOT_WRITER = textwrap.dedent("""\
+    import sqlite3, sys, time
+    db = sqlite3.connect(sys.argv[1], isolation_level=None)
+    db.execute("PRAGMA cache_size=10")   # spill: modified pages reach jobs.db before any commit
+    db.execute("BEGIN IMMEDIATE")
+    db.execute("UPDATE controller_owner SET expires=9e18")
+    db.execute("CREATE TABLE IF NOT EXISTS filler (data BLOB)")
+    for _ in range(500):
+        db.execute("INSERT INTO filler VALUES (zeroblob(4096))")
+    print("ready", flush=True)
+    time.sleep(60)
+""")
+
+
+def test_controller_status_survives_a_hot_journal(tmp_path):
+    """Review 1: a controller killed mid-write leaves ``jobs.db-journal`` hot. A read-only connection cannot roll it
+    back, so every poll failed ("attempt to write a readonly database") and ``controller_start`` (which polls first)
+    could never start a controller. The poll now rolls it back, and still never creates ``jobs.db``."""
+    entry()
+    from tuning_factory.graph_store import GraphStore
+    state = tmp_path / "state"
+    store = GraphStore(state / "jobs.db")
+    store.release_owner(store.acquire_owner("desktop.20.1", ttl_seconds=600))
+    writer = Spawned(tmp_path, [sys.executable, "-c", HOT_WRITER, str(state / "jobs.db")], "writer")
+    try:
+        wait_for(lambda: writer.stdout().startswith(b"ready"), "the writer's open transaction")
+    finally:
+        writer.kill()   # killed mid-transaction: the rollback journal stays hot
+    assert (state / "jobs.db-journal").is_file()
+    status = action(state, "controller_status")
+    assert status["status"] == "ok", status
+    # The uncommitted expiry was rolled back, not read: the released owner is absent.
+    assert status["data"]["controller"] == {"owner_id": "desktop.20.1", "state": "absent", "heartbeat_age_seconds": None}
+    assert not (state / "jobs.db-journal").exists()
+    assert action(state, "controller_stop")["data"] == {"requested": False, "reason": "not_running"}
+    fresh = tmp_path / "fresh"
+    assert action(fresh, "controller_status")["status"] == "ok" and not fresh.exists()   # a poll creates nothing
+
+
+def test_controller_status_is_bounded_while_the_database_is_locked(tmp_path, monkeypatch):
+    """Review 2: one read transaction with one total bound; a locked database is a fixed refusal, never a hang (the
+    native ``controller_start`` then starts nothing)."""
+    ce = entry()
+    from tuning_factory.graph_store import GraphStore
+    state = tmp_path / "state"
+    GraphStore(state / "jobs.db")
+    assert ce.STATUS_TIMEOUT_SECONDS <= 5
+    monkeypatch.setattr(ce, "STATUS_TIMEOUT_SECONDS", 0.5)
+    blocker = sqlite3.connect(state / "jobs.db", isolation_level=None)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        for name in ("controller_status", "controller_stop"):
+            started = time.monotonic()
+            result = action(state, name)
+            assert time.monotonic() - started < 4, name
+            assert result["status"] == "invalid" and [item["code"] for item in result["issues"]] == ["status_busy"]
+            assert result["issues"][0]["message"] == ce.STATUS_BUSY
+    finally:
+        blocker.rollback()
+        blocker.close()
+    assert action(state, "controller_status")["status"] == "ok"
+    assert not (state / "controller").exists()
+
+
+def test_restart_required_names_profiles_a_restart_would_now_serve(tmp_path):
+    """Review 3: a profile skipped for its observation is reported once a matching observation exists. A profile
+    skipped for its key cannot be: a poll carries no ``*_saved`` flag (Task 10 compares ``current.skipped_profiles``
+    with ``executor_profiles_get``)."""
+    ce = entry()
+    from test_gpu_servers import FakeServer
+
+    from tuning_factory.gpu_servers import server_settings
+    state = tmp_path / "state"
+    lab, nokey = server_start(tmp_path, "lab"), runpod_start(tmp_path, "pod-nokey", key=None, name="No key")
+    start = ce.ControllerStart.model_validate(start_message(state, "desktop.23.1", profiles=[lab, nokey]))
+    ce.apply_tracking_scope(start.tracking)
+    controller, info = ce.build_controller(start)
+    owner = controller.acquire_controller(start.owner_id)
+    ce.write_current(state, ce.running_record(start.owner_id, info))
+    controller.pool.shutdown()
+    assert info["skipped_profiles"] == {"lab": "observation_missing", "pod-nokey": "credential_missing"}
+
+    def status():
+        result = action(state, "controller_status", profiles=native(lab, nokey))
+        assert result["status"] == "ok", result
+        return result["data"]
+
+    assert status()["restart_required"]["profiles"] == []
+    observed = datetime.now(timezone.utc)
+    facts = FakeServer(tmp_path / "remote").facts(server_settings(lab["fields"]))
+    other = wp.public_profile("lab", {**lab["fields"], "name": "Another revision"}, facts)
+    wp.save_observation(state, other, facts, revision=other.revision, observed_at=observed)
+    assert status()["restart_required"]["profiles"] == []   # an observation of another revision serves nothing
+    public = wp.public_profile("lab", lab["fields"], facts)
+    wp.save_observation(state, public, facts, revision=public.revision, observed_at=observed)
+    data = status()
+    assert data["restart_required"]["profiles"] == ["lab"]
+    assert data["current"]["skipped_profiles"]["pod-nokey"] == "credential_missing"
+    controller.store.release_owner(owner)
+
+
+def test_a_leftover_stop_request_never_stops_a_new_controller(tmp_path):
+    """Review 5: a stop request written before this start (a killed run's, possibly under the same fixed CLI owner
+    ID) is removed at the start; a request made after the start still stops the controller."""
+    ce = entry()
+    state = tmp_path / "state"
+    stop_file = state / "controller" / "stop-request.json"
+    for leftover in ("cli.fixed", "desktop.24.0"):
+        stop_file.parent.mkdir(parents=True, exist_ok=True)
+        stop_file.write_text(json.dumps({"owner_id": leftover, "requested_at": time.time() - 60}), encoding="utf-8")
+        start = ce.ControllerStart.model_validate(start_message(state, "cli.fixed", settings=FAST))
+        stop, result = threading.Event(), []
+        thread = threading.Thread(target=lambda: result.append(ce.serve(start, stop_event=stop)), daemon=True)
+        thread.start()
+        try:
+            wait_for(lambda: owner_row(state)["owner_id"] == "cli.fixed" and owner_row(state)["expires"] > time.time()
+                     and not stop_file.exists(), "the start to remove the leftover stop request")
+            heartbeats_advance(state, 3)   # several stop-request polls later it still runs
+            assert thread.is_alive() and result == [], leftover
+            ce.request_stop(state, "cli.fixed")
+            thread.join(WAIT)
+            assert result == [0] and not stop_file.exists()
+        finally:
+            stop.set()
+            thread.join(WAIT)
+
+
+def test_a_failed_outbox_backfill_releases_the_owner(tmp_path, monkeypatch, capsys):
+    """Review 6: ``acquire_controller`` takes the owner lease, then backfills the outbox. A failing backfill used to
+    leave the lease held until its TTL with no status; it is released now and the failure recorded."""
+    ce = entry()
+    from tuning_factory.tracking_outbox import TrackingOutbox
+
+    def broken(self, owner):
+        raise RuntimeError("synthetic backfill failure")
+
+    monkeypatch.setattr(TrackingOutbox, "backfill", broken)
+    state = tmp_path / "state"
+    start = ce.ControllerStart.model_validate(start_message(state, "desktop.25.1", settings=FAST))
+    assert ce.serve(start, max_ticks=1) == ce.EXIT_INTERNAL
+    row = owner_row(state)
+    assert row["owner_id"] == "desktop.25.1" and row["expires"] == 0
+    current = current_json(state)
+    assert set(current) == {"ok", "code", "error_type", "owner_id", "at"}
+    assert (current["ok"], current["code"], current["error_type"]) == (False, "controller_failed", "RuntimeError")
+    assert "synthetic" not in json.dumps(current)
+    assert capsys.readouterr().out == ""   # no ready line
+
+
+def test_a_drain_fenced_by_a_successor_is_not_a_clean_stop(tmp_path):
+    """Review 9: when the owner lease is fenced during the drain, ``run_forever`` releases nothing; that is a lost
+    lease (exit 1, ``owner_lost``) even if a successor already holds the owner row."""
+    ce = entry()
+    from tuning_factory.graph_store import GraphStore
+    state = tmp_path / "state"
+    start = ce.ControllerStart.model_validate(start_message(
+        state, "desktop.26.1", settings={"lease_ttl_seconds": 600, "tick_seconds": 60, "lease_heartbeat_seconds": 200}))
+    stop, result = threading.Event(), []
+    thread = threading.Thread(target=lambda: result.append(ce.serve(start, stop_event=stop)), daemon=True)
+    thread.start()
+    try:
+        wait_for(lambda: owner_row(state)["heartbeat"] > owner_row(state)["acquired"], "the first tick")
+        store = GraphStore(state / "jobs.db")
+        with store.jobs.connection() as db:   # the lease expired while the machine slept ...
+            db.execute("UPDATE controller_owner SET expires=?", (time.time() - 1,))
+        store.acquire_owner("desktop.26.2", ttl_seconds=600)   # ... and a successor took the owner row
+        stop.set()   # the drain's next tick finds the lease fenced
+        thread.join(WAIT)
+    finally:
+        stop.set()
+        thread.join(WAIT)
+    assert result == [ce.EXIT_INTERNAL]
+    assert owner_row(state)["owner_id"] == "desktop.26.2" and owner_row(state)["expires"] > time.time()
+    assert current_json(state)["code"] == "owner_lost"
+
+
+def test_the_git_revision_child_inherits_no_credentials(tmp_path):
+    """Review 7: in non-frozen runs the manifest's ``git rev-parse`` child inherited the controller's MLflow token
+    and OIDC values. It now gets this process's environment without any credential variable, and no stdin."""
+    code = textwrap.dedent("""
+        import json, subprocess
+        from tuning_factory import manifest
+        seen, real = {}, subprocess.run
+
+        def run(*args, **kwargs):
+            seen.update(kwargs)
+            return real(*args, **kwargs)
+
+        subprocess.run = run
+        revision = manifest.code_revision()
+        env = seen.get("env") or {}
+        print(json.dumps({"names": sorted(env), "values": sorted(env.values()), "revision": revision,
+                          "stdin_null": seen.get("stdin") == subprocess.DEVNULL}))
+    """)
+    env = child_env(tmp_path)
+    secret_names = ("MLFLOW_TRACKING_TOKEN", "MLFLOW_OIDC_CLIENT_SECRET", "RUNPOD_API_KEY", "AWS_SECRET_ACCESS_KEY",
+                    "HF_TOKEN", "AZURE_CLIENT_SECRET")
+    env.update({name: INHERITED for name in secret_names})
+    env.update({"MLFLOW_OIDC_TOKEN_URL": "https://idp.invalid/token", "MLFLOW_OIDC_CLIENT_ID": "client-id"})
+    process = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd=ROOT,
+                             timeout=WAIT)
+    assert process.returncode == 0, process.stderr
+    seen = json.loads(process.stdout.strip().splitlines()[-1])
+    assert seen["names"], "code_revision must pass an explicit environment"
+    assert not set(seen["names"]) & set(CREDENTIAL_NAMES) and INHERITED not in seen["values"]
+    assert {"PATH", "Path"} & set(seen["names"]) and seen["stdin_null"]
+    assert len(seen["revision"]) == 40 or seen["revision"] == "uncommitted"

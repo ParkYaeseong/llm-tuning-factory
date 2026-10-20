@@ -1,15 +1,37 @@
 import importlib.metadata
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 from .registry import canonical, digest
 
+# Credential variables and ambient cloud credentials: the graph controller pops them before applying its one MLflow
+# scope (controller_entry.CREDENTIAL_ENV is this tuple), and no helper child process ever inherits them (Task 9 §1).
+CREDENTIAL_ENV = ("RUNPOD_API_KEY", "MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_TOKEN", "MLFLOW_TRACKING_USERNAME",
+                  "MLFLOW_TRACKING_PASSWORD", "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID",
+                  "MLFLOW_OIDC_CLIENT_SECRET", "FACTORY_MLFLOW_ARTIFACT_LOCATION", "FACTORY_OPERATOR",
+                  "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN", "AWS_ACCESS_KEY_ID",
+                  "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN",
+                  "HUGGINGFACE_HUB_TOKEN", "AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_SHARED_CREDENTIALS_FILE",
+                  "AWS_CONFIG_FILE", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN",
+                  "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                  "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AZURE_STORAGE_CONNECTION_STRING", "AZURE_STORAGE_ACCESS_KEY",
+                  "AZURE_STORAGE_SAS_TOKEN", "AZURE_CLIENT_SECRET", "AZURE_CLIENT_CERTIFICATE_PATH",
+                  "GOOGLE_APPLICATION_CREDENTIALS", "MLFLOW_TRACKING_INSECURE_TLS", "MLFLOW_TRACKING_CLIENT_CERT_PATH")
+
+
+def child_environment() -> dict:
+    """This process's environment without any credential variable, for helper child processes such as git."""
+    dropped = {name.upper() for name in CREDENTIAL_ENV}
+    return {key: value for key, value in os.environ.items() if key.upper() not in dropped}
+
 
 def code_revision():
     if hasattr(sys, "_MEIPASS"):
         return (Path(sys._MEIPASS) / "assets/commit.txt").read_text().strip()
-    result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
+    result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                            stdin=subprocess.DEVNULL, env=child_environment())
     return result.stdout.strip() if result.returncode == 0 else "uncommitted"
 
 

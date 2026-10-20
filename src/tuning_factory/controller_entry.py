@@ -14,8 +14,9 @@ bounded-request variables and its authentication are process-wide (Task 8 review
 - ``serve``: settings refusal (exit 4, before any owner lease), the owner lease (a duplicate prints
   ``{"ok": false, "code": "owner_held"}`` and exits 3 without writing a status file), ``current.json``, the EOF and
   stop-request watchers, ``run_forever``'s drain (D4, D14), and the final status. There is no kill-now.
-- ``controller_status`` and ``controller_stop`` are workflow actions of the one-request sidecar: DB-only, read-only
-  (a poll never creates or migrates ``jobs.db``) and secret-free.
+- ``controller_status`` and ``controller_stop`` are workflow actions of the one-request sidecar: DB-only, SELECTs
+  only in one bounded read transaction (a poll never creates or migrates ``jobs.db``; it may roll back a hot
+  journal a killed writer left) and secret-free.
 
 Status files under ``state/controller/`` (D19) hold IDs, revisions, hashes, timestamps, fixed codes and fixed texts
 only. Reconcile runs inline on the tick thread (Task 8.5), so a reconcile that hangs inside an open connection
@@ -48,10 +49,19 @@ from .auth import (
     require_secure_tracking,
 )
 from .config import StrictModel
-from .desktop_workflows import NativeProfile, WorkflowContext, WorkflowResult, ok, workflow_action
+from .desktop_workflows import (
+    NativeProfile,
+    WorkflowContext,
+    WorkflowResult,
+    invalid,
+    issue,
+    ok,
+    workflow_action,
+)
 from .executor_profiles import ProfileSecrets, SettingsExecutorProvider
 from .graph_controller import ControllerSettings, DispatchRouter, GraphController, controller_tracker
 from .graph_store import OWNER_HELD, STALE_OWNER, GraphStore
+from .manifest import CREDENTIAL_ENV as MANIFEST_CREDENTIAL_ENV
 from .projects import LocalId
 from .registry import canonical, digest
 from .tracking import (
@@ -74,14 +84,15 @@ EXIT_OK, EXIT_INTERNAL, EXIT_INVALID_START, EXIT_OWNER_HELD, EXIT_SETTINGS_REFUS
 MAX_START_BYTES = 1024 * 1024        # = broker.rs MAX_START_BYTES: the start line, newline included
 INVALID_START = "invalid controller start message"
 UNSUPPORTED_ARGUMENTS = "unsupported sidecar arguments"
-CREDENTIAL_ENV = ("RUNPOD_API_KEY", "MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_TOKEN", "MLFLOW_TRACKING_USERNAME",
-                  "MLFLOW_TRACKING_PASSWORD", "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID",
-                  "MLFLOW_OIDC_CLIENT_SECRET", "FACTORY_MLFLOW_ARTIFACT_LOCATION", "FACTORY_OPERATOR",
-                  "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN", "AWS_ACCESS_KEY_ID",
-                  "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+# The plan's 18 credential variables plus ambient cloud credentials and MLflow TLS overrides (9.4 review); the same
+# tuple keeps them out of helper child processes (manifest.child_environment).
+CREDENTIAL_ENV = MANIFEST_CREDENTIAL_ENV
 CONTROLLER_DIR = "controller"
 CURRENT_FILE, BROKER_FILE, STOP_FILE = "current.json", "broker.json", "stop-request.json"
 MAX_STATUS_BYTES = 1024 * 1024
+# One bound for a status read of jobs.db (one read transaction); a database locked longer is a fixed refusal.
+STATUS_TIMEOUT_SECONDS = 5
+STATUS_BUSY = "컨트롤러 상태를 지금 읽을 수 없습니다. 작업 기록이 사용 중입니다. 잠시 후 다시 확인하세요."
 # Task 8 review: resolve/recover need a time limit. Connecting and the runtime probe take well under a minute; a
 # destination that has not opened after this long is retried after the controller's destination backoff.
 DESTINATION_TIMEOUT_SECONDS = 300
@@ -309,11 +320,7 @@ def provider_profiles(start: ControllerStart) -> tuple[dict[str, ProfileSecrets]
     usable, skipped = {}, {}
     for item in start.profiles:
         profile_id, fields = item.profile_id, dict(item.fields)
-        try:
-            revision = profile_revision(profile_id, fields)
-        except ValueError:
-            skipped[profile_id] = INVALID_FIELDS
-            continue
+        revision = profile_revision(profile_id, fields)   # ProfileStart already holds NativeProfile's allowlist
         settings = dict(fields)
         if fields.get("provider") == "existing_runpod":
             key = item.secrets.get("RUNPOD_API_KEY")
@@ -328,27 +335,32 @@ def provider_profiles(start: ControllerStart) -> tuple[dict[str, ProfileSecrets]
                 continue
             settings["RUNPOD_API_KEY"] = value
         else:
-            try:
-                observation = load_observation(state, profile_id)
-            except ValueError:
-                skipped[profile_id] = OBSERVATION_INVALID
-                continue
-            if observation is None:
-                skipped[profile_id] = OBSERVATION_MISSING
-                continue
-            if observation["revision"] != revision:
-                skipped[profile_id] = OBSERVATION_DIFFERS
-                continue
-            try:
-                public = public_profile(profile_id, fields, observation["facts"])
-            except ValueError:
-                skipped[profile_id] = INVALID_FIELDS
-                continue
-            if public != observation["profile"]:
-                skipped[profile_id] = OBSERVATION_INVALID
+            public, reason = _observed_profile(state, profile_id, fields, revision)
+            if reason is not None:
+                skipped[profile_id] = reason
                 continue
         usable[profile_id] = ProfileSecrets(public=public, settings=settings)
     return usable, skipped
+
+
+def _observed_profile(state: Path, profile_id: str, fields: Mapping[str, str], revision: str):
+    """``(public SSH profile, None)`` from the stored observation of this revision, or ``(None, reason)``. The
+    controller's start and ``controller_status`` (a restart would now serve it) use the same rule."""
+    try:
+        observation = load_observation(state, profile_id)
+    except ValueError:
+        return None, OBSERVATION_INVALID
+    if observation is None:
+        return None, OBSERVATION_MISSING
+    if observation["revision"] != revision:
+        return None, OBSERVATION_DIFFERS
+    try:
+        public = public_profile(profile_id, fields, observation["facts"])
+    except ValueError:
+        return None, INVALID_FIELDS
+    if public != observation["profile"]:
+        return None, OBSERVATION_INVALID
+    return public, None
 
 
 def _sanitized(exc: BaseException, redact: Callable[[str], str]) -> Exception | None:
@@ -417,6 +429,17 @@ class _BoundedOpen:
             raise clean from None
 
 
+class _OwnedStore(GraphStore):
+    """The controller's ``GraphStore``, which remembers the owner lease it released. ``run_forever`` releases only
+    after a clean drain, so this tells a drained stop from a fenced one even when a successor already holds the
+    owner row (9.4 review 9)."""
+    released_owner = None
+
+    def release_owner(self, owner) -> None:
+        super().release_owner(owner)
+        self.released_owner = owner
+
+
 class BoundedProvider:
     """The real ``ExecutorProvider`` with a time limit on opening a destination (``resolve``/``recover``) and
     provider-redacted error texts. ``redact`` and ``status`` are the provider's own."""
@@ -450,7 +473,7 @@ def build_controller(start: ControllerStart, *, clock: Callable[[], float] = tim
     from .attempt_runner import OperationAttemptRunner
     from .simulated_dispatch import DirectoryRootSnapshots, SimulatedOperationDispatcher
     state = Path(start.state_root)
-    store = GraphStore(state / "jobs.db", clock=clock)
+    store = _OwnedStore(state / "jobs.db", clock=clock)
     usable, skipped = provider_profiles(start)
     provider = BoundedProvider(SettingsExecutorProvider(usable, state, clock=clock))
     dispatcher = DispatchRouter(
@@ -545,22 +568,48 @@ def _remove_stop_request(state_dir: Path, owner_id: str) -> None:
             (controller_dir(state_dir) / STOP_FILE).unlink()
 
 
+class StatusBusy(Exception):
+    """``jobs.db`` stayed locked for ``STATUS_TIMEOUT_SECONDS``: the status actions answer ``status_busy``."""
+
+
+def _locked(exc: sqlite3.Error) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    return isinstance(code, int) and code & 0xFF in (5, 6)   # SQLITE_BUSY, SQLITE_LOCKED
+
+
 def _db_view(state_dir: Path, now: float) -> tuple[dict, int]:
-    """``graph_status(...)["controller"]`` and the number of RUNNING or PAUSED graph runs, read through a read-only
-    connection: a poll never creates, migrates or write-locks ``jobs.db``, and never reads every run's status."""
+    """``graph_status(...)["controller"]`` and the number of RUNNING or PAUSED graph runs, without reading every
+    run's status. A poll never creates or migrates ``jobs.db``: it opens an existing file only (``mode=rw`` never
+    creates one) and issues SELECTs only.
+
+    The connection is read-write so that SQLite can roll back the hot journal a writer killed mid-transaction leaves
+    (a read-only connection refuses it, which blocked every poll and so ``controller_start``; 9.4 review 1). The
+    reads share one transaction, so one ``STATUS_TIMEOUT_SECONDS`` bounds the whole read; a longer lock raises
+    ``StatusBusy``."""
     path = Path(state_dir) / "jobs.db"
     owner, active = None, 0
     if path.is_file():
-        db = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=10)
         try:
+            db = sqlite3.connect(f"{path.resolve().as_uri()}?mode=rw", uri=True, timeout=STATUS_TIMEOUT_SECONDS,
+                                 isolation_level=None)
+        except sqlite3.OperationalError as exc:
+            if _locked(exc):
+                raise StatusBusy from None
+            raise
+        try:
+            db.execute("BEGIN")   # deferred: the first SELECT takes the shared lock (and rolls a hot journal back)
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if "controller_owner" in tables:
                 owner = db.execute("SELECT owner_id,heartbeat,expires FROM controller_owner WHERE id=1").fetchone()
             if "graph_runs" in tables:
                 active = db.execute("SELECT COUNT(*) FROM graph_runs WHERE status IN ('RUNNING','PAUSED')"
                                     ).fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            if _locked(exc):
+                raise StatusBusy from None
+            raise
         finally:
-            db.close()
+            db.close()   # nothing was written: closing ends the read transaction
     # Exactly graph_controller.graph_status's controller block (a parity test pins it).
     if owner is None or owner[2] <= 0:
         controller = {"owner_id": owner[0] if owner else None, "state": "absent", "heartbeat_age_seconds": None}
@@ -653,17 +702,26 @@ def _poll_stop_request(state_dir: Path, owner_id: str, stop_event: threading.Eve
 
 
 def _drained(store: GraphStore, owner, stop_event: threading.Event) -> bool:
-    """True when ``run_forever`` drained and released the owner lease; False when it returned because the lease was
-    fenced (lost after a sleep, or taken over), which it does only without a stop or without a release."""
-    if not stop_event.is_set():
-        return False
-    try:
-        row = store.owner_state()
-    except Exception:
-        return False
-    if row is None:
-        return False
-    return row["owner_id"] != owner.owner_id or row["expires"] == 0
+    """True only when ``run_forever`` drained and released this owner lease (``_OwnedStore`` records the release).
+    A lease fenced before or during the drain (lost after a sleep, or taken over by a successor that may already
+    hold the owner row) is never a clean stop."""
+    return stop_event.is_set() and getattr(store, "released_owner", None) == owner
+
+
+def _clear_stale_stop_request(state_dir: Path, owner_id: str, acquired_at: float) -> None:
+    """At the start: a stop request written before this owner lease was acquired, or naming another owner, is a
+    leftover (a killed run's, possibly under the same fixed CLI owner ID); it must not stop this controller. A
+    request for this owner made after the acquisition is kept (9.4 review 5)."""
+    path = controller_dir(state_dir) / STOP_FILE
+    if not path.exists():
+        return
+    data = _read_json(path)
+    requested = data.get("requested_at") if data else None
+    if (data and data.get("owner_id") == owner_id and isinstance(requested, (int, float))
+            and not isinstance(requested, bool) and requested >= acquired_at):
+        return
+    with contextlib.suppress(OSError):
+        path.unlink()
 
 
 def serve(start: ControllerStart, *, stdin: BinaryIO | None = None, stop_event: threading.Event | None = None,
@@ -677,7 +735,7 @@ def serve(start: ControllerStart, *, stdin: BinaryIO | None = None, stop_event: 
     state = Path(start.state_root)
     stop_event = stop_event or threading.Event()
     controller = owner = None
-    serving = False
+    serving = recorded = False
     try:
         state.mkdir(parents=True, exist_ok=True)
         try:
@@ -688,6 +746,7 @@ def serve(start: ControllerStart, *, stdin: BinaryIO | None = None, stop_event: 
             _emit({"ok": False, "code": "settings_refused"})
             return EXIT_SETTINGS_REFUSED
         controller, info = build_controller(start, clock=clock)
+        acquired_at = clock()
         try:
             owner = controller.acquire_controller(start.owner_id)
         except ValueError as exc:
@@ -696,6 +755,8 @@ def serve(start: ControllerStart, *, stdin: BinaryIO | None = None, stop_event: 
             _emit({"ok": False, "code": "owner_held"})
             return EXIT_OWNER_HELD
         write_current(state, running_record(owner.owner_id, info, clock=clock))
+        recorded = True
+        _clear_stale_stop_request(state, owner.owner_id, acquired_at)
         _emit({"ok": True, "owner_id": owner.owner_id, "pid": os.getpid()})
         with _quiet_stdout():
             if stdin is not None:   # daemon thread, never joined: a blocked read never delays the shutdown
@@ -725,17 +786,22 @@ def serve(start: ControllerStart, *, stdin: BinaryIO | None = None, stop_event: 
         _remove_stop_request(state, owner.owner_id)
         return EXIT_OK if drained else EXIT_INTERNAL
     except Exception as exc:
-        if owner is not None:
+        failure = {"ok": False, "code": "controller_failed", "error_type": type(exc).__name__}
+        # acquire_controller takes the owner lease before its outbox backfill: a failing backfill leaves it held
+        # (9.4 review 6), so the lease it recorded is released and the failure written as this owner's.
+        held = owner or (getattr(controller, "_owner", None) if controller is not None else None)
+        if held is not None:
             with contextlib.suppress(Exception):
-                _update_current(state, owner.owner_id, {"ok": False, "code": "controller_failed",
-                                                        "error_type": type(exc).__name__, "stopped_at": clock()})
+                if recorded:
+                    _update_current(state, held.owner_id, {**failure, "stopped_at": clock()})
+                else:
+                    write_current(state, {**failure, "owner_id": held.owner_id, "at": clock()})
             if not serving:
                 with contextlib.suppress(Exception):
-                    controller.store.release_owner(owner)
+                    controller.store.release_owner(held)
         else:
             with contextlib.suppress(Exception):
-                _record_unowned(state, {"ok": False, "code": "controller_failed", "error_type": type(exc).__name__,
-                                        "owner_id": start.owner_id, "at": clock()}, clock())
+                _record_unowned(state, {**failure, "owner_id": start.owner_id, "at": clock()}, clock())
         return EXIT_INTERNAL
     finally:
         if controller is not None and not serving:
@@ -770,13 +836,31 @@ class ControllerStopRequest(StrictModel):
     pass
 
 
-def _profiles_restart(recorded, current: Mapping[str, str]) -> list[str]:
-    """Profile IDs whose native revision differs from the revision the controller snapshotted (added, changed or
-    deleted). Revisions never include a key, so a rotated key needs no restart."""
+def _profiles_restart(current: Mapping, context: WorkflowContext) -> list[str]:
+    """Profile IDs a restart would serve differently:
+
+    - the native revision differs from the one the controller snapshotted (added, changed or deleted);
+    - or the profile was skipped at the start for its observation, and an observation of the same revision now
+      builds it (``_observed_profile``, the start's own rule).
+
+    Not detectable from a poll, which carries no ``*_saved`` flag and no vault data: a RunPod key saved for a
+    profile skipped as ``credential_missing`` (Task 10 compares ``current.skipped_profiles`` with
+    ``executor_profiles_get``), and a rotated key. Revisions never include a key, yet the running controller keeps
+    the key it started with in ``ProfileSecrets``: a rotation needs a restart that polling cannot report."""
+    recorded, skipped = current.get("profiles"), current.get("skipped_profiles")
     started = ({key: value for key, value in recorded.items() if isinstance(key, str) and isinstance(value, str)}
                if isinstance(recorded, dict) else {})
-    return sorted(profile_id for profile_id in set(started) | set(current)
-                  if started.get(profile_id) != current.get(profile_id))
+    revisions = current_profile_revisions(context)
+    changed = {profile_id for profile_id in set(started) | set(revisions)
+               if started.get(profile_id) != revisions.get(profile_id)}
+    for profile_id, reason in (skipped.items() if isinstance(skipped, dict) else ()):
+        if (reason in (OBSERVATION_MISSING, OBSERVATION_DIFFERS, OBSERVATION_INVALID) and profile_id not in changed
+                and profile_id in revisions and profile_id in context.profiles):
+            public, _ = _observed_profile(Path(context.state_dir), profile_id,
+                                          context.profiles[profile_id].fields, revisions[profile_id])
+            if public is not None:
+                changed.add(profile_id)
+    return sorted(changed)
 
 
 def _tracking_restart(recorded, settings: Mapping) -> bool | None:
@@ -798,16 +882,22 @@ def _tracking_restart(recorded, settings: Mapping) -> bool | None:
 def controller_status(context: WorkflowContext, request: ControllerStatusRequest) -> WorkflowResult:
     """The controller's DB heartbeat state (``graph_status``'s ``controller``), the public status files, and what a
     restart would change (D5). ``restart_required`` is filled only for the running owner that wrote
-    ``current.json``."""
+    ``current.json``. While that owner runs, ``broker`` is null: ``broker.json`` only ever describes a start that
+    failed, either before this one or later from the broker of a fenced predecessor that lingered after a sleep
+    (9.4 review 4). A database locked longer than ``STATUS_TIMEOUT_SECONDS`` answers ``status_busy``."""
     state = Path(context.state_dir)
-    controller, active = _db_view(state, context.clock())
+    try:
+        controller, active = _db_view(state, context.clock())
+    except StatusBusy:
+        return invalid(issue("status_busy", STATUS_BUSY))
     current, broker = read_current(state), _read_json(controller_dir(state) / BROKER_FILE)
     owner_id = controller["owner_id"]
     restart = {"profiles": [], "tracking": False}
     if (controller["state"] == "running" and current is not None and current.get("ok") is True
             and current.get("owner_id") == owner_id):
-        restart = {"profiles": _profiles_restart(current.get("profiles"), current_profile_revisions(context)),
+        restart = {"profiles": _profiles_restart(current, context),
                    "tracking": _tracking_restart(current.get("tracking"), context.settings)}
+        broker = None
     return ok({"controller": controller, "current": current, "broker": broker,
                "stop_requested": bool(owner_id) and stop_requested(state, owner_id),
                "restart_required": restart, "runs": {"active": active}})
@@ -817,7 +907,10 @@ def controller_status(context: WorkflowContext, request: ControllerStatusRequest
 def controller_stop(context: WorkflowContext, request: ControllerStopRequest) -> WorkflowResult:
     """D4: a stop request for the running controller, which drains and releases its owner lease. No kill-now."""
     state = Path(context.state_dir)
-    controller, _ = _db_view(state, context.clock())
+    try:
+        controller, _ = _db_view(state, context.clock())
+    except StatusBusy:
+        return invalid(issue("status_busy", STATUS_BUSY))
     if controller["state"] != "running":
         return ok({"requested": False, "reason": "not_running"})
     request_stop(state, controller["owner_id"])
