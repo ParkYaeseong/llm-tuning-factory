@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -30,9 +31,11 @@ KEY_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,249}"   # never a quote: keys go in
 _KEY = re.compile(KEY_PATTERN)
 FAILED_REGISTRATION = "FAILED_REGISTRATION"   # a model version the registry could not create: never adopted
 AUTHENTICATED_HTTPS = "an authenticated MLflow destination requires https tracking and artifact URIs"
-# The graph controller's own tracker bounds each create request (8.3 review Important 1): the MLflow client's defaults
-# (120 s timeout, 7 retries, POST retried too) let one create last about 20 minutes, longer than a tracking claim.
-CONTROLLER_HTTP_MAX_RETRIES = 2
+# The graph controller's own tracker bounds each create request (8.3 review Important 1). mlflow-skinny 3.17.1 builds
+# its session Retry with allowed_methods=None, so a POST is re-sent on 5xx and on read timeouts: a create the server
+# committed whose response was lost would be created again inside one intent. Creates are therefore never re-sent by
+# the transport (8.5 review Important 2); the outbox's durable intent and search-first adoption retry them instead.
+CONTROLLER_HTTP_MAX_RETRIES = 0
 CONTROLLER_HTTP_TIMEOUT_SECONDS = 60
 
 
@@ -93,25 +96,36 @@ def _string_tags(tags):
     return {str(key): str(value) for key, value in dict(tags).items()}
 
 
+_BOUND_NAMES = ("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "MLFLOW_HTTP_REQUEST_TIMEOUT")
+_BOUND_LOCK = threading.Lock()
+_BOUND_STATE = {"depth": 0, "previous": None}
+
+
 @contextmanager
 def _bounded_requests(limits):
     """The MLflow client reads its retry and timeout settings per request from the environment. With ``limits`` (the
     graph controller's own tracker only, never v1) one create request is bounded, and the previous values are restored
-    afterwards. The broker process runs no other MLflow work, and its tracking thread is the only MLflow caller."""
+    when the last bounded caller leaves (a lock and a reference count, 8.5 review Minor 2). The variables are
+    process-wide while a create runs: the controller must own its process (Task 9's broker runs no other MLflow work)."""
     if limits is None:
         yield
         return
-    names = ("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "MLFLOW_HTTP_REQUEST_TIMEOUT")
-    previous = {name: os.environ.get(name) for name in names}
-    os.environ.update({names[0]: str(int(limits[0])), names[1]: str(int(limits[1]))})
+    with _BOUND_LOCK:
+        if _BOUND_STATE["depth"] == 0:
+            _BOUND_STATE["previous"] = {name: os.environ.get(name) for name in _BOUND_NAMES}
+            os.environ.update({_BOUND_NAMES[0]: str(int(limits[0])), _BOUND_NAMES[1]: str(int(limits[1]))})
+        _BOUND_STATE["depth"] += 1
     try:
         yield
     finally:
-        for name, value in previous.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        with _BOUND_LOCK:
+            _BOUND_STATE["depth"] -= 1
+            if _BOUND_STATE["depth"] == 0:
+                for name, value in _BOUND_STATE["previous"].items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
 
 
 class MLflowTracker:
@@ -324,7 +338,9 @@ class MLflowTracker:
     def create_keyed_model_version(self, name, *, run_id, key, tags) -> dict:
         tags = _string_tags(tags) | {REGISTRATION_KEY_TAG: _key(key)}
         with _bounded_requests(self.bounded_requests):
-            version = self.client.create_model_version(name, source=f"runs:/{run_id}/model", run_id=run_id, tags=tags)
+            # Never wait for READY (8.5 review Important 2): a PENDING version carries the key and is adopted as is.
+            version = self.client.create_model_version(name, source=f"runs:/{run_id}/model", run_id=run_id, tags=tags,
+                                                       await_creation_for=0)
         if str(getattr(version, "status", None) or "") == FAILED_REGISTRATION:
             raise RuntimeError("MLflow model version registration failed (FAILED_REGISTRATION)")
         return {"name": version.name, "version": str(version.version)}

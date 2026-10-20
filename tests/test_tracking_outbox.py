@@ -1179,3 +1179,52 @@ def test_changed_evidence_tells_the_operator_what_to_do(tmp_path, monkeypatch):
     status = w.outbox.status(w.run_id)['nodes']['a']
     assert status['tracking_status'] == 'failed' and status['action'] == outbox_api.EVIDENCE_CHANGED_ACTION
     assert 're-arming cannot repair it' in status['action']
+
+
+def test_bounded_requests_nest_across_threads(monkeypatch):
+    """8.5 review Minor 2: interleaved callers never leave the bound behind, and creates are never transport-retried."""
+    import os
+    import threading
+
+    from tuning_factory import tracking as tracking_api
+    monkeypatch.delenv('MLFLOW_HTTP_REQUEST_MAX_RETRIES', raising=False)
+    monkeypatch.setenv('MLFLOW_HTTP_REQUEST_TIMEOUT', '120')
+    assert tracking_api.CONTROLLER_HTTP_MAX_RETRIES == 0
+    limits = (tracking_api.CONTROLLER_HTTP_MAX_RETRIES, tracking_api.CONTROLLER_HTTP_TIMEOUT_SECONDS)
+    entered, release_first, release_second = threading.Event(), threading.Event(), threading.Event()
+    seen = []
+
+    def first():
+        with tracking_api._bounded_requests(limits):
+            entered.set()
+            assert release_first.wait(30)
+            seen.append(('first', os.environ.get('MLFLOW_HTTP_REQUEST_MAX_RETRIES')))
+
+    thread = threading.Thread(target=first)
+    thread.start()
+    assert entered.wait(30)
+    with tracking_api._bounded_requests(limits):
+        release_first.set()
+        thread.join(30)   # the first caller left while the second is still inside
+        seen.append(('second', os.environ.get('MLFLOW_HTTP_REQUEST_MAX_RETRIES')))
+    release_second.set()
+    assert seen == [('first', '0'), ('second', '0')]
+    assert 'MLFLOW_HTTP_REQUEST_MAX_RETRIES' not in os.environ and os.environ['MLFLOW_HTTP_REQUEST_TIMEOUT'] == '120'
+
+
+def test_a_pending_registration_version_is_adopted(tmp_path, monkeypatch):
+    """8.5 review Important 2: creates no longer wait for READY, so a PENDING_REGISTRATION version with the key is
+    the existing one."""
+    w = tracked(tmp_path, monkeypatch, single)
+    claimed, outputs = done(w, 'a')
+    key = registration_key(claimed, outputs.model)
+    w.fake.fail['create_model_version'] = [ConnectionError('refused')]
+    w.publisher.process(w.owner)
+    run_id = identity(event(w, f'evidence:{claimed["lease"].attempt_id}'))['run_id']
+    pending = w.fake.seed_version('factory-project.1-a', run_id, {'factory.registration_key': key})
+    pending.status = 'PENDING_REGISTRATION'
+    due(w, key)
+    w.publisher.process(w.owner)
+    row = event(w, key)
+    assert row['status'] == 'ACKNOWLEDGED' and identity(row)['adopted'] is True and identity(row)['version'] == '1'
+    assert len(w.fake.versions) == 1

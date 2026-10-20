@@ -138,11 +138,16 @@ class FakeProvider:
     """``ExecutorProvider`` over approved destinations: ``refuse[profile_id]`` raises, ``price[profile_id]`` observes
     another live price."""
 
+    secret = None   # a configured credential this provider knows, as SettingsExecutorProvider.redact
+
     def __init__(self, destinations, clock):
         self.destinations = {profile.profile_id: (profile, facts) for profile, facts in destinations}
         self.clock = clock
         self.resolves, self.recovers, self.executors = [], [], []
         self.refuse, self.price = {}, {}
+
+    def redact(self, text):
+        return text.replace(self.secret, '[redacted]') if self.secret else text
 
     def _executor(self, profile_id, **options):
         profile, facts = self.destinations[profile_id]
@@ -198,6 +203,9 @@ class ScriptedDispatcher:
 
     def _result(self, job, lease, launch_id, status, error=None):
         manifest = job['manifest']
+        error_filter = getattr(self.jobs, 'error_filter', None)
+        if error and error_filter is not None:   # as the runner's _accept
+            error = error_filter(error)
         result = OperationResult(status=status, launch_id=launch_id, attempt_id=lease.attempt_id,
                                  manifest_sha256=manifest['sha256'],
                                  operation_sha256=digest(canonical(manifest['operation'])),
@@ -771,9 +779,20 @@ def test_ambiguous_launch_waits_for_the_operator(tmp_path, monkeypatch, record):
         controller.tick(owner)
         w.pool.run_all()
     item = status_of(w, 'a', controller)
-    assert item['uncertain'] and item['needs_operator'] and item['job_status'] == 'FAILED'
-    assert item['wait_reason'] == (gc.AWAITING_RESULT if record else gc.OPERATOR_CONFIRMATION)
-    assert w.store.jobs.gpu_locked('existing_runpod:pod1')
+    assert item['uncertain'] and item['job_status'] == 'FAILED' and w.store.jobs.gpu_locked('existing_runpod:pod1')
+    if record:
+        # 8.5 review Minor 6: before the launch's time limit (900 s) plus a margin, a late result may still come, so
+        # nobody is asked to release the lock yet.
+        assert (item['awaiting_result'], item['needs_operator'], item['wait_reason']) == (True, False,
+                                                                                          gc.AWAITING_RESULT)
+        assert item['result_deadline'] == pytest.approx(attempts(w, 'a')[0]['created'] + 900 + gc.RESULT_MARGIN_SECONDS)
+        controller, owner = restart(w, 'controller-late', advance=900 + gc.RESULT_MARGIN_SECONDS)
+        controller.tick(owner)
+        item = status_of(w, 'a', controller)
+        assert (item['awaiting_result'], item['needs_operator'], item['wait_reason']) == (False, True, gc.RESULT_OVERDUE)
+    else:   # nothing can ever be collected without the remote record
+        assert (item['awaiting_result'], item['needs_operator'], item['wait_reason']) == (False, True,
+                                                                                          gc.OPERATOR_CONFIRMATION)
     assert w.dispatcher.launches == ({'a': 1} if record else Counter()) and len(attempts(w, 'a')) == 1
     attempt = attempts(w, 'a')[0]['attempt_id']
     result = CliRunner().invoke(app, ['--state-dir', str(w.store.state_dir), 'release-lock', a, attempt,
@@ -1268,7 +1287,7 @@ def test_long_uploads_keep_the_owner_and_the_claim_alive(tmp_path, monkeypatch):
             assert renewed.wait(30)
         # Meanwhile another publisher pass in this process finds nothing to claim: the claim is still ours.
         duplicates.append(controller.publisher.outbox.claim_pending(owner))
-        assert os.environ.get('MLFLOW_HTTP_REQUEST_MAX_RETRIES') == '2'   # the controller's create is bounded
+        assert os.environ.get('MLFLOW_HTTP_REQUEST_MAX_RETRIES') == '0'   # never re-sent by the transport
         assert os.environ.get('MLFLOW_HTTP_REQUEST_TIMEOUT') == '60'
         return real_versions(*args, **kwargs)
 
@@ -1304,7 +1323,7 @@ def test_settings_router_and_test_hooks(tmp_path, monkeypatch):
         w.store.acknowledge_tracking(w.store.jobs.current_lease(job_of(w, 'a')))
     assert gs.GraphStore.test_acknowledgement is False
     lazy = gc.controller_tracker('https://mlflow.invalid')
-    assert lazy.bounded_requests == (2, 60)
+    assert lazy.bounded_requests == (0, 60)   # creates are never re-sent by the transport (8.5 review Important 2)
 
 
 def test_changed_evidence_is_named_for_the_operator(tmp_path, monkeypatch):
@@ -1378,3 +1397,302 @@ def test_the_seeding_window_covers_aliases_and_other_providers(tmp_path, monkeyp
     assert reasons['z'] == api().CROSS_PROVIDER and reasons['y'].startswith('waiting for destination ssh_server:')
     drive(w, controller, owner, each=lambda: len(w.pool.pending) <= 1 or pytest.fail('concurrent'))
     assert set(statuses(w).values()) == {'COMPLETED'}
+
+
+# -- 8.5 review fixes ------------------------------------------------------------------------------
+
+@pytest.mark.parametrize('runtime', ['same_runtime', 'other_runtime'])
+def test_a_claim_never_goes_to_another_jobs_destination(tmp_path, monkeypatch, runtime):
+    """Important 1: p1 and p3 are two profiles of pod1. x is pinned to p1, whose profile changed after approval; y is
+    pinned to p3. Opening p3 for y must claim y, never x (x would run the old plan through another profile), and a
+    job of another runtime is never claimed and returned (the ledger would grow every tick)."""
+    w = world(tmp_path, monkeypatch, lambda r: [
+        train(r, 'x', profiles=('p1',)) if runtime == 'same_runtime' else materialize(r, 'x', r.first, ('p1',)),
+        train(r, 'y', profiles=('p3',))], destinations=pods('pod1', aliases=(('p3', 'pod1'),)))
+    w.provider.refuse['p1'] = ValueError(PROFILE_CHANGED)
+    controller, owner = start(w)
+    for _ in range(6):
+        controller.tick(owner)
+        w.pool.run_all()
+    x = job_of(w, 'x')
+    assert attempts(w, 'x') == [] and w.dispatcher.launches['x'] == 0   # never claimed, never launched
+    assert [row for row in readiness.table(w, 'attempt_dispositions') if row['job_id'] == x] == []
+    assert [row for row in readiness.table(w, 'budget_reservations') if row['job_id'] == x] == []
+    assert len(readiness.table(w, 'events', 'WHERE job_id=?', (x,))) == 2   # PENDING and QUEUED only
+    assert node(w, 'y')['status'] == 'COMPLETED' and w.dispatcher.launches['y'] == 1
+    assert 're-plan' in node(w, 'x')['wait_reason']
+
+
+def test_the_runner_refuses_an_executor_resolved_for_another_profile(tmp_path, monkeypatch):
+    """Important 1, defence in depth: the runner compares the profile a provider resolved the executor for."""
+    from test_operation_runner import gpu_host
+
+    from tuning_factory.attempt_runner import OperationAttemptRunner
+    from tuning_factory.executor_profiles import ResourceFacts
+    w = world(tmp_path, monkeypatch, lambda r: [train(r, 'x', profiles=('p1',))],
+              destinations=pods('pod1', aliases=(('p3', 'pod1'),)))
+    calls = []
+    _, executor = gpu_host(tmp_path, monkeypatch, calls)
+    executor.destination_profile = w.provider.destinations['p3'][0]   # what the provider opened: the alias
+    with w.store.jobs.connection() as db:
+        db.execute('UPDATE controller_leases SET expires=? WHERE run_id=?', (w.clock() + 3600, w.run_id))
+    w.store.prepare_ready(w.ctl, node_ids=['x'])
+    claimed = w.store.claim_ready(ResourceFacts(pod_id='pod1', gpu_type='A100', gpu_count=1, total_hourly_cost_usd=2,
+                                                observed_at='2026-10-20T00:00:00Z'), w.ctl)
+    outcome = OperationAttemptRunner(w.store, root=w.store.state_dir).run_claimed(claimed, executor,
+                                                                                approval=w.approval)
+    assert outcome.status == 'FAILED' and 'executor destination differs' in outcome.error
+    assert calls == [] and w.store.jobs.validated_attempt(claimed['lease'])['launch_started'] == 0
+
+
+def test_controller_creates_are_never_resent_by_the_transport(tmp_path, monkeypatch):
+    """Important 2: a create the server committed but whose response was lost must not be POSTed again by the HTTP
+    session inside one intent, and a model version create does not wait for READY."""
+    from mlflow.environment_variables import MLFLOW_HTTP_REQUEST_MAX_RETRIES, MLFLOW_HTTP_REQUEST_TIMEOUT
+    w = world(tmp_path, monkeypatch, lambda r: [train(r, 'a')])
+    seen = []
+    for name in ('create_run', 'create_model_version'):
+        real = getattr(w.fake, name)
+
+        def bounded(*args, _real=real, _name=name, **kwargs):
+            seen.append((_name, MLFLOW_HTTP_REQUEST_MAX_RETRIES.get(), MLFLOW_HTTP_REQUEST_TIMEOUT.get(),
+                         kwargs.get('await_creation_for', 'default')))
+            return _real(*args, **{key: value for key, value in kwargs.items() if key != 'await_creation_for'})
+
+        monkeypatch.setattr(w.fake, name, bounded)
+    controller, owner = start(w)
+    drive(w, controller, owner)
+    assert {item[0] for item in seen} == {'create_run', 'create_model_version'}
+    assert all(item[1:3] == (0, 60) for item in seen)   # the session retries nothing
+    assert [item[3] for item in seen if item[0] == 'create_model_version'] == [0]
+    assert os.environ.get('MLFLOW_HTTP_REQUEST_MAX_RETRIES') is None   # restored afterwards
+
+
+def test_integrity_checks_are_scoped_to_the_nodes_own_lineage(tmp_path, monkeypatch):
+    """Minor 1: a damaged record of an unrelated branch never holds this node; at dispatch, an integrity failure of the
+    node's own lineage is returned unlaunched (uncounted) with an operator wait reason, never a counted failure."""
+    gs = readiness.api()
+    w = world(tmp_path, monkeypatch, lambda r: [materialize(r, 'full', r.first), train(r, 'a'), train(r, 'b', 'a'),
+                                                 evaluate(r, 'e', 'full')], max_concurrent=1)
+    controller, owner = start(w)
+    drive(w, controller, owner, until=lambda: node(w, 'full')['status'] == 'COMPLETED'
+          and status_of(w, 'full')['tracking_status'] == 'saved' and node(w, 'e')['job_id'] is None
+          and node(w, 'b')['job_id'] is None)
+    (saved,) = [outputs for evidence, outputs in w.store.ledger(w.run_id) if evidence.node_id == 'full']
+    target = next(path for path in sorted(w.store.artifacts.path(saved.model.model).rglob('*')) if path.is_file())
+    target.write_bytes(target.read_bytes() + b'damaged')   # full's verified artifact no longer verifies
+    # b (a continuation of a) never depended on 'full': it compiles and runs.
+    drive(w, controller, owner, until=lambda: node(w, 'b')['status'] == 'COMPLETED')
+    assert node(w, 'e')['status'] == 'PENDING' and node(w, 'e')['wait_reason'].startswith(gs.LEDGER_INTEGRITY)
+    assert status_of(w, 'e')['needs_operator'] and node(w, 'e')['error'] is None
+    # At dispatch (the simulated dispatcher re-resolves bindings before launch): a's artifact, b's producer, is damaged
+    # after b was claimed but before its thread ran.
+    from tuning_factory import simulated_dispatch as sd
+    other = world(tmp_path / 'dispatch', monkeypatch, chain, simulation=True, max_attempts=1)
+    dispatcher = sd.SimulatedOperationDispatcher(other.store, root=other.store.state_dir)
+    controller, owner = start(other, dispatcher=dispatcher, provider=None)
+    for _ in range(20):
+        controller.tick(owner)
+        if node(other, 'b')['job_id'] and job_of(other, 'b') in other.pool.pending:
+            break
+        other.pool.run_all()
+    b = job_of(other, 'b')
+    ref = ModelArtifactRef.model_validate(
+        other.store.jobs.get(b)['manifest']['operation']['model_input']['policy']['adapter'])
+    target = next(path for path in sorted(other.store.artifacts.path(ref).rglob('*')) if path.is_file())
+    target.write_bytes(target.read_bytes() + b'damaged')
+    other.pool.run_all()
+    for _ in range(4):
+        controller.tick(owner)
+        other.pool.run_all()
+    (attempt,) = attempts(other, 'b')   # returned uncounted, and never claimed again
+    assert other.store.jobs.get(b)['status'] == 'QUEUED' and attempt['launch_started'] == 0
+    assert [(row['disposition'], row['counted']) for row in readiness.table(other, 'attempt_dispositions')
+            if row['job_id'] == b] == [('returned_unlaunched', 0)]
+    item = status_of(other, 'b', controller)
+    assert item['needs_operator'] and item['wait_reason'].startswith(gs.LEDGER_INTEGRITY)
+
+
+def test_a_stale_started_launch_is_settled_in_one_transaction(tmp_path, monkeypatch):
+    """Minor 3: the FAILED step for an attempt that may have been contacted happens in the same transaction as the
+    token rotation, and an actor that passed RUNNING meanwhile is left alone."""
+    gs = readiness.api()
+    w = world(tmp_path, monkeypatch, lambda r: [train(r, 'a', profiles=('p1',)), train(r, 'c', profiles=('p2',))],
+              destinations=pods('pod1', 'pod2'), max_concurrent=2)
+    with w.store.jobs.connection() as db:
+        db.execute('UPDATE controller_leases SET expires=? WHERE run_id=?', (w.clock() + 3600, w.run_id))
+    w.store.prepare_ready(w.ctl, node_ids=['a', 'c'])
+    results = {}
+    for node_id, case in (('a', 'record'), ('c', 'running')):
+        claimed = readiness.claim(w, node_id)
+        lease = claimed['lease']
+        w.store.jobs.begin_launch(lease)
+        if case == 'record':
+            launch = w.store.state_dir / 'jobs' / claimed['id'] / 'launches' / claimed['launch_id']
+            launch.mkdir(parents=True)
+            (launch / gs.REMOTE_ATTEMPT).write_text('{}', encoding='utf-8')
+        else:
+            w.store.jobs.transition(lease, 'RUNNING')   # the old actor passed RUNNING after the controller's read
+        results[case] = (w.store.settle_stale_launch(w.ctl, claimed['id']), claimed)
+    outcome, claimed = results['record']
+    assert outcome == 'uncertain'
+    job = w.store.jobs.get(claimed['id'])
+    assert (job['status'], job['error']) == ('FAILED', gs.STALE_HEARTBEAT) and w.store.jobs.holds_lock(
+        w.store.jobs.current_lease(claimed['id']))
+    with pytest.raises(ValueError, match='stale attempt lease'):
+        w.store.jobs.transition(claimed['lease'], 'RUNNING')   # the old actor is fenced
+    outcome, claimed = results['running']
+    assert outcome == 'unchanged' and w.store.jobs.get(claimed['id'])['status'] == 'RUNNING'
+    w.store.jobs.heartbeat(claimed['lease'])   # its token was not rotated
+
+
+def test_one_unreadable_run_never_hides_the_others(tmp_path, monkeypatch):
+    """Minor 4: graph_status and status() report an error entry for a run they cannot read, and every other run."""
+    gc = api()
+    w = world(tmp_path, monkeypatch, chain)
+    other = readiness.second_run(w)
+    controller, owner = start(w)
+    with w.store.jobs.connection() as db:
+        db.execute("UPDATE graph_runs SET plan='{}' WHERE id=?", (other.run_id,))
+    status = gc.graph_status(w.store, now=w.clock())
+    by_id = {item['run_id']: item for item in status['runs']}
+    assert set(by_id) == {w.run_id, other.run_id}
+    assert by_id[other.run_id]['error'].startswith('unreadable graph run') and 'nodes' not in by_id[other.run_id]
+    assert by_id[w.run_id]['status'] == 'RUNNING' and len(by_id[w.run_id]['nodes']) == 2
+    controller.tick(owner)   # the controller keeps scheduling the readable run
+    assert {item['run_id'] for item in controller.status()['runs']} == {w.run_id, other.run_id}
+    assert node(w, 'a')['status'] in {'READY', 'RUNNING'}
+
+
+class FailingFuturePool(ManualPool):
+    """A dispatch thread that died with a BaseException (what ThreadPoolExecutor stores in its future)."""
+
+    def submit(self, key, fn):
+        future = concurrent.futures.Future()
+        future.set_running_or_notify_cancel()
+        future.set_exception(Crash('the dispatch thread died'))
+        return future
+
+
+def test_a_dying_dispatch_thread_still_releases_the_owner(tmp_path, monkeypatch):
+    """Minor 5: a BaseException from a dispatch future escapes run_forever only after the owner lease is released."""
+    gc = api()
+    w = world(tmp_path, monkeypatch, chain)
+    controller, owner = start(w, pool=FailingFuturePool(), settings=gc.ControllerSettings(tick_seconds=0.01,
+                                                                                          lease_heartbeat_seconds=0.01))
+    with pytest.raises(Crash):
+        controller.run_forever(threading.Event())
+    assert w.store.owner_state()['expires'] == 0
+    start(w, 'controller-b')   # a successor acquires at once
+
+
+def test_secrets_the_controller_knows_never_reach_the_ledger(tmp_path, monkeypatch):
+    """Minor 7: error text that echoes a destination's configured secret is redacted before any ledger write."""
+    w = world(tmp_path, monkeypatch, lambda r: [train(r, 'a'), train(r, 'f')], max_attempts=1)
+    w.provider.secret = SECRET   # the FakeProvider redacts it, as SettingsExecutorProvider.redact does
+    w.dispatcher.script['f'] = ['fail_remote']   # its error text echoes the secret
+    controller, owner = start(w)
+    drive(w, controller, owner)
+    assert node(w, 'f')['status'] == 'FAILED'
+    with w.store.jobs.connection() as db:
+        dump = '\n'.join(db.iterdump())
+    assert SECRET not in dump and '[redacted]' in dump
+    files = b''.join(path.read_bytes() for path in w.store.state_dir.rglob('*') if path.is_file()
+                     and path.suffix in {'.txt', '.json', '.log', ''})
+    assert SECRET.encode() not in files   # the accepted result and error.txt are redacted too
+    uploaded = repr({run_id: (run.data, run.artifacts) for run_id, run in w.fake.runs.items()})
+    assert SECRET not in uploaded
+
+
+def test_refused_destinations_back_off_and_finished_runs_are_forgotten(tmp_path, monkeypatch, caplog):
+    """Minor 8: a refused destination is not re-opened every tick; in-process maps forget finished runs; a refusal
+    whose return fails for another reason is still returned later."""
+    gc = api()
+    w = world(tmp_path, monkeypatch, lambda r: [train(r, 'a')])
+    w.provider.refuse['p1'] = ConnectionError('ssh connect timed out')
+    controller, owner = start(w, settings=gc.ControllerSettings(lease_ttl_seconds=600))
+    for _ in range(4):
+        controller.tick(owner)
+        w.clock.advance(10)
+    assert w.provider.resolves == ['p1']   # backed off
+    assert node(w, 'a')['wait_reason'].startswith('destination unavailable')
+    w.clock.advance(gc.ControllerSettings().destination_retry_seconds)
+    del w.provider.refuse['p1']
+    drive(w, controller, owner)
+    assert w.provider.resolves.count('p1') == 2 and run_row(w)['status'] == 'COMPLETED'
+    controller.tick(owner)
+    assert not [key for key in controller._reasons if key[0] == w.run_id]
+    assert not controller._outcomes and not controller._reconciled_at and not controller._simulated
+    assert controller.status()['controller']['in_flight'] == []
+
+
+def test_the_runner_redacts_results_and_error_files(tmp_path, monkeypatch):
+    """Minor 7: the accepted result and error.txt pass through the store's error filter (the controller installs it)."""
+    from tuning_factory.attempt_runner import OperationAttemptRunner
+    from tuning_factory.worker_protocol import WorkerRequest
+    w = world(tmp_path, monkeypatch, lambda r: [train(r, 'a')])
+    w.store.jobs.error_filter = lambda text: text.replace(SECRET, '[redacted]')
+    runner = OperationAttemptRunner(w.store, root=w.store.state_dir)
+    launch = w.store.state_dir / 'jobs' / 'j1' / 'launches' / ('a' * 32)
+    launch.mkdir(parents=True)
+    request = WorkerRequest(attempt_id='b' * 32, launch_id='a' * 32, manifest_sha256='c' * 64,
+                            operation_sha256='d' * 64, timeout_seconds=60)
+    raw = {'schema_version': 2, 'status': 'FAILED', 'launch_id': 'a' * 32, 'attempt_id': 'b' * 32,
+           'error': f'remote said {SECRET}'}
+    result = runner._accept(raw, request, launch)
+    assert result.error == 'remote said [redacted]'
+    assert SECRET.encode() not in (launch.parent / f'{"a" * 32}.result.json').read_bytes()
+    runner._write_error('j1', f'refused: {SECRET}')
+    assert (w.store.state_dir / 'jobs' / 'j1' / 'error.txt').read_text(encoding='utf-8') == 'refused: [redacted]'
+
+
+def test_heartbeat_warnings_are_rate_limited(tmp_path, monkeypatch, caplog):
+    """8.5 review Minor 8: a database that stays locked logs the first failure and then only occasionally."""
+    import logging
+    import sqlite3
+
+    from tuning_factory.attempt_runner import OperationAttemptRunner
+    w = world(tmp_path, monkeypatch, lambda r: [train(r, 'a')])
+    runner = OperationAttemptRunner(w.store, root=w.store.state_dir)
+    runner.heartbeat_seconds = 0.001
+    failures, done = [], threading.Event()
+
+    def heartbeat(lease):
+        failures.append(lease)
+        if len(failures) >= 40:
+            done.set()
+        raise sqlite3.OperationalError('database is locked')
+
+    runner.jobs = SimpleNamespace(heartbeat=heartbeat)
+    caplog.set_level(logging.WARNING)
+    stop = runner._heartbeat(SimpleNamespace(job_id='j'))
+    try:
+        assert done.wait(30)
+    finally:
+        stop.set()
+    warnings = [record for record in caplog.records if 'heartbeat failed' in record.getMessage()]
+    assert 1 <= len(warnings) <= 3
+
+
+def test_a_failed_return_never_hides_the_refusal(tmp_path, monkeypatch):
+    """8.5 review Minor 8: if returning a refused launch fails for another reason (a locked database), the refusal
+    itself still surfaces and the next harvest returns the attempt."""
+    import sqlite3
+    gs = readiness.api()
+    w = world(tmp_path, monkeypatch, chain)
+    controller, owner = start(w)
+    controller.tick(owner)
+    a = job_of(w, 'a')
+    w.store.pause(w.run_id)
+    original = gs.GraphStore.return_unlaunched
+
+    def locked(self, *args, **kwargs):
+        raise sqlite3.OperationalError('database is locked')
+
+    monkeypatch.setattr(gs.GraphStore, 'return_unlaunched', locked)
+    future = w.pool.run(a)
+    assert str(future.exception()) == GRAPH_LAUNCH_REFUSED   # not the database error
+    assert w.store.jobs.get(a)['status'] == 'PROVISIONING'
+    monkeypatch.setattr(gs.GraphStore, 'return_unlaunched', original)
+    report = controller.tick(owner)
+    assert a in report.released and w.store.jobs.get(a)['status'] == 'QUEUED'

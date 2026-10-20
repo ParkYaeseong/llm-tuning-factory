@@ -52,6 +52,7 @@ from .graph_store import (
     SETTLED_AS,
     FailureKind,
     GraphStore,
+    LedgerIntegrityError,
     NodeOutputs,
     accepted_result,
 )
@@ -118,14 +119,20 @@ class OperationAttemptRunner:
         job = self.jobs.get(lease.job_id)
         try:
             manifest, operation = self._verify_before_launch(job, claimed, lease, executor, approval)
+            # The continuation's evidence comes from the trusted resolver before the launch begins (8.5 review
+            # Minor 1): a ledger integrity failure leaves the attempt unlaunched for the controller to return,
+            # uncounted, instead of failing it after begin_launch.
+            evidence = self._continuation_evidence(job, operation)
+        except LedgerIntegrityError:
+            raise
         except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
+            error = self.jobs.filtered(f"{type(exc).__name__}: {exc}")
             if not self.jobs.abandon_unlaunched(lease, error):   # a stale lease raises here
                 raise   # started, legacy or no longer provisioning: never failed from here
             self._write_error(job["id"], error)
             return OperationOutcome(job["id"], lease.attempt_id, "FAILED", False, None, error=error)
         launch_id = self.jobs.begin_launch(lease)   # once per attempt: "launch already started or uncertain"
-        return self._launch(job, manifest, operation, lease, launch_id, executor)
+        return self._launch(job, manifest, operation, lease, launch_id, executor, evidence)
 
     def reconcile(self, job_id: str, executor) -> OperationOutcome | None:
         """Finish an uncertain or crashed attempt from its one launch; never launches.
@@ -246,7 +253,7 @@ class OperationAttemptRunner:
 
     # -- launch ---------------------------------------------------------------------------------
 
-    def _launch(self, job, manifest, operation, lease, launch_id, executor) -> OperationOutcome:
+    def _launch(self, job, manifest, operation, lease, launch_id, executor, evidence=((), ())) -> OperationOutcome:
         job_id = job["id"]
         launch = self._launch_dir(job_id, launch_id)
 
@@ -257,7 +264,7 @@ class OperationAttemptRunner:
         stop = self._heartbeat(lease)
         try:
             self.jobs.materialize_job_evidence(job_id)
-            request, transfers = self._prepare(job, manifest, operation, lease, launch)
+            request, transfers = self._prepare(job, manifest, operation, lease, launch, evidence)
             self.jobs.transition(lease, "RUNNING")
             raw = executor.run_operation(self._job_dir(job_id), launch, request, transfers, canceled)
             result = self._accept(raw, request, launch)
@@ -274,7 +281,7 @@ class OperationAttemptRunner:
         except ExecutionUncertain as exc:
             error, uncertain = str(exc), True
         except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
+            error = self.jobs.filtered(f"{type(exc).__name__}: {exc}")
         finally:
             stop.set()
         # Deliberately outside ``finally``: after a crash nothing below runs, and reconcile repairs the ledger.
@@ -289,7 +296,7 @@ class OperationAttemptRunner:
             self._seed_cache(executor, operation, launch, outputs)
         return OperationOutcome(job_id, lease.attempt_id, status, uncertain, outputs, targets, error)
 
-    def _prepare(self, job, manifest, operation, lease, launch):
+    def _prepare(self, job, manifest, operation, lease, launch, evidence=((), ())):
         if launch.exists() or launch.is_symlink():
             raise ValueError("launch directory already exists; an attempt launches once")
         launch.mkdir(parents=True)
@@ -299,8 +306,8 @@ class OperationAttemptRunner:
                                           operation.model_input)
         elif isinstance(operation, EvaluateOperation):
             write_benchmark_data(launch, self._dataset_bytes(operation.benchmark.dataset))
-        evidence, producers = self._continuation_evidence(job, operation)
-        resolved = stage_model_inputs(operation, self.graph.artifacts, launch, target_evidence=evidence,
+        targets, producers = evidence
+        resolved = stage_model_inputs(operation, self.graph.artifacts, launch, target_evidence=targets,
                                       producers=producers)
         request = self._request(lease.attempt_id, launch.name, manifest, operation)
         (launch / COMMAND).write_bytes(canonical(request.model_dump(mode="json")))
@@ -392,6 +399,11 @@ class OperationAttemptRunner:
         elif (getattr(executor, "server_profile", None) is not None
               or (getattr(executor, "pod", None) or {}).get("id") != profile.pod_id):
             raise mismatch
+        # The profile a provider opened this executor for (8.5 review Important 1): an alias of the same Pod or
+        # server is not the pinned destination, so a changed or deleted profile never runs through another one.
+        resolved_for = getattr(executor, "destination_profile", None)
+        if resolved_for is not None and resolved_for != profile:
+            raise mismatch
         # Live GPU type, count and price against the pinned budget (RunPod Pod or observed SSH selection).
         executor.validate_config(_PinnedResources(pinned.legacy_resources(resources.timeout_seconds)))
 
@@ -422,6 +434,8 @@ class OperationAttemptRunner:
         if result.launch_id != request.launch_id or result.status == "COMPLETED" and identities != (
                 request.attempt_id, request.manifest_sha256, request.operation_sha256):
             raise ExecutionUncertain(FOREIGN_RESULT)
+        if result.error:   # the remote's own text may echo a credential the controller knows (8.5 review Minor 7)
+            result = result.model_copy(update={"error": self.jobs.filtered(result.error)})
         _write_atomic(self._record(launch, "result"), canonical(result.model_dump(mode="json")))
         return result
 
@@ -470,14 +484,18 @@ class OperationAttemptRunner:
         stop = threading.Event()
 
         def beat():
+            failures = 0
             while not stop.wait(self.heartbeat_seconds):
                 try:
                     self.jobs.heartbeat(lease)
+                    failures = 0
                 except ValueError:
                     return   # ownership or state changed; later mutations stay fenced
                 except Exception as exc:   # e.g. a locked database: keep beating, never stop silently (8.4 Minor 3)
-                    logging.getLogger(__name__).warning("attempt heartbeat failed; retrying: %s",
-                                                        type(exc).__name__)
+                    failures += 1
+                    if failures == 1 or failures % 100 == 0:   # rate-limited (8.5 review Minor 8)
+                        logging.getLogger(__name__).warning("attempt heartbeat failed %d time(s); retrying: %s",
+                                                            failures, type(exc).__name__)
 
         threading.Thread(target=beat, daemon=True).start()
         return stop
@@ -496,4 +514,4 @@ class OperationAttemptRunner:
         with contextlib.suppress(OSError):
             directory = self._job_dir(job_id)
             directory.mkdir(parents=True, exist_ok=True)
-            (directory / "error.txt").write_text(error, encoding="utf-8")
+            (directory / "error.txt").write_text(self.jobs.filtered(error), encoding="utf-8")

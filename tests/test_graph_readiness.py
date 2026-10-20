@@ -594,7 +594,9 @@ def test_local_selection_completes_atomically_and_cancel_wins(tmp_path, monkeypa
 # -- 9. inspected targets (coordinator item 4) ---------------------------------------------------
 
 def test_inspected_targets_are_verified_and_persisted(tmp_path):
-    w = build(tmp_path, lambda r: [materialize(r, 'full', r.first), evaluate(r, 'e', r.first)])
+    # m evaluates full's output: the resolver re-verifies only a node's own lineage (8.5 review Minor 1).
+    w = build(tmp_path, lambda r: [materialize(r, 'full', r.first), evaluate(r, 'e', r.first),
+                                   evaluate(r, 'm', 'full')])
     store, gs = w.store, api()
     prepare(w, 'full', 'e')
     claimed = finished(w, 'full')
@@ -615,7 +617,8 @@ def test_inspected_targets_are_verified_and_persisted(tmp_path):
     store.acknowledge_tracking(lease)
     (saved,) = [outputs for evidence, outputs in store.ledger(w.run_id) if evidence.node_id == 'full']
     assert saved.inspected_targets == (targets,)
-    assert targets in store.bindings_for(w.run_id, 'e').base_targets   # the resolver uses them, re-verified
+    assert targets in store.bindings_for(w.run_id, 'm').base_targets   # the resolver uses them, re-verified
+    assert targets not in store.bindings_for(w.run_id, 'e').base_targets   # e's lineage never touches full
     evaluation = finished(w, 'e')
     with pytest.raises(ValueError, match='evaluation cannot publish inspected targets'):
         store.record_outputs(evaluation['lease'], gs.NodeOutputs(evaluation=evaluation_output(w, evaluation, 0.5),
@@ -625,7 +628,8 @@ def test_inspected_targets_are_verified_and_persisted(tmp_path):
         payload['inspected_targets'][0]['modules'][0]['output_dimension'] = 3
         db.execute("UPDATE node_outputs SET outputs=? WHERE node_id='full'", (canonical(payload).decode(),))
     with pytest.raises(ValueError, match='inspected base dimensions differ'):
-        store.bindings_for(w.run_id, 'e')
+        store.bindings_for(w.run_id, 'm')
+    store.bindings_for(w.run_id, 'e')   # another branch: unaffected
 
 
 # -- 10-11. dispositions and retries -------------------------------------------------------------

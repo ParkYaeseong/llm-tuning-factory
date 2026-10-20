@@ -41,6 +41,10 @@ class PreparationLease:
 
 
 class JobStore:
+    # A callable the graph controller installs (8.5 review Minor 7): error text from an executor or worker passes
+    # through it before it is stored, so a configured credential it echoes never reaches the ledger.
+    error_filter = None
+
     def __init__(self, path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -255,8 +259,15 @@ class JobStore:
                 raise ValueError('no current attempt lease')
             return AttemptLease(job_id, row['attempt_id'], row['lease_token'], row['resource_id'])
 
+    def filtered(self, error):
+        """``error`` through the installed ``error_filter`` (unchanged without one)."""
+        if error is None or self.error_filter is None:
+            return error
+        return self.error_filter(str(error))
+
     def transition(self, subject, status, error=None):
         job_id = subject.job_id if isinstance(subject, AttemptLease) else subject
+        error = self.filtered(error)
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
@@ -469,6 +480,7 @@ class JobStore:
     def abandon_unlaunched(self, lease, error):
         """Pre-launch refusal: begin_launch never ran, so no remote process can exist.
         Fail the attempt and free its lock; a started, legacy or non-provisioning attempt is untouched."""
+        error = self.filtered(error)
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             row = self.validate_lease(db, lease)
@@ -547,6 +559,7 @@ class JobStore:
     def reconcile_result(self, lease, status, error=None):
         if status not in TERMINAL:
             raise ValueError('invalid reconciled terminal status')
+        error = self.filtered(error)
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             row = self.validate_lease(db, lease)

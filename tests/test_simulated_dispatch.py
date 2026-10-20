@@ -873,3 +873,16 @@ def test_attempt_heartbeats_survive_a_transient_database_error(tmp_path, module)
     finally:
         stop.set()
     assert len(errors) == 2
+
+
+def test_a_failing_directory_fsync_keeps_the_published_result(tmp_path, monkeypatch):
+    """8.5 review Minor 8: the link already published the result; a failing directory fsync is only logged."""
+    sd = api()
+
+    def failing(directory):
+        raise OSError("fsync of a directory is not supported here")
+
+    monkeypatch.setattr(sd, "_fsync_directory", failing)
+    target = tmp_path / "launch.result.json"
+    assert sd._publish_exclusive(target, b"result") is True
+    assert target.read_bytes() == b"result" and sd._publish_exclusive(target, b"other") is False

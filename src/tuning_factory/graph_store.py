@@ -241,6 +241,19 @@ def _readiness(plan, facts):
     return tuple(result)
 
 
+def _ancestors(plan, node_id) -> frozenset:
+    """Every node the given node depends on, transitively (ports and explicit edges)."""
+    edges = graph_edges(plan.graph)
+    found, frontier = set(), [node_id]
+    while frontier:
+        current = frontier.pop()
+        for parent, child in edges:
+            if child == current and parent not in found:
+                found.add(parent)
+                frontier.append(parent)
+    return frozenset(found)
+
+
 def _failed_evaluations(plan, node, statuses):
     """The finished-but-unsuccessful evaluation parents of the selection a node compiles (itself or a parent)."""
     nodes = {entry.node.id: entry.node for entry in plan.nodes}
@@ -493,18 +506,23 @@ class GraphStore:
         entry = next((item for item in plan.nodes if item.node.id == node_id), None)
         if entry is None:
             raise ValueError('unknown graph node')
-        ledger = self.ledger(run_id)
         if self.binding_resolver:
             resolver = self.binding_resolver
             if isinstance(resolver, LedgerBindingResolver):
                 if resolver.store is not self:
                     raise ValueError('the ledger binding resolver belongs to another store')
-                bindings = resolver(plan, node_id, ledger, run_id=run_id)   # the plan alone cannot name the run
+                try:   # recorded evidence that no longer verifies is a ledger integrity error (8.5 review Minor 1)
+                    bindings = resolver(plan, node_id, self.ledger(run_id), run_id=run_id)
+                except LedgerIntegrityError:
+                    raise
+                except ValueError as exc:
+                    raise LedgerIntegrityError(f'{LEDGER_INTEGRITY}: {exc}') from exc
             else:
-                bindings = resolver(plan, node_id, ledger)
+                bindings = resolver(plan, node_id, self.ledger(run_id))
             if not isinstance(bindings, VerifiedBindings):
                 raise TypeError('trusted resolver must return VerifiedBindings')
             return bindings
+        ledger = self.ledger(run_id)
         # Root-node planning works without a controller. Conditional outputs require
         # the trusted controller to assemble and verify their complete producer lineage.
         return VerifiedBindings(registry=self.registry, artifact_store=self.artifacts,
@@ -567,9 +585,11 @@ class GraphStore:
                 bindings = self.bindings_for(run['id'], entry.node.id)
             except ValueError as exc:
                 if gated is not None:
-                    # The resolver re-verifies run-wide ledger evidence (completed producers, persisted targets,
-                    # active jobs' facts). A record that no longer verifies is not this node's refusal: fail
-                    # nothing and let the controller hold the run for an operator (8.2 review M-2).
+                    # The resolver re-verifies the node's recorded lineage (its ancestors' producers and persisted
+                    # targets) and the active jobs' facts. A record that no longer verifies is not this node's
+                    # refusal: fail nothing and let the controller hold it for an operator (8.2 review M-2).
+                    if isinstance(exc, LedgerIntegrityError):
+                        raise
                     raise LedgerIntegrityError(f'{LEDGER_INTEGRITY}: {exc}') from exc
                 self._record_compile_error(controller_lease, run['id'], entry.node.id, exc)
                 continue
@@ -730,9 +750,14 @@ class GraphStore:
         db.execute(DISPOSE, (attempt_id, run_id, row['graph_node_id'], row['id'], disposition, counted, detail,
                              self.clock()))
 
-    def claim_ready(self, resource_facts, controller_lease):
+    def claim_ready(self, resource_facts, controller_lease, *, job_id=None, executor=None):
         """Claim one queued job of this run: with ``resource_facts`` an operation that fits them, with None only a
-        local selection. The attempt's maximum cost is reserved in the same transaction."""
+        local selection. The attempt's maximum cost is reserved in the same transaction.
+
+        ``job_id`` and ``executor`` (8.5 review Important 1) restrict the claim to that job, or to jobs pinned to that
+        public executor profile: the controller opens one job's destination and must never hand it to another job
+        whose profile (an alias of the same Pod) was refused or needs another runtime. Nothing is written otherwise.
+        """
         from pydantic import TypeAdapter
 
         from .executor_profiles import ResourceObservation, observation_fits
@@ -752,9 +777,14 @@ class GraphStore:
             ceiling = plan.max_estimated_cost_usd * (1 + 1e-9)   # defence in depth against float summation order
             for row in db.execute("SELECT j.* FROM jobs j JOIN nodes n ON j.id=n.job_id WHERE n.run_id=? "
                                   "AND j.status='QUEUED' AND j.id NOT IN (SELECT job_id FROM gpu_locks) ORDER BY j.priority DESC,j.created", (run['id'],)).fetchall():
+                if job_id is not None and row['id'] != job_id:
+                    continue
                 operation = json.loads(row['manifest'])['operation']
                 if (operation['kind'] == 'select') != (resource_facts is None):
                     continue   # a GPU observation never claims the local selection; None claims nothing else
+                if (executor is not None
+                        and OperationResources.model_validate(operation['resources']).executor != executor):
+                    continue
                 if operation['kind'] == 'select':
                     resource = 'local:' + run['id']
                 else:
@@ -1196,17 +1226,32 @@ class GraphStore:
         directory after the rotation is therefore stable. Without the record the attempt fails, its lock and
         reservation are released and it is uncounted and retryable at once. Otherwise only the rotation remains.
         """
+        return self._settle_started(controller_lease, job_id, fail_contacted=False) == 'released'
+
+    def settle_stale_launch(self, controller_lease, job_id) -> Literal['released', 'uncertain', 'unchanged']:
+        """The controller's settlement of a stale attempt still PROVISIONING after ``begin_launch``, in one
+        transaction after the token rotation (8.5 review Minor 3): ``released`` as ``release_uncontacted``;
+        ``uncertain`` when its remote record exists (or cannot be proven absent): FAILED with the lock kept, for
+        reconcile; ``unchanged`` when it is no longer such an attempt (its actor passed RUNNING meanwhile), which is
+        left alone and untouched."""
+        return self._settle_started(controller_lease, job_id, fail_contacted=True)
+
+    def _settle_started(self, controller_lease, job_id, *, fail_contacted):
         with self.jobs.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             run = self._controller(db, controller_lease)
             row = self._current_attempt(db, run['id'], job_id)
             if row['status'] != 'PROVISIONING' or not row['launch_started'] or row['legacy']:
-                return False
+                return 'unchanged'
             db.execute('UPDATE job_attempts SET lease_token=? WHERE attempt_id=?',
                        (uuid.uuid4().hex, row['attempt_id']))
-            if self._contacted(job_id, row['launch_id']):
-                return False
             now = time.time()
+            if self._contacted(job_id, row['launch_id']):
+                if not fail_contacted:
+                    return 'contacted'
+                db.execute("UPDATE jobs SET status='FAILED',error=?,updated=? WHERE id=?", (STALE_HEARTBEAT, now, job_id))
+                db.execute('INSERT INTO events VALUES (?,?,?,?)', (job_id, 'FAILED', now, STALE_HEARTBEAT))
+                return 'uncertain'
             db.execute("UPDATE jobs SET status='FAILED',error=?,updated=? WHERE id=?",
                        (RELEASED_BEFORE_CONTACT, now, job_id))
             db.execute('INSERT INTO events VALUES (?,?,?,?)', (job_id, 'FAILED', now, RELEASED_BEFORE_CONTACT))
@@ -1214,7 +1259,7 @@ class GraphStore:
             db.execute("UPDATE budget_reservations SET status='VOID' WHERE attempt_id=?", (row['attempt_id'],))
             self._dispose(db, run['id'], row, row['attempt_id'], 'released_before_contact', 0, RELEASED_BEFORE_CONTACT)
             self._settle_node(db, run, row, 'released_before_contact', 0, RELEASED_BEFORE_CONTACT)
-            return True
+            return 'released'
 
     def recover_stale(self, controller_lease, *, stale_before: float) -> tuple[str, ...]:
         """The run-scoped ``JobStore.recover``: RUNNING/EVALUATING attempts of this run whose heartbeat is older
@@ -1345,6 +1390,7 @@ class LedgerBindingResolver:
         if entry is None:
             raise ValueError('unknown graph node')
         kinds = {item.node.id: item.node.kind for item in plan.nodes}
+        lineage = _ancestors(plan, node_id)   # only the node's own lineage is re-verified (8.5 review Minor 1)
         outputs, evaluations, completed = [], [], []
         producers = [item.producer for item in plan.execution_choices.artifacts]
         targets = {canonical(item.model_dump(mode='json')): item for item in plan.execution_choices.base_targets}
@@ -1352,6 +1398,8 @@ class LedgerBindingResolver:
             if evidence.status != 'completed':
                 continue
             completed.append(evidence)
+            if evidence.node_id not in lineage:
+                continue   # another branch: a damaged record there never holds this node
             if saved.model is not None:
                 outputs.append(saved.model)
                 if kinds[evidence.node_id] in PRODUCERS and evidence.tracking_acknowledged:

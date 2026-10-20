@@ -949,9 +949,9 @@ CPU and with fakes:
   `0d405733…373a`). After Task 8.2 it was `26a68aee…a117` (source `58adcdc8…ec17`). After Task 8.3 it was
   `1ddbabdc…6ceb` (source `eed26807…fc54`). After Task 8.4 it was `2afbd0b8…88f8` (source `9cd9ca7e…6ba0`).
   After Task 8.5 it was `d796f3ed…7f1d` (source `0888d176…ceab`). After Task 9.1 it was `5147d6d9…ab68`
-  (source `ebf51635…76ec`). After Task 9.2, the current receipt is `50a64996…9f66` (29/29 checks, source
-  `0204b69b…16e1`; see "Task 9.2 planning: profiles, observations, HF roots, benchmarks, validation and dry
-  plans").
+  (source `ebf51635…76ec`). After Task 9.2 it was `50a64996…9f66` (source `0204b69b…16e1`). After the 8.5 review
+  fixes, the current receipt is `6524aba8…1c5f` (29/29 checks, source `b6547200…c3a3`; see "Task 8.5 review
+  fixes").
 
 Not verified (needs explicit GPU/host authorization):
 - Any real GPU or host.
@@ -1894,8 +1894,11 @@ Hand-off notes and how each was resolved:
   - The controller's tracker bounds each create (`create_run`, `create_model_version`) through
     `MLFLOW_HTTP_REQUEST_MAX_RETRIES=2` and `MLFLOW_HTTP_REQUEST_TIMEOUT=60`, set only around that call by a tracker
     built with `bounded_requests` (`controller_tracker`, or set by the controller on the tracker it is given) and
-    restored afterwards. v1 trackers never set them. The mlflow client reads both per request, so the worst case of
-    one create is about 3 × 60 s plus backoff, far below the 600 s claim.
+    restored afterwards. v1 trackers never set them. **Corrected by the 8.5 review (Important 2):** the "about
+    3 × 60 s" bound written here was wrong. The client's session `Retry` re-sends a POST on 5xx and on read
+    timeouts, so 2 retries could create a second version inside one intent, and `create_model_version` also waited
+    up to 300 s for READY. Creates now use 0 transport retries and `await_creation_for=0` (see "Task 8.5 review
+    fixes").
   - Contract: one controller per state directory (owner lease), one tracking thread, one claim in flight; the claim TTL
     must exceed the longest create a dead controller may leave in flight.
   - Tests:
@@ -2537,6 +2540,172 @@ main venv with `PYTHONPATH` on the worktree `src`):
 
 Not verified or still open: as in the 9.5 entry (real Credential Manager from the broker, real detached spawn and
 job breakaway, the PyInstaller child and the EOF stop: Task 11).
+
+## Task 8.5 review fixes, 2026-10-20
+
+Commit `fix: tie graph claims to their resolved destination and stop transport-retried creates`, written on `1ca866c`
+(Task 9.1) and rebased onto `2b16eee` (Tasks 9.5, 9.2 and the 9.5 review fixes landed meanwhile; none touches these
+files). It addresses the independent review of `2362144` (8.5): "Ready with fixes", nothing Critical, the core
+invariants held under about 20 probes, and two Important issues to close before Task 9 wires the controller into the
+broker.
+
+Required:
+- **Important 1: a claim could go to another job's destination.** `_claims` opened the iterated job's destination,
+  but `claim_ready(observation)` returned the highest-priority queued job that fits it. RunPod's `observation_key`
+  ignores the profile, so the jobs of two alias profiles of one Pod both fit.
+  - Probe A2 (x pinned to a refused p1, y to its alias p3): x ran through p3's executor and completed.
+  - Probe A3 (different runtimes): x was claimed and returned every tick, so the ledger grew without bound and y never
+    ran.
+  - Fix:
+    - `GraphStore.claim_ready(..., *, job_id=None, executor=None)` claims only that job, or only jobs pinned to that
+      public executor profile, and writes nothing otherwise. The controller passes the iterated job and its pinned
+      profile.
+    - The controller also refuses a destination whose `profile` is not the job's pinned one
+      (`DESTINATION_PROFILE_DIFFERS`), when claiming and when resuming a taken-over claim.
+    - The different-runtime return path (`RUNTIME_DIFFERS`) is gone: no attempt is ever written for another job.
+    - Defence in depth: `SettingsExecutorProvider.resolve` stamps `executor.destination_profile = pinned`, and the
+      runner's `_check_destination` refuses an executor stamped for another profile (RunPod and SSH). Executors built
+      without a provider (tests, v1) carry no stamp and keep the `pod.id`/`server_profile` checks.
+  - Tests:
+    - `test_a_claim_never_goes_to_another_jobs_destination[same_runtime|other_runtime]`: 6 ticks; x has no attempt,
+      disposition, reservation or extra event, and y completes.
+    - `test_the_runner_refuses_an_executor_resolved_for_another_profile`, with the real runner and the GPUHost
+      executor.
+    - Assertions in `test_provider_compares_the_observed_canonical_pod[live|ssh_live]`.
+- **Important 2: the MLflow transport re-POSTed creates.** mlflow-skinny 3.17.1 builds its session `Retry` with
+  `allowed_methods=None`, so with 2 retries a create the server committed but whose response was lost was sent again
+  inside one intent. That could make a second version with the same `factory.registration_key`, which the outbox cannot
+  see. `create_model_version` also polled up to 300 s for READY, so 8.5's "about 3 × 60 s" was wrong (corrected in
+  place).
+  - Fix: `CONTROLLER_HTTP_MAX_RETRIES = 0` (the timeout stays 60 s), so the outbox's durable intent plus search-first
+    adoption is the only retry. `create_keyed_model_version` passes `await_creation_for=0`, and adoption already accepts
+    a PENDING version (only `FAILED_REGISTRATION` is excluded). The optional search after a create is not added, to
+    keep one authoritative search per try.
+  - Tests:
+    - `test_controller_creates_are_never_resent_by_the_transport`: during every `create_run`/`create_model_version`,
+      mlflow's own `MLFLOW_HTTP_REQUEST_MAX_RETRIES.get()` is 0 and the timeout is 60; `await_creation_for=0`; both are
+      restored afterwards.
+    - `test_a_pending_registration_version_is_adopted`, a guard that already passed.
+    - The bound asserted in `test_long_uploads_keep_the_owner_and_the_claim_alive` is now `0`.
+
+Recommended:
+- **Minor 1: the integrity scope was wider than the node.**
+  - `LedgerBindingResolver` re-verifies producers and persisted targets only for the node's own transitive ancestors
+    (`_ancestors`), so a damaged record of another branch no longer holds it.
+  - `bindings_for` turns a resolver failure into `LedgerIntegrityError`.
+  - At dispatch: the runner now resolves a continuation's evidence before `begin_launch`, and both dispatchers re-raise
+    `LedgerIntegrityError` instead of counting it. The controller returns the attempt unlaunched (uncounted) from the
+    dispatch thread and shows the integrity wait reason (`needs_operator`). Before each claim it checks the node's
+    bindings, so a damaged lineage holds the node without any attempt.
+  - Tests: `test_integrity_checks_are_scoped_to_the_nodes_own_lineage` (unrelated damage: b runs and e waits; at
+    dispatch through the simulated dispatcher: one attempt, `returned_unlaunched` uncounted, then no further claim).
+    The 8.2 test `test_inspected_targets_are_verified_and_persisted` now checks the resolver on a node downstream of
+    `full` and that another branch is unaffected.
+- **Minor 2: `_bounded_requests` was process-global and not thread-safe.** It now takes a module lock with a
+  reference count: the first caller saves and sets the variables, and the last one restores them.
+  `test_bounded_requests_nest_across_threads`.
+- **Minor 3: the started-PROVISIONING fallback was not atomic.** The new `GraphStore.settle_stale_launch` (`released`,
+  `uncertain` or `unchanged`) rotates the token and then releases, or marks FAILED with the lock kept, in one
+  transaction. An actor that passed RUNNING meanwhile is left untouched. `release_uncontacted` keeps its boolean
+  contract on the same helper. `test_a_stale_started_launch_is_settled_in_one_transaction`.
+- **Minor 4: one unreadable run broke every status.** `graph_status` now isolates each run: an unreadable one is
+  reported as `{"run_id", "error": "unreadable graph run: …"}`. A requested unknown run still raises.
+  `test_one_unreadable_run_never_hides_the_others`.
+- **Minor 5: a BaseException from a dispatch future escaped without releasing the owner.** `run_forever` now stops the
+  tracking thread, shuts down its own pool and releases the owner lease (unless fenced) in a `finally`, then lets the
+  exception propagate. `test_a_dying_dispatch_thread_still_releases_the_owner`.
+- **Minor 6: `needs_operator` was set as soon as an attempt became uncertain.**
+  - New node fields `awaiting_result` and `result_deadline`: the attempt's claim time plus its operation's
+    `timeout_seconds` plus `RESULT_MARGIN_SECONDS` (600).
+  - `needs_operator` is set for an uncertain attempt only without a remote record, or once that deadline has passed.
+  - Wait reasons: `AWAITING_RESULT` no longer suggests `release-lock`; `RESULT_OVERDUE` does, after the deadline;
+    `OPERATOR_CONFIRMATION` is used without a remote record.
+  - `test_ambiguous_launch_waits_for_the_operator` now checks before and after the deadline.
+- **Minor 7: raw error text was stored unredacted.**
+  - `JobStore.error_filter` (installed by the controller as `GraphController.redact`) filters every error that
+    `transition`, `abandon_unlaunched` and `reconcile_result` store. Because `classify_attempt` and `nodes.error` copy
+    `jobs.error`, they inherit the redaction.
+  - The runner applies it to the accepted `<launch_id>.result.json` error and to `error.txt`; the simulated dispatcher
+    applies it to `error.txt`.
+  - `GraphController.redact` combines the providers' `redact` (new `SettingsExecutorProvider.redact`: values of
+    settings named like keys, tokens, secrets, passwords, passphrases or credentials; `SimulatedExecutorProvider.redact`
+    is the identity) with `tracking_outbox.redact` (MLflow's configured secrets, bearer/basic, `secret=` pairs, URL
+    userinfo).
+  - Tests: `test_secrets_the_controller_knows_never_reach_the_ledger` (the DB dump, the state files and the fake
+    MLflow uploads never contain the synthetic secret), `test_the_runner_redacts_results_and_error_files` and
+    `test_the_provider_redacts_the_secrets_it_holds`.
+  - Remaining for Task 9: remote logs (`train.log`, `worker.log`) uploaded as lineage, and executor exception text that
+    never reaches these paths, are not filtered.
+- **Minor 8:**
+  - A refused or unreachable destination is not reopened for `ControllerSettings.destination_retry_seconds` (60).
+  - Finished runs are pruned from `_reasons`, `_simulated`, the backoff map, `_outcomes` and `_reconciled_at`.
+  - `_inflight` is guarded by a lock for `status()` callers on other threads.
+  - A non-`ValueError` while returning a refused launch is logged and never hides the refusal; harvest returns the
+    attempt later.
+  - A failing directory fsync after the hard link is logged, so the published result stands.
+  - Heartbeat warnings (the controller's, the runner's and the simulated dispatcher's) are logged at the first failure
+    and then every 100th.
+  - Tests: `test_refused_destinations_back_off_and_finished_runs_are_forgotten`,
+    `test_a_failed_return_never_hides_the_refusal`, `test_a_failing_directory_fsync_keeps_the_published_result` and
+    `test_heartbeat_warnings_are_rate_limited`.
+
+New `graph_status` fields for Task 9/10:
+- Each node gains `awaiting_result` (bool: a late result is still plausible) and `result_deadline` (epoch seconds, or
+  null).
+- `needs_operator` follows the rule above.
+- An unreadable run appears as `{"run_id", "error"}` with no other keys.
+- The other fields are unchanged; see "Task 8.5 graph controller and end-to-end recovery".
+
+Deviations:
+- `claim_ready` gains two keyword-only filters, which default to the old behaviour.
+- `JobStore.error_filter` is a new class attribute, set per instance by the controller.
+- `GraphStore.settle_stale_launch` is new.
+- Files: `jobs.py` (the filter) and `tests/test_graph_readiness.py` (the scoped-resolver assertion) were edited for
+  these items. `desktop_workflows.py`, `workflow_planning.py`, `projects.py`, `graph_planner.py` and `desktop/` were
+  not touched.
+
+Actual verification (main tree; RED on `1ca866c`, GREEN and acceptance on the tree rebased onto `7f3a4bc` and
+again onto `2b16eee`):
+- RED, on a `git archive` export of `1ca866c` with the new test files copied in: 23 cases failed for the intended
+  reasons, and the PENDING-adoption guard passed.
+  - x claimed through p3, with 1 or 6 attempts;
+  - the runner completed through an alias executor;
+  - retries were 2 during creates, and `CONTROLLER_HTTP_MAX_RETRIES == 2`;
+  - b was held by an unrelated damaged artifact;
+  - `settle_stale_launch` was missing;
+  - a `ValidationError` broke the whole status;
+  - the owner was not released after a dying future;
+  - the secret was in the DB dump;
+  - 4 resolves in 40 s;
+  - the result error was not redacted;
+  - 40 heartbeat warnings;
+  - the refusal was hidden by `database is locked`;
+  - `awaiting_result` was missing;
+  - `destination_profile` and `redact` were missing;
+  - the fsync `OSError` escaped;
+  - the 8.2 resolver test.
+- GREEN:
+  - `uv run pytest tests/test_graph_controller.py tests/test_tracking_outbox.py -q`: **91 passed (59 + 32)**.
+  - The step-4 regressions with the 8.1–8.4 sets: **533 passed**.
+  - `uv run pytest -q` twice: on `1ca866c` **1396 passed, 1 skipped** both times (1379 + 17 new); after the rebase
+    onto `7f3a4bc`, and again after the rebase onto `2b16eee`, **1459 passed, 2 skipped** both times (1442 + 17 new).
+- Ruff (`src tests`) is clean. `check_secrets.py` reports 0 findings over 821 file versions (every change
+  staged). Both GPU locks are unchanged, `git ls-files --eol` shows no CRLF, and every changed file is CR-free.
+- CPU acceptance (`-I`) exited 0, and all **29** checks passed. Max errors are unchanged.
+  - On the rebased tree: receipt SHA256 `6524aba8f6cc9411e2288c3036f3918902996f50495329146e3b46d51a365c1f`,
+    source_sha256 `b6547200cd504b815d110bb230efa4bbd9067c8bfb87fdb544726da7cd69c3a3` (equal to `source_hash()` of a
+    `git archive` export of the commit), lock_sha256 `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`.
+    Before the rebase it gave `3609afe9…7b02` (source `f152b16f…6466`).
+  - It supersedes 9.2's `50a64996…9f66`.
+
+Remaining, for Task 9:
+- The controller must own its process: the bound on creates sets process-wide environment variables while a create
+  runs.
+- `resolve` and `recover` need timeouts. The heartbeat keeps a hung tick looking `running`.
+- Reconcile runs inline on the tick thread, so a long result download stalls scheduling for that time.
+- Remote log uploads and executor exception text outside the filtered paths are not redacted (Minor 7 remainder).
+- Executors built outside `SettingsExecutorProvider` carry no `destination_profile` stamp; the controller's own profile
+  check covers them.
 
 ---
 

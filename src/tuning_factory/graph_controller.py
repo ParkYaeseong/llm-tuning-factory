@@ -38,7 +38,6 @@ from .gpu_servers import SSHServerFacts
 from .graph_store import (
     LEDGER_INTEGRITY,
     REMOTE_ATTEMPT,
-    STALE_HEARTBEAT,
     STALE_OWNER,
     UNPRICED_ATTEMPT,
     GraphStore,
@@ -62,8 +61,12 @@ CONTROLLER_REQUEST_LIMITS = (CONTROLLER_HTTP_MAX_RETRIES, CONTROLLER_HTTP_TIMEOU
 
 # Wait reasons: the controller's own words, shown by graph_status (never a credential, a remote path or a setting).
 OPERATOR_CONFIRMATION = "operator confirmation required: release-lock --confirm-execution-stopped"
-AWAITING_RESULT = ("waiting for the result of the same launch; if its remote execution stopped without one, "
-                   + OPERATOR_CONFIRMATION)
+# 8.5 review Minor 6: before the launch's time limit plus this margin a late result may still arrive, so the operator
+# is not asked to release the lock (that would free the host for a second job and discard the result).
+RESULT_MARGIN_SECONDS = 600
+AWAITING_RESULT = "waiting for the result of the same launch (its time limit has not passed)"
+RESULT_OVERDUE = ("no result after the launch's time limit; if its remote execution stopped, "
+                  + OPERATOR_CONFIRMATION)
 REPLAN = "live destination facts differ from the approved plan (GPU or a higher price); re-plan before running"
 BUDGET_EXHAUSTED = ("approved budget exhausted: {reserved:.6g} of {approved:.6g} USD already reserved (historical "
                     "attempts reserved by the Task 8 migration count too); re-plan with a larger budget")
@@ -78,10 +81,11 @@ OUTPUTS_REFUSED = "the completed attempt's outputs could not be recorded; an ope
 DESTINATION_UNAVAILABLE = "destination unavailable: {error}"
 DISPATCH_FAILED = "dispatch failed: {error}"
 SETTLE_FAILED = "settling the attempt failed; retrying next tick: {error}"
-RUNTIME_DIFFERS = "waiting: a job with another runtime on this destination was claimed first"
+DESTINATION_PROFILE_DIFFERS = "the opened destination is not this job's pinned profile; re-plan before running"
 RETURNED_AFTER_TAKEOVER = "returned unlaunched after takeover: the graph run is not running"
 STOPPING = "returned unlaunched after takeover: the controller is stopping"
-OPERATOR_PREFIXES = (OUTPUTS_REFUSED.split(":")[0], LEDGER_INTEGRITY.split(";")[0])
+OPERATOR_PREFIXES = (OUTPUTS_REFUSED.split(":")[0], LEDGER_INTEGRITY.split(";")[0], OPERATOR_CONFIRMATION,
+                     RESULT_OVERDUE.split(";")[0])
 _REMOTE_PATH = re.compile(r"(?<![\w.:/-])/(?:[\w.-]+/)+[\w.-]*")
 _PROVIDERS = ("existing_runpod:", "ssh_server:")
 
@@ -109,10 +113,11 @@ class ControllerSettings:
     lease_heartbeat_seconds: float = 20
     tracking_claim_ttl_seconds: float = 600
     tracking_batch: int = 16
+    destination_retry_seconds: float = 60   # a refused or unreachable destination is not reopened sooner
 
     def __post_init__(self):
         for name in ("lease_ttl_seconds", "tick_seconds", "stale_attempt_seconds", "reconcile_interval_seconds",
-                     "lease_heartbeat_seconds", "tracking_claim_ttl_seconds"):
+                     "lease_heartbeat_seconds", "tracking_claim_ttl_seconds", "destination_retry_seconds"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be positive and finite")
@@ -265,10 +270,6 @@ def _conflicts(held, held_facts, resource, facts) -> bool:
     return False
 
 
-def _runtime(operation) -> tuple:
-    return operation["resources"]["runtime"]["profile"], operation["kind"] in {"merge", "materialize"}
-
-
 _UNKNOWN = object()
 
 
@@ -295,8 +296,11 @@ class GraphController:
         self.publisher = TrackingPublisher(self.outbox, store, tracker, local_sink=LocalEvidenceSink(store.state_dir))
         self._own_pool = pool is None
         self.pool = pool if pool is not None else ThreadDispatchPool(settings.max_dispatch_threads)
+        self._lock = threading.RLock()   # _inflight is read by status() from other threads (8.5 review Minor 8)
         self._inflight: dict[str, _InFlight] = {}
         self._outcomes: dict[str, object] = {}
+        self._job_runs: dict[str, str] = {}
+        self._refused: dict = {}   # (run, profile, revision) -> (retry at, reason): destination backoff
         self._run_leases: dict = {}
         self._reconciled_at: dict[str, float] = {}
         self._simulated: dict[str, SimulatedExecutorProvider] = {}
@@ -308,6 +312,18 @@ class GraphController:
         self._tracking_thread: threading.Thread | None = None
         self._tracking_stop = threading.Event()
         self.errors: collections.deque = collections.deque(maxlen=20)
+        # Every error text an executor or worker returns passes through this filter before the ledger stores it
+        # (8.5 review Minor 7): the credentials only the providers hold, then MLflow's and bearer-style ones.
+        store.jobs.error_filter = self.redact
+
+    def redact(self, text) -> str:
+        """``text`` without the credentials this controller's providers hold or MLflow's configured ones."""
+        text = str(text)
+        for provider in (self.provider, self.simulated_provider):
+            redactor = getattr(provider, "redact", None)
+            if callable(redactor):
+                text = redactor(text)
+        return redact(text, 4000)
 
     # -- leases ---------------------------------------------------------------------------------------
 
@@ -357,7 +373,24 @@ class GraphController:
             self._run_leases[run_id] = leases[run_id] = lease
         for run_id in set(self._run_leases) - set(leases):
             self._run_leases.pop(run_id, None)
+        self._prune(set(leases))
         return leases
+
+    def _prune(self, managed) -> None:
+        """Forget in-process facts of runs that are no longer managed (8.5 review Minor 8)."""
+        with self._lock:
+            busy_runs = {entry.run_id for entry in self._inflight.values()}
+        keep = set(managed) | busy_runs
+        for key in [key for key in self._reasons if key[0] not in keep]:
+            del self._reasons[key]
+        for run_id in [run_id for run_id in self._simulated if run_id not in keep]:
+            del self._simulated[run_id]
+        for key in [key for key in self._refused if key[0] not in keep]:
+            del self._refused[key]
+        for job_id in [job_id for job_id, run_id in self._job_runs.items() if run_id not in keep]:
+            self._job_runs.pop(job_id, None)
+            self._outcomes.pop(job_id, None)
+            self._reconciled_at.pop(job_id, None)
 
     @contextlib.contextmanager
     def _heartbeat(self, owner, leases):
@@ -366,13 +399,18 @@ class GraphController:
         ttl = self.settings.lease_ttl_seconds
 
         def beat():
+            failures = 0
             while not stop.wait(self.settings.lease_heartbeat_seconds):
                 try:
                     self.store.renew_owner(owner, ttl_seconds=ttl)
+                    failures = 0
                 except ValueError:
                     return   # fenced: the next tick stops the controller
                 except Exception as exc:
-                    LOG.warning("controller heartbeat failed; retrying: %s", type(exc).__name__)
+                    failures += 1
+                    if failures == 1 or failures % 100 == 0:   # rate-limited (8.5 review Minor 8)
+                        LOG.warning("controller heartbeat failed %d time(s); retrying: %s", failures,
+                                    type(exc).__name__)
                     continue
                 for lease in list(leases.values()):
                     with contextlib.suppress(Exception):
@@ -430,20 +468,26 @@ class GraphController:
     # -- phase 2: harvest -----------------------------------------------------------------------------
 
     def _harvest(self, report) -> None:
-        for entry in [item for item in self._inflight.values() if item.future.done()]:
-            del self._inflight[entry.job_id]   # the dispatch thread returned: the resource is free again (D8)
+        with self._lock:
+            done = [item for item in self._inflight.values() if item.future.done()]
+            for entry in done:
+                del self._inflight[entry.job_id]   # the dispatch thread returned: the resource is free again (D8)
+        for entry in done:
             try:
                 outcome = entry.future.result()
             except ValueError as exc:
-                if str(exc) in REFUSED_LAUNCH:
-                    self._return_refused(entry.run_id, entry.lease, str(exc))   # usually done in the thread already
+                if str(exc) in REFUSED_LAUNCH or isinstance(exc, LedgerIntegrityError):
+                    self._return_refused(entry.run_id, entry.lease, str(exc)[:500])   # usually done in the thread
                     report.add("released", entry.job_id)
+                    if isinstance(exc, LedgerIntegrityError):
+                        self._note_run(entry.run_id, entry.node_id, str(exc))
                     continue
                 self._note_run(entry.run_id, entry.node_id, DISPATCH_FAILED.format(error=_describe(exc)))
             except Exception as exc:
                 self._note_run(entry.run_id, entry.node_id, DISPATCH_FAILED.format(error=_describe(exc)))
             else:
                 self._outcomes[entry.job_id] = outcome
+                self._job_runs[entry.job_id] = entry.run_id
 
     def _return_refused(self, run_id, attempt_lease, reason) -> bool:
         """``begin_launch`` refused (pause or cancel, D12): the attempt never launched, so return it now."""
@@ -454,6 +498,9 @@ class GraphController:
             self.store.return_unlaunched(lease, attempt_lease, reason=reason)
         except ValueError:
             return False   # already returned, or the lease moved on: the settle phase decides from the DB
+        except Exception as exc:   # never hides the refusal itself; harvest or the settle phase returns it later
+            LOG.warning("returning a refused launch failed; it is retried: %s", type(exc).__name__)
+            return False
         return True
 
     # -- phase 3: settle ------------------------------------------------------------------------------
@@ -521,13 +568,12 @@ class GraphController:
                 return False
             if not started:
                 return self._resume_unstarted(lease, row, report)
-            if self.store.release_uncontacted(lease, job_id):   # D9: provably never contacted
+            # D9 in one transaction after the token rotation (8.5 review Minor 3): released when provably never
+            # contacted, else FAILED with the lock kept (uncertain); an actor that passed RUNNING meanwhile is left.
+            settled = self.store.settle_stale_launch(lease, job_id)
+            if settled == "released":
                 report.add("released", job_id)
-                return True
-            # Contacted, or not provably uncontacted: its actor is fenced now (release_uncontacted rotated the token);
-            # settle it as uncertain, FAILED with the lock kept.
-            self.store.jobs.transition(self.store.jobs.current_lease(job_id), "FAILED", STALE_HEARTBEAT)
-            return True
+            return settled != "unchanged"
         if status in ACTIVE:
             return False   # RUNNING/EVALUATING: the run-scoped recover above, once stale
         if locked:
@@ -580,7 +626,7 @@ class GraphController:
             self._note(lease, row["graph_node_id"], self._provider_reason(exc))
             report.add("released", job_id)
             return True
-        if not observation_fits(destination.observation, resources.facts):
+        if destination.profile != resources.executor or not observation_fits(destination.observation, resources.facts):
             stack.close()
             self.store.return_unlaunched(lease, taken["lease"], reason=REPLAN)
             self._note(lease, row["graph_node_id"], REPLAN)
@@ -615,12 +661,11 @@ class GraphController:
             return False
         report.add("reconciled", job_id)
         if outcome is None:
-            launch = self.store.state_dir / "jobs" / job_id / "launches" / (row["launch_id"] or "-")
-            self._note(lease, row["graph_node_id"],
-                       AWAITING_RESULT if (launch / REMOTE_ATTEMPT).is_file() else OPERATOR_CONFIRMATION)
+            self._note(lease, row["graph_node_id"], _uncertain_reason(self.store, row, now))
             return False
         self._reconciled_at.pop(job_id, None)
         self._outcomes[job_id] = outcome
+        self._job_runs[job_id] = lease.run_id
         return True
 
     @contextlib.contextmanager
@@ -729,29 +774,36 @@ class GraphController:
         run at max_concurrent, the budget, a provider refusal) consume no attempt; the node's wait reason says why."""
         plan, run_id = run["plan"], lease.run_id
         queued, active = self._queued(run_id)
-        refused = {}
+        now = self.clock()
         for job_id, node_id, operation in queued:
             resources = OperationResources.model_validate(operation["resources"])
             profile, facts = resources.executor, resources.facts
             resource = ("simulation:" if plan.simulation else "") + facts.exclusivity_key
+            backoff = self._refused.get((run_id, profile.profile_id, profile.revision))
             reason = (AT_CONCURRENCY if active >= plan.graph.max_concurrent
                       else THREADS_BUSY if len(self._inflight) >= self.settings.max_dispatch_threads
                       else self._busy(resource, facts) or self._db_blocked(resource, facts, plan.simulation)
                       or self._budget_reason(run_id, plan, resources)
-                      or refused.get((profile.profile_id, profile.revision)))
+                      or (backoff[1] if backoff and backoff[0] > now else None)
+                      or self._integrity_reason(run_id, node_id, operation))
             if reason:
                 self._note(lease, node_id, reason)
                 continue
             stack = contextlib.ExitStack()
             try:
                 destination = stack.enter_context(self._resolve(run, resources, operation["kind"]))
+                if destination.profile != profile:   # never another profile's executor (8.5 review Important 1)
+                    raise ValueError(DESTINATION_PROFILE_DIFFERS)
             except Exception as exc:   # a refusal (changed profile, transport, Pod) consumes no attempt
                 stack.close()
-                refused[(profile.profile_id, profile.revision)] = self._provider_reason(exc)
-                self._note(lease, node_id, refused[(profile.profile_id, profile.revision)])
+                reason = self._provider_reason(exc)   # backed off, never reopened every tick (8.5 review Minor 8)
+                self._refused[(run_id, profile.profile_id, profile.revision)] = (
+                    now + self.settings.destination_retry_seconds, reason)
+                self._note(lease, node_id, reason)
                 continue
-            try:
-                claimed = self.store.claim_ready(destination.observation, lease)
+            self._refused.pop((run_id, profile.profile_id, profile.revision), None)
+            try:   # this job only, on its own pinned profile: nothing is written for any other (Important 1)
+                claimed = self.store.claim_ready(destination.observation, lease, job_id=job_id, executor=profile)
             except BaseException:
                 stack.close()
                 raise
@@ -760,11 +812,6 @@ class GraphController:
                 self._note(lease, node_id, self._unclaimed_reason(run_id, plan, resources, destination.observation,
                                                                  resource))
                 continue
-            if _runtime(claimed["manifest"]["operation"]) != _runtime(operation):
-                stack.close()   # the executor was opened for another runtime: return it, uncounted
-                self.store.return_unlaunched(lease, claimed["lease"], reason=RUNTIME_DIFFERS)
-                self._note(lease, claimed["graph_node_id"], RUNTIME_DIFFERS)
-                continue
             self._note(lease, claimed["graph_node_id"], None)
             self._submit(run_id, claimed, run["approval"], destination, stack)
             report.add("claimed", claimed["id"])
@@ -772,7 +819,8 @@ class GraphController:
 
     def _submit(self, run_id, claimed, approval, destination, stack) -> None:
         """Hand one claimed attempt to its dispatch thread, which runs it once and closes the destination context. A
-        refused launch (pause or cancel, D12) is returned unlaunched at once, from the thread."""
+        refused launch (pause or cancel, D12) or a ledger integrity failure before the launch is returned unlaunched
+        at once, from the thread, uncounted."""
         job_id, attempt_lease = claimed["id"], claimed["lease"]
         dispatcher, executor = self.dispatcher, destination.executor
 
@@ -780,20 +828,35 @@ class GraphController:
             try:
                 return dispatcher.run_claimed(claimed, executor, approval=approval)
             except ValueError as exc:
-                if str(exc) in REFUSED_LAUNCH:
-                    self._return_refused(run_id, attempt_lease, str(exc))
+                if str(exc) in REFUSED_LAUNCH or isinstance(exc, LedgerIntegrityError):
+                    self._return_refused(run_id, attempt_lease, str(exc)[:500])
                 raise
             finally:
                 stack.close()
 
         future = self.pool.submit(job_id, work)
-        self._inflight[job_id] = _InFlight(job_id, run_id, claimed["graph_node_id"], attempt_lease.resource_id,
-                                           destination.observation, future, attempt_lease)
+        with self._lock:
+            self._inflight[job_id] = _InFlight(job_id, run_id, claimed["graph_node_id"], attempt_lease.resource_id,
+                                               destination.observation, future, attempt_lease)
+            self._job_runs[job_id] = run_id
         future.add_done_callback(lambda _: self._wake.set())
+
+    def _integrity_reason(self, run_id, node_id, operation) -> str | None:
+        """The dispatchers re-resolve a node's recorded lineage before its launch; check it before claiming, so a
+        record that no longer verifies holds the node without an attempt (8.5 review Minor 1)."""
+        if operation["kind"] == "evaluate":
+            return None
+        try:
+            self.store.bindings_for(run_id, node_id)
+        except LedgerIntegrityError as exc:
+            return str(exc)
+        return None
 
     def _busy(self, resource, facts) -> str | None:
         """Why a dispatch thread that has not returned keeps this resource busy (D8), or None."""
-        for entry in self._inflight.values():
+        with self._lock:
+            entries = list(self._inflight.values())
+        for entry in entries:
             if _conflicts(entry.resource, entry.facts, resource, facts):
                 foreign = _provider_prefix(entry.resource) != _provider_prefix(resource)
                 return CROSS_PROVIDER if foreign else DESTINATION_BUSY.format(key=resource)
@@ -904,22 +967,24 @@ class GraphController:
                     self._error(exc)
                 except Exception as exc:
                     self._error(exc)
-                if self._stopping and not self._inflight:
+                with self._lock:
+                    idle = not self._inflight
+                if self._stopping and idle:
                     break
                 if self._stopping:
                     self._wake.wait(self.settings.tick_seconds)   # woken when a dispatch thread returns
                     self._wake.clear()
                 else:
                     stop_event.wait(self.settings.tick_seconds)
-        finally:
+        finally:   # also when a BaseException escapes (8.5 review Minor 5): clean up, then let it propagate
             self._tracking_stop.set()
             self._tracking_thread.join()
             self._tracking_thread = None
-        if self._own_pool:
-            self.pool.shutdown(wait=False)
-        if not fenced:
-            with contextlib.suppress(ValueError):
-                self.store.release_owner(owner)
+            if self._own_pool:
+                self.pool.shutdown(wait=False)
+            if not fenced:
+                with contextlib.suppress(Exception):
+                    self.store.release_owner(owner)
 
     def _tracking_loop(self, owner) -> None:
         while not self._tracking_stop.is_set():
@@ -938,8 +1003,10 @@ class GraphController:
         """``graph_status`` plus in-process facts: in-flight job IDs, busy resources and recent errors."""
         result = graph_status(self.store, now=self.clock())
         provider_status = getattr(self.provider, "status", None)
+        with self._lock:
+            entries = list(self._inflight.values())
         result["controller"].update(
-            in_flight=sorted(self._inflight), busy=sorted({entry.resource for entry in self._inflight.values()}),
+            in_flight=sorted(entry.job_id for entry in entries), busy=sorted({entry.resource for entry in entries}),
             stopping=self._stopping, tracking_thread=self._tracking_thread is not None,
             skipped_runs=dict(sorted(self._skipped.items())), errors=list(self.errors),
             tracking_backfill_skipped=list(self.outbox.backfill_skipped),
@@ -969,10 +1036,44 @@ def graph_status(store: GraphStore, run_id: str | None = None, *, now: float) ->
         run_ids = ([row[0] for row in db.execute("SELECT id FROM graph_runs ORDER BY created,id")]
                    if run_id is None else [run_id])
     outbox = TrackingOutbox(store)
-    return {"controller": controller, "runs": [_run_status(store, outbox, item) for item in run_ids]}
+    runs = []
+    for item in run_ids:
+        try:
+            runs.append(_run_status(store, outbox, item, now))
+        except Exception as exc:   # one unreadable run never hides the others (8.5 review Minor 4)
+            if run_id is not None and isinstance(exc, ValueError) and str(exc) == "unknown graph run":
+                raise
+            runs.append({"run_id": item, "error": _display(f"unreadable graph run: {_describe(exc)}")})
+    return {"controller": controller, "runs": runs}
 
 
-def _run_status(store, outbox, run_id) -> dict:
+def result_deadline(store, row) -> float | None:
+    """When an uncertain attempt's late result stops being plausible: its claim time plus the operation's time
+    limit plus ``RESULT_MARGIN_SECONDS`` (8.5 review Minor 6). None without a pinned time limit (a selection)."""
+    timeout = ((row.get("operation") or {}).get("resources") or {}).get("timeout_seconds")
+    attempt_id = row.get("active_attempt_id")
+    if not timeout or not attempt_id:
+        return None
+    with store.jobs.connection() as db:
+        created = db.execute("SELECT created FROM job_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+    return None if created is None else float(created[0]) + float(timeout) + RESULT_MARGIN_SECONDS
+
+
+def _has_remote_record(store, row) -> bool:
+    launch = Path(store.state_dir) / "jobs" / row["id"] / "launches" / (row.get("launch_id") or "-")
+    return (launch / REMOTE_ATTEMPT).is_file()
+
+
+def _uncertain_reason(store, row, now) -> str:
+    """No result yet: wait while a late result is plausible; ask the operator once it is not, or when nothing could
+    ever be collected (no remote record)."""
+    if not _has_remote_record(store, row):
+        return OPERATOR_CONFIRMATION
+    deadline = result_deadline(store, row)
+    return RESULT_OVERDUE if deadline is not None and now >= deadline else AWAITING_RESULT
+
+
+def _run_status(store, outbox, run_id, now) -> dict:
     run = store.get_run(run_id)
     plan = run["plan"]
     entries = {entry.node.id: entry for entry in plan.nodes}
@@ -998,7 +1099,7 @@ def _run_status(store, outbox, run_id) -> dict:
                     operation["resources"]["timeout_seconds"]) > approved * (1 + 1e-9)):
             exhausted = True
         nodes.append(_node_status(store, plan, entries[node["node_id"]], node, job, operation, counted,
-                                  tracking["nodes"].get(node["node_id"], {})))
+                                  tracking["nodes"].get(node["node_id"], {}), now))
     return {"run_id": run_id, "status": run["status"], "simulation": plan.simulation, "plan_sha256": plan.sha256,
             "approved_cost_usd": approved, "reserved_cost_usd": reserved, "budget_exhausted": exhausted,
             "unpriced_attempts": sum(bool(node["wait_reason"] and node["wait_reason"].startswith(UNPRICED_ATTEMPT))
@@ -1009,9 +1110,15 @@ def _run_status(store, outbox, run_id) -> dict:
             "nodes": nodes}
 
 
-def _node_status(store, plan, entry, node, job, operation, counted, tracking) -> dict:
+def _node_status(store, plan, entry, node, job, operation, counted, tracking, now) -> dict:
     status = node["status"]
     uncertain = bool(job and job["locked"] and job["launch_started"] and job["status"] in ("FAILED", "CANCELED"))
+    deadline = awaiting = None
+    if uncertain:
+        row = {"id": job["id"], "launch_id": job["launch_id"], "active_attempt_id": job["active_attempt_id"],
+               "operation": operation}
+        deadline = result_deadline(store, row)
+        awaiting = _has_remote_record(store, row) and (deadline is None or now < deadline)
     wait_reason = (_display(node["wait_reason"]) if node["wait_reason"] and status in UNFINISHED_NODES else None)
     error = node["error"] or (job["error"] if job and job["status"] in ("FAILED", "CANCELED") else None)
     resources = (operation or {}).get("resources") or {}
@@ -1023,8 +1130,10 @@ def _node_status(store, plan, entry, node, job, operation, counted, tracking) ->
         "max_attempts": plan.graph.retry_policy.max_attempts,
         "resource_id": job["resource_id"] if job else None,
         "destination_profile_id": (resources.get("executor") or {}).get("profile_id"),
-        "uncertain": uncertain,
-        "needs_operator": uncertain or bool(wait_reason and wait_reason.startswith(OPERATOR_PREFIXES)),
+        "uncertain": uncertain, "awaiting_result": bool(awaiting), "result_deadline": deadline,
+        # An uncertain attempt needs the operator only once no late result is plausible (8.5 review Minor 6).
+        "needs_operator": bool(uncertain and not awaiting) or bool(
+            wait_reason and wait_reason.startswith(OPERATOR_PREFIXES)),
         "wait_reason": wait_reason, "error": _display(error) if error else None,
         "retry_at": node["retry_not_before"],
         "tracking_status": tracking.get("tracking_status", "not_started"),

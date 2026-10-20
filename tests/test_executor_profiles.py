@@ -165,6 +165,7 @@ def test_provider_compares_the_observed_canonical_pod(tmp_path, monkeypatch, cas
             return
         with manager as resolved:
             assert resolved.profile == destination.pinned and resolved.executor.server_profile == destination.pinned
+            assert resolved.executor.destination_profile == destination.pinned   # 8.5 review Important 1
             assert observation_key(resolved.observation) == observation_key(destination.pinned)
             assert observation_fits(resolved.observation, destination.facts)
         return
@@ -182,6 +183,7 @@ def test_provider_compares_the_observed_canonical_pod(tmp_path, monkeypatch, cas
         return
     with manager as resolved:
         assert resolved.profile == public and resolved.executor.pod["id"] == "pod1"
+        assert resolved.executor.destination_profile == public   # 8.5 review Important 1: compared by the runner
         assert resolved.observation == ResourceFacts(
             pod_id="pod1", gpu_type="A100", gpu_count=1, total_hourly_cost_usd=2.0,
             observed_at=datetime.fromtimestamp(OBSERVED, timezone.utc))
@@ -284,3 +286,13 @@ def test_provider_secrets_stay_in_memory(tmp_path, monkeypatch):
     assert dict(secrets.settings) == settings   # the settings themselves stay usable in memory
     with pytest.raises(TypeError):
         secrets.settings["RUNPOD_API_KEY"] = "changed"
+
+
+def test_the_provider_redacts_the_secrets_it_holds(tmp_path):
+    """8.5 review Minor 7: the controller redacts error text with the credentials only the provider knows."""
+    ep = api()
+    settings = runpod_settings(tmp_path)
+    provider = provider_for(ep, tmp_path, runpod_profile(ep, settings), settings)
+    text = provider.redact(f"401 for {API_KEY} while reading {HF_TOKEN}; pod pod1")
+    assert API_KEY not in text and HF_TOKEN not in text and text.count("[redacted]") == 2 and "pod1" in text
+    assert ep.SimulatedExecutorProvider().redact("unchanged") == "unchanged"

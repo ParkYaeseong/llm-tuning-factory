@@ -126,6 +126,8 @@ POD_DIFFERS = "observed Pod differs from the approved Pod"
 SERVER_DIFFERS = "observed SSH server differs from the approved server"
 RUNPOD_PRICE_REQUIRED = "positive finite live RunPod API price required"   # SSHExecutor.validate_config's text
 _POD_ID = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*")   # projects.LocalId
+# Setting names whose values are credentials (8.5 review Minor 7): the controller redacts their values from errors.
+_SECRET_SETTING = re.compile(r"(?i)(api_?key|token|secret|password|passphrase|credential)")
 _FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
 _OBSERVATION = TypeAdapter(ResourceObservation)
 
@@ -258,6 +260,16 @@ class SettingsExecutorProvider:
     def __repr__(self):
         return f"SettingsExecutorProvider(profiles={sorted(self._profiles)!r})"
 
+    def redact(self, text: str) -> str:
+        """``text`` without any credential value this provider holds (8.5 review Minor 7). The values stay in memory;
+        only their absence from ``text`` is observable."""
+        text = str(text)
+        for secrets in self._profiles.values():
+            for name, value in secrets.settings.items():
+                if isinstance(value, str) and len(value) >= 6 and _SECRET_SETTING.search(name):
+                    text = text.replace(value, "[redacted]")
+        return text
+
     def status(self) -> dict:
         """Public facts only, for the controller's status: never a setting."""
         return {"provider": "settings", "profiles": [
@@ -311,6 +323,9 @@ class SettingsExecutorProvider:
                 if pod.get("id") != pinned.pod_id:
                     raise ValueError(POD_DIFFERS)
                 observation = runpod_facts(pod, observed_at=self._now())
+            # The runner compares it with the attempt's pinned profile (8.5 review Important 1): an alias of the same
+            # Pod or server opened for another job never runs this one.
+            executor.destination_profile = pinned
             yield ResolvedDestination(profile=pinned, observation=observation, executor=executor)
 
     @contextmanager
@@ -362,6 +377,10 @@ class SimulatedExecutorProvider:
 
     def status(self) -> dict:
         return {"provider": "simulated", "destinations": sorted(key for key, _ in self._observations)}
+
+    @staticmethod
+    def redact(text: str) -> str:
+        return str(text)   # it holds no settings
 
     def _observation(self, profile_id, approved_revision, pinned):
         _check_pinned(profile_id, approved_revision, pinned)

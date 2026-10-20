@@ -209,7 +209,10 @@ def _publish_exclusive(path: Path, data: bytes) -> bool:
             os.link(temporary, path)
         except FileExistsError:
             return False
-        _fsync_directory(path.parent)
+        try:
+            _fsync_directory(path.parent)
+        except OSError as exc:   # the link already published the result; durability is best effort here
+            logging.getLogger(__name__).warning("directory fsync after publishing failed: %s", type(exc).__name__)
         return True
     finally:
         os.unlink(temporary)
@@ -519,7 +522,10 @@ class SimulatedOperationDispatcher:
             manifest, operation, evidence, producers = self._verify_before_launch(job, claimed, lease, executor,
                                                                                   approval)
         except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
+            from .graph_store import LedgerIntegrityError
+            if isinstance(exc, LedgerIntegrityError):
+                raise   # run-wide evidence no longer verifies: returned unlaunched by the controller, uncounted
+            error = self.jobs.filtered(f"{type(exc).__name__}: {exc}")
             if not self.jobs.abandon_unlaunched(lease, error):   # lock released in the same transaction
                 raise   # started, legacy or no longer provisioning: never failed from here
             self._write_error(job["id"], error)
@@ -824,14 +830,18 @@ class SimulatedOperationDispatcher:
         stop = threading.Event()
 
         def beat():
+            failures = 0
             while not stop.wait(self.heartbeat_seconds):
                 try:
                     self.jobs.heartbeat(lease)
+                    failures = 0
                 except ValueError:
                     return   # ownership or state changed; later mutations stay fenced
                 except Exception as exc:   # e.g. a locked database: keep beating, never stop silently (8.4 Minor 3)
-                    logging.getLogger(__name__).warning("attempt heartbeat failed; retrying: %s",
-                                                        type(exc).__name__)
+                    failures += 1
+                    if failures == 1 or failures % 100 == 0:   # rate-limited (8.5 review Minor 8)
+                        logging.getLogger(__name__).warning("attempt heartbeat failed %d time(s); retrying: %s",
+                                                            failures, type(exc).__name__)
 
         threading.Thread(target=beat, daemon=True).start()
         return stop
@@ -850,4 +860,4 @@ class SimulatedOperationDispatcher:
         with contextlib.suppress(OSError):
             directory = self._job_dir(job_id)
             directory.mkdir(parents=True, exist_ok=True)
-            (directory / "error.txt").write_text(error, encoding="utf-8")
+            (directory / "error.txt").write_text(self.jobs.filtered(error), encoding="utf-8")
