@@ -174,3 +174,99 @@ def test_check_model_ops_pins_only_when_requested(monkeypatch):
     with pytest.raises(ValueError, match="primary runtime"):
         runtime.check(None, "ppo", model_ops=True)
     assert len(probes) == 4
+
+
+# -- Task 8.4: pinned profile identity and the v2 recovery executor --------------------------------
+
+IDENTITY = {"profile_id": "lab", "revision": "7", "name": "Lab server", "credential_scope": "vault"}
+
+
+def test_ssh_executor_carries_the_pinned_profile_identity(tmp_path, monkeypatch):
+    from test_gpu_servers import FakeServer, settings
+
+    from tuning_factory import desktop_runtime as runtime
+    from tuning_factory.gpu_servers import ServerApprovalReceipt
+
+    monkeypatch.setattr(runtime, "check", lambda *args, **kwargs: {})
+    server = FakeServer(tmp_path / "remote").install(monkeypatch)
+    config = settings()
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    facts = server.facts(config)
+    pinned = config.profile(facts, **IDENTITY)
+    with runtime.executor_for(native, tmp_path, runtime_profile="primary", profile_identity=IDENTITY) as executor:
+        assert executor.server_profile == pinned and executor.server_facts.server_id == facts.server_id
+    with runtime.executor_for(native, tmp_path, runtime_profile="primary") as executor:
+        assert executor.server_profile == config.profile(facts)   # the default identity is unchanged
+        assert (executor.server_profile.profile_id, executor.server_profile.revision) == ("ssh-server", "1")
+    connects = len(server.connects)
+    receipt = ServerApprovalReceipt.create("1" * 64, pinned, facts)
+    for settings_, kwargs in ((native, dict(profile_identity={"profile_id": "lab"})),
+                              (native, dict(profile_identity={**IDENTITY, "extra": "x"})),
+                              (native, dict(profile_identity=IDENTITY, server_receipt=receipt)),
+                              ({"pod_id": "borrowed"}, dict(profile_identity=IDENTITY))):
+        with pytest.raises(ValueError, match="profile identity"):
+            with runtime.executor_for(settings_, tmp_path, **kwargs):
+                pytest.fail("an inconsistent profile identity reached execution")
+    assert len(server.connects) == connects   # refused before any contact
+
+
+def test_v2_recovery_executor_uses_an_in_memory_receipt(tmp_path, monkeypatch):
+    import importlib
+    import sqlite3
+    from contextlib import closing
+
+    from test_gpu_servers import A4000, UUID1, FakeServer, settings
+
+    from tuning_factory import desktop_runtime as runtime
+    from tuning_factory.executor_profiles import ExecutorProfile, ResourceFacts
+    from tuning_factory.jobs import JobStore
+
+    ep = importlib.import_module("tuning_factory.executor_profiles")
+    if not hasattr(ep, "SettingsExecutorProvider"):
+        pytest.fail("executor_profiles.SettingsExecutorProvider (Task 8.4) is missing")
+    server = FakeServer(tmp_path / "remote").install(monkeypatch)
+    config = settings()
+    facts = server.facts(config)
+    pinned = config.profile(facts, **IDENTITY)
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    state = tmp_path / "state"
+    store = JobStore(state / "jobs.db")
+    provider = ep.SettingsExecutorProvider({"lab": ep.ProfileSecrets(public=pinned, settings=native)}, state)
+    monkeypatch.setattr(runtime, "check", lambda *args, **kwargs: pytest.fail("recovery never preflights"))
+    server.inventory = ((UUID1, A4000, 16376),
+                        ("GPU-33333333-3333-3333-3333-333333333333", "NVIDIA H100", 81559))   # unrelated drift
+    with provider.recover("lab", "7", pinned=pinned, pinned_facts=facts, manifest_sha256="1" * 64) as executor:
+        assert executor.recovery_only and executor.server_profile == pinned and executor.server_facts == facts
+    with closing(sqlite3.connect(store.path)) as db:
+        assert db.execute("SELECT COUNT(*) FROM job_destinations").fetchone()[0] == 0   # never persisted
+    server.machine_id = "c" * 32   # another physical server behind the same transport
+    with pytest.raises(ValueError, match="recovery server differs"):
+        with provider.recover("lab", "7", pinned=pinned, pinned_facts=facts, manifest_sha256="1" * 64):
+            pytest.fail("recovery reached another server")
+    # RunPod recovery: no preflight, and the observed Pod must be the pinned one.
+    pod = {"id": "pod1"}
+    monkeypatch.setattr(runtime, "connection", lambda settings_, **kwargs: _yield(pod))
+    public = ExecutorProfile(profile_id="p", revision="1", name="Pod", pod_id="pod1", credential_scope="local")
+    runpod = {"pod_id": "pod1", "ssh_fingerprint": "SHA256:" + "A" * 43, "ssh_key_file": str(tmp_path / "key")}
+    public = public.model_copy(update={"transport_settings_sha256": ep.runpod_transport_sha256(runpod)})
+    pinned_facts = ResourceFacts(pod_id="pod1", gpu_type="A100", gpu_count=1, total_hourly_cost_usd=2,
+                                 observed_at="2026-10-20T00:00:00Z")
+    provider = ep.SettingsExecutorProvider({"p": ep.ProfileSecrets(public=public, settings=runpod)}, state)
+    with provider.recover("p", "1", pinned=public, pinned_facts=pinned_facts, manifest_sha256="1" * 64) as executor:
+        assert executor.pod == pod and not executor.recovery_only
+    pod["id"] = "pod2"
+    with pytest.raises(ValueError) as error:
+        with provider.recover("p", "1", pinned=public, pinned_facts=pinned_facts, manifest_sha256="1" * 64):
+            pytest.fail("recovery reached another Pod")
+    assert str(error.value) == ep.POD_DIFFERS
+
+
+def _yield(pod):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    @contextmanager
+    def manager():
+        yield dict(pod), SimpleNamespace(close=lambda: None)
+
+    return manager()

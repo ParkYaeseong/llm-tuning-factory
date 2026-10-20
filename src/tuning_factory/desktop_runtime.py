@@ -308,13 +308,32 @@ def operation_stage(training_stage, runtime_profile):
     return "ppo" if runtime_profile == "ppo" else training_stage
 
 
+PROFILE_IDENTITY = ("profile_id", "revision", "name", "credential_scope")
+
+
+def _profile_identity(settings, profile_identity, server_receipt):
+    """The pinned public identity an SSH launch executor's profile carries (Task 8.4); {} keeps the default."""
+    if profile_identity is None:
+        return {}
+    if not isinstance(profile_identity, dict) or set(profile_identity) != set(PROFILE_IDENTITY):
+        raise ValueError("profile identity requires exactly profile_id, revision, name and credential_scope")
+    if server_receipt is not None:
+        raise ValueError("a profile identity and a server receipt cannot both name the destination profile")
+    if settings.get("provider", "existing_runpod") != "ssh_server":
+        raise ValueError("a profile identity applies to SSH server destinations only")
+    return dict(profile_identity)
+
+
 @contextmanager
 def executor_for(settings, state_root, preflight=True, training_stage="sft", *, server_receipt=None,
-                 recovery=False, runtime_profile=None, model_ops=False):
+                 recovery=False, runtime_profile=None, model_ops=False, profile_identity=None):
     """Executor for one destination. ``runtime_profile`` (a v2 operation's runtime) selects the private runtime;
     ``model_ops`` adds the MODEL_OPS_PINS probe for merge/materialize. Launch executors carry the remote model
-    cache root (``<remote_root>/model-cache``) for v2 operations; v1 runs ignore it."""
+    cache root (``<remote_root>/model-cache``) for v2 operations; v1 runs ignore it. ``profile_identity`` (Task 8.4)
+    gives an SSH launch executor's profile the pinned profile ID, revision, name and credential scope; without it
+    the default identity is unchanged."""
     # recovery=True always means the SSH recovery-only executor; RunPod reconciles with preflight=False.
+    identity = _profile_identity(settings, profile_identity, server_receipt)   # before any contact
     training_stage = operation_stage(training_stage, runtime_profile)
     if model_ops and engine_profile(training_stage)["profile"] != "primary":
         raise ValueError(MODEL_OPS_RUNTIME)
@@ -337,7 +356,8 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
             root = runtime_path(training_stage, config.remote_root)
             lock_name = Path(engine_profile(training_stage)["lock_file"]).name
             executor = SSHExecutor("", 22, config.ssh_username, "", client=client,
-                                   server_profile=server_receipt.profile if server_receipt else config.profile(pod),
+                                   server_profile=server_receipt.profile if server_receipt else config.profile(
+                                       pod, **identity),
                                    server_facts=pod,
                                    remote_root=config.remote_root + "/jobs", remote_python=root + "/venv/bin/python",
                                    worker_lock_file=root + "/" + lock_name, hf_home=config.remote_root + "/hf-cache",

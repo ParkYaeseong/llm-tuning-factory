@@ -946,9 +946,9 @@ CPU and with fakes:
   (Windows name aliases and uploaded-input protection on download) it was `a9bece24…e45d` (source `247003f6…6c7f`).
   After the 8.3 short-name follow-up it was `97fa2c89…df3b` (source `0ae3419b…b67a`). After the 7.5 review fixes
   it was `042bf8fe…9c0b` (source `6b57e120…9b5f`). After Task 8.1 it was `5cc24562…63be` (source
-  `0d405733…373a`). After Task 8.2 it was `26a68aee…a117` (source `58adcdc8…ec17`). After Task 8.3, the current
-  receipt is `1ddbabdc…6ceb` (29/29 checks, source `eed26807…fc54`; see "Task 8.3 tracking outbox and MLflow
-  repair").
+  `0d405733…373a`). After Task 8.2 it was `26a68aee…a117` (source `58adcdc8…ec17`). After Task 8.3 it was
+  `1ddbabdc…6ceb` (source `eed26807…fc54`). After Task 8.4, the current receipt is `2afbd0b8…88f8` (29/29 checks,
+  source `9cd9ca7e…6ba0`; see "Task 8.4 executor provider and simulated dispatcher").
 
 Not verified (needs explicit GPU/host authorization):
 - Any real GPU or host.
@@ -1605,6 +1605,162 @@ Not verified or still open:
   job's facts. One tampered or corrupt record raises `ValueError`, and the gated `prepare_ready` then FAILS every
   ready node. 8.5 should separate integrity errors (a run-level `wait_reason` or pause, failing nothing) from
   node-specific compile refusals. Not done here.
+
+## Task 8.4 executor provider and simulated dispatcher, 2026-10-20
+
+Commit `feat: resolve approved destinations and simulate dry-run graph operations`, written on `dfac977` in the
+worktree `codex/task-8.4` in parallel with 8.3, then rebased onto 8.3 (`c7f8683`). It implements plan §4 "8.4" and §5
+(Q21), decisions D11 and D13, and the coordinator's two points from the `dfac977` review (D9 versus simulation;
+refusals release their lock).
+
+What changed:
+- `executor_profiles.py` (providers; `desktop_runtime` is imported only inside provider methods):
+  - `ProfileSecrets(public, settings)`: the settings are a read-only in-memory copy, and the repr and str name only
+    `profile_id@revision`. `ResolvedDestination(profile, observation, executor)` and the `ExecutorProvider` protocol.
+  - `SettingsExecutorProvider(profiles, state_root, *, clock)`:
+    - `resolve` checks before any connection that the profile exists (`PROFILE_MISSING`), that it is still the
+      approved revision and body (`PROFILE_CHANGED`, via `approval_destination`), and that its transport is unchanged
+      (`TRANSPORT_CHANGED`: RunPod `runpod_transport_sha256`; SSH transport and declared cost).
+    - It then opens `executor_for(..., profile_identity=…)` (SSH) and requires the observed Pod (`POD_DIFFERS`, then
+      `runpod_facts`) or SSH server (`SERVER_DIFFERS`, then `server_profile == pinned`) to be the pinned one.
+    - `recover`: SSH through a `ServerApprovalReceipt` created in memory only, never in `job_destinations`, and
+      tolerant of unrelated inventory drift; RunPod with `preflight=False` on the pinned Pod.
+    - `status()` returns public fields only.
+  - `SimulatedExecutorProvider(observations, *, clock)` and `.for_plan(plan)`: the plan's own pinned observations,
+    stamped with the clock. It contacts nothing, never imports `desktop_runtime`, and its executor is always None.
+  - `runpod_facts(pod, *, observed_at)` (D13): `gpu_type` is RunPod's GPU type ID (`gpu.id`), the count is a strict
+    int from 1 to 8, an explicit timezone is required, and a price ≤ 0, non-finite, missing, boolean or non-numeric
+    is refused with `positive finite live RunPod API price required`.
+  - `runpod_transport_sha256(settings)` (D11): provider, Pod ID, SSH fingerprint and a hash of the resolved key path.
+    It never covers the API key. Malformed settings raise fixed texts.
+- `desktop_runtime.executor_for(..., profile_identity=None)`: an SSH launch executor's profile carries the pinned
+  `profile_id`/`revision`/`name`/`credential_scope`. Without the keyword nothing changes. A partial identity, an
+  identity together with a server receipt, or an identity for a RunPod destination is refused before any contact.
+- New `simulated_dispatch.py`:
+  - `SimulatedOperationDispatcher(graph_store, *, root, roots=None)` has the `OperationAttemptRunner` protocol.
+  - Every refusal before launch goes through `abandon_unlaunched`, which releases the lock in the same
+    transaction. That covers `SIMULATION_ONLY`, `NO_EXECUTOR`, approval and destination checks, a lease other than
+    `simulation:<pinned key>`, dataset registrations, the launch ID, `ROOT_SNAPSHOT_MISSING` and `TARGETS_REQUIRED`.
+    `failure_kind` reports these refusals as `refused_before_launch`, counted and terminal.
+  - Launch order: `begin_launch` (D12 gate), the runner's preparation (`manifest.json`, engine files or benchmark
+    bytes, the real `stage_model_inputs`, `command.json`), `transition(RUNNING)`, the local record, and only then
+    `SimulatedWorker.execute`. The result is published exclusively as `<launch_id>.result.json`, then RUNNING →
+    EVALUATING → the real `freeze_operation_output`/`evaluation_record` → COMPLETED → `release_gpu`.
+  - `SimulatedWorker` uses no ledger and writes deterministic bytes: zero-valued F32 tensors, streamed through a
+    stdlib safetensors writer, and canonical JSON. It produces the plan §5 layout for LoRA/QLoRA, full/freeze, rm/ppo
+    value heads, merge (rank Σr, `MergeReceipt`), materialize (`MaterializeReceipt`, `target-inventory.json`) and
+    evaluate (empty predictions). It adds a `simulated.json` marker, and the evidence names every file.
+  - `DirectoryRootSnapshots(directory)` serves `<owner>/<name>/<revision>/`. The dispatcher re-verifies whatever any
+    `RootSnapshotSource` returns.
+  - Every descriptor and evaluation record is `simulation=True`, so `select_best` excludes it with `simulation`.
+
+Decision: simulated attempts versus `release_uncontacted` (D9).
+- The dispatcher writes a documented local record, `launches/<launch_id>/remote-attempt.json` =
+  `{"schema_version": 1, "simulated": true, "contact": "none", attempt_id, launch_id, manifest_sha256}`. It has no
+  `remote_path`, so no real-runner consumer can act on it. It is written after `transition(RUNNING)` and before the
+  first effect, as the real executor does (plan F8).
+- PROVISIONING after `begin_launch`: nothing has run and no record exists. `release_uncontacted` therefore releases
+  it truthfully (uncounted and retryable), and the fenced actor's `transition(RUNNING)` fails before any effect. 8.5
+  can treat simulation runs like real ones here.
+- RUNNING/EVALUATING after `recover_stale` (FAILED, lock held): `failure_kind` reports `uncertain`, and `reconcile`
+  settles from the published result. Without a result, it first publishes a FAILED result exclusively
+  (`SIMULATION_STOPPED`, then `remote_failed`, retryable within `max_attempts`). A suspended original actor can then
+  publish nothing (hard-link create never replaces), and it can no longer transition a FAILED job, so it freezes
+  nothing. Nothing is re-run.
+- COMPLETED or CANCELED holding the lock: handled as by the runner (rebuild and release, or release on an accepted
+  result).
+
+Deviations from the plan:
+- Interfaces:
+  - `SimulatedExecutorProvider(observations=(), *, clock)` instead of `(*, clock)`. A pinned profile alone cannot
+    yield facts that fit; 8.5 uses `.for_plan(plan)`.
+  - Added `SERVER_DIFFERS`, `RUNPOD_PRICE_REQUIRED`, provider `status()` (plan test 4 names it) and an optional
+    `runtime_profile` on `recover`. `PROFILE_MISSING` doubles as the simulated provider's unknown-destination
+    refusal.
+  - The SSH pre-connection check also compares the declared hourly cost with the pinned profile
+    (`TRANSPORT_CHANGED`).
+- Simulated dispatcher:
+  - On the rebase onto 8.3, the simulated `failure_kind` adopted 8.3's M-4 rule as the runner did: an existing
+    disposition answers first (`released_before_contact` as `failed_before_submit`, `returned_unlaunched` as
+    `canceled` or `refused_before_launch`).
+  - `simulated_dispatch.OperationOutcome` copies `attempt_runner.OperationOutcome` field for field (a test pins the
+    fields), because `attempt_runner` imports paramiko through `execution`. 8.5 must treat outcomes structurally, or
+    move the type to a light module.
+  - It does not require dataset export permission (simulated data never leaves the PC); unchanged registered bytes
+    are still checked.
+  - `graph_store`/`jobs` are imported inside the dispatcher only. `SimulatedWorker` and the module import neither.
+  - The coordinator's local record (above).
+  - `engine_version` and the receipt `device` are `"simulated"`.
+- Tests: test 6 is in `tests/test_desktop_runtime.py`, beside test 5. Additions: the transport hash, refusal of an
+  executor or foreign approval, full training with verified targets, untrusted snapshot sources, crashes before
+  RUNNING, during RUNNING and of a suspended actor, and the `OperationOutcome` field parity. `test_simulated_dispatch`
+  imports only light modules, so its chain also runs in a subprocess.
+- The chain of test 10 is train (HF root) → continue → merge → materialize → evaluate → select. The merge takes the
+  real adapters `first`/`second`, after `continue` through an explicit `depends_on`, because compile refuses simulated
+  merge inputs (`_merge_descriptors` is real-only). The plan adds evidence for the HF root, as Task 9's inspector
+  would supply.
+
+Actual verification (worktree `D:\llm-tuning-factory-wt84`, main venv with `PYTHONPATH` on the worktree `src`;
+`tuning_factory.__file__` resolved into the worktree). RED, mutations and the first GREEN ran on `dfac977`; the final
+GREEN, Ruff, secrets and CPU acceptance ran on the tree rebased onto 8.3:
+- RED, before any `src` edit: all 58 new cases failed for the intended reasons:
+  - 56 on the missing provider names or the missing `simulated_dispatch` module (through `api()`, not collection);
+  - one on `executor_for() got an unexpected keyword argument 'profile_identity'`;
+  - the subprocess test on `ModuleNotFoundError`.
+- Mutations, through a pytest plugin in `%TEMP%` with no `src` edit:
+
+  | Mutation | Tests that fail |
+  |---|---|
+  | dispatcher skips the simulation check | refuses real manifests |
+  | the result record overwrites instead of exclusive create | suspended actor |
+  | reconcile publishes no FAILED result | crash while running, suspended actor |
+  | the dispatcher trusts the snapshot source | HF root `untrusted_source` |
+  | the worker runs before `transition(RUNNING)` | 11 cases, including crash before running |
+  | the simulated provider ignores the revision | provider contacts nothing |
+  | `lora_target: all` without evidence uses placeholders | targets refused (`all_targets_on_root`) |
+  | the settings provider skips the transport check | six transport cases and secrets in memory |
+  | `ProfileSecrets.__repr__` shows settings | secrets in memory |
+
+  `require_real=True` in the simulated merge survives: it is equivalent, since compile already requires real merge
+  inputs.
+- GREEN:
+  - The plan's command (`test_simulated_dispatch`, `test_executor_profiles`, `test_desktop_runtime`,
+    `test_operation_runner`, `test_model_inputs`) gave **220 passed**, on `dfac977` and after the rebase.
+  - The full suite gave **1253 passed, 1 skipped** (1195 + 58) on `dfac977`, and **1283 passed, 1 skipped** (8.3's
+    1225 + 58) on the rebased tree.
+  - One rerun on `dfac977`, made while the CPU acceptance ran in parallel, failed the pre-existing
+    `tests/test_jobs.py::test_recovery_does_not_release_unknown_remote_execution`; `jobs.py` and `test_jobs.py` are
+    unchanged from `dfac977`. It is a timing flake: `JobStore.recover(stale_after_seconds=0)` needs
+    `updated < time.time()`, and two consecutive Windows `time.time()` reads can be equal. In isolation it failed 2 of
+    5 runs, and an unloaded rerun of the suite passed. Not fixed here.
+- Ruff (`src tests`) is clean, and `check_secrets.py` reports 0 findings over 759 file versions (rebased tree). It
+  first flagged the synthetic RunPod-shaped test key, which is now built at runtime. Both GPU locks are unchanged,
+  every changed file is CR-free, and the subprocess checks import no paramiko, `desktop_runtime`, `execution`,
+  `attempt_runner`, mlflow, torch, transformers, peft, safetensors or huggingface_hub.
+- CPU acceptance (`-I`, the worktree's script and source):
+  - On `dfac977` it exited 0 twice with byte-identical receipts (`f7e209dd…4b32`, source `ea6ed0bb…d866`).
+  - On the rebased tree it exited 0, and all **29** checks passed. The source hash equals `source_hash()` of the
+    committed `src`.
+  - Max errors are unchanged: merge delta 7.78e-9, materialize delta 9.17e-9, parent→child 6.42e-9, logits
+    3.35e-8/2.98e-8.
+  - Receipt SHA256 `2afbd0b8d548715892fff15361bfac67ed563c87e91eb6d979ad8da2874088f8`, source_sha256
+    `9cd9ca7eec4a61ba4db68833f46dc0259e1d2c9b4fea31249de3515a51066ba0`, lock_sha256
+    `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`.
+  - `model_downloaded`, `gpu_used`, `institution_data_used` and `production_promotable` are false.
+  - It supersedes 8.3's `1ddbabdc…6ceb`.
+
+Not verified or still open:
+- No live RunPod API, SSH server, GPU, network, model download or MLflow was contacted. The RunPod path ran on a
+  fake `connection()`, and the SSH path on `test_gpu_servers.FakeServer` (paramiko-shaped). The real
+  `RunPodController.status` shape and `gpu.id` values are assumptions until Task 9 observes a live Pod.
+- Nothing produces planning-time `ResourceFacts` from `runpod_facts`, or `transport_settings_sha256` from
+  `runpod_transport_sha256`, yet (Task 9). Planned facts must use the same `gpu.id` field.
+- The controller loop is 8.5: provider selection by plan, the dispatch threads, settle and reconcile calls.
+- A simulated full or materialized model of a real-size base writes its whole F32 linear inventory as zeros. It is
+  streamed, but it can be many GB on disk.
+- The exclusive result publish relies on hard links (NTFS and ext4 support them). A filesystem without them fails
+  the attempt.
+- Multi-process contention is untested.
 
 ---
 
