@@ -950,8 +950,9 @@ CPU and with fakes:
   `1ddbabdc…6ceb` (source `eed26807…fc54`). After Task 8.4 it was `2afbd0b8…88f8` (source `9cd9ca7e…6ba0`).
   After Task 8.5 it was `d796f3ed…7f1d` (source `0888d176…ceab`). After Task 9.1 it was `5147d6d9…ab68`
   (source `ebf51635…76ec`). After Task 9.2 it was `50a64996…9f66` (source `0204b69b…16e1`). After the 8.5 review
-  fixes, the current receipt is `6524aba8…1c5f` (29/29 checks, source `b6547200…c3a3`; see "Task 8.5 review
-  fixes").
+  fixes it was `6524aba8…5c1f` (source `b6547200…c3a3`). After Task 9.7 it was `cbad9755…2f8d` (source
+  `3b1f546a…1631`). After the 8.5 re-review Minors, the current receipt is `b4cc02a2…c6d4` (29/29 checks, source
+  `2f5200b0…457c`; see "8.5 re-review Minors" under "Task 8.5 review fixes").
 
 Not verified (needs explicit GPU/host authorization):
 - Any real GPU or host.
@@ -2706,6 +2707,54 @@ Remaining, for Task 9:
 - Remote log uploads and executor exception text outside the filtered paths are not redacted (Minor 7 remainder).
 - Executors built outside `SettingsExecutorProvider` carry no `destination_profile` stamp; the controller's own profile
   check covers them.
+
+### 8.5 re-review Minors, 2026-10-21
+
+Commit `fix: anchor result deadlines on launch and back off replan waits`, on `02436c8` (9.2 follow-ups and 9.7). The
+re-review of `b0d2c90` was "Ready to merge: Yes", which completed Task 8 in software, and left five Minors:
+1. **`result_deadline` was anchored on the claim time.** Probe G: an attempt resumed an hour after its claim, launched
+   and left uncertain, showed `RESULT_OVERDUE`/`needs_operator` at once, and so did long input uploads.
+   - It is now anchored on the attempt's latest job event: the FAILED that made it uncertain.
+   - That is never before the remote launch. The actor uploads its inputs and launches while RUNNING, and the attempt
+     fails only after its actor stopped (the runner gave up on a lost response, or a stale recover after its last
+     heartbeat). Resumed claims and slow uploads therefore never shorten the time limit, and no separate transfer
+     allowance is needed.
+   - The anchor is conservative: it can be later than the launch by up to the stale-detection time, so the operator
+     may wait somewhat longer.
+   - Tests: `test_the_result_deadline_starts_when_the_attempt_became_uncertain[resumed_claim|slow_upload]`. Test 10
+     now asserts the new anchor.
+2. **REPLAN waits re-opened the destination and re-hashed the lineage every tick.** Probe F: 6 resolves and 6 full
+   re-hashes in 6 ticks.
+   - A claim that returns None for REPLAN (a live price or GPU that differs) now backs off for
+     `destination_retry_seconds`, like a refusal.
+   - The pre-claim lineage check runs only where a dispatcher re-resolves bindings before the launch: every
+     non-evaluation in a simulation, and only an adapter continuation for the real runner.
+   - A failed check is held for the same period instead of being re-hashed every tick.
+   - `test_replan_waits_back_off_and_never_rehash_the_lineage`: 1 resolve in 6 ticks, at most b's compile plus one
+     check, none for a root training, and one more resolve after the period.
+3. **The controller did not check its dispatcher's store.** `GraphController` now refuses at construction, with
+   `DISPATCHER_STORE_DIFFERS`, a dispatcher (or a router's real or simulated dispatcher) whose `graph`, `store` or
+   `jobs` is not its own `store`/`store.jobs`; otherwise the error filter would silently not apply. The filter is
+   installed on the store's `JobStore` instance, so the last controller constructed on a store wins.
+   `test_the_dispatcher_must_use_the_controllers_store`.
+4. **`await_creation_for=0` acknowledges PENDING versions.** No code change, recorded for Task 9: if the server later
+   marks such a version `FAILED_REGISTRATION`, `registration_status` still says `registered`. A later check of the
+   version's status (or a re-arm path for registrations) is Task 9's to decide.
+5. The PROGRESS typo `6524aba8…1c5f` is corrected to `…5c1f`.
+
+Verification (main tree, on `02436c8`):
+- RED, on a `git archive` export of `02436c8` with the new tests copied in: the 4 new cases failed for the intended
+  reasons:
+  - both deadline cases were overdue at once (`awaiting_result` False, `needs_operator` True);
+  - the root training's lineage was checked before its claim (2 calls instead of 1);
+  - `DISPATCHER_STORE_DIFFERS` was missing.
+- GREEN: `test_graph_controller` + `test_tracking_outbox`: **95 passed**. `uv run pytest -q`: **1557 passed, 2 skipped (1553 + 4 new)**.
+- Ruff is clean. `check_secrets.py` reports 0 findings over 826 file versions. Both GPU locks are unchanged, and
+  `git ls-files --eol` shows no CRLF.
+- CPU acceptance (`-I`) exited 0, and all 29 checks passed. Max errors are unchanged.
+  - Receipt SHA256 `b4cc02a237003c763f9dd4421d1e61bd1adbab20fb86d526c336fe42d1d2c6d4`, source_sha256 `2f5200b0bbf8c9311748ab5c425b94a8479bda02a114a1a732fdde53e9f5457c` (equal to `source_hash()` of a `git archive` export of the
+    commit), lock_sha256 `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`.
+  - It supersedes 9.7's `cbad9755…2f8d`.
 
 ## Task 9.7 header-only HF-root target inspector, with the 9.2 review follow-ups, 2026-10-21
 

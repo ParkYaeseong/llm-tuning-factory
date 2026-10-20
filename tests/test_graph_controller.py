@@ -785,7 +785,8 @@ def test_ambiguous_launch_waits_for_the_operator(tmp_path, monkeypatch, record):
         # nobody is asked to release the lock yet.
         assert (item['awaiting_result'], item['needs_operator'], item['wait_reason']) == (True, False,
                                                                                           gc.AWAITING_RESULT)
-        assert item['result_deadline'] == pytest.approx(attempts(w, 'a')[0]['created'] + 900 + gc.RESULT_MARGIN_SECONDS)
+        uncertain_at = max(row['timestamp'] for row in readiness.table(w, 'events', 'WHERE job_id=?', (a,)))
+        assert item['result_deadline'] == pytest.approx(uncertain_at + 900 + gc.RESULT_MARGIN_SECONDS)
         controller, owner = restart(w, 'controller-late', advance=900 + gc.RESULT_MARGIN_SECONDS)
         controller.tick(owner)
         item = status_of(w, 'a', controller)
@@ -1696,3 +1697,89 @@ def test_a_failed_return_never_hides_the_refusal(tmp_path, monkeypatch):
     monkeypatch.setattr(gs.GraphStore, 'return_unlaunched', original)
     report = controller.tick(owner)
     assert a in report.released and w.store.jobs.get(a)['status'] == 'QUEUED'
+
+
+
+# -- 8.5 re-review Minors ----------------------------------------------------------------------------
+
+def backdate(w, job_id, seconds, statuses=('PENDING', 'QUEUED', 'PROVISIONING', 'RUNNING')):
+    """As if the job's attempt was claimed (and its earlier steps happened) ``seconds`` ago, in wall time."""
+    with w.store.jobs.connection() as db:
+        db.execute('UPDATE job_attempts SET created=created-? WHERE job_id=?', (seconds, job_id))
+        db.execute('UPDATE jobs SET updated=updated-? WHERE id=?', (seconds, job_id))
+        db.execute('UPDATE events SET timestamp=timestamp-? WHERE job_id=? AND status IN (%s)'
+                   % ','.join('?' * len(statuses)), (seconds, job_id, *statuses))
+
+
+@pytest.mark.parametrize('case', ['resumed_claim', 'slow_upload'])
+def test_the_result_deadline_starts_when_the_attempt_became_uncertain(tmp_path, monkeypatch, case):
+    """Re-review Minor 1: an attempt resumed long after its claim, or one whose input upload took hours after RUNNING,
+    still has its whole time limit after the launch: no RESULT_OVERDUE (and no release-lock prompt) at once."""
+    gc = api()
+    w = world(tmp_path, monkeypatch, chain)
+    w.dispatcher.script['a'] = ['uncertain']
+    controller, owner = start(w)
+    controller.tick(owner)
+    a = job_of(w, 'a')
+    if case == 'resumed_claim':   # claimed an hour ago by a controller that died; resumed and launched now
+        backdate(w, a, 3600)
+        controller, owner = restart(w, advance=61)
+    else:   # RUNNING two hours ago; the inputs uploaded until now, then the launch's response was lost
+        w.dispatcher.during['a'] = lambda: backdate(w, a, 7200)
+    drive(w, controller, owner, until=lambda: bool(w.provider.recovers))
+    item = status_of(w, 'a', controller)
+    assert item['uncertain'] and item['awaiting_result'] and not item['needs_operator']
+    assert node(w, 'a')['wait_reason'] == gc.AWAITING_RESULT
+    assert item['result_deadline'] > w.clock() + 900   # the whole time limit lies ahead
+
+
+def test_replan_waits_back_off_and_never_rehash_the_lineage(tmp_path, monkeypatch):
+    """Re-review Minor 2: a live price above the pinned one is not re-opened every tick, and the lineage is checked
+    before a claim only where the dispatcher needs it (a continuation), once per retry period."""
+    gs = readiness.api()
+    w = world(tmp_path, monkeypatch, chain)
+    resolver_calls = []
+    real = gs.GraphStore.bindings_for
+
+    def spy(self, run_id, node_id):
+        resolver_calls.append(node_id)
+        return real(self, run_id, node_id)
+
+    monkeypatch.setattr(gs.GraphStore, 'bindings_for', spy)
+    controller, owner = start(w)
+    drive(w, controller, owner, until=lambda: node(w, 'a')['status'] == 'COMPLETED'
+          and status_of(w, 'a')['tracking_status'] == 'saved' and node(w, 'b')['job_id'] is None)
+    assert resolver_calls.count('a') == 1   # its compile only: a root training needs no pre-claim lineage check
+    w.provider.price['p1'] = 3.0   # the live price rose above the pinned 2.0
+    resolves, calls = len(w.provider.resolves), len(resolver_calls)
+    for _ in range(6):
+        controller.tick(owner)
+        w.pool.run_all()
+        w.clock.advance(5)
+    assert len(w.provider.resolves) - resolves == 1   # opened once, then backed off
+    assert len(resolver_calls) - calls <= 2          # b's compile and one pre-claim check, never per tick
+    assert 're-plan' in node(w, 'b')['wait_reason'] and attempts(w, 'b') == []
+    for _ in range(2):   # the retry period passes (ticks keep the owner lease alive)
+        w.clock.advance(api().ControllerSettings().destination_retry_seconds / 2)
+        controller.tick(owner)
+    assert len(w.provider.resolves) - resolves == 2   # tried again after the retry period, once
+
+
+def test_the_dispatcher_must_use_the_controllers_store(tmp_path, monkeypatch):
+    """Re-review Minor 3: the error filter is installed on the controller's store, so a dispatcher (or a router's real
+    or simulated dispatcher) on another GraphStore is refused at construction."""
+    gc = api()
+    gs = readiness.api()
+    from tuning_factory.attempt_runner import OperationAttemptRunner
+    from tuning_factory.simulated_dispatch import SimulatedOperationDispatcher
+    w = world(tmp_path, monkeypatch, chain)
+    other = gs.GraphStore(w.store.jobs.path, clock=w.clock)   # the same file, another instance
+    for dispatcher in (OperationAttemptRunner(other, root=other.state_dir),
+                       gc.DispatchRouter(OperationAttemptRunner(w.store, root=w.store.state_dir),
+                                         SimulatedOperationDispatcher(other, root=other.state_dir))):
+        with pytest.raises(ValueError, match=gc.DISPATCHER_STORE_DIFFERS):
+            gc.GraphController(w.store, w.provider, dispatcher, w.tracker, w.clock, pool=ManualPool())
+    controller = gc.GraphController(w.store, w.provider, gc.DispatchRouter(
+        OperationAttemptRunner(w.store, root=w.store.state_dir), SimulatedOperationDispatcher(
+            w.store, root=w.store.state_dir)), w.tracker, w.clock, pool=ManualPool())
+    assert w.store.jobs.error_filter == controller.redact

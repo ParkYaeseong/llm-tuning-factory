@@ -82,6 +82,7 @@ DESTINATION_UNAVAILABLE = "destination unavailable: {error}"
 DISPATCH_FAILED = "dispatch failed: {error}"
 SETTLE_FAILED = "settling the attempt failed; retrying next tick: {error}"
 DESTINATION_PROFILE_DIFFERS = "the opened destination is not this job's pinned profile; re-plan before running"
+DISPATCHER_STORE_DIFFERS = "the operation dispatcher must use the graph controller's own GraphStore"
 RETURNED_AFTER_TAKEOVER = "returned unlaunched after takeover: the graph run is not running"
 STOPPING = "returned unlaunched after takeover: the controller is stopping"
 OPERATOR_PREFIXES = (OUTPUTS_REFUSED.split(":")[0], LEDGER_INTEGRITY.split(";")[0], OPERATOR_CONFIRMATION,
@@ -246,6 +247,29 @@ def _bound_requests(tracker) -> None:
         built.bounded_requests = CONTROLLER_REQUEST_LIMITS
 
 
+def _dispatcher_parts(dispatcher, seen=None):
+    """The dispatcher and, structurally, a router's real and simulated dispatchers."""
+    seen = seen if seen is not None else set()
+    if dispatcher is None or id(dispatcher) in seen:
+        return []
+    seen.add(id(dispatcher))
+    parts = [dispatcher]
+    for name in ("real", "simulated"):
+        parts += _dispatcher_parts(getattr(dispatcher, name, None), seen)
+    return parts
+
+
+def _dispatcher_stores(dispatcher):
+    return [value for part in _dispatcher_parts(dispatcher) for value in (
+        getattr(part, "graph", None), getattr(part, "store", None)) if isinstance(value, GraphStore)]
+
+
+def _dispatcher_jobs(dispatcher):
+    from .jobs import JobStore
+    return [value for part in _dispatcher_parts(dispatcher) for value in [getattr(part, "jobs", None)]
+            if isinstance(value, JobStore)]
+
+
 def _provider_prefix(resource):
     return next((prefix for prefix in _PROVIDERS if resource.startswith(prefix)), None)
 
@@ -285,6 +309,11 @@ class GraphController:
             raise TypeError("ControllerSettings required")
         if not callable(clock):
             raise TypeError("an injected wall clock is required")
+        if any(item is not store for item in _dispatcher_stores(operation_dispatcher)) or any(
+                item is not store.jobs for item in _dispatcher_jobs(operation_dispatcher)):
+            # The error filter is installed on this store's JobStore: a dispatcher on another instance would write
+            # unredacted errors (re-review Minor 3).
+            raise ValueError(DISPATCHER_STORE_DIFFERS)
         self.store, self.provider, self.dispatcher = store, executor_provider, operation_dispatcher
         self.tracker, self.clock, self.settings = tracker, clock, settings
         self.simulated_provider = simulated_provider
@@ -313,7 +342,8 @@ class GraphController:
         self._tracking_stop = threading.Event()
         self.errors: collections.deque = collections.deque(maxlen=20)
         # Every error text an executor or worker returns passes through this filter before the ledger stores it
-        # (8.5 review Minor 7): the credentials only the providers hold, then MLflow's and bearer-style ones.
+        # (8.5 review Minor 7): the credentials only the providers hold, then MLflow's and bearer-style ones. It is
+        # installed on this store's JobStore instance, so the last controller constructed on a store wins.
         store.jobs.error_filter = self.redact
 
     def redact(self, text) -> str:
@@ -785,7 +815,7 @@ class GraphController:
                       else self._busy(resource, facts) or self._db_blocked(resource, facts, plan.simulation)
                       or self._budget_reason(run_id, plan, resources)
                       or (backoff[1] if backoff and backoff[0] > now else None)
-                      or self._integrity_reason(run_id, node_id, operation))
+                      or self._integrity_reason(run_id, node_id, operation, plan.simulation, now))
             if reason:
                 self._note(lease, node_id, reason)
                 continue
@@ -809,8 +839,11 @@ class GraphController:
                 raise
             if claimed is None:
                 stack.close()
-                self._note(lease, node_id, self._unclaimed_reason(run_id, plan, resources, destination.observation,
-                                                                 resource))
+                reason = self._unclaimed_reason(run_id, plan, resources, destination.observation, resource)
+                if reason == REPLAN:   # a live price or GPU that differs: not reopened every tick (re-review Minor 2)
+                    self._refused[(run_id, profile.profile_id, profile.revision)] = (
+                        now + self.settings.destination_retry_seconds, reason)
+                self._note(lease, node_id, reason)
                 continue
             self._note(lease, claimed["graph_node_id"], None)
             self._submit(run_id, claimed, run["approval"], destination, stack)
@@ -841,15 +874,24 @@ class GraphController:
             self._job_runs[job_id] = run_id
         future.add_done_callback(lambda _: self._wake.set())
 
-    def _integrity_reason(self, run_id, node_id, operation) -> str | None:
-        """The dispatchers re-resolve a node's recorded lineage before its launch; check it before claiming, so a
-        record that no longer verifies holds the node without an attempt (8.5 review Minor 1)."""
-        if operation["kind"] == "evaluate":
+    def _integrity_reason(self, run_id, node_id, operation, simulation, now) -> str | None:
+        """Check a node's recorded lineage before claiming it, so a record that no longer verifies holds the node
+        without an attempt (8.5 review Minor 1). Only where its dispatcher re-resolves bindings before the launch:
+        every non-evaluation in a simulation, and only an adapter continuation for the real runner (re-review Minor
+        2). A failed check is held for ``destination_retry_seconds``, never re-hashed every tick."""
+        needed = (operation["kind"] != "evaluate" if simulation else operation["kind"] == "train"
+                  and operation["model_input"]["initialization"] == "continue_adapter")
+        if not needed:
             return None
+        held = self._refused.get((run_id, "integrity", node_id))
+        if held and held[0] > now:
+            return held[1]
         try:
             self.store.bindings_for(run_id, node_id)
         except LedgerIntegrityError as exc:
+            self._refused[(run_id, "integrity", node_id)] = (now + self.settings.destination_retry_seconds, str(exc))
             return str(exc)
+        self._refused.pop((run_id, "integrity", node_id), None)
         return None
 
     def _busy(self, resource, facts) -> str | None:
@@ -1048,15 +1090,22 @@ def graph_status(store: GraphStore, run_id: str | None = None, *, now: float) ->
 
 
 def result_deadline(store, row) -> float | None:
-    """When an uncertain attempt's late result stops being plausible: its claim time plus the operation's time
-    limit plus ``RESULT_MARGIN_SECONDS`` (8.5 review Minor 6). None without a pinned time limit (a selection)."""
+    """When an uncertain attempt's late result stops being plausible (8.5 review Minor 6; anchored by the re-review,
+    Minor 1): the time the attempt became uncertain, plus the operation's time limit, plus ``RESULT_MARGIN_SECONDS``.
+
+    The anchor is the attempt's latest job event, the FAILED that made it uncertain. That is never before the remote
+    launch: the actor uploads its inputs and launches while RUNNING, and the attempt fails only after its actor
+    stopped (the runner gave up on a lost response, or a stale recover after its last heartbeat). A claim resumed
+    long after it was made, or hours of input uploads, therefore never shorten the remote time limit, so no transfer
+    allowance is needed. None without a pinned time limit (a selection)."""
     timeout = ((row.get("operation") or {}).get("resources") or {}).get("timeout_seconds")
     attempt_id = row.get("active_attempt_id")
     if not timeout or not attempt_id:
         return None
     with store.jobs.connection() as db:
-        created = db.execute("SELECT created FROM job_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
-    return None if created is None else float(created[0]) + float(timeout) + RESULT_MARGIN_SECONDS
+        anchor = db.execute("SELECT MAX(e.timestamp) FROM events e JOIN job_attempts a ON a.attempt_id=? "
+                            "WHERE e.job_id=a.job_id AND e.timestamp>=a.created", (attempt_id,)).fetchone()
+    return None if anchor is None or anchor[0] is None else float(anchor[0]) + float(timeout) + RESULT_MARGIN_SECONDS
 
 
 def _has_remote_record(store, row) -> bool:
