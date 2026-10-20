@@ -680,8 +680,10 @@ Verification after the follow-up:
   host-forged inputs with a matching inventory).
 - GREEN: the sub-plan set gave **228 passed**. In a clean detached worktree (HEAD `7115a99` plus only this change; the
   concurrent 7.5 agent's uncommitted source edits are absent there), `uv run pytest -q` gave **1054 passed, 1 skipped**.
-  In the shared tree, `uv run pytest -q --ignore=tests/test_operation_runner.py` gave the result recorded in the commit
-  report.
+  The shared tree's `uv run pytest -q --ignore=tests/test_operation_runner.py` also gave **1054 passed, 1 skipped**.
+  One earlier worktree run hit a single failure in the timing-sensitive
+  `test_cancellation_does_not_wait_for_training_when_taskkill_is_denied` while two suites ran at once. It passed 3/3
+  alone, and the full re-run alone was clean.
 - Ruff is clean, `check_secrets.py` reports 0 findings, and the eol check prints nothing.
 - The CPU acceptance (`-I`, script and sources from the clean worktree) exited 0 twice with byte-identical receipts and
   all **28** checks passed. Max errors and inventories (`cc5fbab0…b54c`, `e124a915…8682`) are unchanged. Receipt
@@ -803,13 +805,16 @@ Actual verification:
 - Tests that rely on the 7.4 publish contract of commit 7115a99: `test_outputs_seed_the_remote_cache_from_their_launch`
   (both cases; the train case fails under the earlier copy-everything publish, because the engine re-saves the
   tokenizer) and `test_runner_launches_on_an_ssh_server_destination`.
-- CPU acceptance (`-I`) exited 0 twice with byte-identical receipts and all **29** checks passed. Max errors are
+- CPU acceptance (`-I`), run on a clean checkout of commit 7120193, exited 0 twice with byte-identical receipts and
+  all **29** checks passed. Max errors are
   unchanged (merge delta 7.78e-9, materialize delta 9.17e-9, parent→child 6.42e-9, logits 3.35e-8/2.98e-8). The
   frozen dispatched outputs keep the 7.3 inventories (merge `cc5fbab0…b54c`, materialize `e124a915…8682`). Receipt
-  SHA256 `a9bece24ded6e84c0637007e7fe78288d61f9125d944a9add348b13b8c7ee45d`, source_sha256
-  `247003f6a987096bcbee4739a3a4ffb4aeaf2836f3c75622c0b42f5e28b96c7f` (equal to the tree), lock_sha256
+  SHA256 `811d41778b1338380f3ab2b4efc797ad4e39e8ddc3c00e73cb44717d7467b673`, source_sha256
+  `478e2a418363e8d115b2537849603e1b2d045fa6402a795d96bdbb6829a5e5d2` (equal to that commit's tree), lock_sha256
   `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`. `model_downloaded`, `gpu_used`,
-  `institution_data_used` and `production_promotable` are false. This supersedes every earlier Task 7 receipt.
+  `institution_data_used` and `production_promotable` are false. This supersedes every earlier Task 7 receipt. (The
+  first recorded value, `a9bece24…e45d` with source `247003f6…6c7f`, came from the shared working tree while another
+  agent's uncommitted `execution.py` edit was present, so it is void.)
 - No real SSH, GPU, model download or institution data. Every remote action ran on `GPUHost`, which runs the real
   `worker.main_v2` with fixture engines and model operations that write small, well-formed safetensors.
 
@@ -824,7 +829,7 @@ Task 7 is complete in software: 7.1–7.5 and their review fixes. Verified on th
   results.
 - A control-plane runner that freezes outputs with exact lineage, computes evaluation receipts under
   `BenchmarkSpec.fingerprint()` (F11 fixed) and rebuilds idempotently after a crash.
-- Final receipt `a9bece24…e45d` (29/29 checks).
+- Final receipt `811d4177…b673` (29/29 checks, source `478e2a41…e5d2` of commit 7120193).
 
 Not verified (needs explicit GPU/host authorization):
 - Any real GPU or host.
