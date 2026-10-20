@@ -951,8 +951,8 @@ CPU and with fakes:
   After Task 8.5 it was `d796f3ed…7f1d` (source `0888d176…ceab`). After Task 9.1 it was `5147d6d9…ab68`
   (source `ebf51635…76ec`). After Task 9.2 it was `50a64996…9f66` (source `0204b69b…16e1`). After the 8.5 review
   fixes it was `6524aba8…5c1f` (source `b6547200…c3a3`). After Task 9.7 it was `cbad9755…2f8d` (source
-  `3b1f546a…1631`). After the 8.5 re-review Minors, the current receipt is `b4cc02a2…c6d4` (29/29 checks, source
-  `2f5200b0…457c`; see "8.5 re-review Minors" under "Task 8.5 review fixes").
+  `3b1f546a…1631`). After the 8.5 re-review Minors it was `b4cc02a2…c6d4` (source `2f5200b0…457c`). After
+  Task 9.3, the current receipt is `00d0043b…7f93` (29/29 checks, source `ef4e1357…4ff1`; see "Task 9.3 runs").
 
 Not verified (needs explicit GPU/host authorization):
 - Any real GPU or host.
@@ -2888,6 +2888,111 @@ Not verified or still open:
 - That header-derived module names equal the runtime module names of `transformers==5.6.0` for the allowed
   architectures is a reasoned assumption, not a run. The meta-device inspector was not compared on real configs.
 - The GUI cannot call `model_root_targets` until `main.rs` lists it (see the first deviation).
+- No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
+
+## Task 9.3 runs: submission, status and steering, 2026-10-21
+
+Commit `feat: submit and steer graph runs from the desktop with explicit approvals`, written in the worktree
+`codex/task-9.3` on `b0d2c90` (the 8.5 review fixes). It was rebased onto `02436c8` (Task 9.7 and the 9.2 planning
+follow-up `8931b1f`), then onto `960c99e` (the 8.5 re-review Minors). Only this file conflicted: every entry is
+kept, this one last, and only the receipt pointer moved. It implements
+[Task 9 plan](superpowers/plans/2026-10-20-task9-secure-desktop-broker.md) §4 "9.3" with D5, D9, D11 and D21.
+Changed: new `src/tuning_factory/workflow_runs.py`, new `tests/test_workflow_runs.py` and this file.
+
+What changed:
+- New `workflow_runs.py`. Its eight actions register through 9.1's closed table: `graph_submit`, `graph_runs_list`,
+  `graph_run_get`, `graph_pause`, `graph_resume`, `graph_cancel`, `tracking_rearm` and `executor_profile_edit_check`.
+  It also has `staleness`, `profile_usage` and `submissions_dir`. `desktop_workflows.py` is unchanged.
+- `graph_submit` (D9):
+  - It loads the stored plan by its hash (`plan_unknown`, or `plan_invalid` when it no longer verifies).
+  - It re-checks freshness; any change is `conflict`/`plan_stale` and creates no run. The project revision is checked
+    at `/project` for every plan. A real plan also checks each pinned profile's current native revision at
+    `/profiles/<id>` (changed or removed) and the MLflow destination hash at `/tracking`.
+  - A real plan needs both `approve_execution` and `approve_data_transfer` (strict booleans; each missing one is an
+    `approval_required` issue at its path). It also refuses practice data (`PRACTICE_SUBMIT_REFUSAL`) and
+    non-exportable data used by any train or evaluate node: `practice_data` or `export_not_allowed` at
+    `/plan_sha256`, with the node ID. This is defence in depth for plans stored by older code.
+  - It builds `ApprovalGrant.for_plan(plan)` and calls `GraphStore.submit`, which is idempotent by request ID
+    (`request_reused` at `/request_id`). It writes the immutable, public receipt
+    `state/workflows/submissions/<run_id>.json` and returns `{run_id, status, simulation, plan_sha256, controller}`.
+    It never starts the controller.
+- `graph_runs_list` and `graph_run_get` read `graph_controller.graph_status` only, with the 8.5 fields:
+  `needs_operator`, `awaiting_result`, `result_deadline`, `budget_exhausted`, `unpriced_attempts`,
+  `tracking_action`, and `{run_id, error}` for an unreadable run. `graph_run_get` adds
+  `plan_summary(plan, state_dir)`, which includes the hash-verified public tracking settings.
+- `graph_pause`, `graph_resume` and `graph_cancel` call `GraphStore` directly. Its fixed refusals become
+  `conflict`/`run_state` at `/run_id`, and an unknown run is `invalid`/`run_unknown`. `tracking_rearm` calls
+  `TrackingOutbox.rearm` (`conflict`/`tracking_state`, `invalid`/`tracking_event_unknown`).
+- `executor_profile_edit_check` (D5, 8.4 review Minor 5) follows 9.5's Rust contract. `{"profile_id"}` comes in.
+  The answer is `conflict`/`profile_in_use` with `data.jobs` (`[{run_id, node_id, job_id, status, locked}]`), or
+  `ok` with `data.affected_runs`. Profile IDs compare by casefold plus `rstrip(".")`. This unblocks the native profile
+  save and delete, which refuse until the check answers.
+- D21: no action releases an operator lock. `graph_run_get` shows `needs_operator` and the wait reason.
+
+Deviations from the plan:
+- Simulation plans skip the profile and tracking freshness checks (9.2 review Minor 4). They pin a profile as
+  observed and never contact it: they route to `SimulatedExecutorProvider` and the local sink. Their project
+  revision is still checked. Real plans keep all three checks.
+- `graph_run_get` also returns `tracking_failures`: the run's FAILED or UNCERTAIN events, each
+  `{event_id, kind, node_id, status, tries, last_error, action}`. Without it, no event ID would reach the desktop or
+  the CLI for `tracking_rearm`. `last_error` passes through `graph_controller._display`, as wait reasons do.
+  `action` is `EVIDENCE_CHANGED_ACTION` for changed evidence.
+- `tracking_rearm` also re-arms a changed-evidence event, because the operator may have restored the files. It then
+  adds the warning `tracking_evidence_changed` with `EVIDENCE_CHANGED_ACTION`.
+- Pause, resume and cancel return `{run, controller}`: the run's status entry and the controller block.
+- `affected_runs` lists only RUNNING or PAUSED **real** runs whose approval pins the profile. A simulation uses its
+  plan's own observations, never the native profile, so an edit needs no re-plan.
+- `profile_in_use` covers every graph job pinned to the profile, simulated ones included (D5 as written). It counts
+  `resource_leases` as well as `gpu_locks`. A lock-holding or active job whose pinned profile cannot be read counts
+  too (fail closed).
+- Reads never create `jobs.db`. Without it, `graph_runs_list` returns no runs and the absent controller block
+  (`NO_CONTROLLER`, pinned against `graph_status` by a test); run reads and steering answer `run_unknown`;
+  `tracking_rearm` answers `tracking_event_unknown`; and the edit check answers `ok` with no affected runs.
+- The receipt is written once. A retry with other approval flags (possible only for a simulation) keeps the first.
+- Freshness is checked before idempotency. Retrying an existing request after the project, a pinned profile or the
+  tracking settings changed is `plan_stale`. No new run is made, and the existing run stays listed.
+- New codes: `plan_invalid`, and the warning `tracking_evidence_changed`. `ProfileEditCheck.profile_id` is limited
+  to 64 characters, like `NativeProfile`.
+
+Actual verification (worktree `D:\llm-tuning-factory-wt93`, main venv with `PYTHONPATH` on the worktree `src`;
+`tuning_factory.__file__` resolved into the worktree):
+- RED, before any `src` edit: all 28 first cases failed on the missing module (`pytest.fail`, not collection).
+- Mutations through a harness under `%TEMP%` (each restored after its run, byte-checked): 20 source mutations, all
+  killed. They covered the real profile check, the simulation skip, the project check, each approval, the data
+  checks (practice, export, the evaluate branch), the tracking check, `_display` of tracking errors, the evidence
+  action and warning, locks versus active statuses, casefolding, simulations in `affected_runs`, PAUSED runs, reads
+  creating the ledger, the `/request_id` pointer, the receipt flags and the fail-closed unreadable job. The
+  first harness run left the unreadable-job mutation alive, so a case was added for it; the evaluate-branch case was
+  added for a branch no test reached. Each new case was shown to fail under its mutation.
+- GREEN on `b0d2c90`: `test_workflow_runs`, `test_workflow_planning`, `test_graph_store`, `test_tracking_outbox`,
+  `test_graph_controller`, `test_desktop_projects` and `test_native_contract` gave **251 passed, 1 skipped** (the
+  skip waits for 9.4's controller entry). The full suite gave **1487 passed, 2 skipped** (1459 + the first 28
+  cases; the evaluate-data case was added after that run).
+- Rebased onto `02436c8`: the same files gave **274 passed, 1 skipped**, and the full suite gave **1582 passed,
+  2 skipped** (9.7's 1553 + 29). The CPU acceptance there gave receipt `7e7cd366…c697` (source `28e1e855…1c23`).
+- Rebased onto `960c99e` (the final tree): the same files gave **278 passed, 1 skipped**, and the full suite gave
+  **1586 passed, 2 skipped** (the re-review's 1557 + 29; the same two skips). Ruff (`src tests`) is clean.
+  `check_secrets.py` reports 0 findings with the change staged. `git diff --exit-code containers/ pyproject.toml
+  uv.lock desktop/` is clean, `git ls-files --eol` shows `i/lf w/lf`, and every changed file is CR-free. A subprocess
+  test shows `workflow_runs` imports no torch, peft, transformers, safetensors, huggingface_hub, keyring, paramiko or
+  mlflow.
+- CPU acceptance (`-I`, the worktree's script and source) on the final tree exited 0, and all **29** checks passed.
+  Receipt SHA256 `00d0043b1c8cf8cff2757205dc935ada7947ebf6d2c8f5b05c708cd098ff7f93`, source_sha256
+  `ef4e1357997c523b78d43401235c8535c726cd3d3be618d7c1beed10addc4ff1` (equal to `source_hash()` of the committed
+  `src`), lock_sha256 `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`. Max errors are
+  unchanged (merge delta 7.78e-9, materialize delta 9.17e-9, parent→child 6.42e-9, logits 3.35e-8/2.98e-8).
+  `model_downloaded`, `gpu_used`, `institution_data_used` and `production_promotable` are false. It supersedes the
+  8.5 re-review's `b4cc02a2…c6d4`.
+
+Not verified or still open:
+- No controller ran in these tests (9.4 owns the controller entry). Runs were claimed only through `GraphStore` to
+  hold a lock for the edit check.
+- The native save and delete were not run against a live sidecar. The shapes are pinned by 9.5's Rust tests and by
+  these Python tests. No Rust, Playwright or UI run: 9.3 changes no Rust or TypeScript.
+- Live shapes stay unverified: RunPod, SSH, HF and MLflow are exercised only with fakes.
+- The 8.5 re-review's note 4 (a PENDING model version that MLflow later marks `FAILED_REGISTRATION` still shows
+  `registered`) is not addressed: re-checking a version needs an MLflow read, and 9.3's actions are DB-only. It
+  stays open for the controller side (9.4) or a later task.
 - No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
 
 ---
