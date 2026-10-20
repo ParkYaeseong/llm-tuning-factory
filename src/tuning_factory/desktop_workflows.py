@@ -62,6 +62,7 @@ CREDENTIAL_NAMES = frozenset(name.casefold() for name in (
     *SECRET_FIELDS, "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "HUGGING_FACE_HUB_TOKEN",
     "MLFLOW_TRACKING_PASSWORD"))
 KEY_MARKERS = ("PRIVATE KEY", "PuTTY-User-Key-File-", "Private-Lines:")             # = main.rs pasted_key
+KEY_FILE_FIELDS = ("ssh_key_file", "server_ssh_key_file")                         # = main.rs KEY_FILE_FIELDS
 RUNPOD_PROFILE_FIELDS = ("provider", "name", "pod_id", "ssh_fingerprint", "ssh_key_file")
 SERVER_PROFILE_FIELDS = ("provider", "name", "server_ssh_host", "server_ssh_port", "server_ssh_username",
                          "server_ssh_fingerprint", "server_remote_root", "server_ssh_key_file",
@@ -82,8 +83,11 @@ DATASET_UNKNOWN = "등록된 데이터 버전을 찾을 수 없습니다."
 PREVIEW_UNKNOWN = "분할 미리보기를 찾을 수 없습니다. 분할을 다시 미리보세요."
 LEGACY_PROFILE_MISSING = "저장된 기존 학습 설정 프로필을 찾을 수 없습니다."
 LEGACY_PROFILE_INVALID = "저장된 기존 학습 설정 프로필을 읽을 수 없습니다."
-LEGACY_DATASET_MISSING = "기존 프로필의 데이터 버전이 이 PC에 등록되어 있지 않아 프로젝트에 연결하지 않았습니다."
+LEGACY_DATASET_MISSING = ("기존 프로필의 데이터 버전을 프로젝트에 연결하지 못했습니다. "
+                          "데이터를 등록한 뒤 프로젝트에서 직접 연결하세요.")
 SPLIT_PREVIEW_CHANGED = "split preview hash mismatch or dataset origins changed"
+# registry.immutable_write: the same path with other bytes. A version conflict only in dataset_import_register.
+IMMUTABLE_EXISTS = "immutable version already exists"
 CONFLICTS: Mapping[str, str] = MappingProxyType({   # exact domain texts (F12, F13, F18) -> code; prefix match
     "definition revision conflict": "revision_conflict",
     "request ID reused with different project details": "request_reused",
@@ -92,7 +96,6 @@ CONFLICTS: Mapping[str, str] = MappingProxyType({   # exact domain texts (F12, F
     "unknown or changed import preview": "preview_changed",
     SPLIT_PREVIEW_CHANGED: "preview_changed",
     "immutable dataset version already registered": "version_exists",
-    "immutable version already exists": "version_exists",   # registry.immutable_write: same ID, other bytes
     "only a running graph can pause": "run_state", "only a paused graph can resume": "run_state",
     "canceled graph cannot resume": "run_state", "a finished graph cannot be canceled": "run_state",
     "only a failed or uncertain tracking event can be re-armed": "tracking_state",
@@ -108,13 +111,17 @@ _DEVICE_NAMES = frozenset({"con", "prn", "aux", "nul", "conin$", "conout$",
                            *(f"{port}{digit}" for port in ("com", "lpt") for digit in "0123456789¹²³")})
 
 
-def command_like_field(name: str) -> bool:
-    """True if a field name, or one of its snake/camel-case words, names a command (D12).
+_COMMAND_WORD = re.compile(r"(?i)(?:" + FORBIDDEN_FIELD.pattern.removeprefix("(?i)") + r")(?:s|line|\d+)?")
 
-    Words, not substrings: ``description`` and 9.3's ``approve_execution`` are data, ``run_command`` is not.
+
+def command_like_field(name: str) -> bool:
+    """True if a field name, the name without separators, or one of its snake/camel-case words is a command
+    word, optionally with a plural, ``line`` or digit suffix (D12): ``run_commands``, ``cmdline``, ``entry_point``,
+    ``argv0``. Words, not substrings: ``description`` and 9.3's ``approve_execution`` are data.
     """
     words = re.split(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])", name)
-    return any(word and FORBIDDEN_FIELD.fullmatch(word) for word in (name, *words))
+    joined = re.sub(r"[^A-Za-z0-9]+", "", name)
+    return any(word and _COMMAND_WORD.fullmatch(word) for word in (name, joined, *words))
 
 
 def _models_in(annotation, depth=0):
@@ -156,16 +163,27 @@ class WorkflowResult(StrictModel):
     data: JsonValue = None
 
 
+def _credential_name(key) -> str:
+    """Compare names as ``RUNPOD_API_KEY``: case, surrounding whitespace and ``-`` versus ``_`` do not matter."""
+    return str(key).strip().replace("-", "_").casefold()
+
+
+def _pasted_key(value) -> bool:
+    return isinstance(value, str) and any(marker in value for marker in KEY_MARKERS)
+
+
+def _credential_entry(key, value) -> bool:
+    """A credential name, or a ``*_saved`` flag that is not a boolean (it could carry the secret itself)."""
+    name = _credential_name(key)
+    return name in CREDENTIAL_NAMES or (name.endswith("_saved") and name.removesuffix("_saved") in CREDENTIAL_NAMES
+                                        and type(value) is not bool)
+
+
 def _refuse_credentials(values: Mapping) -> None:
-    """Refuse credential names, non-boolean ``*_saved`` flags and pasted private keys (public views only)."""
+    """Refuse credentials in a public settings or profile view. Pasted private keys are checked in the key-file
+    fields only, as main.rs ``pasted_key`` does: a display name may say anything."""
     for key, value in values.items():
-        name = str(key)
-        if name.casefold() in CREDENTIAL_NAMES:
-            raise ValueError(CREDENTIALS_REFUSED)
-        if name.endswith("_saved") and name.removesuffix("_saved").casefold() in CREDENTIAL_NAMES \
-                and type(value) is not bool:
-            raise ValueError(CREDENTIALS_REFUSED)
-        if isinstance(value, str) and any(marker in value for marker in KEY_MARKERS):
+        if _credential_entry(key, value) or (_credential_name(key) in KEY_FILE_FIELDS and _pasted_key(value)):
             raise ValueError(CREDENTIALS_REFUSED)
 
 
@@ -206,7 +224,8 @@ class WorkflowEnvelope(StrictModel):
 
     @model_validator(mode="after")
     def unique_profiles(self):
-        if len({profile.profile_id for profile in self.profiles}) != len(self.profiles):
+        # Windows file names and Credential Manager entries ignore case and trailing dots.
+        if len({profile.profile_id.casefold().rstrip(".") for profile in self.profiles}) != len(self.profiles):
             raise ValueError("duplicate executor profile ID")
         return self
 
@@ -374,12 +393,16 @@ def _refused(exc: ValueError, paths: Mapping[str, str] | None = None, default: s
 
 
 def local_file(path: str) -> Path:
-    """A local absolute file path. UNC and device paths (``\\\\server``, ``//server``, ``\\\\?\\``, ``\\\\.\\``)
-    and DOS device names (``C:\\data\\CON``, ``NUL.csv``) are refused because reading them is network or device
+    """A local absolute file path. UNC and device paths (``\\\\server``, ``//server``, ``\\\\?\\``, ``\\\\.\\``),
+    DOS device names (``C:\\data\\CON``, ``NUL.csv``, `` NUL``), any ``:`` after the drive (``nul:``, ``COM1:``,
+    alternate data streams) and surrounding whitespace are refused because reading them is network or device
     access. String checks only."""
-    if not isinstance(path, str) or not path or "\x00" in path or re.match(r"[\\/]{2}", path):
+    if (not isinstance(path, str) or not path or path != path.strip() or "\x00" in path
+            or re.match(r"[\\/]{2}", path)):
         raise ValueError(LOCAL_FILE_ONLY)
-    if any(part.split(".")[0].rstrip(" ").casefold() in _DEVICE_NAMES for part in re.split(r"[\\/]", path)):
+    if ":" in re.sub(r"^[A-Za-z]:", "", path):   # device suffixes (nul:, COM1:) and alternate data streams
+        raise ValueError(LOCAL_FILE_ONLY)
+    if any(part.split(".")[0].strip().casefold() in _DEVICE_NAMES for part in re.split(r"[\\/]", path)):
         raise ValueError(LOCAL_FILE_ONLY)
     value = Path(path)
     if not value.is_absolute():
@@ -388,17 +411,22 @@ def local_file(path: str) -> Path:
 
 
 def _credential_keys(value, path="") -> list[str]:
-    """Pointers of credential-named keys inside free-form JSON that passed model validation."""
+    """Pointers of credentials in request data that passed model validation (it is persisted): credential-named
+    keys and non-boolean ``*_saved`` flags (free-form JSON such as the graph draft), and pasted private keys in any
+    string value."""
     found = []
     if isinstance(value, Mapping):
         for key, item in value.items():
             pointer = path + "/" + _pointer_part(key)
-            if str(key).casefold() in CREDENTIAL_NAMES:
+            if _credential_entry(key, item):
                 found.append(pointer)
-            found.extend(_credential_keys(item, pointer))
+            else:
+                found.extend(_credential_keys(item, pointer))
     elif isinstance(value, list):
         for index, item in enumerate(value):
             found.extend(_credential_keys(item, f"{path}/{index}"))
+    elif _pasted_key(value):
+        found.append(path)
     return found
 
 
@@ -658,17 +686,17 @@ def project_import_legacy(context: WorkflowContext, request: LegacyImport) -> Wo
             {**template.model_dump(), "recipe_id": "legacy-" + digest(request.request_id.encode())[:24]})
     except ValueError as exc:
         return _refused(exc, default="/ai_id")
-    registry, bindings, warnings = context.registry(), [], []
+    registry, bindings, expected = context.registry(), [], []
     profile = config.evaluation_profile
     for binding_id, dataset_id, version in (("train", config.dataset_id, config.dataset_version),
                                             ("validation", profile.dataset_id, profile.dataset_version)):
         if not dataset_id:
             continue
+        expected.append(binding_id)
         try:
             record = registry.get_dataset(dataset_id, version)
         except FileNotFoundError:
-            warnings.append(issue("legacy_dataset_missing", LEGACY_DATASET_MISSING, "/ai_id"))
-            continue
+            continue   # reported below from the stored project's bindings
         except ValueError as exc:
             return _refused(exc, default="/ai_id")
         bindings.append(DatasetBinding(binding_id=binding_id, role=binding_id, dataset=DatasetRef(
@@ -688,11 +716,20 @@ def project_import_legacy(context: WorkflowContext, request: LegacyImport) -> Wo
         if current.revision_sha256 == created.revision_sha256:
             desired = ProjectSpec.model_validate({**created.spec.model_dump(), "legacy_origin": config.ai_id,
                                                   "datasets": [binding.model_dump() for binding in bindings]})
-            current = projects.save(desired, created.revision_sha256)
+            try:
+                current = projects.save(desired, created.revision_sha256)
+            except ValueError as exc:
+                if not str(exc).startswith("definition revision conflict"):
+                    raise
+                current = projects.get(created.spec.project_id)   # another writer saved first: return its revision
         # Otherwise this import already completed (or the project was edited since): return it as it is.
     except ValueError as exc:
         return _refused(exc, {"request_reused": "/request_id", "revision_conflict": "/request_id"},
                         default="/ai_id")
+    bound = {binding.binding_id for binding in current.spec.datasets}
+    # From the returned project, so a retry reports the same gap as the first import.
+    warnings = [issue("legacy_dataset_missing", LEGACY_DATASET_MISSING, "/ai_id")
+                for binding_id in expected if binding_id not in bound]
     return ok({**_project(current), "recipe": stored_recipe.spec.model_dump(mode="json"),
                "recipe_revision_sha256": stored_recipe.revision_sha256,
                "datasets": [binding.model_dump(mode="json") for binding in current.spec.datasets]},
@@ -785,6 +822,8 @@ def dataset_import_register(context: WorkflowContext, request: ImportRegister) -
     except OSError:
         return invalid(issue("source_unknown", SOURCE_UNKNOWN, "/source_id"))
     except ValueError as exc:
+        if str(exc).startswith(IMMUTABLE_EXISTS):   # the provenance pointer of this ID and version differs
+            return conflict(issue("version_exists", str(exc), "/version"))
         return _refused(exc, {"preview_changed": "/preview_sha256", "import_issues": "/preview_sha256",
                               "version_exists": "/version", "size_limit": "/source_id"})
     return ok({"dataset": result["dataset"], "preview_sha256": result["preview_sha256"]})

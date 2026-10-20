@@ -213,9 +213,11 @@ def field_names(model, seen=None):
 
 
 def command_like(name):
-    pattern = workflows().FORBIDDEN_FIELD
-    parts = [name, *re.split(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])", name)]
-    return any(part and pattern.fullmatch(part) for part in parts)
+    """The name, the name without separators, or one of its words is a command word, with an optional
+    plural, ``line`` or digit suffix (independent of the implementation's helper)."""
+    word = re.compile(r"(?i)(?:" + workflows().FORBIDDEN_FIELD.pattern.removeprefix("(?i)") + r")(?:s|line|\d+)?")
+    parts = [name, re.sub(r"[^A-Za-z0-9]+", "", name), *re.split(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])", name)]
+    return any(part and word.fullmatch(part) for part in parts)
 
 
 # 1
@@ -296,8 +298,14 @@ def test_request_models_have_no_command_like_fields():
     requests = wf.registered_requests()
     assert set(ACTIONS_91) <= set(requests)
     assert set(requests) <= set(wf.WORKFLOW_ACTIONS)
-    assert command_like("run_command") and command_like("shellCmd") and command_like("argv")
-    assert not command_like("description") and not command_like("approve_execution")
+    commands = ("run_command", "shellCmd", "argv", "run_commands", "scripts", "cmdline", "CMDLine", "entry_point",
+                "programs", "argv0", "Exec", "entryPoint", "shell_cmd", "executables")
+    data = ("description", "approve_execution", "executor_profile_id", "executor_profile_ids", "descriptor",
+            "execution_choices", "programme_name", "recipe_id", "lora_target")
+    for name in commands:
+        assert command_like(name) and wf.command_like_field(name), name
+    for name in data:
+        assert not command_like(name) and not wf.command_like_field(name), name
     for action, model in requests.items():
         assert issubclass(model, StrictModel), action
         assert model.model_config.get("extra") == "forbid" and model.model_config.get("frozen") is True, action
@@ -498,6 +506,10 @@ def test_import_register_conflicts_and_reserved_ids(tmp_path):
     assert Registry(state / "registry").get_dataset("mapped", "1") == record
     strict = register(state, source_id, shown["preview_sha256"], "flags", export_allowed="yes")
     only_issue(strict, "invalid", "invalid_value", "/export_allowed")
+    # The registry's generic immutable_write text is a version conflict only inside this action (M6).
+    wf = workflows()
+    assert wf.classify("immutable version already exists: 1.json") == ("invalid", "refused")
+    assert wf.classify("immutable dataset version already registered") == ("conflict", "version_exists")
 
 
 # 10
@@ -547,7 +559,12 @@ def test_split_preview_commit_conflicts_and_reserved_outputs(tmp_path):
 def test_import_source_reads_local_files_only(tmp_path):
     wf = workflows()
     state = tmp_path / "state"
-    devices = [str(tmp_path / name) for name in ("CON", "nul.csv", "Com1.txt", "LPT9", "conout$", "AUX .csv")]
+    write(tmp_path, "x.csv", csv_bytes())
+    # Built as strings: "nul:" opens the NUL device on Windows, "COM1:" can block, "x.csv:stream" is an ADS.
+    devices = [os.path.join(str(tmp_path), name) for name in (
+        "CON", "nul.csv", "Com1.txt", "LPT9", "conout$", "AUX .csv", "nul:", "CON:x", "COM1:", "CONIN$:", " NUL",
+        "NUL .", os.path.join("inbox", "x.csv:stream"), os.path.join("inbox", "x.csv::$DATA"))]
+    devices.append(" " + str(tmp_path / "inbox" / "x.csv"))
     for path in (r"\\server\share\a.csv", "//server/a.csv", r"\\?\C:\a.csv", r"\\.\pipe\x", "\\/server/a.csv",
                  "relative/a.csv", "a.csv", "", *devices):
         result = call(state, "dataset_import_source", {"path": path})
@@ -560,7 +577,7 @@ def test_import_source_reads_local_files_only(tmp_path):
             wf.local_file(path)
     assert not state.exists()
     large = tmp_path / "inbox" / "large.csv"
-    large.parent.mkdir()
+    large.parent.mkdir(exist_ok=True)
     with large.open("wb") as stream:
         stream.truncate(32 * 1024 * 1024 + 1)
     only_issue(call(state, "dataset_import_source", {"path": str(large)}), "invalid", "size_limit", "/path")
@@ -785,6 +802,77 @@ def test_synthetic_secrets_never_reach_responses_files_or_environment(tmp_path, 
     assert SECRET not in repr(context) and SECRET not in str(context)
 
 
+def test_workflow_envelope_with_non_object_settings_is_an_envelope_error(tmp_path, monkeypatch, capsys):
+    wf = workflows()
+    for settings in (None, [], "x" * 12, 7):
+        # One fixed error line; before M2 the redaction code raised AttributeError and printed nothing.
+        response, _ = sidecar(monkeypatch, capsys, envelope(tmp_path / "state", "projects_list", settings=settings))
+        assert response == {"ok": False, "error": wf.INVALID_ENVELOPE + " (settings)"}
+    for fields in ({"secrets": None}, {"profiles": None}, {"profiles": [None, "x"]}, {"data": []}):
+        response, _ = sidecar(monkeypatch, capsys, {**envelope(tmp_path / "state", "projects_list"), **fields})
+        assert response["ok"] is False and response["error"].startswith(wf.INVALID_ENVELOPE)
+
+
+def test_free_json_credentials_are_refused_like_the_envelope(tmp_path, monkeypatch, capsys):
+    wf = workflows()
+    state = tmp_path / "state"
+    created = call(state, "project_create", {"request_id": "free", "name": "자유 JSON"})
+    project, revision = created["data"]["project"], created["data"]["revision_sha256"]
+    pasted = "-----BEGIN " + "RSA " + "PRIVATE KEY-----\n" + SECRET
+    cases = (({"graph": {"RUNPOD_API_KEY_saved": SECRET}}, "/spec/graph/RUNPOD_API_KEY_saved"),
+             ({"graph": {"RUNPOD_API_KEY_SAVED": SECRET}}, "/spec/graph/RUNPOD_API_KEY_SAVED"),
+             ({"graph": {"RUNPOD-API-KEY": SECRET}}, "/spec/graph/RUNPOD-API-KEY"),
+             ({"graph": {"n": [{" HF_TOKEN ": SECRET}]}}, "/spec/graph/n/0/ HF_TOKEN "),
+             ({"graph": {"Aws-Secret-Access-Key": SECRET}}, "/spec/graph/Aws-Secret-Access-Key"),
+             ({"graph": {"nodes": [{"note": pasted}]}}, "/spec/graph/nodes/0/note"),
+             ({"purpose": pasted}, "/spec/purpose"))
+    before = snapshot(state)
+    for update, pointer in cases:
+        result = call(state, "project_save", {"spec": {**project, **update}, "expected_revision": revision})
+        issue = only_issue(result, "invalid", "credential_field", pointer)
+        assert issue["message"] == wf.CREDENTIALS_REFUSED and SECRET not in json.dumps(result)
+    assert snapshot(state) == before
+    flag = call(state, "project_save", {"spec": {**project, "graph": {"HF_TOKEN_saved": True}},
+                                        "expected_revision": revision})
+    assert flag["status"] == "ok"
+    for settings in ({"RUNPOD-API-KEY": SECRET}, {" HF_TOKEN": SECRET}, {"RUNPOD_API_KEY_SAVED": SECRET},
+                     {"hf-token_Saved": "yes"}):
+        response, captured = sidecar(monkeypatch, capsys, envelope(state, "projects_list", settings=settings))
+        assert response == {"ok": False, "error": wf.CREDENTIALS_REFUSED}
+        assert SECRET not in captured.out + captured.err
+
+
+def test_legacy_import_retries_report_stored_bindings_and_survive_a_concurrent_edit(tmp_path, monkeypatch):
+    from tuning_factory.projects import ProjectSpec, ProjectStore
+    state = tmp_path / "state"
+    write_legacy_profile(state, legacy_config("late_profile", dataset_id="late_data"))
+    first = call(state, "project_import_legacy", {"request_id": "late-1", "ai_id": "late_profile"})
+    assert first["status"] == "ok" and first["data"]["datasets"] == []
+    assert [warning["code"] for warning in first["data"]["warnings"]] == ["legacy_dataset_missing"]
+    Registry(state / "registry").register_dataset(
+        "late_data", "1", write(tmp_path, "late.json", json.dumps([{"instruction": "q", "output": "a"}]).encode()))
+    # The stored project still has no binding, so a retry reports the same warning, not a silent gap.
+    assert call(state, "project_import_legacy", {"request_id": "late-1", "ai_id": "late_profile"}) == first
+
+    original = ProjectStore.save
+    competing = []
+
+    def racing_save(self, spec, expected_revision=None):
+        if spec.legacy_origin == "paper_extraction" and expected_revision is not None:
+            current = self.get(spec.project_id)
+            edited = ProjectSpec.model_validate({**current.spec.model_dump(), "purpose": "동시에 바뀐 목적"})
+            competing.append(original(self, edited, current.revision_sha256))
+        return original(self, spec, expected_revision)
+
+    monkeypatch.setattr(ProjectStore, "save", racing_save)
+    write_legacy_profile(state, legacy_config())
+    raced = call(state, "project_import_legacy", {"request_id": "race-1", "ai_id": "paper_extraction"})
+    assert raced["status"] == "ok", raced
+    assert raced["data"]["revision_sha256"] == competing[0].revision_sha256
+    assert raced["data"]["project"]["purpose"] == "동시에 바뀐 목적" and raced["data"]["datasets"] == []
+    assert [warning["code"] for warning in raced["data"]["warnings"]] == ["legacy_dataset_missing"]
+
+
 def test_registration_is_closed_to_unknown_names_foreign_modules_and_command_fields():
     wf = workflows()
     before = dict(wf._HANDLERS)
@@ -842,9 +930,21 @@ def test_native_profiles_are_allowlisted_per_provider(tmp_path):
                    {**runpod, "RUNPOD_API_KEY": SECRET}, {**runpod, "name": "n" * 2049}, {"name": "no provider"}):
         with pytest.raises(ValueError):
             wf.NativeProfile.model_validate({"profile_id": "p", "fields": fields})
-    with pytest.raises(ValueError):
-        wf.WorkflowEnvelope.model_validate(envelope(tmp_path, "projects_list", profiles=[
-            {"profile_id": "same", "fields": runpod}, {"profile_id": "same", "fields": server}]))
+    # Windows file names and Credential Manager entries ignore case and trailing dots (M9).
+    for first, second in (("same", "same"), ("Pod-A", "pod-a"), ("pod-a", "pod-a."), ("POD-A..", "pod-a")):
+        with pytest.raises(ValueError):
+            wf.WorkflowEnvelope.model_validate(envelope(tmp_path, "projects_list", profiles=[
+                {"profile_id": first, "fields": runpod}, {"profile_id": second, "fields": server}]))
+    # Key markers are refused only in key-file fields, as main.rs pasted_key does (M4).
+    pasted = "-----BEGIN " + "OPENSSH " + "PRIVATE KEY-----"
+    for fields in ({**runpod, "ssh_key_file": pasted}, {**server, "server_ssh_key_file": "PuTTY-User-Key-File-3"}):
+        with pytest.raises(ValueError):
+            wf.NativeProfile.model_validate({"profile_id": "p", "fields": fields})
+    named = {**runpod, "name": "PRIVATE KEY lab pod", "pod_id": "Private-Lines: 3"}
+    assert wf.NativeProfile.model_validate({"profile_id": "p", "fields": named}).fields == named
+    accepted = call(tmp_path / "state", "projects_list", settings={"FACTORY_OPERATOR": "PRIVATE KEY team"},
+                    profiles=[{"profile_id": "pod-a", "fields": named}])
+    assert accepted["status"] == "ok"
     assert wf.RUNPOD_PROFILE_FIELDS == ("provider", "name", "pod_id", "ssh_fingerprint", "ssh_key_file")
     assert wf.SERVER_PROFILE_FIELDS == ("provider", "name", "server_ssh_host", "server_ssh_port",
                                         "server_ssh_username", "server_ssh_fingerprint", "server_remote_root",

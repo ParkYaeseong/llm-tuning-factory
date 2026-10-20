@@ -583,7 +583,10 @@ def main():
         message = str(exc) if isinstance(exc, (ValueError, KeyError, FileNotFoundError, ExecutionUncertain,
                                                TimeoutError)) else type(exc).__name__
         sent = locals().get("request")
-        values = list((request.get("settings", {}) if isinstance(sent, dict) else {}).values())
+        settings = request.get("settings", {}) if isinstance(sent, dict) else {}
+        if isinstance(sent, dict) and sent.get("channel") == "workflow" and not isinstance(settings, dict):
+            settings = {}   # the workflow envelope error is answered; the legacy path is unchanged
+        values = list(settings.values())
         if isinstance(sent, dict) and isinstance(sent.get("secrets"), dict):
             values.extend(sent["secrets"].values())   # workflow channel: the action's scoped secrets
         if isinstance(sent, dict) and isinstance(sent.get("profiles"), list):
