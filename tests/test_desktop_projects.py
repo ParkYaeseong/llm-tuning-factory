@@ -969,3 +969,83 @@ def test_workflow_channel_imports_no_heavy_or_keyring_modules(tmp_path):
     response, heavy = process.stdout.splitlines()
     assert json.loads(response) == {"ok": True, "result": {"status": "ok", "issues": [], "data": {"projects": []}}}
     assert json.loads(heavy) == []
+
+
+# Task 9.2, parent RED: a blank project reaches a dry plan with mapped data and no bundled example.
+def test_blank_project_to_mapped_data_recipe_and_dry_plan_without_examples(tmp_path, monkeypatch):
+    import builtins
+    import io
+
+    from test_workflow_planning import COMMIT, REPO, FakeHub
+    empty_assets = tmp_path / "empty-assets"
+    empty_assets.mkdir()
+    monkeypatch.setattr(desktop, "assets_root", lambda: empty_assets)
+    blocked = [(ROOT / "configs" / "ai").resolve(), (ROOT / "examples").resolve(), empty_assets.resolve()]
+    opened = []
+    real_open = io.open
+
+    def guarded(file, *args, **kwargs):
+        if isinstance(file, (str, os.PathLike)):
+            path = Path(os.fspath(file)).resolve()
+            if any(path == root or path.is_relative_to(root) for root in blocked):
+                opened.append(path)
+                raise AssertionError(f"a dry plan must not read bundled examples: {path}")
+        return real_open(file, *args, **kwargs)
+
+    hub = FakeHub().install(monkeypatch)
+    monkeypatch.setattr(io, "open", guarded)
+    monkeypatch.setattr(builtins, "open", guarded)
+    state = tmp_path / "state"
+    created = call(state, "project_create", {"request_id": "blank-1", "name": "효소 반응 조건 요약",
+                                             "purpose": "실험 노트에서 반응 조건을 짧게 요약한다",
+                                             "task_type": "summarization"})
+    assert created["status"] == "ok", created
+    source_id = import_source(state, tmp_path, csv_bytes(), "reactions.csv")
+    shown = preview(state, source_id)
+    assert shown["status"] == "ok", shown
+    registered = register(state, source_id, shown["data"]["preview_sha256"], "reactions", "1")
+    assert registered["status"] == "ok", registered
+    dataset = registered["data"]["dataset"]
+    recipe = call(state, "recipe_save", {"spec": {"recipe_id": "summary-sft", "name": "요약 SFT LoRA",
+                                                  "training_stage": "sft", "training_method": "lora",
+                                                  "hyperparameters": {"lora_target": "q_proj,v_proj"}},
+                                         "expected_revision": None})
+    assert recipe["status"] == "ok", recipe
+    root = call(state, "model_root_snapshot", {"repo_id": REPO, "revision": COMMIT, "download_approved": True})
+    assert root["status"] == "ok", root
+    assert hub.requests and not any("authorization" in request.headers for request in hub.requests)
+    project = created["data"]["project"]
+    graph = {"nodes": [{"kind": "train", "id": "summarize", "label": "요약 학습",
+                        "recipe_revision": recipe["data"]["revision_sha256"],
+                        "model_input": {"policy": {"base": root["data"]["root"]}, "initialization": "new_adapter"},
+                        "dataset_binding": "train", "executor_profile_ids": ["estimate-gpu"]}],
+             "retry_policy": {"max_attempts": 2}}
+    saved = call(state, "project_save", {"spec": {**project, "datasets": [
+        {"binding_id": "train", "role": "train", "dataset": dataset}], "graph": graph},
+        "expected_revision": created["data"]["revision_sha256"]})
+    assert saved["status"] == "ok", saved
+    validated = call(state, "graph_validate", {"project_id": project["project_id"]})
+    assert validated["status"] == "ok", validated
+    price, timeout, attempts = 1.25, 5400, 2
+    planned = call(state, "graph_plan", {"project_id": project["project_id"], "simulation": True,
+                                         "node_resources": [{"node_id": "summarize", "timeout_seconds": timeout}],
+                                         "estimates": [{"profile_id": "estimate-gpu", "gpu_type": "L40S",
+                                                        "gpu_count": 1, "total_hourly_cost_usd": price}]})
+    assert planned["status"] == "ok", planned
+    summary = planned["data"]
+    assert summary["simulation"] is True and summary["project_id"] == project["project_id"]
+    assert summary["project_revision"] == saved["data"]["revision_sha256"]
+    assert summary["max_estimated_cost_usd"] == pytest.approx(price * timeout / 3600 * attempts)
+    assert summary["datasets"] == [{**dataset, "synthetic": False, "export_allowed": False}]
+    from tuning_factory.workflow_planning import stored_plan
+    plan = stored_plan(state, summary["plan_sha256"])
+    [snapshot] = plan.execution_choices.datasets
+    assert snapshot.dataset.model_dump() == dataset
+    assert plan.project_revision.spec.datasets[0].dataset.model_dump() == dataset
+    assert opened == []
+    database = state / "jobs.db"
+    if database.exists():
+        with sqlite3.connect(database) as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            for table in {"jobs", "graph_runs"} & tables:
+                assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0

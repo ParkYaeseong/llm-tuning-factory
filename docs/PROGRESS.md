@@ -948,9 +948,10 @@ CPU and with fakes:
   it was `042bf8fe…9c0b` (source `6b57e120…9b5f`). After Task 8.1 it was `5cc24562…63be` (source
   `0d405733…373a`). After Task 8.2 it was `26a68aee…a117` (source `58adcdc8…ec17`). After Task 8.3 it was
   `1ddbabdc…6ceb` (source `eed26807…fc54`). After Task 8.4 it was `2afbd0b8…88f8` (source `9cd9ca7e…6ba0`).
-  After Task 8.5 it was `d796f3ed…7f1d` (source `0888d176…ceab`). After Task 9.1, the current receipt is
-  `5147d6d9…ab68` (29/29 checks, source `ebf51635…76ec`; see "Task 9.1 workflow channel, projects, recipes and
-  data").
+  After Task 8.5 it was `d796f3ed…7f1d` (source `0888d176…ceab`). After Task 9.1 it was `5147d6d9…ab68`
+  (source `ebf51635…76ec`). After Task 9.2, the current receipt is `50a64996…9f66` (29/29 checks, source
+  `0204b69b…16e1`; see "Task 9.2 planning: profiles, observations, HF roots, benchmarks, validation and dry
+  plans").
 
 Not verified (needs explicit GPU/host authorization):
 - Any real GPU or host.
@@ -2322,6 +2323,123 @@ Not verified or still open:
 - The 9.3 `executor_profile_edit_check` and 9.4 `controller_status`/`controller_stop`/`--controller` contracts are
   coded against the plan. Rust tests cover them with fake answers; the Python parity test runs once 9.4 lands.
   Until 9.3 and 9.4 land, profile save/delete and `controller_start` refuse with `not_available` (fail closed).
+- No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
+
+## Task 9.2 planning: profiles, observations, HF roots, benchmarks, validation and dry plans, 2026-10-20
+
+Commit `feat: plan training graphs from desktop projects with pinned destinations`, written in the worktree
+`codex/task-9.2` on 9.1's first commit (`3d119c6`) while 9.1 was under review. It was then rebased, without code
+changes, onto 9.1's review fixes (`1ca866c`, on 8.5 `2362144`) and onto 9.5 (`a308949`); only this file
+conflicted. It implements
+[Task 9 plan](superpowers/plans/2026-10-20-task9-secure-desktop-broker.md) §4 "9.2" with D6, D11 and D13–D18.
+
+What changed:
+- New `workflow_planning.py`. Its eight actions register through 9.1's closed table: `executor_profile_inspect`,
+  `model_root_snapshot`, `model_roots_list`, `benchmark_save`, `benchmarks_list`, `graph_validate`, `graph_plan`
+  and `graph_plan_get`. It also has the helpers that 9.3, 9.4 and 9.6 consume: `profile_revision`,
+  `public_profile`, `public_auth_mode`, `tracking_destination`, `save_observation`/`load_observation`,
+  `root_snapshots_dir`, `BenchmarkStore`, `stored_plan`, `plan_summary` and `current_profile_revisions`.
+- Only two actions touch the network, and only in production: a read-only RunPod `status` GET or the fixed SSH probe
+  (scope `RUNPOD_API_KEY`), and an explicitly approved HF download of `config.json` and the tokenizer files (scope
+  `HF_TOKEN`). `graph_validate` and `graph_plan` are offline. A real plan needs an observation of the current profile
+  revision that is ≤3600 s old, every transport hash, and a tracking destination. The destination is
+  `tracking_settings_sha256(public_tracking_settings(uri, DEFAULT_EXPERIMENT, artifact_location,
+  auth_mode=public_auth_mode(settings)))`, checked against the HTTPS and OIDC rules first. RunPod facts come from
+  `runpod_facts` (`gpu.id`) and the transport hash from `runpod_transport_sha256`.
+- `projects._RevisionStore.get_by_revision`. `graph_planner._runtime` reads the GPU lock through
+  `_project_root()`, which is `sys._MEIPASS/assets` when frozen (D18).
+- Seam for 9.7: HF-root target evidence is stored beside the root index, at
+  `state/workflows/root-targets/<digest(canonical(root))>.json`, through `save_root_targets`, `load_root_targets`
+  and `root_targets_path`. `graph_plan` passes it as `ExecutionChoices.base_targets`. D15's `base_targets_missing`
+  refusal, and the simulation warning `simulated_execution_needs_targets`, apply only to HF roots without evidence.
+  `model_roots_list` reports `targets_ready`.
+
+Deviations from the plan:
+- `plan_summary(plan, state_dir=None)`. `GraphPlan` holds only the tracking hash. A real plan therefore stores its
+  public tracking settings content-addressed at `state/workflows/tracking/<sha>.json`. `plan_summary` returns them
+  only when given `state_dir`, verified against the hash; otherwise `settings` is null.
+- Observation files are keyed by `profile_key` = casefold plus `rstrip(".")` (9.1 M9), not by the raw ID.
+  - A record of another ID with the same key is refused as `observation_conflict`. `executor_profile_inspect`
+    refuses it before any request.
+  - DOS device names are refused.
+  - The record carries the exact ID and its own `sha256`, so a damaged or edited record is `observation_invalid`.
+- Simulation plans pin no tracking destination: simulated runs publish to the local sink. With a stored observation
+  of an older profile revision, a simulation plan pins the profile as it was observed and warns
+  `observation_revision_differs`; a real plan is blocked.
+- `tracking_incomplete` matches `auth.require_complete_oidc` on the filtered settings exactly. It covers any OIDC
+  URL without both a client ID and a saved secret, not only "URL and saved secret without a client ID".
+- Issue paths:
+  - Tracking issues are at `/tracking`, and profile or observation issues at `/profiles/<id>` (9.3's convention).
+  - Estimate issues are at `/estimates/<i>`.
+  - Graph issues are at `/graph/nodes/<i>[/field]` with `node_id`; others at `/graph` or `/datasets`.
+  - Pydantic's follow-on `too_short` on `nodes`, raised when a node already failed, is dropped.
+- `model_root_snapshot`:
+  - It downloads every tokenizer file the revision lists, because the fingerprint must equal what the worker
+    computes. It refuses, rather than skips, a selected name that is weight-suffixed or unsafe.
+  - It refuses repository names that Windows would alter (a trailing dot or space, device names).
+  - It reuses an existing directory only if that directory matches the root.
+  - The first root-index entry wins.
+- Rewrites of immutable records (benchmarks, plans, tracking settings) over other bytes map to this module's own
+  refusals, `benchmark_invalid` and `plan_invalid` (9.1 M6: `version_exists` belongs only to
+  `dataset_import_register`).
+- New codes beyond the plan:
+  - `executor_profile_invalid`, `observation_invalid`, `observation_conflict`, `estimate_duplicate`,
+    `node_resource_duplicate`, `recipe_invalid`.
+  - `model_root_invalid`, `root_targets_invalid`, `tracking_invalid`, `repository_unsupported`,
+    `model_unsupported`, `snapshot_refused`, `tokenizer_incomplete`, `config_changed`, `root_snapshot_conflict`,
+    `snapshot_failed`.
+  - `sample_id_invalid`, `dataset_unknown`, `benchmark_invalid`, `plan_unknown`, `plan_invalid`.
+- `graph_validate` runs the definition checks (schema, recipes, `validate_graph`, benchmarks, roots, D15, D16) and
+  returns `{project_id, project_revision, node_count}`. `benchmark_save` does not apply
+  `check_generation_benchmark`; `plan_graph` still refuses such a benchmark at planning (`plan_refused`).
+- `executor_profile_inspect` checks the public fields offline before any request. For RunPod it also requires the
+  observed Pod ID to equal the profile's. A real plan also refuses an observation with a negative age.
+
+Actual verification (worktree `D:\llm-tuning-factory-wt92`, main venv with `PYTHONPATH` on the worktree `src`;
+`tuning_factory.__file__` resolved into the worktree):
+- RED, before any `src` edit: all 55 new cases failed. 52 failed on the missing module (`pytest.fail`, not
+  collection) and one in the import subprocess. One failed on the missing `get_by_revision`. The frozen-bundle test
+  got the source lock's digest instead of the bundle's. Two more cases were added later, test-first (streamed and
+  total download caps); a handler-level profile-ID collision check was added to an existing case.
+- Mutations through a harness outside the worktree (each restored after its run): 30 source mutations, all killed.
+  They covered the age check, weight suffixes, `*_saved` truthiness, the D15 refusal and evidence lookup, the
+  HTTPS rule, the config hash, real estimates, the artifact location in the hash, an unconditional Authorization
+  header, both collision checks, record integrity, practice and export rules, the frozen lock path, the simulation
+  warning, both rewrite texts, pointers without data, D16, streamed and total caps, OIDC completeness, the revision
+  check, the missing URI, node resources, estimate collision, type-name-only provider errors and `validate_pod`.
+- GREEN: the plan's command (`test_workflow_planning`, `test_desktop_projects`, `test_graph_planner`,
+  `test_graph_schema`, `test_projects`, `test_executor_profiles`, `test_model_hub`) gave **204 passed**. The full
+  suite on `3d119c6` gave **1372 passed, 1 skipped, 1 failed** (1316 + 57). The failure was the known Windows flake
+  `test_jobs.py::test_recovery_does_not_release_unknown_remote_execution`, while the CPU acceptance ran in parallel;
+  it passed alone. An earlier full run with 55 of the new cases gave **1371 passed, 1 skipped**.
+- Rebased onto `1ca866c`: the plan's command gave **207 passed** (9.1's fixes add three cases), and the full suite
+  gave **1436 passed, 1 skipped** (9.1's 1379 + 57). Rebased onto 9.5 (`a308949`, the final tree): the plan's
+  command plus `test_native_contract` gave **213 passed, 1 skipped**, and the full suite gave **1442 passed,
+  2 skipped** (9.5's 1385 + 57; the same two skips). The known flake did not occur in either run. The
+  auth-mode parity test resolved `auth.current_auth_mode` (8.5) on this tree and `tracking.current_auth_mode` on
+  `3d119c6`. Ruff (`src tests`) is clean. `check_secrets.py` reports 0 findings with the change staged.
+  `git diff --exit-code containers/ pyproject.toml uv.lock desktop/` is clean. Every changed file is CR-free.
+  A subprocess test shows `workflow_planning` imports no torch, peft, transformers, safetensors,
+  huggingface_hub, keyring, paramiko or mlflow.
+- CPU acceptance (`-I`, the worktree's script and source) on both rebased trees exited 0, and all **29** checks
+  passed, with a byte-identical receipt (9.5 changed no `src`). Receipt SHA256
+  `50a64996f6ebac8547edcc22a359f06af206e1dce4630ead90ba6897aa549f66`, source_sha256
+  `0204b69b7e192a5d3ef8e31797222c0b46bbb9167e64a8463222e478236d16e1` (equal to `source_hash()` of the clean,
+  committed tree), lock_sha256 `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`. Max
+  errors are unchanged (merge delta 7.78e-9, materialize delta 9.17e-9, parent→child 6.42e-9, logits
+  3.35e-8/2.98e-8). `model_downloaded`, `gpu_used`, `institution_data_used` and `production_promotable` are
+  false. It supersedes 9.1's `5147d6d9…ab68`. (On `3d119c6` it gave `aee29d26…a733`, source
+  `1390ef14…9afd`.)
+
+Not verified or still open:
+- Live shapes are exercised only with fakes: `RunPodController.status` and `gpu.id` values, real SSH facts,
+  HF `siblings` listings, gated-model access, LFS redirects (httpx drops the Authorization header across origins)
+  and real tokenizer file sizes.
+- HF-root target evidence is not produced yet (9.7). Until then continuation, merge and materialize on HF roots are
+  refused at planning, and simulated execution of default (`lora_target: all`) or full/freeze recipes on HF roots
+  stops at the dispatcher (the plan warns).
+- External artifact inputs stay refused (D16). The directory rename on publish is untested against antivirus locks.
+- No Rust, Playwright or UI run: 9.2 changes no TypeScript or Rust.
 - No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
 
 ---

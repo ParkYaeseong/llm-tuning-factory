@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -378,9 +379,17 @@ def _definition_issues(project, graph, recipes, datasets):
     return issues
 
 
+def _project_root():
+    """Where the GPU locks live: ``sys._MEIPASS/assets`` in the frozen sidecar (as ``manifest.resolve`` and
+    ``desktop.assets_root`` resolve it), else the source tree (D18)."""
+    if hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / "assets"
+    return Path(__file__).resolve().parents[2]
+
+
 def _runtime(profile):
     details = engine_profile("ppo" if profile == "ppo" else "sft")
-    lock = Path(__file__).resolve().parents[2] / details["lock_file"]
+    lock = _project_root() / details["lock_file"]
     return RuntimeProfile(profile=profile, engine_version=details["engine_version"], dependency_sha256=digest(lock.read_bytes()))
 
 

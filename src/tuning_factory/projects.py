@@ -191,6 +191,20 @@ class _RevisionStore(Generic[T]):
         with self._connection() as db:
             return self._get(db, id, revision)
 
+    def get_by_revision(self, revision_sha256: str) -> Revision[T]:
+        """The revision a graph pins by hash alone (a train node's ``recipe_revision``).
+
+        Exactly one entity of this namespace must hold it ("unknown definition revision" otherwise); the body is
+        verified as in ``get``. Bodies include the entity ID, so two entities never share a revision hash.
+        """
+        revision = self._checked_hash(revision_sha256)
+        with self._connection() as db:
+            rows = db.execute("SELECT entity_id FROM definition_revisions WHERE namespace=? AND revision_sha256=?",
+                              (self.namespace, revision)).fetchall()
+            if len(rows) != 1:
+                raise ValueError("unknown definition revision")
+            return self._get(db, rows[0][0], revision)
+
     def list(self) -> list[Revision[T]]:
         with self._connection() as db:
             # One read snapshot keeps pointers and immutable bodies consistent.
