@@ -301,7 +301,7 @@ async function approve(title: string, body: string): Promise<boolean> {
 }
 function tutorialCard() {
   if (tutorial.active() || tutorialSeen()) return "";
-  return `<section class="tutorial-card" aria-label="튜토리얼 안내"><div><h3>처음 사용하시나요?</h3><p>약 5분 실습 튜토리얼로 연결 → 데이터 → 학습 설정 → 실행 계획 순서를 익혀 보세요. GPU를 사용하거나 데이터를 전송하지 않습니다.</p></div><div class="actions">${button("다음에 하기", "tutorial-dismiss")}${button("튜토리얼 시작", "tutorial", "primary")}</div></section>`;
+  return `<section class="tutorial-card" aria-label="튜토리얼 안내"><div><h3>처음 사용하시나요?</h3><p>약 7분 튜토리얼로 연결 → 데이터 → 학습 설정 → 실행 계획 순서를 실습하고, 프로젝트·데이터 가져오기·학습 그래프·그래프 실행 화면을 둘러보세요. GPU를 사용하거나 데이터를 전송하지 않습니다.</p></div><div class="actions">${button("다음에 하기", "tutorial-dismiss")}${button("튜토리얼 시작", "tutorial", "primary")}</div></section>`;
 }
 function overview() {
   const running = state.jobs.filter((j: Obj) => ["RUNNING", "PROVISIONING", "EVALUATING"].includes(j.status)).length;

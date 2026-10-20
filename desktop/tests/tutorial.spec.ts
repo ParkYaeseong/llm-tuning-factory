@@ -6,6 +6,19 @@ const config = JSON.parse(readFileSync(new URL("./config.json", import.meta.url)
 const forbidden = ["submit", "execute", "resume", "runtime_check", "runtime_prepare", "connection", "pod",
   "s3_list", "s3_head", "s3_import", "server_inspect", "server_facts", "runtime_reservations", "runtime_release",
   "save_profile", "model_import", "cancel", "recover", "reconcile"];
+// Task 10 (D16): no native command that changes or picks anything, and only the read-only actions the project screens
+// make on entering (observations_list is 9.8's read of the profiles page, added after the plan's list).
+const forbiddenNative = ["executor_profile_save", "executor_profile_delete", "controller_start", "controller_stop", "pick_file"];
+const tourReads = ["projects_list", "recipes_list", "graph_runs_list", "model_roots_list", "benchmarks_list", "controller_status",
+  "observations_list"];
+/** The legacy, native and workflow side-effect checks of a whole tour. */
+function expectNoSideEffects(calls: any[]) {
+  expect(calls.filter((c: any) => c.command === "factory_action" && forbidden.includes(c.args.action))).toEqual([]);
+  expect(calls.map((c: any) => c.command)).not.toContain("settings_save");
+  expect(calls.map((c: any) => c.command)).not.toContain("forget_credentials");
+  expect(calls.filter((c: any) => forbiddenNative.includes(c.command))).toEqual([]);
+  expect(calls.filter((c: any) => c.command === "workflow_action" && !tourReads.includes(c.args.action))).toEqual([]);
+}
 type Boot = { registered?: boolean; withoutDummy?: boolean; seen?: boolean; noTemplates?: boolean };
 
 async function boot(page: Page, options: Boot = {}) {
@@ -18,10 +31,21 @@ async function boot(page: Page, options: Boot = {}) {
     const datasets: any[] = options.withoutDummy ? [] : [{ dataset_id: "dummy", version: "1", rows: 2, export_allowed: true, synthetic: true }];
     if (options.registered) datasets.push({ dataset_id: "tutorial_sample", version: "1", rows: 8, export_allowed: false, synthetic: true });
     (window as any).__testCalls = calls;
+    const ok = (data: unknown) => ({ status: "ok", issues: [], data });
+    const absent = { state: "absent", owner_id: null, heartbeat_age_seconds: null };
+    // The project screens' reads answer empty valid results (D16); any other workflow action is not installed.
+    const reads: Record<string, unknown> = { projects_list: ok({ projects: [] }), recipes_list: ok({ recipes: [] }),
+      graph_runs_list: ok({ runs: [], controller: absent }), model_roots_list: ok({ roots: [] }), benchmarks_list: ok({ benchmarks: [] }),
+      observations_list: ok({ observations: [] }) };
     (window as any).__TAURI_INTERNALS__ = { invoke: async (command: string, args: any) => {
       calls.push({ command, args });
       if (command === "settings_get") return {};
       if (command === "settings_save") return { ...args.values };
+      if (command === "workflow_action") return structuredClone(reads[args.action]
+        ?? { status: "invalid", issues: [{ code: "not_available", path: "", message: "이 기능은 아직 설치되지 않았습니다." }], data: null });
+      if (command === "controller_status") return ok({ controller: absent, current: null, broker: null, stop_requested: false,
+        restart_required: { profiles: [], tracking: null }, runs: { active: 0 } });
+      if (command === "executor_profiles_get") return { profiles: [] };
       if (command !== "factory_action") return {};
       const { action, data } = args;
       if (action === "catalog") return { templates: options.noTemplates ? [] : [{ name: "paper_extraction", config }], profiles: [], datasets: structuredClone(datasets),
@@ -132,6 +156,49 @@ test("hands-on tutorial reaches a dry-run plan with every step anchored and no s
   expect(calls.filter((c: any) => c.command === "factory_action" && forbidden.includes(c.args.action))).toEqual([]);
   expect(calls.map((c: any) => c.command)).not.toContain("settings_save");
   expect(calls.map((c: any) => c.command)).not.toContain("forget_credentials");
+  expectNoSideEffects(calls);
+});
+
+test("the tour explains the project screens without creating anything", async ({ page }) => {
+  await boot(page);
+  const card = page.getByRole("region", { name: "튜토리얼 안내" });
+  await expect(card).toContainText("약 7분");
+  await expect(card).toContainText("프로젝트");
+  await card.getByRole("button", { name: "튜토리얼 시작" }).click();
+  await expectStep(page, "welcome");
+  // The welcome names the project flow and the single-job group; the practice still starts at the connection.
+  for (const text of ["프로젝트", "데이터", "레시피", "그래프 실행", "단일 학습"]) await expect(popover(page)).toContainText(text);
+  await advanceTo(page, "project-start");
+  const titles: Record<string, string> = { overview: "작업 공간", profiles: "실행 프로필", "data-import": "데이터 가져오기",
+    graph: "학습 그래프", runs: "그래프 실행" };
+  const explained = ["project-start", "executor-profiles", "data-import", "graph-editor", "graph-runs"];
+  // Right after the practice's last explanation and right before the end.
+  expect(tutorialSteps.map(s => s.id).slice(tutorialSteps.findIndex(s => s.id === "jobs-history"))).toEqual(["jobs-history", ...explained, "finish"]);
+  for (const id of explained) {
+    const step = tutorialSteps.find(s => s.id === id)!;
+    await expectStep(page, id);
+    expect([step.kind, step.anchor, step.cta, step.enter, step.done]).toEqual(["explain", id, undefined, undefined, undefined]);
+    await expect(page.getByRole("heading", { level: 1 })).toHaveText(titles[step.page]);
+    await expect(page.locator(".notice.busy")).toHaveCount(0);
+    await expect(page.locator(`#app [data-tour="${step.anchor}"]`)).toHaveCount(1);
+    await expect(popover(page)).not.toHaveClass(/centered/);
+    await expect(popover(page)).not.toContainText("화면 요소를 찾지 못했습니다");
+    await expect(popover(page).locator(".tour-meta .badge")).toHaveText("설명");
+    await tourButton(page, "다음").click();
+  }
+  await expectStep(page, "finish");
+  for (const text of ["프로젝트", "그래프", "단일 학습"]) await expect(popover(page)).toContainText(text);
+  await expect(tourButton(page, "연결 설정으로 이동")).toBeVisible();
+  await tourButton(page, "완료").click();
+  await expect(popover(page)).toHaveCount(0);
+  const calls = await page.evaluate(() => (window as any).__testCalls);
+  expectNoSideEffects(calls);
+  // The project screens were read (never written) while they were explained.
+  const reads = new Set(calls.filter((c: any) => c.command === "workflow_action").map((c: any) => c.args.action));
+  expect([...reads].sort()).toEqual(["graph_runs_list", "observations_list"]);
+  expect(calls.map((c: any) => c.command)).toEqual(expect.arrayContaining(["executor_profiles_get", "controller_status"]));
+  expect(await page.evaluate(() => [Object.keys(localStorage), sessionStorage.length])).toEqual([["tuning-factory.tutorial.v1"], 0]);
+  await expect(page.locator("img")).toHaveCount(0);
 });
 
 test("ending the tutorial restores the previous training draft", async ({ page }) => {

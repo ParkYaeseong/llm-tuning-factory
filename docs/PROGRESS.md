@@ -4988,8 +4988,119 @@ Actual verification:
   containers/ pyproject.toml uv.lock desktop/package.json desktop/package-lock.json` is clean; every changed file is
   CR-free.
 
+- Rebased onto `248aa37` (10.6 and the 10.5 review fixes; only this file conflicted, every entry kept): at this commit
+  `npx playwright test` **233 passed** (10.6's 226 + 7) in a scratch worktree on port 1491.
+
 Not verified or still open:
 - A real Windows IME in WebView2: the tests dispatch `compositionstart`/`input`/`compositionend` themselves. Task 11.
+
+## Task 10.8 tutorial and full regression / Task 10 complete (software), 2026-10-21
+
+Commit `feat: build general-purpose project and training graph workbench` (the parent plan's Task 10 message), written in
+the main tree on `f6bf66e` (the deferred nits above), then rebased with it onto `248aa37` (10.6 and the 10.5 review
+fixes; only this file conflicted, every entry kept). It implements [Task 10 plan](superpowers/plans/2026-10-21-task10-workflow-workbench-ui.md)
+§4 "10.8" with D16. Changed: `desktop/src/tutorial-steps.ts`, `desktop/src/main.ts` (the first-run card text in
+`tutorialCard()` only), `desktop/tests/tutorial.spec.ts`, new `desktop/tests/workflow-regression.spec.ts` and this file.
+No view, Python, Rust, package or lock file changed.
+
+What changed:
+- Tutorial (D16). Five explain-only steps sit between `jobs-history` and `finish`, with §4's IDs, anchors, titles and
+  bodies: `project-start` (작업 공간), `executor-profiles` (실행 프로필), `data-import` (데이터 가져오기),
+  `graph-editor` (학습 그래프) and `graph-runs` (그래프 실행). The tour has 16 steps.
+  - None has `enter`, `done` or a call-to-action, so the tour adds no call of its own. Entering those pages runs only
+    their read-only reads: `graph_runs_list`, `observations_list`, `executor_profiles_get` and `controller_status`. The
+    graph page without a project reads nothing.
+  - Each anchor already rendered exactly once, also in the empty states (10.2–10.7); no view changed.
+  - The practice stays on the legacy data and training forms, and `welcome` → `connection-provider` stays adjacent.
+  - Texts: `welcome` names 프로젝트 → 데이터 → 레시피 → 그래프 실행 and 단일 학습 and says 약 7분. `finish` lists both
+    paths (프로젝트·그래프, 단일 학습) and keeps "연결 설정으로 이동". The first-run card says 약 7분 and names the
+    project screens.
+- `tutorial.spec.ts`, as §4 lists:
+  - The boot mock answers the project screens' reads with empty valid results, `controller_status` with the absent
+    controller and `executor_profiles_get` with no profiles.
+  - `forbidden` gains a native list and a workflow allowlist (`expectNoSideEffects`). The existing walkthrough calls it
+    after its unchanged assertions.
+  - New test 1, "the tour explains the project screens without creating anything": the step order, each step's
+    page, anchor (count 1), a popover that is not centered and no missing-anchor note; the texts; no mutating call;
+    only `tuning-factory.tutorial.v1` in `localStorage` afterwards.
+  - The other 24 tests keep their names and assertions; the walkthrough now iterates 16 steps.
+- `workflow-regression.spec.ts`:
+  - Test 2, "workflow pages escape data, label controls and never nest forms". Hostile payloads sit in project and
+    recipe names, column names, a profile name, a node label, a wait reason, a tracking error and issue messages
+    (import row, validation).
+    - It visits projects, project, recipes, data-import with a preview, profiles (with the edit form), graph (after a
+      save) and runs (with a run open).
+    - On each page: one `h1`, no `img`, no `form form`, no `dialog`, `.sidebar-foot small` once, an accessible name on
+      every visible `input`/`select`/`textarea`, empty `localStorage` and `sessionStorage`, and no page error.
+  - Test 3 (the parent Task 9 RED flow at the UI level) boots with no catalog template and no saved setting:
+    - a blank project from the overview;
+    - 데이터 가져오기 from the project (CSV question/context/answer, preview, register);
+    - 프로젝트에 연결, and a project-page save whose `project_save` carries the binding;
+    - an SFT LoRA recipe;
+    - on the graph page, a pinned base model and its approved snapshot, then the "단일 학습" starter with that recipe,
+      root and binding.
+    - It is two tests sharing that walk (see deviations):
+      - "… reaches a saved and validated graph …" saves (one `graph_validate`).
+      - "… reaches a dry-run plan …" goes on: an estimate added in 10.6's plan panel and chosen on the card, save,
+        validate, 계획 확인 (dry run by default; `graph_plan` with 3600 s and the estimate), 모의 실행 등록 (one
+        dialog, no checkbox; `graph_submit` with both approvals `false`), then the runs page shows the run and
+        `controller_start` was never called.
+    - Both assert the call order, that no example ID reached any request, no `form form` and no storage.
+
+Deviations:
+- `observations_list` is in the tutorial allowlist and mock. 9.8 added it after §4 was written; the profiles page reads
+  it on entering, and it is read-only. `controller_status` is a native command, so it never appears as a workflow
+  action; the native reads are asserted separately.
+- Test 3 is two tests. 10.6 was still in progress when this was written, so the walk up to a validated graph is its own
+  test; the plan test was first written against 10.6's commit `018f636` (cherry-picked into a scratch worktree) and
+  skipped on this branch until the plan panel existed. 10.6 landed before the push; after the rebase the skip guard
+  was removed and the plan test runs.
+- The plan test answers `planning_inputs_get`/`_save` and `graph_plan` from a small in-page fake (as 10.6's spec does);
+  the shared mock (10.1) is unchanged.
+
+Actual verification:
+- Against this tree's own Vite on port 1490 (and port 1491 for the scratch worktree), through scratch configs under
+  `%TEMP%` with `reuseExistingServer: false`.
+- RED first: the new tutorial test failed on the first-run card ("약 5분"), then, with the card text in place, on the
+  welcome text (no 프로젝트). With the five steps removed it fails on the step order. Tests 2 and 3a passed on their
+  first run: they are regression nets over 10.1–10.7, as §4 allows, and no view needed a fix. Test 3b passed against
+  `018f636` on its first run.
+- Mutations: an unescaped project name in the list, an unescaped column name, a binding select stripped of its label,
+  a renamed step and a missing `executor-profiles` anchor each fail a test. Removing only the `aria-label` of a select
+  inside its `<label>` survives, correctly.
+- From `desktop/`, before the rebase (on `f6bf66e`): `npx playwright test` **214 passed, 1 skipped** (211 + 4 new; the
+  skip was the plan test); `npm run build` passes; the changed specs passed `--repeat-each=3`. Combined with `018f636`
+  in the scratch worktree: **228 passed**.
+- After the rebase onto `248aa37`, without the skip guard: `npx playwright test` **237 passed** (10.6's 226 + the 7 of
+  the commit above + these 4); `npm run build` passes.
+- `cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` **49 passed** (Rust unchanged).
+- From the root, before and again after the rebase: `uv run pytest -q` **1716 passed, 1 skipped** (no Python change);
+  `uv run ruff check src tests` passes; `scripts/check_secrets.py` reports 0 findings with the change staged;
+  `git diff --exit-code src/ desktop/src-tauri/ containers/ pyproject.toml uv.lock desktop/package.json
+  desktop/package-lock.json` against the base is clean; every changed file is CR-free.
+- Manual reading pass (§4). The legacy flows of the parent's step 4 are still exercised by the unchanged
+  `workspace.spec.ts` and `connections.spec.ts`:
+  - HF search and import: "HF model search imports …";
+  - S3 list, head and import: "S3 browse paginates …", "S3 folder navigation …", "changed S3 object …";
+  - single-job plan, start and queue: "plan is offline …", "busy GPU keeps a submitted job queued …", and the
+    server and RunPod plan tests;
+  - jobs: "jobs explain … resume", "progress graph …";
+  - history compare: "shared history escapes data …", "loaded history search filters …".
+  - The tutorial flows are `tutorial.spec.ts`. Neither boot nor a legacy page calls the workflow channel
+    (`navigation.spec.ts` test 1 and test 3 here).
+
+**Task 10 is complete in software.** 10.1–10.8 and their review fixes are on this branch: blank projects, data import
+and splits, recipes, executor profiles and the controller bar, the graph editor, planning and separate approvals, graph
+runs, the tutorial and the legacy flows, each covered by mocked Playwright specs (237 tests). No GPU, network, SSH,
+RunPod, MLflow, model download or institution data was used.
+
+Still unverified, for Task 11 (installed app):
+- real WebView2: `<dialog>`, focus return, native `<select>` keys, timers and `visibilitychange`, the
+  `import.meta.glob` bundle, bidirectional text;
+- a real sidecar, controller, broker and Credential Manager;
+- an IME in WebView2: the tests dispatch composition events themselves;
+- screen readers (Narrator, NVDA): accessible names are checked only as Playwright computes them;
+- the 16-step tour in WebView2 (Task 10 §5 item 7) and the rest of Task 10 §5.
 
 ---
 

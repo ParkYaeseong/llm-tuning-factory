@@ -29,7 +29,7 @@ const practiceData = (id: unknown, version: unknown) => id === TUTORIAL_DATASET.
 
 export const tutorialSteps: TutorialStep[] = [
   { id: "welcome", page: "overview", anchor: "overview-setup", kind: "explain", title: "작업 공간 둘러보기",
-    body: "왼쪽 메뉴에서 데이터 → 학습 설정 → 실행 관리 → 기록 비교 순서로 작업합니다. 오른쪽 ‘시작하기’ 목록은 아직 남은 준비 단계를 보여 줍니다.\n이 튜토리얼은 약 5분 걸리며 GPU를 쓰거나 데이터를 전송하지 않습니다." },
+    body: "왼쪽 메뉴의 워크스페이스에서는 프로젝트 → 데이터 → 레시피 → 그래프 실행 순서로 여러 학습을 이어서 진행하고, 단일 학습(학습 설정 · 실행 관리)에서는 학습 하나를 바로 계획합니다. 오른쪽 ‘시작하기’ 목록은 아직 남은 준비 단계를 보여 줍니다.\n이 튜토리얼은 약 7분 걸립니다. 단일 학습으로 실습한 뒤 프로젝트 화면을 둘러보며, GPU를 쓰거나 데이터를 전송하지 않습니다." },
   { id: "connection-provider", page: "connections", anchor: "connection-provider", kind: "explain", title: "GPU 연결 방식 고르기",
     body: "RunPod는 관리자가 배정한 Pod를 RunPod API로 확인한 뒤 SSH로 학습합니다. GPU 서버는 BOP 같은 기관 Linux·NVIDIA 서버에 SSH로 직접 접속해 학습합니다.\n배정받은 자원에 맞는 방식을 고르세요. 앱은 Pod나 서버를 켜거나 끄지 않습니다." },
   { id: "connection-fields", page: "connections", anchor: "connection-fields", kind: "explain", title: "연결에 필요한 정보",
@@ -66,7 +66,18 @@ export const tutorialSteps: TutorialStep[] = [
     body: "실행 전 확인에는 업무 AI, 학습 데이터 건수, 최대 실행 시간 기준 예상 GPU 비용이 나옵니다.\n‘데이터 전송에 동의하고 학습 시작’은 데이터를 GPU로 보내 실제 학습을 시작하는 버튼이며, 누르면 확인 창이 한 번 더 나옵니다. 연습 데이터는 GPU 전송이 허용되지 않아 실제로 실행되지 않습니다." },
   { id: "jobs-history", page: "jobs", anchor: "jobs-list", kind: "explain", title: "실행 관리와 기록 비교",
     body: "실제 학습을 시작하면 이곳에서 상태, 학습 로그, 실제 train loss 진행과 평가 결과를 봅니다. 앱을 다시 열었을 때는 ‘연결 끊긴 작업 확인’과 ‘재연결 · 결과 회수’로 결과를 가져옵니다.\n왼쪽 메뉴의 ‘기록 비교’에서는 공용 MLflow에 저장된 두 실행의 설정과 지표를 나란히 비교합니다." },
+  // Explain-only tour of the project screens (Task 10, D16): after the practice, before the end; no practice, no call.
+  { id: "project-start", page: "overview", anchor: "project-start", kind: "explain", title: "빈 프로젝트에서 시작하기",
+    body: "예제 없이도 이름과 목적만으로 새 프로젝트를 만들 수 있습니다. 프로젝트에 데이터·레시피·학습 그래프를 연결해 여러 학습을 이어서 실행합니다.\n예제 시작점은 선택 사항입니다." },
+  { id: "executor-profiles", page: "profiles", anchor: "executor-profiles", kind: "explain", title: "실행 프로필과 컨트롤러",
+    body: "배정받은 Pod나 GPU 서버를 실행 프로필로 여러 개 저장하고 ‘자원 확인’으로 GPU와 요금을 읽어 옵니다. 그래프 실행은 백그라운드 컨트롤러가 진행하며, 시작·정지는 직접 누릅니다.\n앱을 닫아도 컨트롤러는 계속 동작합니다." },
+  { id: "data-import", page: "data-import", anchor: "data-import", kind: "explain", title: "열을 연결해 데이터 가져오기",
+    body: "CSV·JSON·JSONL 파일의 열을 지시문·입력·정답 같은 학습 형식에 연결하고 미리보기로 행 오류를 확인한 뒤 바뀌지 않는 버전으로 등록합니다. 필요하면 학습·검증·시험으로 나눕니다.\n연습 데이터(tutorial_sample)는 이 경로로 등록할 수 없습니다." },
+  { id: "graph-editor", page: "graph", anchor: "graph-editor", kind: "explain", title: "학습 그래프 만들기",
+    body: "단계 카드를 직렬(다음 단계)이나 병렬(나란히)로 추가하고 입력을 연결합니다. 미리보기는 카드와 같은 내용으로 그려집니다.\n계획은 기본이 모의 실행이며, 실제 실행은 실행 승인과 데이터 전송 승인을 따로 받습니다." },
+  { id: "graph-runs", page: "runs", anchor: "graph-runs", kind: "explain", title: "그래프 실행 따라가기",
+    body: "등록한 실행의 단계별 상태, 대기 이유, 기록 저장 상태와 선택 결과를 봅니다. 화면이 보이는 동안만 상태를 다시 읽습니다.\n‘운영자 확인 필요’는 앱이 아니라 관리자가 원격 종료를 확인한 뒤 처리합니다." },
   { id: "finish", page: "overview", anchor: "overview-setup", kind: "explain", title: "튜토리얼 완료",
-    body: "실제 학습은 ① 연결 설정에서 배정받은 RunPod 또는 GPU 서버 연결 ② 실제 데이터 등록과 GPU 전송 허용 선택 ③ 학습 설정과 실행 계획 확인 순서로 진행합니다.\n등록한 tutorial_sample은 연습용으로 남으며 실제 학습에는 쓸 수 없습니다. 튜토리얼은 왼쪽 메뉴의 ‘튜토리얼’에서 다시 볼 수 있습니다.",
+    body: "실제 학습은 두 방법으로 진행합니다. 프로젝트·그래프는 ① 실행 프로필에 배정받은 Pod나 GPU 서버 저장 ② 프로젝트를 만들어 데이터를 가져오고 레시피 준비 ③ 학습 그래프를 저장하고 모의 실행부터 계획 확인 순서입니다. 단일 학습은 ① 연결 설정에서 배정받은 RunPod 또는 GPU 서버 연결 ② 실제 데이터 등록과 GPU 전송 허용 선택 ③ 학습 설정과 실행 계획 확인 순서입니다.\n등록한 tutorial_sample은 연습용으로 남으며 실제 학습에는 쓸 수 없습니다. 튜토리얼은 왼쪽 메뉴의 ‘튜토리얼’에서 다시 볼 수 있습니다.",
     cta: { label: "연결 설정으로 이동", async run(context) { await context.finish(); await context.navigate("connections"); } } },
 ];
