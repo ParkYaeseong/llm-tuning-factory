@@ -57,6 +57,14 @@ def check_model_input_contract(config, model_input: ModelInput) -> ModelInput:
     return model_input
 
 
+def check_generation_benchmark(benchmark) -> None:
+    """The pinned engine's predict path can enforce only greedy causal-LM generation in fp16/bf16 (plan §6 Q8)."""
+    if benchmark.semantic_model_kind != "causal_lm" or benchmark.generation_mode != "greedy":
+        raise ValueError("v2 evaluation supports greedy causal-LM generation benchmarks only")
+    if benchmark.precision == "fp32":
+        raise ValueError("fp32 benchmark precision cannot be enforced by the pinned engine")
+
+
 class CanceledError(RuntimeError):
     pass
 
@@ -250,6 +258,45 @@ class LlamaFactoryBackend(TrainingBackend):
                   "validation_sha256": validation_sha256, "source": "llamafactory-native-generation"}
         (directory / "output").mkdir(exist_ok=True)
         (directory / "output" / "predictions.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+
+    @staticmethod
+    def prediction_plan(benchmark, *, model_path: str, adapter_path: str | None, max_samples: int) -> dict:
+        """Greedy generation over the worker-derived ``factory_validation`` subset on verified local paths."""
+        check_generation_benchmark(benchmark)
+        plan = {"model_name_or_path": model_path, "trust_remote_code": False, "stage": "sft", "do_train": False,
+                "do_predict": True, "finetuning_type": "lora" if adapter_path else "full",
+                "template": benchmark.template, "eval_dataset": "factory_validation", "dataset_dir": "./data",
+                "output_dir": "./prediction", "predict_with_generate": True, "max_samples": max_samples,
+                "max_new_tokens": benchmark.max_new_tokens, "do_sample": False, "cutoff_len": benchmark.cutoff_len,
+                "seed": benchmark.seed, "per_device_eval_batch_size": 1, "report_to": "none",
+                "fp16": benchmark.precision == "fp16", "bf16": benchmark.precision == "bf16"}
+        if adapter_path:
+            plan["adapter_name_or_path"] = adapter_path
+        if benchmark.quantization_bit is not None:
+            plan.update(quantization_bit=benchmark.quantization_bit, quantization_method="bnb")
+        return plan
+
+    def predict_bound(self, directory, plan, sample_ids, timeout, canceled=lambda: False) -> dict:
+        """Run a bound prediction plan; write ``output/predictions.json`` with predictions only, in sample order.
+
+        References and metrics are recomputed by the control plane from the registered rows.
+        """
+        directory = Path(directory)
+        with (directory / "predict.yaml").open("xb") as stream:
+            stream.write(yaml.safe_dump(plan, sort_keys=True).encode("utf-8"))
+        self.run_config(directory, timeout, canceled, "predict.yaml", "predict.log")
+        if plan.get("quantization_bit") is not None:
+            self.confirm_quantization(directory / "predict.log", plan["quantization_bit"])
+        source = directory / "prediction" / "generated_predictions.jsonl"
+        rows = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if len(rows) != len(sample_ids):
+            raise ValueError("native prediction result has invalid sample count")
+        result = {"ordered_sample_ids": list(sample_ids), "predictions": [row["predict"].strip() for row in rows],
+                  "source": "llamafactory-native-generation"}
+        (directory / "output").mkdir(exist_ok=True)
+        with (directory / "output" / "predictions.json").open("xb") as stream:
+            stream.write(canonical(result))
+        return result
 
     def evaluate_reward(self, config, directory, validation_sha256, timeout, canceled=lambda: False):
         if config.training_stage != "rm" or config.evaluation_profile.kind != "reward":

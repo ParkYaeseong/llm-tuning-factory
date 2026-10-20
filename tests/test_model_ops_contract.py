@@ -979,3 +979,518 @@ def test_source_files_have_lf_line_endings_for_a_checkout_independent_source_has
     carriage = [path.relative_to(ROOT).as_posix() for path in sorted((ROOT / "src").rglob("*.py"))
                 if b"\r" in path.read_bytes()]
     assert carriage == []
+
+
+# -- Task 7.3: output publishing and platform newlines -------------------------------------------
+
+def write_platform_json(path, value):
+    # transformers writes JSON in text mode, so its newlines follow the platform's os.linesep.
+    import os
+    with open(path, "w", encoding="utf-8", newline=os.linesep) as stream:
+        stream.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def fake_transformers_save(directory):
+    directory.mkdir(parents=True)
+    write_platform_json(directory / "config.json", {"model_type": "qwen2", "hidden_size": 16, "dtype": "float32"})
+    write_platform_json(directory / "generation_config.json", {"bos_token_id": 2, "eos_token_id": 3})
+    (directory / "tokenizer_config.json").write_bytes(b"{\r\n}\r\n")   # base bytes, copied verbatim
+    write_safetensors(directory / "model.safetensors", base_tensors())
+
+
+def test_materialized_json_is_normalized_so_the_output_inventory_ignores_os_linesep(tmp_path, monkeypatch):
+    import os
+
+    from tuning_factory.model_artifacts import directory_inventory_sha256
+    module = api()
+    inventories, configs = [], []
+    for name, linesep in (("windows", "\r\n"), ("linux", "\n")):
+        monkeypatch.setattr(os, "linesep", linesep)
+        payload = tmp_path / name / ".model-op-x" / "payload"
+        fake_transformers_save(payload)
+        configs.append((payload / "config.json").read_bytes())
+        module.normalize_json_newlines(payload)
+        # Tokenizer files are base bytes (fingerprinted); only transformers' own JSON is normalized.
+        assert (payload / "tokenizer_config.json").read_bytes() == b"{\r\n}\r\n"
+        output = tmp_path / name / "output"
+        module.publish_output(payload, output)
+        for file in ("config.json", "generation_config.json"):
+            assert b"\r" not in (output / file).read_bytes()
+        assert json.loads((output / "config.json").read_bytes()) == json.loads(configs[-1])
+        inventories.append(directory_inventory_sha256(output))
+    assert b"\r\n" in configs[0] and b"\r" not in configs[1]   # the two platforms really wrote different bytes
+    assert inventories[0] == inventories[1]
+
+
+def test_json_newline_normalization_never_changes_content(tmp_path):
+    module = api()
+    invalid = b'{"a":\r\n"x\ry"}'   # a raw CR inside a string is not JSON
+    (tmp_path / "config.json").write_bytes(invalid)
+    with pytest.raises(ValueError, match="JSON"):
+        module.normalize_json_newlines(tmp_path)
+    assert (tmp_path / "config.json").read_bytes() == invalid
+    (tmp_path / "config.json").write_bytes(b'{\r\n  "a": 1\r\n}\r\n')
+    module.normalize_json_newlines(tmp_path)   # generation_config.json is absent: nothing to do
+    assert (tmp_path / "config.json").read_bytes() == b'{\n  "a": 1\n}\n'
+
+
+def test_publish_output_fsyncs_every_file_and_directory_before_the_move(tmp_path, monkeypatch):
+    module = api()
+    parent = tmp_path / "model-op"
+    payload = parent / ".model-op-x" / "payload"
+    (payload / "chat_templates").mkdir(parents=True)
+    (payload / "config.json").write_text("{}", encoding="utf-8")
+    (payload / "chat_templates" / "default.jinja").write_text("t", encoding="utf-8")
+    events = []
+    monkeypatch.setattr(module, "_fsync_file", lambda path: events.append(
+        ("file", Path(path).relative_to(payload).as_posix())))
+    monkeypatch.setattr(module, "_fsync_directory", lambda path: events.append(("directory", Path(path).name)))
+    original = module._rename_noreplace
+
+    def rename(source, destination):
+        events.append(("rename", Path(destination).name))
+        original(source, destination)
+
+    monkeypatch.setattr(module, "_rename_noreplace", rename)
+    output = parent / "output"
+    module.publish_output(payload, output)
+    moved = events.index(("rename", "output"))
+    assert {event for event in events[:moved] if event[0] == "file"} == {
+        ("file", "config.json"), ("file", "chat_templates/default.jinja")}
+    assert {("directory", "payload"), ("directory", "chat_templates")} <= set(events[:moved])
+    assert events[moved + 1:] == [("directory", "model-op")]
+    assert (output / "chat_templates" / "default.jinja").read_text(encoding="utf-8") == "t"
+    assert not payload.exists()
+
+
+@pytest.mark.parametrize("existing", ["file", "empty_directory", "race"])
+def test_publish_output_never_replaces_an_existing_path(tmp_path, monkeypatch, existing):
+    module = api()
+    payload = tmp_path / ".model-op-x"
+    payload.mkdir()
+    (payload / "config.json").write_text("{}", encoding="utf-8")
+    output = tmp_path / "output"
+    if existing == "file":
+        output.write_text("keep", encoding="utf-8")
+    elif existing == "empty_directory":
+        output.mkdir()
+    else:
+        # An empty directory appears after the existence check, in the window before the rename.
+        def racing_fsync(path):
+            if Path(path) == payload:
+                output.mkdir()
+
+        monkeypatch.setattr(module, "_fsync_directory", racing_fsync)
+    with pytest.raises(ValueError, match="model-operation output already exists"):
+        module.publish_output(payload, output)
+    assert (payload / "config.json").read_text(encoding="utf-8") == "{}"
+    if existing == "file":
+        assert output.read_text(encoding="utf-8") == "keep"
+    else:
+        assert output.is_dir() and list(output.iterdir()) == []
+
+
+def test_posix_no_replace_move_uses_renameat2_or_exclusive_links(tmp_path):
+    import ctypes
+    import errno
+    import os
+    module = api()
+    payload = tmp_path / "payload"
+    (payload / "sub").mkdir(parents=True)
+    (payload / "config.json").write_text("{}", encoding="utf-8")
+    (payload / "sub" / "file.txt").write_text("x", encoding="utf-8")
+    calls = []
+
+    def renamed(*args):
+        calls.append(args)
+        return 0
+
+    target = tmp_path / "out"
+    assert module._renameat2_noreplace(payload, target, function=renamed) is True
+    assert calls == [(-100, os.fsencode(payload), -100, os.fsencode(target), 1)]   # AT_FDCWD, RENAME_NOREPLACE
+
+    def failing(code):
+        def function(*args):
+            ctypes.set_errno(code)
+            return -1
+        return function
+
+    with pytest.raises(FileExistsError):
+        module._renameat2_noreplace(payload, target, function=failing(errno.EEXIST))
+    for code in (errno.ENOSYS, errno.EINVAL):
+        assert module._renameat2_noreplace(payload, target, function=failing(code)) is False
+    with pytest.raises(PermissionError):
+        module._renameat2_noreplace(payload, target, function=failing(errno.EACCES))
+    # Portable fallback: every directory is created exclusively and every file is hard-linked (never replaced).
+    taken = tmp_path / "taken"
+    taken.mkdir()
+    with pytest.raises(FileExistsError):
+        module._move_tree_noreplace(payload, taken)
+    assert list(taken.iterdir()) == [] and (payload / "sub" / "file.txt").is_file()
+    module._move_tree_noreplace(payload, tmp_path / "moved")
+    assert (tmp_path / "moved" / "sub" / "file.txt").read_text(encoding="utf-8") == "x"
+    assert (tmp_path / "moved" / "config.json").read_text(encoding="utf-8") == "{}"
+    assert not payload.exists()
+
+
+def test_inspect_linear_modules_is_reexported_and_lazy(monkeypatch):
+    module = api()
+    from tuning_factory import target_inspection
+    assert module.inspect_linear_modules is target_inspection.inspect_linear_modules
+    block_heavy_imports(monkeypatch)
+    with pytest.raises(RuntimeError, match="model-operation runtime is missing"):
+        module.inspect_linear_modules(ROOT)
+
+
+# -- Task 7.3: execute_operation dispatch (fake model_ops, no torch) -----------------------------
+
+JOB_DIRECTORY = "6" * 32
+
+
+def launch(tmp_path, name):
+    directory = tmp_path / JOB_DIRECTORY / name
+    directory.mkdir(parents=True)
+    return directory
+
+
+def dispatch_fixture(tmp_path):
+    import test_model_inputs as inputs
+
+    from tuning_factory.model_artifacts import ModelArtifactStore
+    store = ModelArtifactStore(tmp_path / "model-cache")
+    base = inputs.frozen(store, inputs.full_model(tmp_path, "base"))
+    first = inputs.frozen(store, inputs.peft_adapter(tmp_path, "first", base=base[0], parents=(base[0],)))
+    second = inputs.frozen(store, inputs.peft_adapter(tmp_path, "second", rank=3, alpha=9, base=base[0],
+                                                      parents=(base[0],)))
+    return inputs, store, base[0], first[0], second[0]
+
+
+def pinned_runtime(monkeypatch):
+    from importlib import metadata
+
+    from tuning_factory.runtime_profiles import MODEL_OPS_PINS
+    installed = {**MODEL_OPS_PINS, "llamafactory": "0.9.5"}
+
+    def version(name):
+        if name not in installed:
+            raise metadata.PackageNotFoundError(name)
+        return installed[name]
+
+    monkeypatch.setattr(metadata, "version", version)
+    return installed
+
+
+def full_output_files(output):
+    import test_model_inputs as inputs
+    output.mkdir(parents=True)
+    (output / "config.json").write_bytes(inputs.CONFIG)
+    inputs.write_safetensors(output / "model.safetensors", {f"{name}.weight": (2, 2) for name in inputs.MODULES})
+
+
+class FakeOps:
+    """Records every model-operation call; writes small fixture outputs (never real weights)."""
+
+    def __init__(self, receipt_changes=None):
+        self.calls, self.receipt_changes = [], receipt_changes or {}
+
+    def merge_adapters(self, inputs, weights, output, *, base, policy, device, require_real, probe_ids=None):
+        self.calls.append(("merge", tuple(inputs), tuple(weights), output, base, policy, device, require_real))
+        output.mkdir()
+        (output / "adapter_config.json").write_text("{}", encoding="utf-8")
+        (output / "adapter_model.safetensors").write_bytes(b"fixture")
+        return api().MergeReceipt(**{
+            "policy_id": policy, "inputs": tuple(model.identity for model in inputs), "normalized_weights": (0.25, 0.75),
+            "output_rank": 5, "max_abs_delta_error": 1e-9, "max_abs_logits_error": 1e-8, "finite_tensors_checked": 8,
+            "output_files": ("adapter_config.json", "adapter_model.safetensors"), **self.receipt_changes})
+
+    def materialize_model(self, load, output, *, policy, device, probe_ids=None):
+        self.calls.append(("materialize", load, output, policy, device))
+        full_output_files(output)
+        return api().MaterializeReceipt(**{
+            "policy_id": policy, "base": load.base.identity, "adapter": load.adapter.identity,
+            "max_abs_delta_error": 1e-9, "max_abs_logits_error": 1e-8, "non_target_tensors_identical": True,
+            "tokenizer_fingerprint": load.base.tokenizer_fingerprint, "finite_tensors_checked": 4,
+            "output_files": ("config.json", "model.safetensors"), **self.receipt_changes})
+
+    def inspect_linear_modules(self, model_dir):
+        from tuning_factory.graph_planner import TargetModuleEvidence
+        self.calls.append(("inspect", Path(model_dir)))
+        return tuple(TargetModuleEvidence(name=name, input_dimension=2, output_dimension=2)
+                     for name in ("model.q_proj", "model.v_proj"))
+
+    def inspect_target_modules(self, model_dir, base):
+        raise AssertionError("continuation inspection is not part of this operation")
+
+
+def test_execute_operation_dispatches_merge_and_materialize_to_model_ops(tmp_path, monkeypatch):
+    from tuning_factory import operation_runner as runner
+    from tuning_factory.model_artifacts import directory_inventory_sha256
+    from tuning_factory.operations import MaterializeOperation, MergeOperation
+    inputs, store, base_ref, first_ref, second_ref = dispatch_fixture(tmp_path)
+    pinned_runtime(monkeypatch)
+    block_heavy_imports(monkeypatch)   # the device probe needs no torch in the main env: cpu
+    merge = MergeOperation(models=(first_ref, second_ref), weights=(0.25, 0.75), resources=inputs.resources(),
+                           lineage=inputs.lineage())
+    directory = launch(tmp_path, "1" * 32)
+    runner.stage_model_inputs(merge, store, directory)
+    ops = FakeOps()
+    result = runner.execute_operation(merge, directory, 60, lambda: False, model_cache=store.root, ops=ops)
+    _, received, weights, output, base, policy, device, require_real = ops.calls[0]
+    assert [model.identity for model in received] == [first_ref, second_ref]
+    assert [Path(model.path).as_posix() for model in received] == [inputs.cache_path(store, ref)
+                                                                    for ref in (first_ref, second_ref)]
+    assert [model.descriptor for model in received] == [store.verify(ref) for ref in (first_ref, second_ref)]
+    assert (weights, policy, device, require_real) == ((0.25, 0.75), "model-ops-f32-v1", "cpu", True)
+    assert base.identity == base_ref and Path(base.path).as_posix() == inputs.cache_path(store, base_ref)
+    assert output == directory / "model-op" / "output"
+    assert (result.status, result.kind, result.launch_id) == ("COMPLETED", "merge", directory.name)
+    assert result.operation_sha256 == runner.operation_sha256(merge) and result.engine_version == "0.9.5"
+    receipt_bytes = (directory / "operation-receipt.json").read_bytes()
+    receipt = json.loads(receipt_bytes)
+    assert receipt["receipt"]["kind"] == "merge" and receipt["output"] == "model-op/output"
+    assert receipt["output_inventory_sha256"] == directory_inventory_sha256(output)
+    assert result.evidence["operation-receipt.json"] == sha(receipt_bytes)
+    binding = json.loads((directory / "model-binding.json").read_bytes())
+    assert [(item["role"], item["index"]) for item in binding["models"]] == [
+        ("operation_adapter", 0), ("operation_adapter", 1), ("operation_base", 0)]
+    assert result.evidence["model-binding.json"] == sha((directory / "model-binding.json").read_bytes())
+    assert "target-inventory.json" not in result.evidence
+
+    materialize = MaterializeOperation(model=first_ref, resources=inputs.resources(), lineage=inputs.lineage())
+    directory = launch(tmp_path, "2" * 32)
+    runner.stage_model_inputs(materialize, store, directory)
+    result = runner.execute_operation(materialize, directory, 60, lambda: False, model_cache=store.root, ops=ops)
+    _, load, output, policy, device = ops.calls[1]
+    assert (load.base.identity, load.adapter.identity) == (base_ref, first_ref)
+    assert Path(load.adapter.path).as_posix() == inputs.cache_path(store, first_ref)
+    assert (output, policy, device) == (directory / "model-op" / "output", "model-ops-f32-v1", "cpu")
+    assert ops.calls[2] == ("inspect", output)
+    inventory = json.loads((directory / "target-inventory.json").read_bytes())
+    assert inventory == {"schema_version": 1, "modules": [
+        {"name": "model.q_proj", "input_dimension": 2, "output_dimension": 2},
+        {"name": "model.v_proj", "input_dimension": 2, "output_dimension": 2}]}
+    assert result.evidence["target-inventory.json"] == sha((directory / "target-inventory.json").read_bytes())
+    assert (result.status, result.kind) == ("COMPLETED", "materialize")
+
+
+def test_model_ops_refused_in_ppo_runtime_or_on_pin_drift(tmp_path, monkeypatch):
+    from tuning_factory import operation_runner as runner
+    from tuning_factory.operations import MergeOperation
+    inputs, store, _, first_ref, second_ref = dispatch_fixture(tmp_path)
+    installed = pinned_runtime(monkeypatch)
+    ops = FakeOps()
+    ppo = MergeOperation(models=(first_ref, second_ref), weights=(0.25, 0.75), resources=inputs.resources("ppo"),
+                         lineage=inputs.lineage())
+    first_directory = launch(tmp_path, "1" * 32)
+    runner.stage_model_inputs(ppo, store, first_directory)
+    with pytest.raises(ValueError, match="^model operation requires the primary runtime with pinned PEFT 0.18.1$"):
+        runner.execute_operation(ppo, first_directory, 60, lambda: False, model_cache=store.root, ops=ops)
+    primary = MergeOperation(models=(first_ref, second_ref), weights=(0.25, 0.75), resources=inputs.resources(),
+                             lineage=inputs.lineage())
+    directory = launch(tmp_path, "2" * 32)
+    runner.stage_model_inputs(primary, store, directory)
+    installed["peft"] = "0.18.0"
+    with pytest.raises(ValueError, match="model operation requires the primary runtime with pinned PEFT 0.18.1: peft"):
+        runner.execute_operation(primary, directory, 60, lambda: False, model_cache=store.root, ops=ops)
+    assert ops.calls == []
+    assert not (first_directory / "model-op").exists() and not (directory / "model-op").exists()
+
+
+def test_model_operation_owns_an_exclusive_output_parent(tmp_path, monkeypatch):
+    from tuning_factory import operation_runner as runner
+    from tuning_factory.operations import MaterializeOperation
+    inputs, store, _, first_ref, _ = dispatch_fixture(tmp_path)
+    pinned_runtime(monkeypatch)
+    materialize = MaterializeOperation(model=first_ref, resources=inputs.resources(), lineage=inputs.lineage())
+    directory = launch(tmp_path, "1" * 32)
+    runner.stage_model_inputs(materialize, store, directory)
+    # A crashed run left staging inside this attempt's own output parent: it is never reused or deleted.
+    stale = directory / "model-op" / ".model-op-stale" / "payload"
+    stale.mkdir(parents=True)
+    (stale / "partial.part").write_bytes(b"partial")
+    ops = FakeOps()
+    with pytest.raises(ValueError, match="model-operation output parent already exists"):
+        runner.execute_operation(materialize, directory, 60, lambda: False, model_cache=store.root, ops=ops)
+    assert ops.calls == [] and (stale / "partial.part").read_bytes() == b"partial"
+    # The launch directory holds no weights before any operation, and its name is the launch_id.
+    for name, setup, message in (
+            ("2" * 32, lambda path: (path / "stray.safetensors").write_bytes(b"w"), "must not contain model weights"),
+            ("not-a-launch-id", lambda path: None, "launch directory must be named by its 32-hex launch_id")):
+        directory = launch(tmp_path, name)
+        runner.stage_model_inputs(materialize, store, directory)
+        setup(directory)
+        with pytest.raises(ValueError, match=message):
+            runner.execute_operation(materialize, directory, 60, lambda: False, model_cache=store.root, ops=ops)
+    assert ops.calls == []
+
+
+@pytest.mark.parametrize("changes", [{"output_files": ("model.safetensors",)}, {"policy_id": "other"}])
+def test_model_operation_receipt_must_describe_this_operation_and_output(tmp_path, monkeypatch, changes):
+    from tuning_factory import operation_runner as runner
+    from tuning_factory.operations import MaterializeOperation
+    inputs, store, _, first_ref, _ = dispatch_fixture(tmp_path)
+    pinned_runtime(monkeypatch)
+    materialize = MaterializeOperation(model=first_ref, resources=inputs.resources(), lineage=inputs.lineage())
+    directory = launch(tmp_path, "1" * 32)
+    runner.stage_model_inputs(materialize, store, directory)
+    with pytest.raises(ValueError, match="model-operation receipt differs from the operation or its output"):
+        runner.execute_operation(materialize, directory, 60, lambda: False, model_cache=store.root,
+                                 ops=FakeOps(changes))
+    assert not (directory / "operation-receipt.json").exists()
+
+
+def evaluate_fixture(tmp_path, **benchmark_changes):
+    from tuning_factory.operations import EvaluateOperation
+    from tuning_factory.projects import DatasetRef
+    inputs, store, base_ref, first_ref, _ = dispatch_fixture(tmp_path)
+    raw = (ROOT / "examples" / "dummy.json").read_bytes()
+    spec = inputs.benchmark(DatasetRef(dataset_id="bench", version="1", sha256=sha(raw)),
+                            ordered_sample_ids=("row:2", "row:0"), **benchmark_changes)
+    operation = EvaluateOperation(model=first_ref, benchmark=spec, resources=inputs.resources(),
+                                  lineage=inputs.lineage())
+    return inputs, store, base_ref, first_ref, raw, operation
+
+
+def evaluate_launch(tmp_path, store, operation, raw, name):
+    from tuning_factory import operation_runner as runner
+    directory = launch(tmp_path, name)
+    runner.stage_model_inputs(operation, store, directory)
+    runner.write_benchmark_data(directory, raw)
+    return directory
+
+
+def test_evaluate_runs_ordered_subset_and_writes_predictions(tmp_path, monkeypatch):
+    from tuning_factory import operation_runner as runner
+    from tuning_factory import worker
+    from tuning_factory.training import LlamaFactoryBackend
+    inputs, store, base_ref, first_ref, raw, evaluate = evaluate_fixture(tmp_path)
+    preflights, calls = [], []
+
+    def preflight(benchmark, paths, gpu_count):
+        preflights.append((paths.path("operation_base"), gpu_count))
+        return {"fixture": True}
+
+    monkeypatch.setattr(worker, "evaluation_preflight_bound", preflight)
+
+    class Backend(LlamaFactoryBackend):
+        def predict_bound(self, directory, plan, sample_ids, timeout, canceled=lambda: False):
+            calls.append((plan, tuple(sample_ids)))
+            (Path(directory) / "predict.yaml").write_text(json.dumps(plan), encoding="utf-8")
+            (Path(directory) / "output").mkdir()
+            (Path(directory) / "output" / "predictions.json").write_bytes(b'{"predictions":[]}')
+
+    directory = evaluate_launch(tmp_path, store, evaluate, raw, "1" * 32)
+    assert (directory / "data" / "benchmark.json").read_bytes() == raw
+    result = runner.execute_operation(evaluate, directory, 60, lambda: False, backend=Backend(), model_cache=store.root)
+    rows = json.loads(raw)
+    subset = (directory / "data" / "validation.json").read_bytes()
+    assert json.loads(subset) == [rows[2], rows[0]]   # ordered_sample_ids order, from the registered bytes
+    info = json.loads((directory / "data" / "dataset_info.json").read_bytes())
+    assert info["factory_validation"]["file_name"] == "validation.json"
+    plan, sample_ids = calls[0]
+    assert sample_ids == ("row:2", "row:0")
+    assert {key: plan[key] for key in ("max_samples", "template", "cutoff_len", "max_new_tokens", "seed", "do_sample",
+                                       "bf16", "fp16", "finetuning_type", "stage", "do_predict")} == {
+        "max_samples": 2, "template": "qwen", "cutoff_len": 128, "max_new_tokens": 16, "seed": 7, "do_sample": False,
+        "bf16": True, "fp16": False, "finetuning_type": "lora", "stage": "sft", "do_predict": True}
+    assert plan["model_name_or_path"] == inputs.cache_path(store, base_ref)
+    assert plan["adapter_name_or_path"] == inputs.cache_path(store, first_ref)
+    assert "quantization_bit" not in plan and inputs.ROOT.repo_id not in json.dumps(plan)
+    assert preflights == [(Path(inputs.cache_path(store, base_ref)), 1)]
+    assert (result.status, result.kind) == ("COMPLETED", "evaluate")
+    assert result.evidence["data/validation.json"] == sha(subset)
+    assert result.evidence["output/predictions.json"] == sha(b'{"predictions":[]}')
+    for index, (changes, message) in enumerate((
+            ({"generation_mode": "sample"}, "^v2 evaluation supports greedy causal-LM generation benchmarks only$"),
+            ({"precision": "fp32"}, "^fp32 benchmark precision cannot be enforced by the pinned engine$"),
+            ({"semantic_model_kind": "reward_model"},
+             "^v2 evaluation supports greedy causal-LM generation benchmarks only$"),
+            ({"tokenizer_fingerprint": "0" * 64}, "benchmark tokenizer differs from the evaluated model"))):
+        refused = evaluate.model_copy(update={"benchmark": evaluate.benchmark.model_copy(update=changes)})
+        directory = evaluate_launch(tmp_path, store, refused, raw, f"{index + 2}" * 32)
+        with pytest.raises(ValueError, match=message):
+            runner.execute_operation(refused, directory, 60, lambda: False, backend=Backend(), model_cache=store.root)
+    assert len(calls) == 1
+    directory = evaluate_launch(tmp_path, store, evaluate, raw, "9" * 32)
+    (directory / "data" / "benchmark.json").write_bytes(raw.replace(b"DEMO-001", b"DEMO-002"))
+    with pytest.raises(ValueError, match="transferred dataset hash mismatch"):
+        runner.execute_operation(evaluate, directory, 60, lambda: False, backend=Backend(), model_cache=store.root)
+    assert len(calls) == 1
+
+
+def test_predict_bound_runs_the_engine_on_a_path_bound_plan(tmp_path):
+    import test_model_inputs as inputs
+    import yaml
+
+    from tuning_factory.training import LlamaFactoryBackend
+    spec = inputs.benchmark(quantization_bit=4, precision="fp16")
+    plan = LlamaFactoryBackend.prediction_plan(spec, model_path="/cache/base/files", adapter_path=None, max_samples=2)
+    assert plan["model_name_or_path"] == "/cache/base/files" and "adapter_name_or_path" not in plan
+    assert (plan["finetuning_type"], plan["quantization_bit"], plan["quantization_method"]) == ("full", 4, "bnb")
+    assert (plan["fp16"], plan["bf16"], plan["do_sample"], plan["max_samples"]) == (True, False, False, 2)
+    runs = []
+
+    class Engine(LlamaFactoryBackend):
+        def run_config(self, directory, timeout, canceled, filename, log_name):
+            runs.append((filename, log_name))
+            (Path(directory) / "prediction").mkdir()
+            rows = [{"predict": " first ", "label": "a"}, {"predict": "second", "label": "b"}]
+            (Path(directory) / "prediction" / "generated_predictions.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            (Path(directory) / log_name).write_text("Quantizing model to 4 bit with bitsandbytes.\n", encoding="utf-8")
+
+    result = Engine().predict_bound(tmp_path, plan, ("row:2", "row:0"), 60)
+    assert runs == [("predict.yaml", "predict.log")]
+    assert yaml.safe_load((tmp_path / "predict.yaml").read_text(encoding="utf-8")) == plan
+    assert result == {"ordered_sample_ids": ["row:2", "row:0"], "predictions": ["first", "second"],
+                      "source": "llamafactory-native-generation"}
+    assert json.loads((tmp_path / "output" / "predictions.json").read_bytes()) == result
+    again = tmp_path / "again"
+    again.mkdir()
+    with pytest.raises(ValueError, match="invalid sample count"):
+        Engine().predict_bound(again, plan, ("row:2",), 60)
+
+
+@pytest.mark.parametrize("method", ["full", "freeze", "lora"])
+def test_full_model_outputs_emit_target_inventory(tmp_path, monkeypatch, method):
+    from tuning_factory import operation_runner as runner
+    from tuning_factory import worker
+    from tuning_factory.operations import TrainOperation
+    from tuning_factory.projects import DatasetRef
+    from tuning_factory.training import LlamaFactoryBackend
+    inputs, store, base_ref, _, _ = dispatch_fixture(tmp_path)
+    pinned_runtime(monkeypatch)
+    raw = (ROOT / "examples" / "dummy.json").read_bytes()
+    model_input = inputs.policy(base_ref) if method == "lora" else inputs.full_weights(base_ref)
+    operation = TrainOperation(config=inputs.graph_config(method=method), model_input=model_input,
+                               dataset=DatasetRef(dataset_id="data", version="1", sha256=sha(raw)),
+                               resources=inputs.resources(), lineage=inputs.lineage())
+    directory = launch(tmp_path, "1" * 32)
+    LlamaFactoryBackend().prepare(operation.config, directory, raw, operation.model_input)
+    runner.stage_model_inputs(operation, store, directory)
+    monkeypatch.setattr(worker, "runtime_preflight_bound", lambda config, paths: {"fixture": True})
+    runs = []
+
+    class Engine(LlamaFactoryBackend):
+        def run_config(self, directory, timeout, canceled, filename, log_name):
+            runs.append(filename)
+            output = Path(directory) / "output"
+            if method == "lora":
+                output.mkdir()
+                (output / "adapter_config.json").write_text('{"peft_type":"LORA"}', encoding="utf-8")
+                (output / "adapter_model.safetensors").write_bytes(b"fixture")
+            else:
+                full_output_files(output)
+
+    ops = FakeOps()
+    result = runner.execute_operation(operation, directory, 60, lambda: False, backend=Engine(),
+                                      model_cache=store.root, ops=ops)
+    assert runs == ["train.bound.yaml"] and result.kind == "train"
+    assert result.evidence["train.bound.yaml"] == sha((directory / "train.bound.yaml").read_bytes())
+    if method == "lora":
+        assert ops.calls == [] and not (directory / "target-inventory.json").exists()
+        return
+    assert ops.calls == [("inspect", directory / "output")]
+    inventory = (directory / "target-inventory.json").read_bytes()
+    assert [item["name"] for item in json.loads(inventory)["modules"]] == ["model.q_proj", "model.v_proj"]
+    assert result.evidence["target-inventory.json"] == sha(inventory)

@@ -50,3 +50,45 @@ def test_full_ppo_reward_model_requires_identical_tokenizer(monkeypatch):
     import pytest
     with pytest.raises(ValueError, match='tokenizer'):
         runtime_preflight(AIConfig.model_validate(value))
+
+
+def test_operation_profile_pins_model_operations_to_the_primary_runtime():
+    import pytest
+
+    from tuning_factory.runtime_profiles import MODEL_OPS_PINS, engine_profile, operation_profile
+    assert operation_profile('train', 'primary') == engine_profile('sft')
+    assert operation_profile('train', 'ppo') == engine_profile('ppo')
+    assert operation_profile('evaluate', 'primary') == engine_profile('sft')
+    for kind in ('merge', 'materialize'):
+        profile = operation_profile(kind, 'primary')
+        assert {key: profile[key] for key in engine_profile('sft')} == engine_profile('sft')
+        assert profile['model_ops_pins'] == dict(MODEL_OPS_PINS)
+        with pytest.raises(ValueError, match='^model operation requires the primary runtime with pinned PEFT 0.18.1$'):
+            operation_profile(kind, 'ppo')
+    with pytest.raises(ValueError, match='local selection never dispatches to a GPU worker'):
+        operation_profile('select', 'primary')
+    with pytest.raises(ValueError, match='unsupported operation kind'):
+        operation_profile('shell', 'primary')
+    with pytest.raises(ValueError, match='unsupported runtime profile'):
+        operation_profile('train', 'cuda')
+
+
+def test_model_ops_pin_drift_is_reported_without_importing_the_runtime(monkeypatch):
+    import sys
+    from importlib import metadata
+
+    from tuning_factory.runtime_profiles import MODEL_OPS_PINS, model_ops_pin_drift
+    for name in ('torch', 'peft', 'transformers', 'safetensors'):
+        monkeypatch.setitem(sys.modules, name, None)
+    installed = {**MODEL_OPS_PINS, 'torch': '2.7.1+cu126'}
+
+    def version(name):
+        if name not in installed:
+            raise metadata.PackageNotFoundError(name)
+        return installed[name]
+
+    monkeypatch.setattr(metadata, 'version', version)
+    assert model_ops_pin_drift() == ()
+    installed['peft'] = '0.18.0'
+    del installed['safetensors']
+    assert model_ops_pin_drift() == ('peft', 'safetensors')

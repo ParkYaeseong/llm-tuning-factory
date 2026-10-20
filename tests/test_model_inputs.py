@@ -114,11 +114,11 @@ def full_model(tmp_path, marker, *, modules=MODULES, config=CONFIG, tokenizer=TO
 
 def peft_adapter(tmp_path, marker, *, rank=2, alpha=4, base=None, parents=(), method="lora",
                  quantization_bit=None, value_head=False, targets=("q_proj", "v_proj"), loraplus_lr_ratio=None,
-                 **export_changes):
+                 config=CONFIG, **export_changes):
     """A LoRA adapter whose adapter_config.json carries every key of a real PEFT 0.18.1 export."""
     from tuning_factory.model_ops import adapter_metadata_from_config
     directory = tmp_path / "src" / marker
-    write_snapshot(directory)
+    write_snapshot(directory, config=config)
     exported = {**PEFT_0181_EXPORT, "r": rank, "lora_alpha": alpha, "target_modules": sorted(targets),
                 **export_changes}
     (directory / "adapter_config.json").write_text(json.dumps(exported, indent=2, sort_keys=True), encoding="utf-8")
@@ -137,7 +137,7 @@ def peft_adapter(tmp_path, marker, *, rank=2, alpha=4, base=None, parents=(), me
         producer_job_id=marker, producer_attempt_id=marker, producer_manifest_sha256="b" * 64,
         storage_kind="adapter", semantic_kind="reward_model" if value_head else "causal_lm",
         has_value_head=value_head, root=ROOT, effective_base=base or ROOT, parents=parents,
-        config_sha256=ROOT.config_sha256, tokenizer_fingerprint=ROOT.tokenizer_fingerprint, adapter=metadata,
+        config_sha256=sha(config), tokenizer_fingerprint=ROOT.tokenizer_fingerprint, adapter=metadata,
         tensors=tuple(tensors))
     return directory, descriptor
 
@@ -940,9 +940,16 @@ def test_qlora_child_requires_unquantized_full_base(tmp_path, store):
     with pytest.raises(ValueError, match="QLoRA requires an unquantized full effective base"):
         stage(tmp_path, store, train_operation(policy(quantized_ref), method="qlora"))
     config = canonical({"model_type": "qwen2", "hidden_size": 2, "quantization_config": {"load_in_4bit": True}})
-    prequantized_ref, _ = frozen(store, full_model(tmp_path, "prequantized", config=config))
+    prequantized_ref, descriptor = frozen(store, full_model(tmp_path, "prequantized", config=config))
     operation = train_operation(policy(prequantized_ref), method="qlora")
-    resolved = stage(tmp_path, store, operation)
+    # The pre-quantized config.json is refused on the control plane, before any attempt directory is written.
+    with pytest.raises(ValueError, match="QLoRA requires an unquantized full effective base"):
+        stage(tmp_path, store, operation)
+    assert not (tmp_path / "attempt" / "model-inputs.json").exists()
+    # ...and again by the worker, which re-reads the bound config.json itself.
+    resolved = module.ResolvedModelInputs(
+        operation_kind="train", operation_sha256=digest(canonical(operation.model_dump(mode="json"))),
+        models=(staged_artifact(module, "policy_base", prequantized_ref, descriptor),), transfers=(prequantized_ref,))
     with pytest.raises(ValueError, match="QLoRA requires an unquantized full effective base"):
         module.verify_model_paths(resolved, operation, model_cache=store.root, hf_home=None)
 
@@ -1070,3 +1077,97 @@ def test_operation_runner_uses_only_public_artifact_verification():
                and (node.module or "").endswith("model_artifacts") for alias in node.names if alias.name.startswith("_")]
     assert private == []
     assert not hasattr(module, "_check_load")
+
+
+# -- Task 7.3: evaluate staging and earlier loader checks ----------------------------------------
+
+def resources(profile="primary"):
+    from tuning_factory.operations import OperationResources, RuntimeProfile
+    return OperationResources(executor=EXECUTOR, facts=FACTS, timeout_seconds=900, runtime=RuntimeProfile(
+        profile=profile, engine_version="0.9.3" if profile == "ppo" else "0.9.5", dependency_sha256="e" * 64))
+
+
+def lineage(simulation=False):
+    from tuning_factory.operations import OperationLineage
+    return OperationLineage(project_id="project", project_revision="f" * 64, node_id="node", plan_sha256="d" * 64,
+                            simulation=simulation)
+
+
+def benchmark(dataset=None, **changes):
+    from tuning_factory.benchmarks import BenchmarkSpec
+    values = dict(dataset=dataset or DatasetRef(dataset_id="bench", version="1", sha256="c" * 64),
+                  evaluator_kind="text", evaluator_version="1", ordered_sample_ids=("row:0",), max_new_tokens=16,
+                  cutoff_len=128, seed=7, precision="bf16", quantization_bit=None,
+                  tokenizer_fingerprint=ROOT.tokenizer_fingerprint, template="qwen", semantic_model_kind="causal_lm")
+    return BenchmarkSpec(**{**values, **changes})
+
+
+def staged_artifact(module, role, ref, descriptor, index=0):
+    return module.StagedModel(role=role, index=index, source="artifact", artifact=ref,
+                              storage_kind=descriptor.storage_kind, config_sha256=descriptor.config_sha256,
+                              tokenizer_fingerprint=descriptor.tokenizer_fingerprint)
+
+
+def test_evaluate_operation_stages_the_evaluated_model_roles(tmp_path, store, sft):
+    from tuning_factory.operations import EvaluateOperation
+    module = runner()
+    sft_ref, _ = sft
+    adapter_ref, _ = frozen(store, peft_adapter(tmp_path, "evaluated", base=sft_ref, parents=(sft_ref,)))
+    evaluate = EvaluateOperation(model=adapter_ref, benchmark=benchmark(), resources=resources(), lineage=lineage())
+    resolved = stage(tmp_path, store, evaluate)
+    assert resolved.operation_kind == "evaluate"
+    assert resolved.operation_sha256 == digest(canonical(evaluate.model_dump(mode="json")))
+    assert [(item.role, item.index, item.artifact) for item in resolved.models] == [
+        ("operation_base", 0, sft_ref), ("operation_adapter", 0, adapter_ref)]
+    assert resolved.transfers == tuple(sorted((sft_ref, adapter_ref),
+                                              key=lambda ref: (ref.artifact_id, ref.inventory_sha256)))
+    assert [item.name for item in (tmp_path / "attempt").rglob("*")] == ["model-inputs.json"]
+    verified = module.verify_model_paths(resolved, evaluate, model_cache=store.root, hf_home=None)
+    assert verified.path("operation_base").as_posix() == cache_path(store, sft_ref)
+    assert verified.path("operation_adapter").as_posix() == cache_path(store, adapter_ref)
+    # A full model is evaluated alone, without an adapter role.
+    full = EvaluateOperation(model=sft_ref, benchmark=benchmark(), resources=resources(), lineage=lineage())
+    resolved_full = module.stage_model_inputs(full, store, tmp_path / "full-attempt")
+    assert [(item.role, item.artifact) for item in resolved_full.models] == [("operation_base", sft_ref)]
+    # A real evaluation refuses synthetic models; a tampered model is refused before model-inputs.json exists.
+    synthetic_ref, _ = frozen(store, full_model(tmp_path, "synthetic", synthetic=True))
+    with pytest.raises(ValueError, match="synthetic/simulation artifact is ineligible for real use"):
+        module.stage_model_inputs(full.model_copy(update={"model": synthetic_ref}), store, tmp_path / "synthetic")
+    (Path(cache_path(store, adapter_ref)) / "adapter_model.safetensors").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="hash|inventory"):
+        module.stage_model_inputs(evaluate, store, tmp_path / "tampered")
+    assert not (tmp_path / "tampered" / "model-inputs.json").exists()
+
+
+def test_staging_runs_full_model_loader_checks_before_any_attempt(tmp_path, store):
+    redirect = canonical({"model_type": "qwen2", "hidden_size": 2, "transformers_weights": "other.safetensors"})
+    redirect_ref, _ = frozen(store, full_model(tmp_path, "redirect", config=redirect))
+    with pytest.raises(ValueError, match="transformers_weights"):
+        stage(tmp_path, store, train_operation(policy(redirect_ref)))
+    assert not (tmp_path / "attempt" / "model-inputs.json").exists()
+
+
+def test_merge_and_materialize_refuse_a_prequantized_base_config_at_staging_and_worker(tmp_path, store):
+    from tuning_factory.operations import MaterializeOperation, MergeOperation
+    module = runner()
+    config = canonical({"model_type": "qwen2", "hidden_size": 2, "quantization_config": {"load_in_4bit": True}})
+    base_ref, base = frozen(store, full_model(tmp_path, "prequantized", config=config))
+    first_ref, first = frozen(store, peft_adapter(tmp_path, "first", base=base_ref, parents=(base_ref,), config=config))
+    second_ref, second = frozen(store, peft_adapter(tmp_path, "second", rank=3, alpha=9, base=base_ref,
+                                                    parents=(base_ref,), config=config))
+    merge = MergeOperation(models=(first_ref, second_ref), weights=(0.25, 0.75), resources=resources(),
+                           lineage=lineage())
+    materialize = MaterializeOperation(model=first_ref, resources=resources(), lineage=lineage())
+    adapters = {"merge": ((first_ref, first), (second_ref, second)), "materialization": ((first_ref, first),)}
+    for operation, name in ((merge, "merge"), (materialize, "materialization")):
+        with pytest.raises(ValueError, match=f"^{name} requires unquantized effective base weights$"):
+            stage(tmp_path, store, operation)
+        assert not (tmp_path / "attempt" / "model-inputs.json").exists()
+        models = (staged_artifact(module, "operation_base", base_ref, base),
+                  *(staged_artifact(module, "operation_adapter", ref, descriptor, index)
+                    for index, (ref, descriptor) in enumerate(adapters[name])))
+        resolved = module.ResolvedModelInputs(
+            operation_kind=operation.kind, operation_sha256=digest(canonical(operation.model_dump(mode="json"))),
+            models=models, transfers=module._transfers(models))
+        with pytest.raises(ValueError, match=f"^{name} requires unquantized effective base weights$"):
+            module.verify_model_paths(resolved, operation, model_cache=store.root, hf_home=None)

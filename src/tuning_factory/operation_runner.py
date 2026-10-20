@@ -20,6 +20,11 @@ which are trees of symlinks. Fingerprints are computed on exactly the tree that 
 The producer stage of a parent adapter is ledger evidence, not artifact metadata, so the
 SFT-to-preference rule is enforced at compilation and staging only; the worker cannot re-derive it.
 
+Worker protocol v2 (7.3): ``WorkerRequest`` is ``command.json``, whose SHA256 is the worker's argv;
+``StartMarker`` is ``start.json``, created once with O_CREAT|O_EXCL so that a launch directory starts at
+most one execution; ``OperationResult`` is ``result.json``. ``execute_operation`` dispatches train,
+evaluate, merge and materialize through an allowlist (LocalSelect never reaches a worker).
+
 Module import touches only the standard library, pydantic, PyYAML and local contracts: no graph_store or
 jobs (the control-plane runner, 7.5) and no torch, transformers or huggingface_hub (imported lazily).
 """
@@ -34,11 +39,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import Field, TypeAdapter, model_validator
+from pydantic import Field, TypeAdapter, field_validator, model_validator
 
+from . import model_ops as default_model_ops
+from .capabilities import STAGES
 from .config import StrictModel
 from .model_artifacts import (
     TOKENIZER_FILES,
@@ -49,8 +56,14 @@ from .model_artifacts import (
     ModelArtifactStore,
     ModelDescriptor,
     check_link_free,
+    directory_inventory_sha256,
 )
 from .model_ops import (
+    POLICY_F32_V1,
+    LocalModel,
+    MaterializeReceipt,
+    MergeReceipt,
+    StagedLoad,
     check_continuation,
     check_full_model_directory,
     local_config_sha256,
@@ -58,10 +71,18 @@ from .model_ops import (
     validate_merge_inputs,
     verify_inspected_targets,
 )
-from .operations import MaterializeOperation, MergeOperation, OperationSpec, TrainOperation
+from .operations import EvaluateOperation, MaterializeOperation, MergeOperation, OperationSpec, TrainOperation
 from .projects import Sha256
-from .registry import canonical, digest
-from .training import ROLE_PREFIX, ROLE_SLOTS, check_model_input_contract
+from .registry import canonical, dataset_descriptor, digest, file_digest, parse_dataset
+from .runtime_profiles import MODEL_OPS_RUNTIME, model_ops_pin_drift, operation_profile
+from .training import (
+    ROLE_PREFIX,
+    ROLE_SLOTS,
+    CanceledError,
+    LlamaFactoryBackend,
+    check_generation_benchmark,
+    check_model_input_contract,
+)
 
 ModelRole = Literal["policy_base", "policy_adapter", "reference_base", "reference_adapter",
                     "reward_base", "reward_adapter", "operation_base", "operation_adapter"]
@@ -246,6 +267,25 @@ def _derive(operation, verifier: ArtifactVerifier) -> ResolvedModelInputs:
                                reference_quantization_bit=reference_bit, reward_model_type=reward_type)
 
 
+def _loader_rules(operation, configs: Mapping[tuple[str, int], dict]) -> None:
+    """Rules on the bound full models' config.json, checked before any engine or model operation starts.
+
+    ``configs`` maps (role, index) to the config.json of each full model whose files are readable here
+    (``check_full_model_directory`` already ran on them): every artifact on the control plane, and every
+    artifact and HF snapshot on the worker.
+    """
+    def prequantized(role: str) -> bool:
+        config = configs.get((role, 0))
+        return config is not None and "quantization_config" in config
+
+    if isinstance(operation, TrainOperation):
+        if operation.config.training_method == "qlora" and prequantized("policy_base"):
+            raise ValueError("QLoRA requires an unquantized full effective base")
+    elif isinstance(operation, (MergeOperation, MaterializeOperation)) and prequantized("operation_base"):
+        name = "merge" if isinstance(operation, MergeOperation) else "materialization"
+        raise ValueError(f"{name} requires unquantized effective base weights")
+
+
 def _parent_stage(operation: TrainOperation, parent: ModelDescriptor, producers) -> None:
     """Ledger rule (graph_planner._training_parent): an SFT adapter needs materialize before DPO/KTO."""
     ref, stage = operation.model_input.policy.adapter, operation.config.training_stage
@@ -306,6 +346,14 @@ def stage_model_inputs(operation, approved_cache: ModelArtifactStore, staging_ro
         raise TypeError("staging requires the approved control-plane ModelArtifactStore")
     verifier = approved_cache.verifier()   # lineage-aware; each artifact hashed once in this call
     resolved = _derive(operation, verifier)
+    # The control plane holds every artifact's files: run the worker's loader checks here too, so a
+    # redirected, ambiguous or pre-quantized full model is refused before any attempt is launched.
+    loaded = {}
+    for item in resolved.models:
+        if item.artifact is not None and item.storage_kind == "full_model" and _key(item.artifact) not in loaded:
+            loaded[_key(item.artifact)] = check_full_model_directory(verifier.path(item.artifact))
+    _loader_rules(operation, {(item.role, item.index): loaded[_key(item.artifact)] for item in resolved.models
+                              if item.artifact is not None and _key(item.artifact) in loaded})
     if isinstance(operation, TrainOperation) and operation.model_input.initialization == "continue_adapter":
         _parent_stage(operation, verifier.verify(operation.model_input.policy.adapter), tuple(producers))
 
@@ -420,27 +468,26 @@ def verify_model_paths(resolved: ResolvedModelInputs, operation, *, model_cache:
     if _derive(operation, verifier) != resolved:
         raise ValueError("staged model inputs differ from the operation's verified roles")
     home = Path(hf_home).absolute() if hf_home is not None else None
-    snapshots, configs, entries = {}, {}, []
+    snapshots, loaded, configs, entries = {}, {}, {}, []
     for staged in resolved.models:
         if staged.artifact is not None:
             path, descriptor = verifier.path(staged.artifact), verifier.verify(staged.artifact)
             if staged.storage_kind == "full_model":
-                configs[path] = check_full_model_directory(path)
+                if path not in loaded:
+                    loaded[path] = check_full_model_directory(path)
+                configs[(staged.role, staged.index)] = loaded[path]
         else:
             if home is None:
                 raise ValueError("HF root inputs require an approved HF_HOME cache")
             key = staged.hf_root.model_dump_json()
             if key not in snapshots:
-                snapshots[key], config = _resolve_hf_snapshot(staged.hf_root, home)
-                configs[snapshots[key]] = config
-            path, descriptor = snapshots[key], None
+                snapshots[key] = _resolve_hf_snapshot(staged.hf_root, home)
+            (path, configs[(staged.role, staged.index)]), descriptor = snapshots[key], None
         entries.append(VerifiedModelPath(role=staged.role, index=staged.index, path=path, staged=staged,
                                          descriptor=descriptor))
     verified = VerifiedModelPaths(models=tuple(entries))
+    _loader_rules(operation, configs)   # before any engine or model operation starts
     if isinstance(operation, TrainOperation):
-        if operation.config.training_method == "qlora" and "quantization_config" in configs[
-                verified.path("policy_base")]:
-            raise ValueError("QLoRA requires an unquantized full effective base")
 
         def evidence_for(base):
             if inspect_targets is None:
@@ -580,3 +627,354 @@ def write_bound_plan(directory: Path, bound: BoundTrainingPlan) -> None:
     for name, data in (("train.bound.yaml", plan_bytes), ("model-binding.json", canonical(bound.binding)),
                        ("binding-evidence.json", canonical(evidence))):
         _write_atomic(directory / name, data)
+
+
+# -- worker protocol v2: request, start marker, result -------------------------------------------
+
+Hex32 = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
+OperationKind = Literal["train", "evaluate", "merge", "materialize"]
+OPERATION_KINDS = ("train", "evaluate", "merge", "materialize")   # the worker's dispatch allowlist
+COMMAND, START_MARKER, RESULT = "command.json", "start.json", "result.json"
+MODEL_OP_PARENT = "model-op"   # merge/materialize: exclusive output parent, created by the execution itself
+MODEL_BINDING, PREFLIGHT = "model-binding.json", "device-preflight.json"
+OPERATION_RECEIPT, TARGET_INVENTORY = "operation-receipt.json", "target-inventory.json"
+_HEX32 = re.compile(r"^[0-9a-f]{32}$")
+_EVIDENCE_NAME = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$")
+_SMALL_FILE = 16 * 1024 * 1024
+
+
+class WorkerRequest(StrictModel):
+    """``command.json``: bytes are ``canonical(model_dump(mode="json"))``; their SHA256 is the worker argv."""
+    schema_version: Literal[2] = 2
+    attempt_id: Hex32
+    launch_id: Hex32
+    manifest_sha256: Sha256
+    operation_sha256: Sha256                    # digest(canonical(manifest["operation"]))
+    timeout_seconds: int = Field(strict=True, ge=1, le=604800)
+
+
+class StartMarker(StrictModel):
+    """``start.json``, created once with O_CREAT|O_EXCL. Only its creator writes anything else there.
+
+    Identities are the request's claims (None when the request itself failed verification); the
+    result carries the same ``launch_id``.
+    """
+    schema_version: Literal[2] = 2
+    launch_id: Hex32
+    command_sha256: Sha256
+    attempt_id: Hex32 | None = None
+    manifest_sha256: Sha256 | None = None
+    operation_sha256: Sha256 | None = None
+    pid: int = Field(strict=True, ge=0)
+    started_at: str = Field(min_length=1)
+
+
+class OperationResult(StrictModel):
+    """``result.json``, written atomically after ``artifacts.json``; ``launch_id`` is the directory name."""
+    schema_version: Literal[2] = 2
+    status: Literal["COMPLETED", "FAILED", "CANCELED"]
+    launch_id: Hex32
+    attempt_id: Hex32 | None = None
+    manifest_sha256: Sha256 | None = None
+    operation_sha256: Sha256 | None = None
+    kind: OperationKind | None = None
+    engine_version: str | None = None
+    error: str | None = None
+    evidence: dict[str, Sha256] = Field(default_factory=dict)   # launch-relative file -> SHA256 of its bytes
+
+    @field_validator("evidence")
+    @classmethod
+    def relative_evidence(cls, value):
+        if any(not _EVIDENCE_NAME.match(name) or ".." in name.split("/") for name in value):
+            raise ValueError("evidence names are launch-relative POSIX paths")
+        return value
+
+    @model_validator(mode="after")
+    def completed_identity(self):
+        if self.status == "COMPLETED" and (self.kind is None or self.operation_sha256 is None
+                                           or self.error is not None):
+            raise ValueError("a completed result names its operation and kind and carries no error")
+        return self
+
+
+def create_start_marker(directory: Path, marker: StartMarker) -> bool:
+    """Create ``start.json`` exclusively; False (and nothing written) if any start marker already exists."""
+    marker = StartMarker.model_validate(marker.model_dump(mode="json"))
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(Path(directory) / START_MARKER, flags, 0o644)
+    except FileExistsError:
+        return False
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(canonical(marker.model_dump(mode="json")))
+        stream.flush()
+        os.fsync(stream.fileno())
+    return True
+
+
+def write_operation_result(directory: Path, result: OperationResult) -> None:
+    """Publish ``result.json`` atomically (tmp -> replace), as v1 does; it is the completion marker."""
+    data = canonical(OperationResult.model_validate(result.model_dump(mode="json")).model_dump(mode="json"))
+    temporary = Path(directory) / "result.tmp"
+    with temporary.open("wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(Path(directory) / RESULT)
+
+
+def write_benchmark_data(directory: Path, raw: bytes) -> Path:
+    """Write the registered benchmark bytes of an evaluate launch as ``data/benchmark.<json|jsonl>``."""
+    _, _, file_format = parse_dataset(raw, "instruction")
+    data = Path(directory) / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    path = data / f"benchmark.{file_format}"
+    _write_new(path, raw)
+    return path
+
+
+# -- worker: operation dispatch ------------------------------------------------------------------
+
+def _write_new(path: Path, data: bytes) -> None:
+    with Path(path).open("xb") as stream:   # never replaces an uploaded or earlier file
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _read_small(path: Path) -> bytes:
+    check_link_free(path)
+    with Path(path).open("rb") as stream:
+        raw = stream.read(_SMALL_FILE + 1)
+    if len(raw) > _SMALL_FILE:
+        raise ValueError(f"{Path(path).name} exceeds the size limit")
+    return raw
+
+
+def _evidence(directory: Path, names: Sequence[str]) -> dict[str, str]:
+    evidence = {}
+    for name in names:
+        check_link_free(directory / name)
+        evidence[name] = file_digest(directory / name)
+    return evidence
+
+
+def _dataset_file(directory: Path, stem: str, ref, kind: str) -> tuple[str, bytes]:
+    """The uploaded ``data/<stem>.<json|jsonl>``: exactly one, hash-equal to the pinned DatasetRef."""
+    data = directory / "data"
+    present = [name for name in (f"{stem}.json", f"{stem}.jsonl")
+               if (data / name).exists() or (data / name).is_symlink()]
+    if len(present) != 1:
+        raise ValueError("transferred dataset is missing or ambiguous")
+    name = present[0]
+    check_link_free(data / name)
+    raw = (data / name).read_bytes()
+    if digest(raw) != ref.sha256:
+        raise ValueError("transferred dataset hash mismatch")
+    _, _, file_format = parse_dataset(raw, kind)
+    if name != f"{stem}.{file_format}":
+        raise ValueError("transferred dataset format differs from its file name")
+    return name, raw
+
+
+def _paths_binding(verified: VerifiedModelPaths) -> dict:
+    return {"schema_version": 1, "models": [
+        {"role": item.role, "index": item.index, "path": item.path.as_posix(),
+         **item.staged.model_dump(mode="json", exclude={"role", "index"})}
+        for item in sorted(verified.models, key=lambda item: (item.role, item.index))]}
+
+
+def _entry(verified: VerifiedModelPaths, role: str, index: int = 0) -> VerifiedModelPath | None:
+    return next((item for item in verified.models if (item.role, item.index) == (role, index)), None)
+
+
+def _local_model(verified: VerifiedModelPaths, role: str, index: int = 0) -> LocalModel:
+    entry = _entry(verified, role, index)
+    if entry is None:
+        raise ValueError(f"unbound model role: {role}")
+    staged = entry.staged
+    return LocalModel(path=entry.path, identity=staged.artifact if staged.artifact is not None else staged.hf_root,
+                      descriptor=entry.descriptor, config_sha256=staged.config_sha256,
+                      tokenizer_fingerprint=staged.tokenizer_fingerprint)
+
+
+def _model_ops_device() -> str:
+    try:
+        import torch
+    except ImportError:
+        return "cpu"   # model_ops then refuses the missing runtime with its own message
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _dump(value) -> Any:
+    return value.model_dump(mode="json") if hasattr(value, "model_dump") else value
+
+
+def _write_target_inventory(directory: Path, output: Path, ops) -> None:
+    """``target-inventory.json`` of a full-model output; 7.5 binds it to the frozen artifact and verifies it."""
+    from .graph_planner import TargetModuleEvidence
+    check_full_model_directory(output)
+    modules = sorted((TargetModuleEvidence.model_validate(_dump(item)) for item in ops.inspect_linear_modules(output)),
+                     key=lambda item: item.name)
+    if not modules or len({item.name for item in modules}) != len(modules):
+        raise ValueError("full-model output target inventory is empty or ambiguous")
+    _write_new(directory / TARGET_INVENTORY, canonical({"schema_version": 1, "modules": [
+        item.model_dump(mode="json") for item in modules]}))
+
+
+def _inspects_full_output(operation, profile: dict) -> bool:
+    # The inspector needs the pinned model-operation libraries, which only the primary runtime has.
+    return isinstance(operation, MaterializeOperation) or (
+        isinstance(operation, TrainOperation) and operation.config.training_method in {"full", "freeze"}
+        and profile["profile"] == "primary")
+
+
+def _sample_ordinals(sample_ids: Sequence[str], count: int) -> list[int]:
+    ordinals = []
+    for value in sample_ids:
+        match = re.fullmatch(r"row:(0|[1-9][0-9]*)", value)
+        if match is None or int(match.group(1)) >= count:
+            raise ValueError("benchmark sample IDs must name rows of the registered dataset")
+        ordinals.append(int(match.group(1)))
+    return ordinals
+
+
+def _execute_train(operation: TrainOperation, directory: Path, timeout, canceled, backend, resolved, caches,
+                   roots, ops, profile) -> list[str]:
+    config = backend.validate_config(operation.config)
+    template = backend.translate(config, operation.model_input)
+    if yaml.safe_load(_read_small(directory / "train.yaml").decode("utf-8")) != template:
+        raise ValueError("training YAML differs from resolved configuration")
+    kind = STAGES[config.training_stage][1]
+    name, raw = _dataset_file(directory, "dataset", operation.dataset, kind)
+    if json.loads(_read_small(directory / "data" / "dataset_info.json")) != {
+            "factory_dataset": dataset_descriptor(raw, kind, name)}:
+        raise ValueError("dataset_info.json differs from the transferred dataset")
+    verified = verify_model_paths(resolved, operation, model_cache=caches[0], hf_home=caches[1],
+                                  inspect_targets=ops.inspect_target_modules)
+    write_bound_plan(directory, bind_training_plan(template, verified, approved_roots=roots))
+    from .worker import runtime_preflight_bound
+    _write_new(directory / PREFLIGHT, canonical(runtime_preflight_bound(config, verified)))
+    backend.run_config(directory, timeout, canceled, "train.bound.yaml", "train.log")
+    backend.validate_outputs(directory, config)
+    backend.validate_training_result(directory, config)
+    names = ["train.yaml", "train.bound.yaml", MODEL_BINDING, "binding-evidence.json", PREFLIGHT]
+    if _inspects_full_output(operation, profile):
+        _write_target_inventory(directory, directory / "output", ops)
+        names.append(TARGET_INVENTORY)
+    return names
+
+
+def _execute_evaluate(operation: EvaluateOperation, directory: Path, timeout, canceled, backend, resolved, caches,
+                      roots) -> list[str]:
+    benchmark = operation.benchmark
+    check_generation_benchmark(benchmark)
+    _, raw = _dataset_file(directory, "benchmark", benchmark.dataset, "instruction")
+    verified = verify_model_paths(resolved, operation, model_cache=caches[0], hf_home=caches[1])
+    base, adapter = _entry(verified, "operation_base"), _entry(verified, "operation_adapter")
+    evaluated = adapter or base
+    if benchmark.tokenizer_fingerprint != evaluated.staged.tokenizer_fingerprint:
+        raise ValueError("benchmark tokenizer differs from the evaluated model")
+    if evaluated.descriptor is None or evaluated.descriptor.semantic_kind != benchmark.semantic_model_kind:
+        raise ValueError("v2 evaluation supports greedy causal-LM generation benchmarks only")
+    rows, _, _ = parse_dataset(raw, "instruction")
+    ordinals = _sample_ordinals(benchmark.ordered_sample_ids, len(rows))
+    subset = json.dumps([rows[ordinal] for ordinal in ordinals], ensure_ascii=False).encode("utf-8")
+    _write_new(directory / "data" / "validation.json", subset)
+    _write_new(directory / "data" / "dataset_info.json", json.dumps({
+        "factory_validation": dataset_descriptor(subset, "instruction", "validation.json")}).encode("utf-8"))
+    _write_new(directory / MODEL_BINDING, canonical(_paths_binding(verified)))
+    from .worker import evaluation_preflight_bound
+    _write_new(directory / PREFLIGHT, canonical(evaluation_preflight_bound(
+        benchmark, verified, operation.resources.facts.gpu_count)))
+    plan = backend.prediction_plan(
+        benchmark, model_path=_approved_path(base.path, roots).as_posix(),
+        adapter_path=_approved_path(adapter.path, roots).as_posix() if adapter is not None else None,
+        max_samples=len(ordinals))
+    backend.predict_bound(directory, plan, benchmark.ordered_sample_ids, timeout, canceled)
+    return ["data/validation.json", "data/dataset_info.json", MODEL_BINDING, PREFLIGHT, "predict.yaml",
+            "output/predictions.json"]
+
+
+def _execute_model_operation(operation, directory: Path, canceled, resolved, caches, ops) -> list[str]:
+    verified = verify_model_paths(resolved, operation, model_cache=caches[0], hf_home=caches[1])
+    base = _local_model(verified, "operation_base")
+    parent = directory / MODEL_OP_PARENT
+    try:
+        parent.mkdir()   # exclusive: model_ops stages .model-op-* only inside this attempt's own parent
+    except FileExistsError as exc:
+        raise ValueError("model-operation output parent already exists; an attempt runs at most once") from exc
+    output = parent / "output"
+    _write_new(directory / MODEL_BINDING, canonical(_paths_binding(verified)))
+    if canceled():
+        raise CanceledError("cancellation requested")
+    device = _model_ops_device()
+    if isinstance(operation, MergeOperation):
+        inputs = tuple(_local_model(verified, "operation_adapter", index) for index in range(len(operation.models)))
+        receipt = MergeReceipt.model_validate(_dump(ops.merge_adapters(
+            inputs, operation.weights, output, base=base, policy=POLICY_F32_V1, device=device,
+            require_real=not operation.lineage.simulation)))
+        matches = receipt.inputs == operation.models
+    else:
+        adapter = _local_model(verified, "operation_adapter")
+        receipt = MaterializeReceipt.model_validate(_dump(ops.materialize_model(
+            StagedLoad(base=base, adapter=adapter), output, policy=POLICY_F32_V1, device=device)))
+        matches = (receipt.base, receipt.adapter) == (base.identity, operation.model)
+    check_link_free(output)
+    files = tuple(sorted(path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file()))
+    if not matches or receipt.policy_id != POLICY_F32_V1 or receipt.output_files != files:
+        raise ValueError("model-operation receipt differs from the operation or its output")
+    names = [MODEL_BINDING]
+    if isinstance(operation, MaterializeOperation):
+        _write_target_inventory(directory, output, ops)
+        names.append(TARGET_INVENTORY)
+    _write_new(directory / OPERATION_RECEIPT, canonical({
+        "schema_version": 1, "kind": operation.kind, "device": device, "output": f"{MODEL_OP_PARENT}/output",
+        "output_inventory_sha256": directory_inventory_sha256(output), "receipt": receipt.model_dump(mode="json")}))
+    return [*names, OPERATION_RECEIPT]
+
+
+def execute_operation(operation, directory: Path, timeout: float, canceled: Callable[[], bool], *,
+                      backend: LlamaFactoryBackend | None = None, model_cache: Path | None = None,
+                      hf_home: Path | None = None, ops=None) -> OperationResult:
+    """Run one verified operation in its launch directory; return its COMPLETED result, or raise.
+
+    ``worker.main_v2`` has already checked the request, manifest, runtime lock and engine, and fills
+    the attempt and manifest identities. Here: the operation runtime and model-operation pins, the
+    uploaded data, the staged model inputs against the worker's own cache roots (``model_cache`` and
+    ``hf_home`` come from the worker configuration, never from the request), then dispatch through the
+    kind allowlist. ``ops`` defaults to ``model_ops``; LocalSelect never reaches this function.
+    """
+    operation = _operation(operation)
+    directory = Path(directory).absolute()
+    if not _HEX32.match(directory.name):
+        raise ValueError("launch directory must be named by its 32-hex launch_id")
+    check_link_free(directory)
+    if model_cache is None:
+        raise ValueError("worker model cache is not configured")
+    caches = (Path(model_cache).absolute(), Path(hf_home).absolute() if hf_home is not None else None)
+    roots = tuple(root for root in caches if root is not None)
+    profile = operation_profile(operation.kind, operation.resources.runtime.profile)
+    if "model_ops_pins" in profile or _inspects_full_output(operation, profile):
+        drift = model_ops_pin_drift()   # before any work, without importing torch
+        if drift:
+            raise ValueError(f"{MODEL_OPS_RUNTIME}: {', '.join(drift)}")
+    if any(path.suffix in _WEIGHT_SUFFIXES for path in directory.rglob("*")):
+        raise ValueError("attempt directory must not contain model weights; stage them through the model cache")
+    if (directory / "output").exists() or (directory / "output").is_symlink():
+        raise ValueError("attempt output already exists")
+    resolved = ResolvedModelInputs.model_validate_json(_read_small(directory / MODEL_INPUTS))
+    backend = backend or LlamaFactoryBackend()
+    ops = ops or default_model_ops
+    if isinstance(operation, TrainOperation):
+        names = _execute_train(operation, directory, timeout, canceled, backend, resolved, caches, roots, ops,
+                               profile)
+    elif isinstance(operation, EvaluateOperation):
+        names = _execute_evaluate(operation, directory, timeout, canceled, backend, resolved, caches, roots)
+    elif isinstance(operation, (MergeOperation, MaterializeOperation)):
+        names = _execute_model_operation(operation, directory, canceled, resolved, caches, ops)
+    else:   # pragma: no cover - OperationSpec admits only the four kinds above
+        raise ValueError("unsupported operation kind")
+    return OperationResult(status="COMPLETED", launch_id=directory.name, operation_sha256=operation_sha256(operation),
+                           kind=operation.kind, engine_version=operation.resources.runtime.engine_version,
+                           evidence=_evidence(directory, (MODEL_INPUTS, *names)))

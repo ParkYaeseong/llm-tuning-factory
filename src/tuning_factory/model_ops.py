@@ -8,15 +8,22 @@ re-exported here. Policy ``model-ops-f32-v1`` computes in FP32 from an exact upc
 the inputs and stores every output tensor as F32. Inputs are ``LocalModel`` directories that the
 caller has already verified against their identity; the checks here repeat the cheap ones. The
 adapter conversion rules are graph_planner's public ``check_*`` rules, so planning and the worker agree.
+Outputs are staged in ``.model-op-*`` under the output's parent (the worker gives each attempt its own
+exclusive parent) and published by ``publish_output``: every file and directory is fsynced, and the
+move never replaces an existing path. transformers' platform-newline JSON in a materialized model is
+normalized to LF first, so the output inventory is the same on Windows and Linux.
 The continuation helpers at the end decide whether a child training run may resume a parent adapter.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
+import stat
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -39,6 +46,8 @@ from .model_artifacts import (
     _check_ancestors,
     _FileEntry,
     _files,
+    _json,
+    _not_link,
     _open_regular,
     _read_json,
     _tensor_header,
@@ -48,16 +57,16 @@ from .model_artifacts import (
 )
 from .runtime_profiles import model_ops_runtime
 from .safetensors_scan import scan_finite_safetensors
-from .target_inspection import inspect_target_modules, verify_inspected_targets
+from .target_inspection import inspect_linear_modules, inspect_target_modules, verify_inspected_targets
 
 __all__ = [
     "CONTINUATION_REFUSAL", "EXPORT_ONLY_ADAPTER_FIELDS", "POLICY_F32_V1", "TOLERANCE_POLICIES", "LocalModel",
     "MaterializeReceipt", "MergePlan", "MergeReceipt", "StagedLoad", "TolerancePolicy",
     "adapter_metadata_from_config", "check_continuation", "check_continuation_targets",
     "check_full_model_directory", "continuation_mismatches", "expected_continuation_adapter",
-    "inspect_target_modules", "local_config_sha256", "local_tokenizer_fingerprint", "materialize_model",
-    "merge_adapters", "scan_finite_safetensors", "validate_materialize_input", "validate_merge_inputs",
-    "verify_inspected_targets", "write_adapter_config",
+    "inspect_linear_modules", "inspect_target_modules", "local_config_sha256", "local_tokenizer_fingerprint",
+    "materialize_model", "merge_adapters", "normalize_json_newlines", "publish_output", "scan_finite_safetensors",
+    "validate_materialize_input", "validate_merge_inputs", "verify_inspected_targets", "write_adapter_config",
 ]
 
 POLICY_F32_V1 = "model-ops-f32-v1"
@@ -72,6 +81,10 @@ SHARD_INDEX = "model.safetensors.index.json"
 SINGLE_WEIGHTS = "model.safetensors"
 # transformers loads config.transformers_weights instead of model.safetensors/the index (modeling_utils).
 WEIGHT_REDIRECT = "config.json transformers_weights redirects the weight loader; refusing"
+OUTPUT_EXISTS = "model-operation output already exists"
+# JSON that transformers writes in text mode, i.e. with platform newlines (CRLF on Windows).
+TRANSFORMERS_JSON = ("config.json", "generation_config.json")
+AT_FDCWD, RENAME_NOREPLACE = -100, 1   # Linux renameat2(2)
 
 
 def _quantized(operation: str) -> str:
@@ -511,11 +524,122 @@ def _require_f32(directory: Path, *, adapter: bool) -> None:
 def _check_output(output) -> Path:
     output = Path(output).absolute()
     if output.exists() or output.is_symlink():
-        raise ValueError("model-operation output already exists")
+        raise ValueError(OUTPUT_EXISTS)
     _check_ancestors(output.parent)
     if not output.parent.is_dir():
         raise ValueError("model-operation output parent directory is missing")
     return output
+
+
+# -- durable, never-replacing publication of a finished output (stdlib only) ----------------------
+
+def normalize_json_newlines(directory: Path, names: Sequence[str] = TRANSFORMERS_JSON) -> None:
+    """Rewrite transformers' platform-newline JSON files with LF bytes, so output bytes match across hosts.
+
+    Only the named top-level files are touched (never tokenizer files, which are base bytes), and the
+    parsed JSON must be identical before and after.
+    """
+    directory = Path(directory).absolute()
+    for name in names:
+        path = directory / name
+        if not (path.exists() or path.is_symlink()):
+            continue
+        with _open_regular(path) as stream:
+            raw = stream.read()
+        normalized = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        if normalized == raw:
+            continue
+        try:
+            unchanged = _json(raw) == _json(normalized)
+        except ValueError as exc:
+            raise ValueError(f"invalid JSON in {name}; refusing newline normalization") from exc
+        if not unchanged:
+            raise ValueError(f"JSON newline normalization would change {name}")
+        with path.open("r+b") as stream:
+            stream.write(normalized)
+            stream.truncate()
+
+
+def _fsync_file(path: Path) -> None:
+    with Path(path).open("r+b") as stream:   # Windows commits only handles opened for writing
+        os.fsync(stream.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":   # Windows cannot open a directory for fsync; NTFS journals the metadata
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _renameat2_noreplace(source: Path, destination: Path, *, function=None) -> bool:
+    """Atomic Linux rename that refuses any existing destination; False when unsupported here."""
+    import ctypes
+    if function is None:
+        try:
+            function = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+        except (OSError, TypeError):
+            function = None
+        if function is None:
+            return False
+        function.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+        function.restype = ctypes.c_int
+    if function(AT_FDCWD, os.fsencode(source), AT_FDCWD, os.fsencode(destination), RENAME_NOREPLACE) == 0:
+        return True
+    code = ctypes.get_errno()
+    if code in {errno.ENOSYS, errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL),
+                getattr(errno, "EOPNOTSUPP", errno.EINVAL)}:
+        return False   # kernel or filesystem without RENAME_NOREPLACE: use the portable move
+    raise OSError(code, os.strerror(code), str(destination))
+
+
+def _move_tree_noreplace(source: Path, destination: Path) -> None:
+    """Portable no-replace move: create each directory exclusively and hard-link each file, then unlink."""
+    source, destination = Path(source), Path(destination)
+    os.mkdir(destination)   # FileExistsError for any existing path, even an empty directory
+    for child in sorted(source.iterdir()):
+        target = destination / child.name
+        if stat.S_ISDIR(_not_link(child).st_mode):
+            _move_tree_noreplace(child, target)
+        else:
+            os.link(child, target)   # refuses an existing target, unlike rename
+            os.unlink(child)
+    _fsync_directory(destination)
+    os.rmdir(source)
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    if os.name == "nt":
+        os.rename(source, destination)   # MoveFileExW without REPLACE_EXISTING refuses any existing path
+    elif not _renameat2_noreplace(source, destination):
+        _move_tree_noreplace(source, destination)
+
+
+def publish_output(payload: Path, output: Path) -> None:
+    """Durably move a finished payload to the new path ``output``; never replace an existing path.
+
+    Every file and directory is fsynced before the move (as ``ModelArtifactStore.freeze`` does for its
+    files) and the parent afterwards. The move itself refuses an existing destination, including an
+    empty directory created after the check below.
+    """
+    payload, output = Path(payload).absolute(), Path(output).absolute()
+    _check_ancestors(output.parent)
+    if output.exists() or output.is_symlink():
+        raise ValueError(OUTPUT_EXISTS)
+    files = _files(payload)   # link-free regular files only
+    for _, file in files:
+        _fsync_file(file)
+    directories = {payload, *(path for path in payload.rglob("*") if path.is_dir())}
+    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+        _fsync_directory(directory)
+    try:
+        _rename_noreplace(payload, output)
+    except FileExistsError as exc:
+        raise ValueError(OUTPUT_EXISTS) from exc
+    _fsync_directory(output.parent)
 
 
 def _copy_snapshot_files(source: Path, target: Path, *, config: bool) -> None:
@@ -601,7 +725,7 @@ def merge_adapters(inputs: Sequence[LocalModel], weights: Sequence[float], outpu
         delta_error, logits_error = _verify_merge(torch, peft, transformers, inputs, plan, base_path, payload,
                                                   target, tolerance, probe_ids)
         files = _output_files(payload)
-        payload.rename(output)
+        publish_output(payload, output)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return MergeReceipt(policy_id=tolerance.policy_id, inputs=plan.inputs, normalized_weights=plan.normalized_weights,
@@ -664,6 +788,9 @@ def materialize_model(input: StagedLoad, output: Path, *, policy: str = POLICY_F
         merged.save_pretrained(str(payload), safe_serialization=True)
         del merged, model
         (payload / "README.md").unlink(missing_ok=True)
+        # transformers wrote config.json/generation_config.json with platform newlines; the output
+        # inventory must not depend on the host, so they become LF before anything is listed or hashed.
+        normalize_json_newlines(payload)
         _copy_snapshot_files(base_path, payload, config=False)
         _require_f32(payload, adapter=False)
         if local_tokenizer_fingerprint(payload) != load.base.tokenizer_fingerprint:
@@ -677,7 +804,7 @@ def materialize_model(input: StagedLoad, output: Path, *, policy: str = POLICY_F
         if not ok:
             raise ValueError(LOGITS_FAILED)
         files = _output_files(payload)
-        payload.rename(output)
+        publish_output(payload, output)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return MaterializeReceipt(policy_id=tolerance.policy_id, base=load.base.identity, adapter=load.adapter.identity,

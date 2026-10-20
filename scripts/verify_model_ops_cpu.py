@@ -564,6 +564,84 @@ class Acceptance:
 
         self.record("target_inspection_exact_and_verified", inspection)
 
+    def check_execute_operation(self):
+        """Task 7.3: the worker dispatch (stage -> verify -> model_ops -> publish) end to end, CPU only."""
+        from datetime import datetime, timezone
+
+        from tuning_factory.executor_profiles import ExecutorProfile, ResourceFacts
+        from tuning_factory.operation_runner import execute_operation, stage_model_inputs
+        from tuning_factory.operations import (
+            MaterializeOperation,
+            MergeOperation,
+            OperationLineage,
+            OperationResources,
+            RuntimeProfile,
+        )
+        inventory = self.artifacts.directory_inventory_sha256
+        lock = REPO / "containers" / "gpu-requirements.lock"
+        resources = OperationResources(
+            executor=ExecutorProfile(profile_id="cpu-acceptance", revision="1", name="CPU acceptance",
+                                     pod_id="cpu-acceptance", credential_scope="local"),
+            facts=ResourceFacts(pod_id="cpu-acceptance", gpu_type="CPU", gpu_count=1, total_hourly_cost_usd=0,
+                                observed_at=datetime(2026, 10, 20, tzinfo=timezone.utc)),
+            timeout_seconds=1800,
+            runtime=RuntimeProfile(profile="primary", engine_version="0.9.5", dependency_sha256=sha256_file(lock)))
+        # The fixtures are synthetic, so the operations are simulation lineage (require_real=False).
+        lineage = OperationLineage(project_id="cpu-acceptance", project_revision="0" * 64, node_id="operation",
+                                   plan_sha256="0" * 64, simulation=True)
+        launches = self.work / "launches" / ("a" * 32)
+
+        def run(operation, launch_id):
+            directory = launches / launch_id
+            stage_model_inputs(operation, self.store, directory)
+            result = execute_operation(operation, directory, 1800, lambda: False, model_cache=self.store.root)
+            self.receipts[f"execute_{operation.kind}"] = json.loads(
+                (directory / "operation-receipt.json").read_text(encoding="utf-8"))
+            return directory, result
+
+        def adapters():
+            # Same seeds and ranks as the direct fixtures, but on the frozen base artifact (no HF download).
+            self.op_adapters = tuple(self.make_adapter(f"op-adapter-r{rank}", rank, alpha, seed,
+                                                       base_dir=self.base_dir, effective_base=self.base_ref,
+                                                       parents=(self.base_ref,))
+                                     for rank, alpha, seed in ((2, 4, 1), (3, 9, 2)))
+
+        self.operation("execute_operation_fixtures", adapters)
+
+        def merge():
+            operation = MergeOperation(models=tuple(model.identity for model in self.op_adapters),
+                                       weights=(0.25, 0.75), resources=resources, lineage=lineage)
+            directory, result = run(operation, "b" * 32)
+            output = directory / "model-op" / "output"
+            receipt = self.receipts["execute_merge"]
+            return {"passed": result.status == "COMPLETED" and result.kind == "merge"
+                    and receipt["receipt"]["output_rank"] == 5
+                    and receipt["output_inventory_sha256"] == inventory(output) == inventory(self.merged_dir)
+                    and set(result.evidence) == {"model-inputs.json", "model-binding.json", "operation-receipt.json"},
+                    "output_inventory_sha256": inventory(output), "direct_inventory_sha256": inventory(self.merged_dir),
+                    "max_abs_error": receipt["receipt"]["max_abs_delta_error"]}
+
+        def materialize():
+            operation = MaterializeOperation(model=self.op_adapters[0].identity, resources=resources,
+                                             lineage=lineage)
+            directory, result = run(operation, "c" * 32)
+            output = directory / "model-op" / "output"
+            receipt = self.receipts["execute_materialize"]
+            targets = json.loads((directory / "target-inventory.json").read_text(encoding="utf-8"))["modules"]
+            text = {name: (output / name).read_bytes() for name in ("config.json", "generation_config.json")
+                    if (output / name).exists()}
+            tokenizer = all((output / name).read_bytes() == (self.base_dir / name).read_bytes()
+                            for name in ("tokenizer.json", "tokenizer_config.json"))
+            return {"passed": result.status == "COMPLETED" and "config.json" in text
+                    and not any(b"\r" in data for data in text.values()) and tokenizer and len(targets) == 14
+                    and receipt["output_inventory_sha256"] == inventory(output) == inventory(self.materialized),
+                    "output_inventory_sha256": inventory(output),
+                    "direct_inventory_sha256": inventory(self.materialized), "lf_only_json": sorted(text),
+                    "target_modules": len(targets), "max_abs_error": receipt["receipt"]["max_abs_delta_error"]}
+
+        self.record("execute_operation_merge_end_to_end", merge)
+        self.record("execute_operation_materialize_end_to_end", materialize)
+
     def run(self):
         from unittest import mock
 
@@ -578,7 +656,8 @@ class Acceptance:
         with mock.patch.object(peft_save, "check_file_exists_on_hf_hub", hub_lookup):
             try:
                 for phase in (self.check_fixtures, self.check_merge, self.check_materialize, self.check_parent_child,
-                              self.check_frozen_reference, self.check_nonfinite, self.check_targets):
+                              self.check_frozen_reference, self.check_nonfinite, self.check_targets,
+                              self.check_execute_operation):
                     phase()
             except PrerequisiteFailed as exc:
                 self.stopped_after = str(exc)   # dependent checks did not run; the receipt says so

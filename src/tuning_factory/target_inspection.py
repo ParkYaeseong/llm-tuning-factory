@@ -47,13 +47,24 @@ def verify_inspected_targets(evidence, descriptor: ModelDescriptor, ref: ModelAr
 
 def inspect_target_modules(model_dir: Path, base: BaseRef) -> ModelTargetEvidence:
     """Meta-device inventory of every LoRA-targetable Linear module (LLaMA-Factory's rule)."""
-    from .graph_planner import ModelTargetEvidence, TargetModuleEvidence
-    from .runtime_profiles import model_ops_runtime
+    from .graph_planner import ModelTargetEvidence
     model_dir = Path(model_dir).absolute()
     if isinstance(base, HFRootRef):
         with _open_regular(model_dir / "config.json") as stream:
             if hashlib.file_digest(stream, "sha256").hexdigest() != base.config_sha256:
                 raise ValueError("model config snapshot fingerprint mismatch")
+    return ModelTargetEvidence(base=base, modules=inspect_linear_modules(model_dir))
+
+
+def inspect_linear_modules(model_dir: Path) -> tuple:
+    """The sorted ``TargetModuleEvidence`` of a local full model, before it has an artifact identity.
+
+    The worker writes these for full-model outputs; the control plane binds them to the frozen
+    artifact and accepts them only through ``verify_inspected_targets``.
+    """
+    from .graph_planner import TargetModuleEvidence
+    from .runtime_profiles import model_ops_runtime
+    model_dir = Path(model_dir).absolute()
     torch, _, _, transformers = model_ops_runtime()
     config = transformers.AutoConfig.from_pretrained(str(model_dir), local_files_only=True)
     with torch.device("meta"):
@@ -68,4 +79,4 @@ def inspect_target_modules(model_dir: Path, base: BaseRef) -> ModelTargetEvidenc
          for name, module in model.named_modules()
          if "Linear" in type(module).__name__ and "Embedding" not in type(module).__name__
          and not any(item in name for item in excluded)), key=lambda item: item.name)
-    return ModelTargetEvidence(base=base, modules=tuple(modules))
+    return tuple(modules)

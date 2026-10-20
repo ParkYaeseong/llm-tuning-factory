@@ -523,10 +523,36 @@ def test_completed_verification_cache_does_not_survive_public_calls(tmp_path):
 def test_shared_verification_cache_never_skips_active_cycle_check(tmp_path):
     store, _, _, refs = make_shared_lineage(tmp_path, count=2)
     identity = (refs[0].artifact_id, refs[0].inventory_sha256)
-    completed = {identity: store.get(refs[0])}
+    verifier = store.verifier()
+    verifier.verify(refs[0])
+    assert identity in verifier._completed
     # A completed node cannot legitimize a reference back into the active path.
     with pytest.raises(ValueError, match='cyclic'):
-        store._verify(refs[0], {identity}, completed)
+        verifier._verify(refs[0], frozenset({identity}))
+
+
+def test_entry_only_verification_cache_cannot_reach_a_lineage_verifier(tmp_path):
+    module = api()
+    store, _, _, _ = make_shared_lineage(tmp_path, count=2)
+    # Each verifier owns its completed-cache; nobody can hand an entry-only cache to a lineage verifier.
+    with pytest.raises(TypeError):
+        module.ArtifactVerifier(store.root, completed={})
+    # lineage=False is the worker's entry-only mode; the control-plane store never offers it.
+    with pytest.raises(TypeError):
+        store.verifier(lineage=False)
+    assert store.verifier().lineage is True
+    assert not hasattr(store, '_verify')
+    worker, control = module.ArtifactVerifier(store.root, lineage=False), store.verifier()
+    assert worker._completed is not control._completed
+
+
+def test_directory_inventory_sha256_is_the_frozen_inventory_identity(tmp_path):
+    module = api()
+    directory, descriptor = fixture_model(tmp_path)
+    store = module.ModelArtifactStore(tmp_path / 'store')
+    ref = store.freeze(directory, descriptor)
+    assert module.directory_inventory_sha256(directory) == ref.inventory_sha256
+    assert module.directory_inventory_sha256(store.path(ref)) == ref.inventory_sha256
 
 
 def test_historical_descriptor_identity_survives_added_effective_option_defaults(tmp_path):

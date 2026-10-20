@@ -394,16 +394,98 @@ Verification after the review fixes:
   `66d599bb1c57e14a2d6fe0cd33f02f5c93cd891f84cff5f9604b807ef9564b62`, and lock_sha256
   `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437` unchanged.
 
+Task 7.3 (2026-10-20, sub-plan §3 7.3): worker protocol v2 and operation dispatch.
+- `operation_runner` adds `WorkerRequest` (`command.json`: canonical bytes, SHA256 on the worker argv), `StartMarker`
+  (`start.json`), `OperationResult` (`result.json`, atomic) and `execute_operation(operation, directory, timeout,
+  canceled, *, backend, model_cache, hf_home, ops)`. The dispatch allowlist is train/evaluate/merge/materialize;
+  LocalSelect is refused (`local selection never dispatches to a GPU worker`).
+- `worker DIRECTORY --request SHA256` runs `main_v2`. It requires `<job_id>/<launch_id>` 32-hex directories (else exit 2,
+  nothing written), reads and hash-checks `command.json`, then creates `start.json` with `O_CREAT|O_EXCL`. Only the
+  creator of the start marker writes anything else: a second start exits 3 and touches nothing, so a lost start
+  response can never become a second training run, and the marker and the result carry the same `launch_id`. The
+  checks then run in order: launch identity, manifest hash and schema 2, operation hash, kind allowlist, resolved form,
+  simulation refusal, source hash, request timeout equal to the operation budget, `FACTORY_GPU_LOCK_FILE` hash equal to
+  `runtime.dependency_sha256`, LLaMA-Factory version, manifest datasets equal to the operation's, and
+  `FACTORY_MODEL_CACHE`. A result reports identities only as far as they were verified. `--verify-model-cache DIR
+  ARTIFACT_ID INVENTORY_SHA256` is the fixed-argv cache check for 7.4 (exit 0/1, never deletes). The v1 argv, body and
+  `test_remote_worker.py` are unchanged (389 lines added, 0 removed); `runtime_preflight`'s tokenizer comparison became
+  the identical helper `_same_tokenizer`.
+- Train: the logical template is recomputed and must equal the uploaded `train.yaml`; data and `dataset_info.json`
+  are hash-checked. Then `verify_model_paths` (with `model_ops.inspect_target_modules` as `inspect_targets`) →
+  `bind_training_plan(approved_roots=(FACTORY_MODEL_CACHE, HF_HOME))`, from the worker's environment, never the request
+  → `write_bound_plan` → `runtime_preflight_bound` (AutoConfig/AutoTokenizer only on the bound local policy base with
+  `local_files_only`; cutoff checked against the bound config; a full PPO reward's tokenizer is compared on its bound
+  path) → `run_config(..., "train.bound.yaml")` → output validation. Full/freeze outputs in the primary runtime get
+  `target-inventory.json` (modules only, via the new `inspect_linear_modules`); 7.5 binds it to the frozen artifact
+  through `verify_inspected_targets`.
+- Evaluate: the registered benchmark bytes are uploaded as `data/benchmark.<json|jsonl>` (`write_benchmark_data`). The
+  worker derives `data/validation.json` in `ordered_sample_ids` order and runs `predict_bound` on
+  `prediction_plan(...)`: bound paths, benchmark template, cutoff, max_new_tokens, seed, `do_sample: false`, fp16/bf16
+  and the benchmark quantization. Output is `output/predictions.json` with predictions only. `sample`, `fp32`,
+  `reward_model` semantics and a benchmark tokenizer that differs from the model are refused;
+  `evaluation_preflight_bound` checks GPU, BF16 and context on the bound model.
+- Merge/materialize: these require the primary runtime (`operation_profile`) and installed `MODEL_OPS_PINS` (checked
+  with package metadata before any work). Each execution creates its own exclusive output parent `model-op/` (an
+  existing one, for example with a crashed run's `.model-op-*` staging, is refused and left untouched). The receipt
+  must name this operation, the F32 policy and the exact output files. `operation-receipt.json` records the output
+  `directory_inventory_sha256`. Materialize also writes `target-inventory.json`.
+- Output safety (7.1 review M6): `model_ops.publish_output` fsyncs every payload file and directory, then moves
+  without ever replacing a path. On Windows this uses `os.rename`; on Linux, `renameat2(RENAME_NOREPLACE)`, with a
+  portable fallback that creates each directory exclusively and hard-links each file. The parent directory is fsynced
+  after the move. An existing file, an empty directory, or an empty directory created in the race window is refused.
+- Platform newlines: transformers 5.6.0 writes `config.json`/`generation_config.json` with CRLF on Windows (probed).
+  `materialize_model` now rewrites them to LF (the parsed content must be unchanged; tokenizer files are never
+  touched) before listing or hashing, so the output inventory no longer depends on `os.linesep`.
+- Earlier failures: staging now runs `check_full_model_directory` on every full-model artifact and the pre-quantized
+  `config.json` rule (QLoRA policy base, merge/materialize base), and the worker's `verify_model_paths` applies the
+  same rule to merge/materialize bases. Both run before any engine starts.
+- Verifier hardening: `ArtifactVerifier(completed=)` is gone (each verifier owns a private cache), and
+  `ModelArtifactStore.verifier()` takes no `lineage` argument, so entry-only verification is the worker's alone. The
+  store's private `_verify` was removed and the cycle test migrated to a verifier.
+- Added the missing `EvaluateOperation` staging test.
+
+Deviations from the sub-plan:
+- `execute_operation` returns the COMPLETED result and raises on failure. `main_v2` fills `attempt_id` and
+  `manifest_sha256` and turns exceptions into FAILED/CANCELED results.
+- Merge/materialize outputs live in `model-op/output`, not `output/`.
+- `predict_bound(directory, plan, sample_ids, timeout, canceled)` is paired with a static `prediction_plan`;
+  `evaluation_preflight_bound` and `inspect_linear_modules` are new.
+- `target-inventory.json` has no base reference (the output has no identity yet) and is not written in the PPO runtime,
+  whose transformers differs from `MODEL_OPS_PINS` (fail-closed: a PPO full output carries no inspected targets).
+- `test_model_inputs.py::test_qlora_child_requires_unquantized_full_base` now expects the staging refusal; the
+  test fixture `peft_adapter` gains `config=`.
+
+Actual verification:
+- RED: 48 new tests failed on the missing protocol, dispatch, publishing, verifier and staging behaviour.
+- GREEN: the sub-plan set (`test_remote_worker`, `test_model_ops_contract`, `test_model_inputs`, `test_runtime_profiles`)
+  gave **228 passed**. `uv run pytest -q` gave **975 passed, 1 skipped**.
+- Ruff is clean, `check_secrets.py` reports 0 findings, both GPU locks are unchanged, `git ls-files --eol` shows no CRLF,
+  and the main `.venv` has no torch/peft/transformers/safetensors/huggingface_hub.
+- The CPU acceptance (`-I`) exited 0 with all **28** checks passed: the 25 from 7.1/7.2 with unchanged max errors
+  (merge delta 7.78e-9, materialize delta 9.17e-9, parent→child 6.42e-9, logits 3.35e-8/2.98e-8), plus three new 7.3
+  checks. `execute_operation_fixtures` builds adapters on the frozen base artifact, so nothing is downloaded.
+  `execute_operation_merge_end_to_end` runs stage → `execute_operation` → `model_ops` → `publish_output`.
+  `execute_operation_materialize_end_to_end` also checks LF-only JSON, base tokenizer bytes and a 14-module
+  `target-inventory.json`. The dispatched outputs are byte-identical to the direct `model_ops` outputs (merge inventory
+  `cc5fbab0…b54c`, materialize `e124a915…8682`). Receipt SHA256
+  `3890086443760e87afd03bfee924c42fabbba120c94cf8c51de6ee16f6c0cee3` (byte-identical on a second run), source_sha256
+  `c58b9786fc27bed0fc5fe8024eadf9cf6479c10d6e737cd98e3be0e4363793fe`, lock_sha256 `5883aae6…1437` unchanged;
+  `model_downloaded`, `gpu_used`, `institution_data_used` and `production_promotable` are false.
+
 Still open for Task 7 GPU work:
 - Hardware and numerics: merge/materialize tolerances at real model sizes on CUDA (TF32 off); memory (FP32 loads;
   about 3 base loads per merge); a BF16 storage policy (none yet; F32 doubles size).
-- Worker v2 (7.3): wire `verify_model_paths` → `bind_training_plan(approved_roots=<configured cache, HF_HOME>)` →
-  `write_bound_plan`, with `model_ops.inspect_target_modules` as `inspect_targets`.
-- SSH cache and single launch (7.4): remote cache entries must stay link-free (uploaded directories moved with
-  `mv -T`, never symlinked). HF_HOME and the model cache on the GPU host must not sit under a symlink or junction, and
-  HF roots are resolved on the worker, never uploaded.
-- Attempt runner (7.5, including F11).
-- Real LF training on a bound YAML, real DPO/KTO references and PPO remain unverified.
+- Worker v2 on a real GPU host: real LF training on `train.bound.yaml`, real `predict_bound` generation, real
+  `runtime_preflight_bound`/`evaluation_preflight_bound` facts and `renameat2` on the host filesystem are unverified
+  (all tested with fakes). Merge/materialize cannot be interrupted mid-operation; the executor deadline applies.
+- SSH cache and single launch (7.4): `run_operation`, the remote `start.json`/`result.json` check before upload,
+  `start.json` in the upload exclusions, `>>` log append, and `--verify-model-cache` over fixed argv. Remote cache
+  entries must stay link-free (uploaded directories moved with `mv -T`, never symlinked). HF_HOME and the model cache
+  on the GPU host must not sit under a symlink or junction, and HF roots are resolved on the worker, never uploaded.
+- Attempt runner (7.5, including F11): write `command.json`, upload benchmark bytes with `write_benchmark_data`, read
+  outputs from `output/` (train) or `model-op/output` (merge/materialize), bind `target-inventory.json` to the frozen
+  ref, and compare the frozen `inventory_sha256` with `operation-receipt.json`.
+- Real DPO/KTO references and PPO remain unverified.
 
 ---
 

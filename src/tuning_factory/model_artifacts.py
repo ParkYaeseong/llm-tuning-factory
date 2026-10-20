@@ -320,6 +320,11 @@ def tokenizer_fingerprint(directory: str | Path) -> str:
     return _tokenizer_hash(_inventory(Path(directory).absolute()))
 
 
+def directory_inventory_sha256(directory: str | Path) -> str:
+    """The ``inventory_sha256`` that ``ModelArtifactStore.freeze`` records for these exact file bytes."""
+    return digest(_inventory_bytes(_inventory(Path(directory).absolute())))
+
+
 def _tensor_header(path: Path, relative: str) -> tuple[TensorMetadata, ...]:
     with _open_regular(path) as stream:
         prefix = stream.read(8)
@@ -513,16 +518,17 @@ class ArtifactVerifier:
     """Verifies each artifact at most once while it lives; create one per public operation.
 
     ``lineage=True`` (the control-plane store) also verifies every ancestor and the lineage rules.
-    ``lineage=False`` verifies each entry alone, for a worker cache that holds only the roles an
-    operation binds. ``verify``, ``path``, ``validate_input`` and lineage share one completed-cache, so a
-    shared base is hashed once per operation, and nothing verified survives the instance.
+    ``lineage=False`` verifies each entry alone, for the GPU worker's own cache that holds only the
+    roles an operation binds; ``ModelArtifactStore`` never offers it. ``verify``, ``path``,
+    ``validate_input`` and lineage share one private completed-cache, so a shared base is hashed once per
+    operation, and nothing verified survives the instance or reaches another verifier.
     """
 
-    def __init__(self, root: str | Path, *, lineage: bool = True, completed: dict | None = None):
+    def __init__(self, root: str | Path, *, lineage: bool = True):
         self.root = Path(root).absolute()
         _check_ancestors(self.root)
         self.lineage = lineage
-        self._completed = {} if completed is None else completed
+        self._completed = {}
 
     def location(self, ref: ModelArtifactRef) -> Path:
         ref = ModelArtifactRef.model_validate(ref)
@@ -617,9 +623,12 @@ class ModelArtifactStore:
         _check_ancestors(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def verifier(self, *, lineage: bool = True) -> ArtifactVerifier:
-        """A verifier whose completed-cache spans one public operation (each artifact hashed once)."""
-        return ArtifactVerifier(self.root, lineage=lineage)
+    def verifier(self) -> ArtifactVerifier:
+        """A lineage verifier whose completed-cache spans one public operation (each artifact hashed once).
+
+        The control-plane store always verifies lineage; entry-only verification is the worker's alone.
+        """
+        return ArtifactVerifier(self.root)
 
     def _location(self, ref: ModelArtifactRef) -> Path:
         return self.root / ref.artifact_id / ref.inventory_sha256
@@ -667,9 +676,6 @@ class ModelArtifactStore:
         finally:
             if temporary.exists():
                 shutil.rmtree(temporary)
-
-    def _verify(self, ref: ModelArtifactRef, active: set, completed: dict) -> ModelDescriptor:
-        return ArtifactVerifier(self.root, completed=completed)._verify(ref, frozenset(active))
 
     def get(self, ref: ModelArtifactRef) -> ModelDescriptor:
         return self.verify(ref)
