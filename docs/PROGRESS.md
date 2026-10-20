@@ -3476,6 +3476,7 @@ Actual verification:
 Not verified or still open:
 - Real WebView2 (dialogs, focus, the views in the `import.meta.glob` bundle) and a real sidecar: Task 11.
 - Deleting projects or recipes has no action; graph editing (10.5) and data import (10.3) are separate sub-tasks.
+- No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
 
 ## Task 9.6 CLI: project and graph commands, 2026-10-21
 
@@ -3727,12 +3728,22 @@ Actual verification (main venv, `PYTHONPATH` on the worktree `src`, `--basetemp`
     2c1956d55a62b2a0eb8ec1631fe71e52a21c6782744bfecfd1284f11389f52e8`, equal to `source_hash()` of the tree.
 - Ruff is clean. `check_secrets.py` reports 0 findings with the change staged. Every changed file is LF only.
   `git diff --exit-code desktop/ containers/ pyproject.toml uv.lock` is clean.
-- CPU acceptance (`-I`, wt94b's script and receipt): exit 0, **29/29**.
+- Pre-rebase CPU acceptance on `6c4b877`/`0c38b3f` (superseded by the `aef4e294…` receipt above; `-I`, wt94b's
+  script and receipt): exit 0, **29/29**.
   - Receipt SHA256 `e1d07227a2c426e6122db546b61e9ba671bfcc6d768706b0d7c75bb7808c58b8`.
   - `source_sha256 b0f24bdf6100ba09de7633217ee509f0c0beca4b6d9959dc72a94eac0fbec53f`, equal to `source_hash()` of the
     tree.
   - `lock_sha256 5883aae6…1437`.
 - No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
+- Re-review of `d227b7d`: ready to merge. Two notes it recorded:
+  - **TLS behaviour change.** Graph controllers, both the desktop sidecar and the CLI `graph-work`, now pop
+    `MLFLOW_TRACKING_INSECURE_TLS` and the mTLS `MLFLOW_TRACKING_CLIENT_CERT_PATH`, which v1 `work` honours.
+    - A self-signed MLflow server needs `MLFLOW_TRACKING_SERVER_CERT_PATH`, which is kept, as are `REQUESTS_CA_BUNDLE`
+      and `SSL_CERT_FILE`.
+    - mTLS MLflow is not supported for graph runs.
+  - **Status poll timing.** The 5 s bound measures about 1.37× on Windows, roughly 6.8 s, because of SQLite
+    busy-handler sleep granularity. Task 10 spaces polls by measured call time (D10), so a slow poll delays the next
+    one instead of piling up.
 
 ## Task 10.1 review fixes: typed drafts across deferred renders, guarded view hooks, 2026-10-21
 
