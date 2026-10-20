@@ -10,6 +10,8 @@ import { benchmarkFormHtml, benchmarkProblems, benchmarkSpec, EVALUATOR_LABELS, 
   type BenchmarkDraft, type RowCounts } from "../components/benchmark-form";
 import { captureRootsForm, findRoot, inspectModel, inspectTargets, loadRoots, modelRootsPanel, pickModel, rootsState,
   searchModels, snapshotRoot } from "../components/model-roots";
+import { applyPlanningInputs, bindPlanPanel, capturePlanPanel, planAction, planFeedback, planPanelBody, planPanelHtml,
+  readPlanningInputs, type PlanEnv, type PlanView } from "../components/plan-panel";
 import { addNode, addParallel, addSerial, connect, findNode, graphToJson, initializationFor, inputOptions, isRef, KIND_LABELS,
   labelOf, layout, localIssues, MAX_NODES, metricChoices, NOTES, outputRef, percentText, previewSvg, readGraph, REASONS,
   removeNode, rootInput, sameRoot, selectionEvaluators, serialKinds, starter, upstreamRoot, waitingOnSharedProfile,
@@ -20,6 +22,7 @@ import { createQueue } from "../poller";
 import type { ProjectDraft } from "../project-store";
 import type { View, ViewContext } from "../view-types";
 import { button, errorText, escapeHtml, focusKey, openDialog, restoreFocus, statusPill } from "../workbench";
+import { sessionInspections } from "./executor-profiles";
 import type { BenchmarkRevision, HFRootRef, PublicProfile, RecipeRevision, RecipeSummary, Sha256, WorkflowIssue,
   WorkflowResult } from "../workflow-types";
 
@@ -131,18 +134,27 @@ function rowCounts(ctx: ViewContext, draft: ProjectDraft): RowCounts {
 }
 
 // -- what one render shows --
+/** `issues`/`warnings`: the validation's and the store's, plus the plan panel's for cards and fields (10.6). */
 interface Shown { projectId: string; draft: ProjectDraft; graph: GraphJson; dctx: DraftContext; plan: ReturnType<typeof layout>;
-  local: WorkflowIssue[]; waiting: Set<string>; selected: string | null; saved: string[] }
+  local: WorkflowIssue[]; waiting: Set<string>; selected: string | null; saved: string[]; issues: WorkflowIssue[]; warnings: WorkflowIssue[] }
 function shown(ctx: ViewContext): Shown | null {
   const draft = draftOf(ctx);
   if (!draft || !ctx.arg) return null;
   const graph = graphOf(draft);
   const dctx = draftContext(draft);
+  const planned = planFeedback(draft);
   return { projectId: ctx.arg, draft, graph, dctx, plan: layout(graph), local: localIssues(graph, dctx), waiting: waitingOnSharedProfile(graph),
-    selected: selectedIn(ctx.arg, graph), saved: savedIds(draft) };
+    selected: selectedIn(ctx.arg, graph), saved: savedIds(draft), issues: [...draft.issues, ...planned.issues],
+    warnings: [...draft.warnings, ...planned.warnings] };
 }
-const cardIssues = (view: Shown, id: string) => nodeIssues(view.draft.issues, id, view.saved);
-const cardWarnings = (view: Shown, id: string) => nodeIssues(view.draft.warnings, id, view.saved);
+const cardIssues = (view: Shown, id: string) => nodeIssues(view.issues, id, view.saved);
+const cardWarnings = (view: Shown, id: string) => nodeIssues(view.warnings, id, view.saved);
+/** What the plan panel shows besides the draft (10.6). */
+function planView(ctx: ViewContext, draft: ProjectDraft): PlanView {
+  return { profiles: profileList ?? [], inspections: sessionInspections(), settings: ctx.settings, recipes: draftContext(draft).recipes,
+    usable: ctx.store.planUsable(draft.projectId) };
+}
+const planEnv = (draft: ProjectDraft): PlanEnv => ({ recipes: draftContext(draft).recipes, profiles: profileList ?? [], queue });
 
 /** The module-structure hint of a card: its train input is a root without evidence, or a check asked for evidence. */
 function targetsHint(view: Shown, node: NodeJson): { text: string; short: string; root: HFRootRef | null } | null {
@@ -461,7 +473,7 @@ const FORM_FIELDS: Record<NodeKind, string[]> = {
 };
 function fieldIssuesFor(view: Shown, nodeId: string) {
   const index = view.saved.indexOf(nodeId);
-  return (field: string) => index < 0 ? [] : issuesAt(view.draft.issues, `/graph/nodes/${index}/${field}`);
+  return (field: string) => index < 0 ? [] : issuesAt(view.issues, `/graph/nodes/${index}/${field}`);
 }
 /** The card's reasons, missing fields, check results not shown under a field, plan warnings and the targets hint. */
 function nodeReasonsHtml(view: Shown, node: NodeJson): string {
@@ -525,7 +537,8 @@ function graphPage(ctx: ViewContext): string {
     <section class="card graph-centre" aria-labelledby="graph-cards-title"><div class="section-title"><h3 id="graph-cards-title">단계 카드 <span class="count">${view.graph.nodes.length}</span></h3></div>
       <div id="graph-cards">${cardsHtml(ctx, view)}</div><div id="graph-toolbar">${toolbarHtml(ctx, view)}</div>
       <div id="graph-preview" class="graph-preview">${previewHtml(view)}</div></section>
-    <div class="graph-detail">${nodeFormHtml(ctx, view)}${benchmarkHtml(ctx, view)}</div></div></div>`;
+    <div class="graph-detail">${nodeFormHtml(ctx, view)}${benchmarkHtml(ctx, view)}</div></div>
+    ${planPanelHtml(view.draft, planView(ctx, view.draft), ctx.busy)}</div>`;
 }
 
 /** Re-renders what a typed value changes, without touching the control being typed in. */
@@ -540,6 +553,17 @@ function refreshDerived(ctx: ViewContext) {
   if (node && document.getElementById("node-reasons")) ctx.patch("node-reasons", nodeReasonsHtml(view, node), options);
   if (node && document.getElementById("merge-sum")) ctx.patch("merge-sum", escapeHtml(mergeSum(node as Obj)), options);
   if (document.getElementById("graph-settings-note")) ctx.patch("graph-settings-note", settingsNoteHtml(view), options);
+  // A draft edit drops a held plan and changes what the plan panel can do (10.6).
+  if (document.getElementById("plan-panel")) {
+    capturePlanPanel();
+    ctx.patch("plan-panel", planPanelBody(view.draft, planView(ctx, view.draft), ctx.busy), options);
+    bindPlan(ctx);                                         // the patch replaced its forms (the shell rebinds only actions)
+  }
+}
+function bindPlan(ctx: ViewContext) {
+  const projectId = ctx.arg;
+  if (projectId && document.getElementById("plan-panel"))
+    bindPlanPanel(ctx, projectId, () => planView(ctx, ctx.store.draft(projectId)!), () => profileList ?? []);
 }
 /** A full render that keeps the focus on the control that changed (by its focus key). */
 function rerender(ctx: ViewContext, key: string | null) {
@@ -763,11 +787,14 @@ async function enterGraph(ctx: ViewContext) {
   if (!projectId) return;
   loadIssues.delete(projectId);
   await ctx.task("학습 그래프 불러오는 중", async () => {
+    // The stored planning inputs first (read-only, 9.8), then the project and its lists as before (10.6).
+    await queue.run(() => readPlanningInputs(projectId));
     const opened = await queue.run(() => ctx.store.open(projectId));   // null: a dirty draft is kept as it is
     if (opened && opened.status !== "ok") {
       if (notAvailable(opened)) unavailable = true;
       loadIssues.set(projectId, opened.issues);
     }
+    applyPlanningInputs(ctx.store, projectId);
     await readLists(ctx, ctx.store.draft(projectId));
   });
 }
@@ -948,12 +975,14 @@ function bindPage(ctx: ViewContext) {
   document.getElementById("graph-add-kinds")?.addEventListener("keydown", event => {
     if (event.key === "Escape") { event.preventDefault(); toggleMenu(ctx, false); }
   });
+  bindPlan(ctx);
 }
 
 async function graphAction(ctx: ViewContext, verb: string, arg: string | null) {
   const projectId = ctx.arg;
   const draft = projectId ? ctx.store.draft(projectId) : undefined;
   const selected = projectId && draft ? selectedIn(projectId, graphOf(draft)) : null;
+  if (verb.startsWith("plan-")) { if (projectId && draft) await planAction(ctx, projectId, verb, arg, planEnv(draft)); return; }
   if (verb === "select" && arg) selectCard(ctx, arg);
   else if (verb === "add-menu") toggleMenu(ctx, !addMenu);
   else if (verb === "add-menu-close") toggleMenu(ctx, false);
@@ -997,7 +1026,8 @@ export const view: View = {
     if (ctx.page !== "graph") return;
     captureRootsForm();
     captureBenchmark();
-    // The card form and the graph settings apply every edit as it happens (input/change): nothing else to read.
+    capturePlanPanel();
+    // The card form, the graph settings and the planning inputs apply every edit as it happens (input/change).
   },
   async enter(ctx) { await enterGraph(ctx); },
   leave() { addMenu = false; toolbarNote = null; },

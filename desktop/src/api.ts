@@ -3,7 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { WORKFLOW_ACTIONS, type BenchmarkRevision, type BenchmarkSpec, type ControllerStatus, type ControllerStopResult,
   type ControllerView, type GraphRun, type GraphValidation, type ImportMapping, type ImportPreview, type ImportRegistered, type ImportSource,
-  type LegacyImport, type ModelRoot, type Observation, type PlanRequest, type PlanSummary, type ProjectRevision,
+  type LegacyImport, type ModelRoot, type Observation, type PlanningEstimate, type PlanRequest, type PlanSummary, type ProjectRevision,
   type ProjectSpec, type ProjectSummary, type PublicProfile, type RecipeRevision, type RecipeSpec, type RecipeSummary,
   type RootSnapshot, type RootTargets, type RunDetail, type RunList, type RunSteered, type Sha256, type SplitCommitted,
   type SplitPlan, type SplitPreview, type SubmitResult, type TrackingRearmed, type UnreadableRun, type WorkflowAction,
@@ -83,6 +83,24 @@ export interface ProfileInventory {
 export const observationsList = () => workflow<{ observations: (ObservationSummary | { profile_id: string; error: string })[] }>("observations_list");
 /** The GPU listing of a saved SSH profile (contacts the server read-only; stores nothing). */
 export const profileInventory = (profile_id: string) => workflow<ProfileInventory>("executor_profile_inventory", { profile_id });
+// 9.8 planning inputs, used by the plan panel (10.6). Their shapes are declared here because workflow-types.ts stays as
+// it is for that sub-task (workflow_planning.planning_inputs_get / planning_inputs_save).
+export interface NodeTimeLimit { node_id: string; timeout_minutes: number }      // 1–10080 whole minutes
+export interface StoredPlanningInputs {
+  project_revision: Sha256; simulation: boolean; node_time_limits: NodeTimeLimit[]; estimates: PlanningEstimate[]; saved_at: string;
+}
+/** Both actions answer the project's current revision beside its stored inputs (null before the first save); inputs
+ * saved for an earlier revision come back as they are, with their own `project_revision`. */
+export interface PlanningInputsView { project_id: string; current_project_revision: Sha256; inputs: StoredPlanningInputs | null }
+export interface PlanningInputsSave {
+  project_id: string; project_revision: Sha256; simulation: boolean; node_time_limits: NodeTimeLimit[]; estimates: PlanningEstimate[];
+}
+export const planningInputs = {
+  /** A read: the stored inputs of a project. */
+  get: (project_id: string) => workflow<PlanningInputsView>("planning_inputs_get", { project_id }),
+  /** Replaces them, only for the project's current revision (`revision_conflict` otherwise); never a secret. */
+  save: (request: PlanningInputsSave) => workflow<PlanningInputsView>("planning_inputs_save", request),
+};
 export const runs = {
   submit: (r: { plan_sha256: Sha256; request_id: string; approve_execution: boolean; approve_data_transfer: boolean }) => workflow<SubmitResult>("graph_submit", r),
   list: () => workflow<RunList>("graph_runs_list"),

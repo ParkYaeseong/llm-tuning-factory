@@ -4786,6 +4786,94 @@ Not verified or still open:
 - Wait reasons are still matched by English prefixes; a provider text outside the files read above (a deeper SSH or
   RunPod client error) shows as received with kind `error`. Real WebView2 and a real controller: Task 11.
 
+## Task 10.6 plan and approval, 2026-10-21
+
+Commit `feat: plan graphs and approve execution and data transfer separately`, written in the worktree
+`D:\llm-tuning-factory-wt102` (branch `codex/task-10.6`) on `d731f7f`. It implements
+[Task 10 plan](superpowers/plans/2026-10-21-task10-workflow-workbench-ui.md) §4 "10.6" with D5, D8, D9 and the root
+decision that replaces D20. Changed: new `desktop/src/components/{plan-panel.ts,plan-panel.css,plan-dialog.ts}` and
+`desktop/tests/graph-plan.spec.ts`; `desktop/src/views/graph-editor.ts` (mounts the panel); `desktop/src/api.ts`
+(typed `planning_inputs_get`/`planning_inputs_save` wrappers only); this file. No Python, Rust, package or lock file.
+
+What changed:
+- The "계획과 승인" panel sits below the graph editor.
+  - Inputs: the plan kind (모의 실행 계획 by default, or 실제 실행 계획), each non-select card's maximum run time
+    (60 minutes by default, 1–10080), and the estimates for dry runs. Estimates are entered in a sibling form with
+    local checks that mirror the backend's patterns; there is no default price.
+  - Inputs are read with `planning_inputs_get` when the page is entered, before `project_get`, so 10.5's reads after it
+    are unchanged.
+  - Stored inputs never replace this session's unsaved changes.
+  - "계획 확인" saves changed inputs with `planning_inputs_save`, for the saved revision and only for the saved graph's
+    non-select cards (a removed card's limit is never sent). It then sends `graph_plan`: every non-select node gets its
+    timeout, runtime "ppo" for PPO recipes and "primary" otherwise. A dry run sends all estimates; a real plan sends only
+    the estimates a card uses.
+- Blockers: an unsaved or dirty draft ("먼저 저장하세요"), a saved graph without steps, a time limit out of range, and a
+  real plan without an MLflow address.
+- Issues go to their sections: profiles, estimate rows (by the request's index), the MLflow line, time-limit rows,
+  data, and the editor's cards and fields (`/graph/...`). Warnings never block. `observation_revision_differs` is shown
+  at its profile with the fixed text; `simulated_execution_needs_targets` is shown on its card with "모듈 구조 확인".
+- A plan is held only when its project, revision and kind equal the request. Its basis is the saved graph's recipe
+  revisions plus the generations from before the request. Any edit, input change (also a typed invalid value), profile
+  save, recipe revision or settings save replaces the plan card with "변경되어 다시 계획해야 합니다: …".
+- The approval dialog (D8) shows:
+  - the plan hash, the steps and their recipes;
+  - the maximum cost with the note that it is not a billing cap, the duration and concurrent GPUs;
+  - each destination (name, ID, GPU ×n, hourly total, cost source, steps), each dataset (ID, version, 8-character
+    SHA256, 합성/사용자, 전송 허용/불가) and the MLflow destination;
+  - "대기 후 순차 실행" for later steps on a shared single resource.
+
+  A dry run registers without approvals. A real plan needs the two checkboxes, "실행 승인" and "데이터 전송 승인".
+- Submitting:
+  - `graph_submit` always carries the held plan's request ID (reused after a bridge error or a refusal);
+  - `plan_stale` drops the plan, names 프로젝트, each profile and MLflow 설정, keeps the draft and offers "다시 계획";
+  - other refusals are shown under the plan, which is kept;
+  - on success the runs page opens after the task, with a notice to press "컨트롤러 시작". The controller is never
+    started.
+
+Deviations:
+- `planBlockers` blocks only on what the session knows for certain. A missing or old session inspection is a
+  non-blocking hint ("실행 프로필 자원을 1시간 이내에 확인하세요", with "실행 프로필 열기"), because a check stored by an
+  earlier session may still be fresh; the backend decides.
+- A real plan sends the estimates its cards use, not none, so `estimate_real` lands on that estimate instead of an
+  unknown profile on the card.
+- Signatures:
+  - `planPanelHtml`'s view also takes `recipes` and `usable`;
+  - `runPlan`/`approveAndSubmit` take a third `env` (recipes, profiles, the page queue);
+  - extra exports: `planWaiting`, `planFeedback`, `planPanelBody`, `bindPlanPanel`, `planAction`,
+    `readPlanningInputs`, `applyPlanningInputs`, `runtimeOf`.
+- File list: `components/plan-panel.css` is new; `api.ts` gained only the planning-inputs wrappers (`graph_plan_get`
+  already existed and is unused). Plan issues reach cards through `planFeedback`, merged by the editor; `draft.issues`
+  and `draft.warnings` are left to validation.
+- Inputs are saved by "계획 확인" only when they differ from what is stored. Only explicit limits are stored; defaults
+  are applied at request time.
+- Tests: retries after a closed dialog confirm with the keyboard (the shell swallows a pointer click at the same spot
+  within 400 ms). Planning inputs and plans come from a per-test invoke wrapper; the shared mock is not edited.
+
+Actual verification:
+- RED first: all 12 initial `graph-plan.spec.ts` tests failed on the missing panel (radio, "계획 확인", "추정 자원
+  추가") or on the missing `planning_inputs_get` call. Two tests added later were shown to fail first:
+  - the answer-mismatch test, against a mutant without the check;
+  - the in-place panel patch test, which failed because the typed limit was not registered (the real bug: a card-label
+    patch had dropped the form listeners).
+- 15 mutations were run; 14 were killed: the real confirm without both checks, an approval sent for a dry run, a new
+  request ID per submit, every estimate in a real plan, removed cards saved, no PPO runtime, both parallel steps
+  waiting, an invalid limit keeping the plan, stored inputs over session edits, `plan_stale` keeping the plan, inputs
+  never saved, no MLflow blocker, recipe revisions missing from the basis, and plan issues missing from cards. The
+  survivor is the drop when profiles or settings change while `graph_plan` is in flight. The UI cannot reach that
+  (every save is busy-disabled), so it stays untested defence.
+- Playwright ran against this worktree's own Vite (a scratch config under `%TEMP%`, port 1480,
+  `reuseExistingServer: false`). `npx playwright test` **215 passed**: 202 existing, unchanged, plus 13 new.
+  - One earlier full run had a single failure of the "refused submit" test. It did not recur in four later full runs,
+    in 75 repeats of the submit tests or in 72 repeats of the spec.
+- `npm run build` passes.
+- From the root (main venv, `PYTHONPATH` = the worktree's `src`): `pytest -q` **1716 passed, 1 skipped**; `ruff check
+  src tests` passes; `scripts/check_secrets.py` reports 0 findings with the change staged; the protected-path diff is
+  clean; every changed file is CR-free.
+
+Not verified or still open:
+- Real WebView2 (dialog sizing, radio and number-input keyboard behaviour), a real sidecar with real 9.2/9.3/9.8
+  answers, a real controller after a submit: Task 11. No network, GPU, provider, MLflow or institution data was used.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
