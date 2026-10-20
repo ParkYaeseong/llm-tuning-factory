@@ -11,9 +11,12 @@ import os
 import re
 import time
 from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
+# current_auth_mode lives beside credentials_configured (8.3 review Minor 5) and is re-exported here.
+from .auth import current_auth_mode
 from .registry import canonical, digest
 
 DEFAULT_EXPERIMENT = "llm-tuning-factory"
@@ -23,7 +26,14 @@ AUTH_MODES = ("oidc", "token", "none")
 TRACKING_KEY_TAG = "factory.tracking_key"
 REGISTRATION_KEY_TAG = "factory.registration_key"
 TERMINAL_STATUSES = ("FINISHED", "FAILED", "KILLED")
-_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,249}")   # never a quote: keys go into filter strings
+KEY_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,249}"   # never a quote: keys go into filter strings
+_KEY = re.compile(KEY_PATTERN)
+FAILED_REGISTRATION = "FAILED_REGISTRATION"   # a model version the registry could not create: never adopted
+AUTHENTICATED_HTTPS = "an authenticated MLflow destination requires https tracking and artifact URIs"
+# The graph controller's own tracker bounds each create request (8.3 review Important 1): the MLflow client's defaults
+# (120 s timeout, 7 retries, POST retried too) let one create last about 20 minutes, longer than a tracking claim.
+CONTROLLER_HTTP_MAX_RETRIES = 2
+CONTROLLER_HTTP_TIMEOUT_SECONDS = 60
 
 
 def _key(key):
@@ -36,15 +46,6 @@ def _quotable(value, what):
     if not isinstance(value, str) or not value or "'" in value or "\\" in value:
         raise ValueError(f"invalid MLflow {what}")
     return value
-
-
-def current_auth_mode():
-    """The MLflow auth scope of this process, never a credential: ``oidc``, ``token`` or ``none``."""
-    from .auth import credentials_configured
-    if not credentials_configured():
-        return "none"
-    oidc = os.environ.get("MLFLOW_OIDC_TOKEN_URL") and os.environ.get("MLFLOW_OIDC_CLIENT_SECRET")
-    return "oidc" if oidc else "token"
 
 
 def _public(public):
@@ -62,6 +63,9 @@ def _public(public):
     for value in (uri, location):
         if value and (urlsplit(value).username is not None or urlsplit(value).password is not None):
             raise ValueError("tracking settings must not embed credentials")
+    # A credentialed destination over plain HTTP would always be refused at send time (8.3 review Minor 4).
+    if mode != "none" and (urlsplit(uri).scheme != "https" or location and urlsplit(location).scheme == "http"):
+        raise ValueError(AUTHENTICATED_HTTPS)
     return {key: public[key] for key in TRACKING_SETTINGS}
 
 
@@ -89,8 +93,30 @@ def _string_tags(tags):
     return {str(key): str(value) for key, value in dict(tags).items()}
 
 
+@contextmanager
+def _bounded_requests(limits):
+    """The MLflow client reads its retry and timeout settings per request from the environment. With ``limits`` (the
+    graph controller's own tracker only, never v1) one create request is bounded, and the previous values are restored
+    afterwards. The broker process runs no other MLflow work, and its tracking thread is the only MLflow caller."""
+    if limits is None:
+        yield
+        return
+    names = ("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "MLFLOW_HTTP_REQUEST_TIMEOUT")
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update({names[0]: str(int(limits[0])), names[1]: str(int(limits[1]))})
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 class MLflowTracker:
-    def __init__(self, uri, experiment=DEFAULT_EXPERIMENT, client=None, artifact_location=None):
+    def __init__(self, uri, experiment=DEFAULT_EXPERIMENT, client=None, artifact_location=None, *,
+                 bounded_requests=None):
         # MLflow's terminal URL output breaks machine-readable JSON and legacy Windows consoles.
         os.environ["MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT"] = "true"
         from .auth import configure_oidc, require_secure_artifacts, require_secure_tracking
@@ -98,16 +124,28 @@ class MLflowTracker:
         artifact_location = artifact_location or os.environ.get("FACTORY_MLFLOW_ARTIFACT_LOCATION")
         require_secure_artifacts(artifact_location)
         self.uri, self.experiment, self.artifact_location = uri, experiment, artifact_location
+        self.bounded_requests = bounded_requests
         self.auth_mode = current_auth_mode()
         self.auth_refresher = configure_oidc()
-        if client is None:
-            from mlflow import MlflowClient
-            client = MlflowClient(tracking_uri=uri)
-        self.client = client
-        found = client.get_experiment_by_name(experiment)
-        if found is not None:
-            require_secure_artifacts(getattr(found, "artifact_location", None))
-        self.experiment_id = found.experiment_id if found else client.create_experiment(experiment, artifact_location=artifact_location)
+        try:
+            if client is None:
+                from mlflow import MlflowClient
+                client = MlflowClient(tracking_uri=uri)
+            self.client = client
+            found = client.get_experiment_by_name(experiment)
+            if found is not None:
+                require_secure_artifacts(getattr(found, "artifact_location", None))
+            self.experiment_id = found.experiment_id if found else client.create_experiment(
+                experiment, artifact_location=artifact_location)
+        except BaseException:
+            self.close()   # a failed construction never leaves an OIDC refresher thread behind (8.3 review Minor 3)
+            raise
+
+    def close(self) -> None:
+        """Stop this tracker's OIDC refresher thread, if any."""
+        refresher, self.auth_refresher = getattr(self, "auth_refresher", None), None
+        if refresher is not None:
+            refresher.stop.set()
 
     def start(self, job_id, manifest):
         tags = {"factory.job_id": job_id, "factory.simulation": str(manifest["simulation"]).lower(),
@@ -216,7 +254,8 @@ class MLflowTracker:
             tags["mlflow.parentRunId"] = parent_run_id
         if os.environ.get("FACTORY_OPERATOR"):
             tags["factory.operator"] = os.environ["FACTORY_OPERATOR"]
-        info = self.client.create_run(self.experiment_id, tags=tags, run_name=run_name).info
+        with _bounded_requests(self.bounded_requests):
+            info = self.client.create_run(self.experiment_id, tags=tags, run_name=run_name).info
         identity = {"run_id": info.run_id, "start_time": getattr(info, "start_time", None),
                     "artifact_uri": _artifact_uri(info)}
         self._refuse_insecure_root(info.run_id, identity["artifact_uri"])
@@ -276,21 +315,33 @@ class MLflowTracker:
         name, run_id, key = _quotable(name, "registered model name"), _quotable(run_id, "run ID"), _key(key)
         versions = self._pages(lambda token: self.client.search_model_versions(
             filter_string=f"name = '{name}' and run_id = '{run_id}'", page_token=token))
+        # A version whose registration failed is never adopted: it counts as a failed create (8.3 review Minor 9).
         found = {str(item.version): {"name": item.name, "version": str(item.version)} for item in versions
-                 if item.name == name and (item.tags or {}).get(REGISTRATION_KEY_TAG) == key}
+                 if item.name == name and (item.tags or {}).get(REGISTRATION_KEY_TAG) == key
+                 and str(getattr(item, "status", None) or "") != FAILED_REGISTRATION}
         return sorted(found.values(), key=lambda item: int(item["version"]))
 
     def create_keyed_model_version(self, name, *, run_id, key, tags) -> dict:
         tags = _string_tags(tags) | {REGISTRATION_KEY_TAG: _key(key)}
-        version = self.client.create_model_version(name, source=f"runs:/{run_id}/model", run_id=run_id, tags=tags)
+        with _bounded_requests(self.bounded_requests):
+            version = self.client.create_model_version(name, source=f"runs:/{run_id}/model", run_id=run_id, tags=tags)
+        if str(getattr(version, "status", None) or "") == FAILED_REGISTRATION:
+            raise RuntimeError("MLflow model version registration failed (FAILED_REGISTRATION)")
         return {"name": version.name, "version": str(version.version)}
 
 
 class LazyMLflowTracker:
-    """Validation/status/dry-run do not create remote experiments or authenticate."""
-    def __init__(self, uri):
+    """Validation/status/dry-run do not create remote experiments or authenticate.
+
+    ``build()`` constructs the tracker once. A refusal of the settings themselves (a ``ValueError``: credentials over
+    plain HTTP, an incomplete OIDC configuration, an insecure artifact root) is kept and raised again without another
+    construction, so retries never start another OIDC refresher; another failure (an unreachable server) may be
+    retried, and a failed construction stops its own refresher. ``bounded_requests`` goes to ``MLflowTracker``."""
+    def __init__(self, uri, *, bounded_requests=None):
         self.uri = uri
+        self.bounded_requests = bounded_requests
         self._tracker = None
+        self._refusal = None
 
     def public_settings(self):
         """Known without constructing the client, so a mismatched destination never contacts MLflow."""
@@ -299,7 +350,18 @@ class LazyMLflowTracker:
         return public_tracking_settings(self.uri, DEFAULT_EXPERIMENT,
                                         os.environ.get("FACTORY_MLFLOW_ARTIFACT_LOCATION") or None)
 
-    def __getattr__(self, name):
+    def build(self):
         if self._tracker is None:
-            self._tracker = MLflowTracker(self.uri)
-        return getattr(self._tracker, name)
+            if self._refusal is not None:
+                raise ValueError(self._refusal)
+            try:
+                self._tracker = MLflowTracker(self.uri, bounded_requests=self.bounded_requests)
+            except ValueError as exc:
+                self._refusal = str(exc)
+                raise
+        return self._tracker
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self.build(), name)

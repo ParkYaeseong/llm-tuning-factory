@@ -40,7 +40,7 @@ def test_recovery_does_not_release_unknown_remote_execution(tmp_path):
     store.transition(job["id"], "QUEUED")
     claimed = store.claim("pod1", 1)
     store.transition(claimed["lease"], "RUNNING")
-    store.recover(stale_after_seconds=0)
+    store.recover(stale_after_seconds=-1)   # strictly older than now: two Windows clock reads can be equal
     recovered = store.get(job["id"])
     assert recovered["status"] == "FAILED"
     assert "reconcile" in recovered["error"]

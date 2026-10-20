@@ -912,3 +912,270 @@ def test_v1_tracking_failure_semantics_unchanged(tmp_path):
         assert ('registry unavailable' if case == 'create' else 'unavailable') in error
         assert not fake.versions and count(fake, 'create_model_version') == (1 if case == 'create' else 0)
         assert not factory.store.gpu_locked('mock-cpu')
+
+
+# -- 8.3 review fixes (folded into 8.5) -------------------------------------------------------------
+
+def test_a_long_upload_past_the_claim_ttl_never_registers_twice(tmp_path, monkeypatch):
+    """Important 1, shaped like the reviewer's probe (fake clock, uploads longer than the 600 s claim, a reclaim).
+
+    - Upload 500 s, then a create that lasts 200 s: record_intent extended the claim when the create began, so a
+      second pass during the create finds nothing to claim (before the fix it reclaimed, searched an empty registry
+      and created a second version with the same key).
+    - Upload 700 s while a second pass reclaims and registers: A's expired claim is refused before its create, and A
+      abandons the event quietly (before the fix its process() raised)."""
+    outbox_api = api()
+    for case in ('slow_create', 'slow_upload'):
+        w = tracked(tmp_path / case, monkeypatch, single, claim_ttl=600)
+        claimed, outputs = done(w, 'a')
+        key = registration_key(claimed, outputs.model)
+        second = outbox_api.TrackingPublisher(outbox_api.TrackingOutbox(w.store, clock=w.clock), w.store, w.tracker,
+                                              local_sink=w.sink)
+        real_upload, real_create, reclaimed = w.fake.log_artifacts, w.fake.create_model_version, []
+
+        def slow_upload(run_id, local_dir, artifact_path=None, *, w=w, case=case, second=second, real=real_upload,
+                        reclaimed=reclaimed):
+            if artifact_path == 'model' and not reclaimed:
+                w.clock.advance(500 if case == 'slow_create' else 700)
+                if case == 'slow_upload':   # the claim expired during the upload: another pass registers
+                    reclaimed.append(None)
+                    reclaimed.append(second.process(w.owner))
+            return real(run_id, local_dir, artifact_path=artifact_path)
+
+        def slow_create(*args, w=w, case=case, second=second, real=real_create, reclaimed=reclaimed, **kwargs):
+            if case == 'slow_create' and not reclaimed:
+                reclaimed.append(None)
+                w.clock.advance(200)   # 700 s after the claim, 200 s into the create
+                reclaimed.append(second.process(w.owner))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(w.fake, 'log_artifacts', slow_upload)
+        monkeypatch.setattr(w.fake, 'create_model_version', slow_create)
+        w.publisher.process(w.owner)
+        if case == 'slow_create':
+            assert reclaimed == [None, 0]                          # nothing claimable while A creates
+        else:
+            assert reclaimed == [None, 1]                          # B registered while A uploaded
+        assert len(w.fake.versions) == 1 and count(w.fake, 'create_model_version') == 1
+        row = event(w, key)
+        assert row['status'] == 'ACKNOWLEDGED' and identity(row)['duplicates'] == []
+
+
+def test_a_live_tracking_claim_is_renewed_and_an_expired_one_refused(tmp_path, monkeypatch):
+    """Important 1: the controller's heartbeat renews the claim being sent; an expired or replaced claim, or a released
+    owner, is refused."""
+    outbox_api = api()
+    # A live claim is renewed (the controller's heartbeat): nobody else can claim it, and record_intent extends it.
+    other = tracked(tmp_path / 'renew', monkeypatch, single, claim_ttl=600)
+    done(other, 'a')
+    (first,) = other.outbox.claim_pending(other.owner, limit=1)
+    for _ in range(3):
+        other.clock.advance(500)
+        other.outbox.renew_claim(first.event_id, claim_token=first.claim_token, owner=other.owner)
+        assert other.outbox.claim_pending(other.owner) == ()
+    other.outbox.record_intent(first.event_id, {'op': 'create_run'}, claim_token=first.claim_token, owner=other.owner)
+    assert event(other, first.event.idempotency_key)['claim_expires'] == other.clock() + 600
+    other.clock.advance(601)
+    for stale in (lambda: other.outbox.renew_claim(first.event_id, claim_token=first.claim_token),
+                  lambda: other.outbox.record_intent(first.event_id, {'op': 'x'}, claim_token=first.claim_token),
+                  lambda: other.outbox.record_receipt(first.event_id, {'run_id': 'r'}, claim_token=first.claim_token)):
+        with pytest.raises(outbox_api.StaleTrackingClaim, match='stale tracking claim'):
+            stale()
+    other.store.release_owner(other.owner)
+    (again,) = outbox_api.TrackingOutbox(other.store, clock=other.clock).claim_pending(
+        other.store.acquire_owner('controller-b'))
+    with pytest.raises(ValueError, match='stale controller owner lease'):   # the owner is validated too
+        other.outbox.record_intent(again.event_id, {'op': 'x'}, claim_token=again.claim_token, owner=other.owner)
+
+
+def test_record_outputs_rerun_survives_a_later_worker_log(tmp_path, monkeypatch):
+    """Minor 1: an idempotent rerun never re-hashes evidence that changed after the first record."""
+    gs = readiness.api()
+    w = tracked(tmp_path, monkeypatch, single)
+    readiness.prepare(w, 'a')
+    claimed = finished(w, 'a')
+    outputs = gs.NodeOutputs(model=adapter_output(w, claimed))
+    w.store.record_outputs(claimed['lease'], outputs)
+    before = rows(w)
+    launch = w.store.state_dir / 'jobs' / claimed['id'] / 'launches' / claimed['launch_id']
+    launch.mkdir(parents=True, exist_ok=True)
+    (launch / 'worker.log').write_text('written after the first record\n', encoding='utf-8')
+    w.store.record_outputs(claimed['lease'], outputs)   # before the fix: tracking idempotency key reused
+    assert rows(w) == before
+
+
+def test_a_tracker_that_cannot_be_built_defers_without_an_intent(tmp_path, monkeypatch):
+    """Minor 3: building the lazy tracker happens before any intent; a failure defers the event untried, a settings
+    refusal is kept (built once), and a failed construction leaves no OIDC refresher thread."""
+    import threading
+
+    from tuning_factory.auth import INSECURE_TRACKING
+    outbox_api, tracking_api = api(), tracking()
+    refreshers = []
+
+    def configure_oidc():
+        refreshers.append(SimpleNamespace(stop=threading.Event()))
+        return refreshers[-1]
+
+    constructed = []
+
+    class Unreachable:
+        def __init__(self, tracking_uri):
+            constructed.append(tracking_uri)
+
+        def get_experiment_by_name(self, name):
+            raise ConnectionError('MLflow is unreachable')
+
+    w = tracked(tmp_path, monkeypatch, single)
+    done(w, 'a')
+    monkeypatch.setattr('tuning_factory.auth.configure_oidc', configure_oidc)
+    monkeypatch.setattr('mlflow.MlflowClient', Unreachable)
+    lazy = tracking_api.LazyMLflowTracker(URI)
+    publisher = outbox_api.TrackingPublisher(w.outbox, w.store, lazy, local_sink=w.sink)
+    assert publisher.process(w.owner) == 1
+    row = event(w, f'graph:{w.run_id}')
+    assert (row['status'], row['tries'], row['intent']) == ('PENDING', 0, None)
+    assert outbox_api.TRACKER_UNAVAILABLE in row['last_error'] and 'ConnectionError' in row['last_error']
+    assert refreshers and all(item.stop.is_set() for item in refreshers)   # no refresher leaked
+    w.clock.advance(31)
+    publisher.process(w.owner)   # a transient failure is tried again, still without an intent
+    assert len(constructed) == 2 and event(w, f'graph:{w.run_id}')['intent'] is None
+    # A refusal of the settings themselves is kept: no second construction, no second refresher.
+    monkeypatch.setenv('MLFLOW_TRACKING_TOKEN', TOKEN)
+    monkeypatch.setattr('mlflow.MlflowClient', lambda tracking_uri: constructed.append(tracking_uri) or SimpleNamespace(
+        get_experiment_by_name=lambda name: SimpleNamespace(experiment_id='1', artifact_location='http://a.invalid/x')))
+    refused = tracking_api.LazyMLflowTracker(URI)
+    for _ in range(2):
+        with pytest.raises(ValueError, match=re.escape(INSECURE_TRACKING)):
+            refused.build()
+    assert len(constructed) == 3 and len(refreshers) == 3 and refreshers[-1].stop.is_set()
+
+
+def test_tracking_settings_and_shared_helpers(tmp_path, monkeypatch):
+    """Minor 4: a credentialed destination over http is refused when pinned. Minor 5: one auth-mode rule (auth.py)
+    and one key pattern. Minor 6: the gate opens only through the outbox outside tests."""
+    from tuning_factory import auth
+    outbox_api, tracking_api = api(), tracking()
+    public = {'tracking_uri': 'http://mlflow.invalid', 'experiment': EXPERIMENT, 'artifact_location': None,
+              'auth_mode': 'token'}
+    for mode in ('token', 'oidc'):
+        with pytest.raises(ValueError, match='requires https'):
+            tracking_api.tracking_settings_sha256(public | {'auth_mode': mode})
+    with pytest.raises(ValueError, match='requires https'):
+        tracking_api.tracking_settings_sha256(public | {'tracking_uri': URI, 'artifact_location': 'http://a.invalid'})
+    tracking_api.tracking_settings_sha256(public | {'auth_mode': 'none'})   # an unauthenticated local server
+    assert tracking_api.current_auth_mode is auth.current_auth_mode
+    monkeypatch.setenv('MLFLOW_TRACKING_TOKEN', TOKEN)
+    assert auth.current_auth_mode() == 'token'
+    assert outbox_api.KEY_PATTERN == f'^{tracking_api.KEY_PATTERN}$'
+    w = tracked(tmp_path, monkeypatch, single)
+    readiness.prepare(w, 'a')
+    claimed = finished(w, 'a')
+    monkeypatch.setattr('tuning_factory.graph_store.GraphStore.test_acknowledgement', False)
+    with pytest.raises(ValueError, match='test hook'):
+        w.store.acknowledge_tracking(claimed['lease'])
+
+
+def test_unreadable_runs_never_block_backfill_or_processing(tmp_path, monkeypatch):
+    """Minor 7: one unreadable stored plan is skipped (and listed), per row, in backfill and in process()."""
+    gs = readiness.api()
+    outbox_api = api()
+    w = tracked(tmp_path, monkeypatch, single, simulation=True)
+    claimed, _ = done(w, 'a')
+    ctl = readiness.second_run(w)
+    readiness.prepare(w, 'a', ctl=ctl)
+    other, _ = complete(w, 'a', ctl=ctl, ack=False)
+    with w.store.jobs.connection() as db:   # pre-8.3 state, then one run's plan becomes unreadable
+        db.execute('DELETE FROM tracking_events')
+        db.execute("UPDATE graph_runs SET plan='{}' WHERE id=?", (w.run_id,))
+    outbox = outbox_api.TrackingOutbox(w.store, clock=w.clock)
+    assert outbox.backfill(w.owner) == 4   # the readable run only
+    assert outbox.backfill_skipped == (claimed['lease'].attempt_id,)
+    assert {row['run_id'] for row in rows(w)} == {ctl.run_id}
+    with w.store.jobs.connection() as db:   # an event of the unreadable run, as if enqueued before it broke
+        db.execute("INSERT INTO tracking_events (event_id,idempotency_key,kind,run_id,payload,status,tries,"
+                   "next_attempt_at,created,updated) VALUES ('e0','graph:poisoned','graph_run',?,'{}','PENDING',0,0,0,0)",
+                   (w.run_id,))
+    publisher = outbox_api.TrackingPublisher(outbox, w.store, None, local_sink=w.sink)
+    assert publisher.process(w.owner) == 5
+    poisoned = event(w, 'graph:poisoned')
+    assert poisoned['status'] == 'FAILED' and outbox_api.UNREADABLE_RUN in poisoned['last_error']
+    assert {row['status'] for row in rows(w) if row['run_id'] == ctl.run_id} == {'ACKNOWLEDGED'}
+    assert acknowledged(w, other['lease'].attempt_id)
+    assert gs.GraphStore(w.store.jobs.path, clock=w.clock).owner_state()   # the store itself still opens
+
+
+def test_tracking_status_follows_the_latest_attempt(tmp_path, monkeypatch):
+    """Minor 8: an earlier attempt's failed tracking no longer describes a node whose retry was saved."""
+    monkeypatch.setattr(readiness, 'TRACKING', destination())
+    w = build(tmp_path, single, max_attempts=2)
+    owner = w.store.acquire_owner('controller-a', ttl_seconds=10 ** 7)
+    outbox = api().TrackingOutbox(w.store, clock=w.clock)
+    publisher = api().TrackingPublisher(outbox, w.store, tracking().MLflowTracker(URI, client=FakeMlflowClient()),
+                                        local_sink=api().LocalEvidenceSink(w.store.state_dir))
+    readiness.prepare(w, 'a')
+    first = failed(w, 'a', 'remote_failed')
+    with w.store.jobs.connection() as db:   # the first attempt's tracking ended FAILED (retries exhausted)
+        db.execute("UPDATE tracking_events SET status='FAILED',last_error='exhausted' WHERE attempt_id=?",
+                   (first['lease'].attempt_id,))
+    assert outbox.status(w.run_id)['nodes']['a']['tracking_status'] == 'failed'
+    assert w.store.requeue_retry(w.ctl, first['id'])
+    complete(w, 'a', ack=False)
+    publisher.process(owner, limit=64)
+    assert outbox.status(w.run_id)['nodes']['a']['tracking_status'] == 'saved'
+
+
+def test_a_failed_registration_version_is_never_adopted(tmp_path, monkeypatch):
+    """Minor 9: a FAILED_REGISTRATION version is a failed create: never adopted, and a create returning one fails."""
+    tracking_api = tracking()
+    w = tracked(tmp_path, monkeypatch, single)
+    claimed, outputs = done(w, 'a')
+    key = registration_key(claimed, outputs.model)
+    w.fake.fail['create_model_version'] = [ConnectionError('refused')]
+    w.publisher.process(w.owner)
+    run_id = identity(event(w, f'evidence:{claimed["lease"].attempt_id}'))['run_id']
+    broken = w.fake.seed_version('factory-project.1-a', run_id, {'factory.registration_key': key})
+    broken.status = tracking_api.FAILED_REGISTRATION
+    due(w, key)
+    w.publisher.process(w.owner)
+    row = event(w, key)
+    assert row['status'] == 'ACKNOWLEDGED' and identity(row)['adopted'] is False and identity(row)['version'] == '2'
+    real_create = w.fake.create_model_version
+
+    def failed_registration(*args, **kwargs):
+        version = real_create(*args, **kwargs)
+        version.status = tracking_api.FAILED_REGISTRATION
+        return version
+
+    monkeypatch.setattr(w.fake, 'create_model_version', failed_registration)
+    with pytest.raises(RuntimeError, match='FAILED_REGISTRATION'):
+        w.tracker.create_keyed_model_version('factory-project.1-a', run_id=run_id, key=key, tags={})
+
+
+def test_an_attempt_that_never_ran_gets_no_mlflow_attempt_run(tmp_path, monkeypatch):
+    """Minor 10: the M4 uncounted refused_before_launch, like returned or released attempts, enqueues nothing."""
+    from tuning_factory.jobs import GRAPH_LAUNCH_REFUSED
+    w = tracked(tmp_path, monkeypatch, single)
+    readiness.prepare(w, 'a')
+    claimed = readiness.claim(w, 'a')
+    w.store.pause(w.run_id)
+    with pytest.raises(ValueError, match=GRAPH_LAUNCH_REFUSED):
+        w.store.jobs.begin_launch(claimed['lease'])
+    w.store.resume(w.run_id)
+    w.store.jobs.recover(stale_after_seconds=-1)
+    assert w.store.classify_attempt(w.ctl, claimed['id'], 'refused_before_launch') == 'refused_before_launch'
+    assert w.store.attempt_disposition(claimed['id'])['counted'] == 0
+    assert not [row for row in rows(w) if row['attempt_id'] == claimed['lease'].attempt_id]
+
+
+def test_changed_evidence_tells_the_operator_what_to_do(tmp_path, monkeypatch):
+    """Minor 2: a re-arm cannot repair changed evidence, so the status names the action instead."""
+    outbox_api = api()
+    w = tracked(tmp_path, monkeypatch)
+    claimed, _ = done(w, 'a')
+    manifest = w.store.state_dir / 'jobs' / claimed['id'] / 'manifest.json'
+    manifest.write_bytes(manifest.read_bytes().replace(b'"train"', b'"tampered"', 1))
+    w.publisher.process(w.owner)
+    status = w.outbox.status(w.run_id)['nodes']['a']
+    assert status['tracking_status'] == 'failed' and status['action'] == outbox_api.EVIDENCE_CHANGED_ACTION
+    assert 're-arming cannot repair it' in status['action']

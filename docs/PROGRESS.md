@@ -947,8 +947,9 @@ CPU and with fakes:
   After the 8.3 short-name follow-up it was `97fa2c89…df3b` (source `0ae3419b…b67a`). After the 7.5 review fixes
   it was `042bf8fe…9c0b` (source `6b57e120…9b5f`). After Task 8.1 it was `5cc24562…63be` (source
   `0d405733…373a`). After Task 8.2 it was `26a68aee…a117` (source `58adcdc8…ec17`). After Task 8.3 it was
-  `1ddbabdc…6ceb` (source `eed26807…fc54`). After Task 8.4, the current receipt is `2afbd0b8…88f8` (29/29 checks,
-  source `9cd9ca7e…6ba0`; see "Task 8.4 executor provider and simulated dispatcher").
+  `1ddbabdc…6ceb` (source `eed26807…fc54`). After Task 8.4 it was `2afbd0b8…88f8` (source `9cd9ca7e…6ba0`).
+  After Task 8.5, the current receipt is `d796f3ed…7f1d` (29/29 checks, source `0888d176…ceab`; see "Task 8.5
+  graph controller and end-to-end recovery / Task 8 complete (software)").
 
 Not verified (needs explicit GPU/host authorization):
 - Any real GPU or host.
@@ -1761,6 +1762,342 @@ Not verified or still open:
 - The exclusive result publish relies on hard links (NTFS and ext4 support them). A filesystem without them fails
   the attempt.
 - Multi-process contention is untested.
+
+## Task 8.5 graph controller and end-to-end recovery / Task 8 complete (software), 2026-10-20
+
+Commit `feat: automate graph scheduling and repair tracking without retraining`, on `f75e628` (the Task 9 plan, docs
+only, on `73e1bd7`). It implements plan §4 "8.5" (decisions D1–D14 as accepted), resolves every hand-off note of the
+8.1–8.4 entries, and folds in the fixes from the independent reviews of `c7f8683` (8.3) and `73e1bd7` (8.4), listed
+separately below. It is the last sub-task of Task 8.
+
+What changed:
+- New `graph_controller.py`:
+  - `GraphController(store, executor_provider, operation_dispatcher, tracker, clock, *, simulated_provider, outbox,
+    pool, settings)` with `acquire_controller(owner_id)`, `tick(owner_lease) -> TickReport`, `run_forever(stop_event)`
+    and `status()`. The constructor installs `LedgerBindingResolver` as `store.binding_resolver`.
+  - `ControllerSettings`: `lease_ttl_seconds=60`, `tick_seconds=5`, `stale_attempt_seconds=120`,
+    `reconcile_interval_seconds=60`, `max_dispatch_threads=8`, plus `lease_heartbeat_seconds=20`,
+    `tracking_claim_ttl_seconds=600` and `tracking_batch=16`. The heartbeat must be at most half the lease TTL and a
+    third of the claim TTL.
+  - `DispatchRouter(real, simulated)` routes by the manifest's `lineage.simulation`. `ThreadDispatchPool` runs one
+    thread per in-flight attempt. `controller_tracker(uri)` is the lazy tracker Task 9's broker hands the controller.
+  - `graph_status(store, run_id=None, *, now)`: DB-only and secret-free (below).
+- `acquire_controller` takes the owner lease (`controller already running` for a duplicate) and runs the outbox
+  `backfill` once.
+- Each tick, the DB being the source of truth:
+  1. Leases: `renew_owner` (a refusal stops the controller), then one run lease per managed run, renewed every tick.
+     Managed: RUNNING or PAUSED, an unfinished node, a held lock, a PENDING tracking event, or tracking events but no
+     graph summary yet (a crash between the last settle and `finalize_run`). A run that predates the outbox and is
+     finished is left alone; an unexpired owner-less (pre-Task-8) run lease is skipped until it expires.
+  2. Harvest: a dispatch thread that returned frees its resource. Its outcome is cached; a refused launch is returned
+     unlaunched (normally the thread already did that); any other exception becomes the node's wait reason.
+  3. Settle every job not in flight in this process, in the table's order, re-reading the row after each step:
+     - stale RUNNING/EVALUATING: the run-scoped `recover_stale`, with a threshold that never reaches an attempt in flight
+       here;
+     - stale PROVISIONING, unstarted: `takeover_attempt`, then `complete_local_selection` (select), the same attempt's
+       dispatch (it launches once), or `return_unlaunched` (paused, canceled or stopping);
+     - stale PROVISIONING, started: `release_uncontacted` (D9). When it cannot prove non-contact, the actor is already
+       fenced and the attempt becomes FAILED with its lock kept (`recover_stale` skips PROVISIONING);
+     - FAILED/CANCELED holding the lock: `failure_kind` first. `refused_before_launch` (M4) and a proven `canceled`
+       (7.5 Minor B) are classified, uncounted or released by the store. Otherwise, every
+       `reconcile_interval_seconds`: `takeover_attempt`, then `provider.recover(...)`, then `dispatcher.reconcile`.
+       None keeps the lock and sets the wait reason (`operator confirmation required: release-lock
+       --confirm-execution-stopped` without a remote record; "waiting for the result of the same launch; …" with one).
+       A defensive `attempt is final` refusal is settled as final;
+     - COMPLETED holding the lock: `takeover_attempt` and `reconcile(job, None)` (rebuild and release; no contact);
+     - COMPLETED without outputs: the cached outcome, else `outputs_for`, recorded under a takeover lease with the
+       outcome's `inspected_targets`. A refusal becomes an operator wait reason;
+     - FAILED/CANCELED without a disposition: `classify_attempt(failure_kind)`; a due retry: `requeue_retry`, otherwise
+       the backoff is the wait reason (`attempt n of m`);
+     - `settle_canceled_jobs` first.
+
+     One job's error is shown on its node and never stops the others.
+  4. Prepare (RUNNING): `readiness`, then the gated `prepare_ready(node_ids=ready)`. Waiting nodes get their readiness
+     reason (with the parent's tracking failure and its action when it has one); blocked ones are blocked.
+  5. Local selections (RUNNING, not stopping): `claim_ready(None)` then `complete_local_selection`.
+  6. GPU claims (RUNNING, not stopping): per queued job, its pinned destination unless the run is at
+     `max_concurrent`, every dispatch thread is busy, the resource is busy in this process (D8) or in the DB, or the
+     budget would be exceeded. Otherwise `provider.resolve(...)` (one `SimulatedExecutorProvider.for_plan` per
+     simulation run), `claim_ready(observation)` and a dispatch thread that runs `run_claimed` once and closes the
+     destination context. A refusal, a price above the pinned one, or a busy resource consumes no attempt and becomes
+     the wait reason. A claimed job of another runtime than the resolved one is returned unlaunched.
+  7. Tracking: `TrackingPublisher.process(owner)` inline, or on `run_forever`'s tracking thread.
+  8. `finalize_run`, which enqueues the graph summary.
+- A heartbeat thread runs during every tick and every tracking pass. Every `lease_heartbeat_seconds` (wall time) it
+  renews the owner lease, the run leases and the tracking claim being sent, so a long upload, create or SSH connect never
+  lets them lapse.
+- `run_forever(stop_event)`: the tick loop, with tracking on its own thread (never concurrent with itself). After the
+  stop event it skips phases 5–6, keeps settling until no dispatch thread is left (woken by each thread's
+  completion), lets the in-flight publish finish, then calls `release_owner` (D14). A fenced owner stops at once and
+  releases nothing.
+- `graph_status` (Task 9 `graph_run_get`/`controller_status`, Task 10 polling):
+  - `controller`: `owner_id`, `state` (`running` while the heartbeat is fresh, `stale` once it expired, `absent` with
+    no owner or after a clean release) and `heartbeat_age_seconds`.
+  - `runs[]`: `run_id`, `status`, `simulation`, `plan_sha256`, `approved_cost_usd`, `reserved_cost_usd`,
+    `budget_exhausted`, `unpriced_attempts`, `created`, `tracking` (event counts, graph status, action) and `nodes[]`.
+  - Each node: `node_id`, `label`, `kind`, `status`, `job_status`, `attempt_id`, `attempts`, `counted_attempts`,
+    `max_attempts`, `resource_id`, `destination_profile_id`, `uncertain`, `needs_operator`, `wait_reason` (unfinished
+    nodes only), `error`, `retry_at`, `tracking_status`, `registration_status`, `tracking_action`, `output`, `selection`
+    (winner artifact or `no_winner`) and `cache_seed` (`published`, `failed` or `missing`).
+  - Errors and wait reasons pass through `redact` and lose remote POSIX paths. `status()` adds the in-process facts:
+    in-flight jobs, busy resources, stopping, skipped runs, recent errors, backfill skips and the provider's public
+    status.
+
+Hand-off notes and how each was resolved:
+1. Settle order: `takeover_attempt` comes before every `reconcile`, and `reconcile` is called only for a lock-holding
+   attempt (FAILED/CANCELED after `failure_kind`, COMPLETED with `executor=None`). A completed final attempt goes to
+   `outputs_for`. Tests 11 and 12.
+2. Refused launches: the dispatch thread returns the attempt (`return_unlaunched`) as soon as `run_claimed` raises
+   `GRAPH_LAUNCH_REFUSED` or `GRAPH_CANCEL_REFUSED`; harvest repeats it if the thread could not.
+   `test_refused_launches_are_returned_at_once[pause|job_cancel]` and test 5.
+3. M3: `GraphStore._controller` joins `controller_owner` and requires `owner_token IS NULL OR (lease_token = owner_token
+   AND expires > now)`, so `release_owner` and owner expiry fence the owner's run leases at once (D14). Owner-less
+   leases are unchanged. `test_owner_release_and_expiry_fence_run_leases_at_once`.
+4. M-2: in the gated `prepare_ready`, a `bindings_for` failure (the resolver's run-wide re-verification of producers,
+   persisted targets and active jobs' facts) raises the new `LedgerIntegrityError` (`LEDGER_INTEGRITY`) and fails
+   nothing; the controller shows it as the ready nodes' wait reason (`needs_operator`). A compile refusal of the node
+   itself still fails it and blocks its subtree. The ungated path is unchanged. `test_ledger_integrity_errors_fail_nothing`.
+5. M2: when the reservations (the 8.1 backfill's historical ones included) leave no room for a claim, the node's wait
+   reason says `approved budget exhausted: R of A USD already reserved (historical attempts reserved by the Task 8
+   migration count too); re-plan with a larger budget`, plus `UNPRICED_ATTEMPT` when the run has one. The check runs
+   before the provider is contacted. `graph_status` adds `budget_exhausted` and `unpriced_attempts`, and the
+   controller never overwrites an `UNPRICED_ATTEMPT` notice. `test_a_budget_exhausted_by_history_is_named`.
+6. Long uploads: the heartbeat above renews the owner lease, the run leases and the claim being sent (`renew_claim`,
+   new) during every tick and tracking pass, and under `run_forever` uploads run on the tracking thread while the tick
+   thread keeps renewing. The claim TTL is `ControllerSettings.tracking_claim_ttl_seconds` (600 s), passed to the
+   outbox. It must exceed the longest single create the heartbeat cannot cover (a dead controller); each create of the
+   controller's tracker is bounded to 2 retries and a 60 s timeout (below). `test_long_uploads_keep_the_owner_and_the_claim_alive`.
+7. D8: a resource stays busy in this process until its dispatch thread returns, cache seeding after `release_gpu`
+   included, under the same alias, GPU-UUID and cross-provider rules as `JobStore._resource_blocked`. Seeding is never
+   retried; `cache_seed` shows `missing` after a crash while seeding. Test 14.
+8. Windows flake: `tests/test_jobs.py::test_recovery_does_not_release_unknown_remote_execution` now calls
+   `recover(stale_after_seconds=-1)`, as the other tests do. It was the only `stale_after_seconds=0` call; every other
+   `recover`/`recover_stale` call in the tests already uses `-1` or `time.time() + 1`. `jobs.py` is unchanged.
+9. Simulated attempts and `release_uncontacted`: a crash in PROVISIONING after `begin_launch` is released truthfully
+   (no record); a crash while RUNNING without a result is now terminal (8.4 review Important 1, below).
+   `test_a_simulated_attempt_stopped_while_running_is_terminal`.
+- The earlier notes for 8.5 are covered too: `backfill(owner)` once after acquiring the owner; `process(owner)` each
+  tick; `TrackingOutbox.status` for the tracking and registration fields; `settle_canceled_jobs` in the settle phase;
+  only the gated `prepare_ready(node_ids=…)`; `LedgerBindingResolver` installed on the trusted path; outcomes used
+  structurally (the two `OperationOutcome` classes stay; nothing is checked by type).
+
+8.3 review fixes (independent review of `c7f8683`, "Ready with fixes"):
+- Important 1, a long upload plus a reclaim could register twice:
+  - `TrackingOutbox._claimed` refuses an expired claim, and `record_intent`, `record_receipt`, `retry`, `defer` and the
+    new `renew_claim` go through it (`StaleTrackingClaim`, a `ValueError` with the old text). `record_intent` also
+    validates the owner lease (`ClaimedEvent.owner`) and extends the claim by the TTL.
+  - The publisher claims one event at a time (so no claim waits behind another event's upload), never runs
+    `process()` concurrently with itself (a lock), exposes `renew_current()` for the controller's heartbeat, and
+    abandons an event whose claim it lost.
+  - The controller's tracker bounds each create (`create_run`, `create_model_version`) through
+    `MLFLOW_HTTP_REQUEST_MAX_RETRIES=2` and `MLFLOW_HTTP_REQUEST_TIMEOUT=60`, set only around that call by a tracker
+    built with `bounded_requests` (`controller_tracker`, or set by the controller on the tracker it is given) and
+    restored afterwards. v1 trackers never set them. The mlflow client reads both per request, so the worst case of
+    one create is about 3 × 60 s plus backoff, far below the 600 s claim.
+  - Contract: one controller per state directory (owner lease), one tracking thread, one claim in flight; the claim TTL
+    must exceed the longest create a dead controller may leave in flight.
+  - Tests:
+    - `test_a_long_upload_past_the_claim_ttl_never_registers_twice`, shaped like the reviewer's probe. With a 500 s
+      upload and a 200 s create, a second pass during the create finds nothing to claim; before the fix it reclaimed,
+      searched an empty registry and created a second version. With a 700 s upload and a reclaim meanwhile, A
+      abandons quietly; before the fix its `process()` raised. Each case ends with exactly one version.
+    - `test_a_live_tracking_claim_is_renewed_and_an_expired_one_refused`: renewal, expiry and owner refusals.
+    - The controller-level `test_long_uploads_keep_the_owner_and_the_claim_alive`: a create lasting 400 s on a 300 s
+      claim is renewed by the heartbeat, no second claim is possible, there is one version, and the create is bounded.
+- Minor 1: `record_outputs` returns before enqueuing when its `node_outputs` row already exists, so a rerun never
+  re-hashes evidence (a later `worker.log`). `test_record_outputs_rerun_survives_a_later_worker_log`.
+- Minor 3: `LazyMLflowTracker.build()` constructs once; a settings refusal (`ValueError`) is kept and re-raised without
+  another construction, and a failed construction stops its own OIDC refresher (`MLflowTracker.close()`). The
+  publisher builds a lazy tracker before any intent: a failure defers the event untried, with no intent
+  (`TRACKER_UNAVAILABLE`). `test_a_tracker_that_cannot_be_built_defers_without_an_intent`.
+- Minor 4: `tracking_settings_sha256` refuses `token`/`oidc` with a non-https tracking URI or an http artifact
+  location (`AUTHENTICATED_HTTPS`).
+- Minor 5: `current_auth_mode` moved to `auth.py` beside `credentials_configured` (re-exported by `tracking`), and
+  `tracking_outbox.KEY_PATTERN` is built from `tracking.KEY_PATTERN`. Minors 4 and 5: `test_tracking_settings_and_shared_helpers`.
+- Minor 6: `GraphStore.acknowledge_tracking` refuses unless the class flag `test_acknowledgement` is set;
+  `tests/conftest.py` sets it for the ledger-level tests, `test_graph_controller.py` clears it, and no `src` code calls
+  it. The 8.4 subprocess chain probe sets it too.
+- Minor 7: `backfill` skips a row it cannot turn into events (savepoint per row) and lists it in
+  `backfill_skipped` (shown by the controller's `status()`); `_publish` reads the run inside its try, so a poisoned
+  event fails permanently (`UNREADABLE_RUN`) without aborting `process()`.
+  `test_unreadable_runs_never_block_backfill_or_processing`.
+- Minor 8: a node's `tracking_status` and `registration_status` use its latest attempt's events (and its node run).
+  `test_tracking_status_follows_the_latest_attempt`.
+- Minor 9: `find_keyed_model_versions` never returns a `FAILED_REGISTRATION` version (a failed create: the next
+  authoritative empty search creates once), and `create_keyed_model_version` raises when the server returns one.
+  `test_a_failed_registration_version_is_never_adopted`.
+- Minor 10: an uncounted classification (the M4 `refused_before_launch`) enqueues no tracking events, like the other
+  never-run settlements. `test_an_attempt_that_never_ran_gets_no_mlflow_attempt_run`. Documented: the I-3 refusal of a
+  local selection settles as counted and terminal even while the run is PAUSED, because it is deterministic.
+- Minor 2: `local evidence changed after enqueue` cannot be repaired by `rearm`. `TrackingOutbox.status` gives it an
+  `action` (`EVIDENCE_CHANGED_ACTION`: restore the evidence files, or re-run the node in a new graph run), shown as the
+  node's `tracking_action` and in the waiting child's reason. `test_changed_evidence_tells_the_operator_what_to_do` and
+  `test_changed_evidence_is_named_for_the_operator`.
+
+8.4 review fixes (independent review of `73e1bd7`, "Ready with fixes"):
+- Important 1: the simulated `failure_kind` maps a FAILED result with error `SIMULATION_STOPPED` and no
+  `engine_version` (the one `reconcile` publishes itself) to `failed_before_submit`: counted and terminal, as the real
+  path after an operator confirms the stop. A result the simulated worker published keeps `remote_failed`.
+  `test_simulated_attempt_crashed_while_running_settles_once_by_reconcile` was updated (no retry with `max_attempts=2`;
+  the worker ran once), and the controller test above agrees.
+- Important 2: `SimulatedWorker.check` sums the layout's tensor bytes and refuses above `max_output_bytes`
+  (`SIMULATED_OUTPUT_TOO_LARGE`; default `MAX_SIMULATED_OUTPUT_BYTES` = 1 GiB, configurable on
+  `SimulatedOperationDispatcher`) before `begin_launch`, through `abandon_unlaunched` (`refused_before_launch`); nothing
+  is written. `test_simulated_outputs_above_the_size_cap_are_refused_before_launch` (a 7B-class root at the default cap,
+  and a 16-byte cap through the dispatcher).
+- Minor 1: `ExecutorProvider.recover` declares `runtime_profile`.
+- Minor 2: `hard_links_supported` probes the launches directory before `begin_launch` (`NO_HARD_LINKS`), and
+  `_publish_exclusive` fsyncs the directory after the link where the platform allows it (not on Windows).
+  `test_a_filesystem_without_hard_links_is_refused_before_launch`.
+- Minor 3: the heartbeat threads of the simulated dispatcher and of `attempt_runner` keep beating after any non-fencing
+  error and log it (a `ValueError` still ends them: the lease was fenced).
+  `test_attempt_heartbeats_survive_a_transient_database_error[simulated|runner]`.
+- Minor 6 (move shared helpers into a light module) is skipped: it would be invasive, and the controller needs no
+  shared type.
+- Notes for Task 9 (recorded only): Minor 4, SSH `resolve` runs the read-only preflight `check` before
+  `SERVER_DIFFERS`/`PROFILE_CHANGED` (low risk: the same host-key pin applies). Minor 5, `recover` goes through
+  `_approved`, so a profile edit while an attempt holds its lock blocks result collection: Task 9 must forbid such
+  edits, or `recover` must require only the transport identity.
+- Merge gap: compile stays real-only for merges, including simulation plans. The simulated diamond of test 20 joins by
+  its selection (`a → (b = evaluate a, c = continue a → ec = evaluate c) → d = select(b, ec)`), because two
+  evaluations of one model are duplicate candidates. Task 11's mock diamond must not merge simulated outputs, or relax
+  the check for simulation plans only.
+
+Deviations from the plan:
+- Interfaces:
+  - `ControllerSettings` gains `lease_heartbeat_seconds`, `tracking_claim_ttl_seconds` and `tracking_batch`.
+  - `DispatchRouter(real, simulated, *, store=None)` falls back to the dispatchers' own `graph` store.
+  - New: `controller_tracker`, `CONTROLLER_REQUEST_LIMITS`, the wait-reason constants, `GraphStore.LedgerIntegrityError`
+    and `LEDGER_INTEGRITY`, `TrackingOutbox.renew_claim`, `StaleTrackingClaim`, `TrackingPublisher.renew_current`,
+    `LazyMLflowTracker.build`, `MLflowTracker.close` and `bounded_requests`, `hard_links_supported`,
+    `SIMULATED_OUTPUT_TOO_LARGE`, `MAX_SIMULATED_OUTPUT_BYTES` and `NO_HARD_LINKS`.
+- `run_forever` runs tracking on its own thread (the 8.3 reviewer's recommendation), so `tick` tracks inline only
+  without it.
+- `graph_status`:
+  - `absent` also after a clean release (expiry 0);
+  - added `budget_exhausted`, `unpriced_attempts`, `tracking.graph`, `tracking.action` and the node's
+    `tracking_action`;
+  - a wait reason is shown for unfinished nodes only.
+- Settle table:
+  - A stale started PROVISIONING attempt that `release_uncontacted` cannot release becomes FAILED with its lock kept,
+    through `transition` under the current (just rotated) lease. The plan said `recover_stale`, which skips
+    PROVISIONING.
+  - A job claimed for another runtime than the one its destination was opened for is returned unlaunched, because
+    `claim_ready` takes no job filter.
+  - Managed runs include those with tracking events but no summary.
+- Fakes: `ScriptedDispatcher` freezes `test_model_inputs` fixture artifacts under the attempt's producer identity,
+  instead of `SimulatedWorker` + `freeze_operation_output`. Its `failure_kind` is the real runner's, read from the
+  records it writes. The real `SimulatedOperationDispatcher` and the real `OperationAttemptRunner` are covered by
+  tests 20 and 22.
+- Test 20's diamond is `a → (b, c → ec) → d` (the merge gap; two evaluations of one model are duplicate candidates).
+- Tests beyond the plan's 24:
+  - `test_refused_launches_are_returned_at_once[pause|job_cancel]`, the M3, M-2 and note-6 tests, and
+    `test_settings_router_and_test_hooks`;
+  - `test_changed_evidence_is_named_for_the_operator`, `test_a_simulated_attempt_stopped_while_running_is_terminal`
+    and `test_the_seeding_window_covers_aliases_and_other_providers`.
+- Files beyond the 8.5 list:
+  - `graph_store.py` (M3, M-2, 8.3 Minors 1, 6 and 10);
+  - `tracking_outbox.py`, `tracking.py` and `auth.py` (8.3 review, authorized);
+  - `simulated_dispatch.py`, `executor_profiles.py` and `attempt_runner.py` (8.4 review, authorized; Minor 3 in the
+    runner too);
+  - `tests/conftest.py` (Minor 6 flag), `tests/test_jobs.py` (note 8), `tests/test_tracking_outbox.py` and
+    `tests/test_simulated_dispatch.py`.
+- The outcome type was not moved; the controller uses outcomes structurally.
+- RED was checked on a `git archive HEAD` export with the new test files copied in (as 8.3 did), because parts of the
+  implementation were written before their tests. There, the two `test_acknowledgement` monkeypatches used
+  `raising=False`, since the attribute is new.
+
+Actual verification (main tree; no other agent's uncommitted changes):
+- RED, on the `73e1bd7` export with the new tests (main venv, `PYTHONPATH` on the export's `src`; `tuning_factory`
+  resolved into the export): the 60 new or changed cases failed for the intended reasons, and the other 46 cases of
+  those files passed:
+  - 45 controller cases on `tuning_factory.graph_controller (Task 8.5) is missing`;
+  - the M3 test on `DID NOT RAISE` (the run lease outlived its owner);
+  - the 8.3 fixes:
+    - the slow-create probe produced 2 versions, and then `process()` raised `stale tracking claim`;
+    - `renew_claim` was missing;
+    - the rerun raised `tracking idempotency key reused with different payload`;
+    - the deferred event had `tries=1` and an intent;
+    - the http token destination did not raise;
+    - `KeyError: 'sha256'` aborted the backfill;
+    - the status was `failed` instead of `saved`;
+    - `FAILED_REGISTRATION` was missing;
+    - the never-run attempt had an `attempt:` event;
+    - the status had no `action`;
+  - the 8.4 fixes: `remote_failed` instead of `failed_before_submit`, the missing cap and link-probe names, and both
+    heartbeats stopping after the first database error.
+
+  The seeding-window alias test was added after the export check. It fails there on the missing module, and the
+  `_conflicts` mutation below fails it.
+- Mutations, as pytest plugins in `%TEMP%` with no `src` edit:
+
+  | Mutation | Tests that fail |
+  |---|---|
+  | `_busy` never busy (no D8) | test 14 |
+  | `_conflicts` only for identical keys | the seeding-window alias test |
+  | `TrackingOutbox._claimed` ignores expiry and the owner | the live-claim test |
+  | `GraphStore._controller` without the owner join (M3) | the M3 test |
+  | the dispatch thread never returns a refused launch | test 5, both refused-launch cases, simulated cancel |
+  | `reconcile` without `takeover_attempt` | test 11 |
+- GREEN:
+  - `uv run pytest tests/test_graph_controller.py tests/test_tracking_outbox.py -q`: **76 passed (46 + 30)**.
+  - The step-4 regressions with the 8.1–8.4 sets (`test_evaluation_tracking`, `test_execution`,
+    `test_reconciliation`, `test_runner_cli`, `test_graph_store`, `test_graph_planner`, `test_jobs`,
+    `test_operation_runner`, `test_gpu_servers`, `test_desktop_servers`, `test_graph_readiness`,
+    `test_simulated_dispatch`, `test_executor_profiles`, `test_desktop_runtime`, `test_model_inputs`): **531 passed**.
+  - `uv run pytest -q` twice on the final tree: **1343 passed, 1 skipped** and **1343 passed, 1 skipped** (1283 + 60 new). Neither run hit the old
+    Windows flake.
+- Ruff (`src tests`) is clean. `check_secrets.py` reports 0 findings over 775 file versions (every change
+  staged). Both GPU locks are unchanged, `git ls-files --eol` shows no CRLF, and every changed file is CR-free.
+  `graph_controller` imports no heavy library, and the 8.4 subprocess import probe still passes.
+- CPU acceptance (`-I`), run once on the final source:
+  - It exited 0, and all **29** checks passed. Max errors are unchanged: merge delta 7.78e-9, materialize delta
+    9.17e-9, parent→child 6.42e-9, logits 3.35e-8/2.98e-8.
+  - Receipt SHA256 `d796f3edb76c873b483afdefe7c84290ce456bbd48db4694954c7d25043c7f1d`, source_sha256 `0888d176108edd46620467e8df32664da40f5473d7746488d7a15d30d0c9ceab` (equal to `source_hash()` of a `git archive` export of the
+    commit), lock_sha256 `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`.
+  - `model_downloaded`, `gpu_used`, `institution_data_used` and `production_promotable` are false.
+  - It supersedes 8.4's `2afbd0b8…88f8`.
+- Module sizes: new `graph_controller.py` 1065, `graph_store.py` 1401 (1359), `tracking_outbox.py` 832
+  (727), `tracking.py` 367 (305), `simulated_dispatch.py` 853 (789).
+
+Not verified or still open (Task 8 as a whole):
+- **No real infrastructure was used.** Everything ran on fakes, local files and SQLite, with in-process threads.
+  Still unverified:
+  - real concurrency across several Pods;
+  - real SSH servers (BOP-style included) and real recovery executors;
+  - a real MLflow server: its version, tag-filter search and pagination, `search_model_versions` with `run_id`,
+    artifact roots and proxying, and real upload and create times;
+  - the Windows broker process (Task 9);
+  - a real lost launch response;
+  - RunPod transport hashes from real settings, and a live RunPod price observation.
+- The bounded create relies on mlflow-skinny 3.17.1 reading `MLFLOW_HTTP_REQUEST_MAX_RETRIES`/`_TIMEOUT` per request.
+  That was read from the installed source, not exercised against a server. The variables are process-wide during the
+  call, which is safe only because the broker process runs no other MLflow work.
+- Contention between two controller processes is covered only by the owner lease; the races are in-process.
+  `ThreadDispatchPool` ran only in unit form, and long dispatch threads holding SSH are untested.
+- A COMPLETED attempt whose outputs `record_outputs` refuses stays COMPLETED with an operator wait reason; no state
+  leads out of COMPLETED.
+- Heartbeats run on wall time. A wall-clock jump can expire a lease early; the old owner is then fenced, which is safe.
+- The simulation merge gap remains (above).
+
+What Task 9 must wire (plan §7):
+- The headless broker `--controller`:
+  - `GraphStore(state/jobs.db)` and `SettingsExecutorProvider(profiles, state)`;
+  - `DispatchRouter(OperationAttemptRunner(store, root=state), SimulatedOperationDispatcher(store, root=state,
+    roots=DirectoryRootSnapshots(...)))`;
+  - `controller_tracker(uri)` and `clock=time.time`. No `simulated_provider` is needed: the controller builds one per
+    simulation run.
+  - Then `GraphController(...).acquire_controller(owner_id)`, where `controller already running` maps to a fixed exit
+    code, and `run_forever(stop_event)`, set by closing stdin or by a termination signal.
+- Desktop actions call `GraphStore.pause/resume/cancel` directly.
+- Status polls `graph_status(store, run_id, now=time.time())`: `controller.state`, and per node `wait_reason`,
+  `needs_operator`, `tracking_status`, `tracking_action`, `registration_status`, `selection` and `cache_seed`.
+- Operator actions:
+  - `release-lock --confirm-execution-stopped` for `needs_operator`;
+  - `TrackingOutbox.rearm(event_id)` for FAILED/UNCERTAIN tracking, except changed evidence (`tracking_action`).
+- Destination hashes: `runpod_transport_sha256` and `tracking_settings_sha256`. An authenticated destination requires
+  https.
+- Forbid profile edits while an attempt holds its lock (8.4 Minor 5), and keep the 8.4 Minor 4 preflight-order note.
 
 ---
 

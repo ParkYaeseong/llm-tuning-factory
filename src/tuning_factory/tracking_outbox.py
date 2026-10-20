@@ -27,6 +27,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -40,12 +41,13 @@ from .config import StrictModel
 from .model_artifacts import ModelArtifactRef, ModelDescriptor
 from .projects import LocalId
 from .registry import canonical, digest, file_digest, immutable_write
+from .tracking import KEY_PATTERN as TRACKING_KEY
 from .tracking import TRACKING_UNCERTAIN, tracking_settings_sha256
 
 EventKind = Literal["graph_run", "node_run", "attempt_run", "attempt_evidence", "model_registration",
                     "graph_summary"]
 EVENT_STATUSES = ("PENDING", "ACKNOWLEDGED", "FAILED", "UNCERTAIN")
-KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,249}$"   # no quote: keys become MLflow filter values
+KEY_PATTERN = f"^{TRACKING_KEY}$"   # tracking.KEY_PATTERN: no quote, since keys become MLflow filter values
 EVENTS_TABLE = '''CREATE TABLE IF NOT EXISTS tracking_events (
   event_id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE NOT NULL, kind TEXT NOT NULL,
   run_id TEXT NOT NULL, node_id TEXT, job_id TEXT, attempt_id TEXT, depends_on TEXT, payload TEXT NOT NULL,
@@ -58,10 +60,15 @@ KEY_REUSED = "tracking idempotency key reused with different payload"
 PARENT_MISSING = "tracking parent event is missing"
 STALE_CLAIM = "stale tracking claim"
 EVIDENCE_CHANGED = "local evidence changed after enqueue"
+# 8.3 review Minor 2: a re-arm re-reads the same changed bytes, so it can never repair this one.
+EVIDENCE_CHANGED_ACTION = ("local evidence changed after it was recorded; re-arming cannot repair it. Restore the "
+                           "attempt's original evidence files, or re-run the node in a new graph run")
+UNREADABLE_RUN = "the graph run's stored plan is unreadable; its tracking events are skipped"
 DESTINATION_DIFFERS = ("tracking destination differs from the approved plan; restart the controller with the "
                        "approved MLflow settings")
 TRACKER_MISSING = "MLflow tracking is not configured for this controller; the real graph run waits for it"
 NO_DESTINATION = "the real graph run has no pinned tracking destination"
+TRACKER_UNAVAILABLE = "the MLflow tracker could not be built; fix the controller's MLflow settings and restart it"
 PRODUCERS = frozenset({"train", "merge", "materialize"})
 TERMINAL = {"COMPLETED": "FINISHED", "FAILED": "FAILED", "CANCELED": "KILLED"}
 # What an attempt leaves locally, besides the job manifest and the accepted result; never dataset bytes.
@@ -113,6 +120,14 @@ class ClaimedEvent:
     event: TrackingEvent
     intent: dict | None             # a create may already have been sent: search before any new create
     parent_identity: dict | None    # the receipt of ``depends_on`` (e.g. the MLflow parent run ID)
+    owner: object | None = None     # the controller owner lease that claimed it (8.3 review Important 1)
+
+
+class StaleTrackingClaim(ValueError):
+    """Our claim is gone (expired, replaced by another claimant or already settled): stop handling the event."""
+
+    def __init__(self):
+        super().__init__(STALE_CLAIM)
 
 
 @dataclass(frozen=True)
@@ -336,6 +351,7 @@ class TrackingOutbox:
                 or not math.isfinite(claim_ttl_seconds) or claim_ttl_seconds <= 0):
             raise ValueError("claim TTL must be positive and finite")
         self.store, self.clock, self.policy, self.claim_ttl = store, clock, policy, claim_ttl_seconds
+        self.backfill_skipped: tuple[str, ...] = ()
 
     def enqueue(self, event: TrackingEvent, transaction) -> str:
         return enqueue_event(transaction, event, self.clock())
@@ -358,28 +374,46 @@ class TrackingOutbox:
                                       idempotency_key=row['idempotency_key'], depends_on_key=row['parent_key'],
                                       payload=json.loads(row['payload']))
                 claimed.append(ClaimedEvent(row['event_id'], token, event, _loads(row['intent']),
-                                            _loads(row['parent_identity'])))
+                                            _loads(row['parent_identity']), lease))
             return tuple(claimed)
 
-    @staticmethod
-    def _claimed(db, event_id, claim_token):
+    def _claimed(self, db, event_id, claim_token, owner=None):
+        """The event row while our claim is current: same token, still PENDING and unexpired (8.3 review Important
+        1: an expired claim may already belong to another claimant), and the owner lease, when given, unexpired."""
         row = db.execute('SELECT * FROM tracking_events WHERE event_id=?', (event_id,)).fetchone()
         if row is None:
             raise ValueError("unknown tracking event")
-        if row['status'] != 'PENDING' or not claim_token or row['claim_token'] != claim_token:
-            raise ValueError(STALE_CLAIM)
+        if (row['status'] != 'PENDING' or not claim_token or row['claim_token'] != claim_token
+                or row['claim_expires'] is None or row['claim_expires'] <= self.clock()):
+            raise StaleTrackingClaim()
+        if owner is not None:
+            self.store.validate_owner(db, owner)
         return row
 
-    def record_intent(self, event_id: str, intent: dict, *, claim_token: str) -> None:
-        """Durable before a non-idempotent create leaves the PC; it stays until the event is acknowledged."""
+    def record_intent(self, event_id: str, intent: dict, *, claim_token: str, owner=None) -> None:
+        """Durable before a non-idempotent create leaves the PC; it stays until the event is acknowledged. Refused
+        unless the claim (and the owner lease, when given) is current; the claim is extended by the claim TTL, so the
+        create starts with a whole TTL ahead of it."""
         with self.store.jobs.connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            self._claimed(db, event_id, claim_token)
-            db.execute('UPDATE tracking_events SET intent=?,updated=? WHERE event_id=?',
-                       (canonical(intent).decode(), self.clock(), event_id))
+            self._claimed(db, event_id, claim_token, owner)
+            now = self.clock()
+            db.execute('UPDATE tracking_events SET intent=?,claim_expires=?,updated=? WHERE event_id=?',
+                       (canonical(intent).decode(), now + self.claim_ttl, now, event_id))
+
+    def renew_claim(self, event_id: str, *, claim_token: str, owner=None) -> None:
+        """Extend a current claim by the claim TTL: the controller's heartbeat while a long upload or create runs,
+        so no other claimant can take the event meanwhile. Refused once the claim expired or was replaced."""
+        with self.store.jobs.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self._claimed(db, event_id, claim_token, owner)
+            now = self.clock()
+            db.execute('UPDATE tracking_events SET claim_expires=?,updated=? WHERE event_id=?',
+                       (now + self.claim_ttl, now, event_id))
 
     def record_receipt(self, event_id: str, remote_identity: dict, *, claim_token: str) -> None:
-        """ACKNOWLEDGED. For attempt evidence, the ledger's tracking gate opens in the same transaction (D5)."""
+        """ACKNOWLEDGED. For attempt evidence, the ledger's tracking gate opens in the same transaction (D5). An
+        expired claim is refused: the receipt is lost, and the next claimant adopts by the stable key."""
         with self.store.jobs.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             row = self._claimed(db, event_id, claim_token)
@@ -433,8 +467,11 @@ class TrackingOutbox:
 
     def backfill(self, lease) -> int:
         """Events for pre-8.3 attempts whose ``tracking_outbox`` row is unacknowledged and has no evidence event.
-        Returns how many events were added (a second call adds none)."""
+        Returns how many events were added (a second call adds none). A row that cannot be turned into events (an
+        unreadable stored plan, a missing descriptor) is skipped and listed in ``backfill_skipped``; it never blocks
+        the other runs (8.3 review Minor 7)."""
         store = self.store
+        skipped = []
         with store.jobs.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             store.validate_owner(db, lease)
@@ -446,12 +483,19 @@ class TrackingOutbox:
                     "JOIN job_attempts a ON a.attempt_id=t.attempt_id JOIN graph_runs r ON r.id=j.graph_run_id "
                     "WHERE t.acknowledged=0 AND NOT EXISTS (SELECT 1 FROM tracking_events e "
                     "WHERE e.idempotency_key='evidence:'||t.attempt_id) ORDER BY a.created,t.attempt_id").fetchall():
-                facts = AttemptFacts(run_id=row['run_id'], node_id=row['graph_node_id'], job_id=row['job_id'],
-                                     attempt_id=row['attempt_id'], launch_id=row['launch_id'],
-                                     manifest=json.loads(row['manifest']), created=row['created'])
-                for event in attempt_events(store, facts, row['plan'], row['approval'], status='COMPLETED',
-                                            outputs_json=row['outputs']):
-                    enqueue_event(db, event, now)
+                db.execute('SAVEPOINT backfill_row')
+                try:
+                    facts = AttemptFacts(run_id=row['run_id'], node_id=row['graph_node_id'], job_id=row['job_id'],
+                                         attempt_id=row['attempt_id'], launch_id=row['launch_id'],
+                                         manifest=json.loads(row['manifest']), created=row['created'])
+                    for event in attempt_events(store, facts, row['plan'], row['approval'], status='COMPLETED',
+                                                outputs_json=row['outputs']):
+                        enqueue_event(db, event, now)
+                except (KeyError, TypeError, ValueError, OSError):
+                    db.execute('ROLLBACK TO backfill_row')
+                    skipped.append(row['attempt_id'])
+                db.execute('RELEASE backfill_row')
+            self.backfill_skipped = tuple(skipped)
             return db.execute('SELECT COUNT(*) FROM tracking_events').fetchone()[0] - before
 
     def status(self, run_id: str) -> dict:
@@ -460,8 +504,8 @@ class TrackingOutbox:
         claim token or remote path."""
         with self.store.jobs.connection() as db:
             rows = [dict(row) for row in db.execute(
-                'SELECT kind,node_id,status,tries,last_error FROM tracking_events WHERE run_id=? ORDER BY rowid',
-                (run_id,))]
+                'SELECT kind,node_id,attempt_id,status,tries,last_error FROM tracking_events WHERE run_id=? '
+                'ORDER BY rowid', (run_id,))]
             node_ids = [row['node_id'] for row in db.execute('SELECT node_id FROM nodes WHERE run_id=? ORDER BY node_id',
                                                              (run_id,))]
         counts = {status: sum(row['status'] == status for row in rows) for status in EVENT_STATUSES}
@@ -470,17 +514,27 @@ class TrackingOutbox:
             return next((row['last_error'] for row in items if row['status'] != 'ACKNOWLEDGED' and row['last_error']),
                         None)
 
+        def action(items):
+            """What the operator can do; changed evidence is the one failure a re-arm cannot repair (Minor 2)."""
+            last = error(items)
+            return EVIDENCE_CHANGED_ACTION if last and EVIDENCE_CHANGED in last else None
+
         nodes = {}
         for node_id in node_ids:
             own = [row for row in rows if row['node_id'] == node_id]
+            # The node's latest attempt only: an earlier attempt's failed tracking no longer describes the node
+            # once a retry was saved (8.3 review Minor 8). The node run itself has no attempt.
+            latest = next((row['attempt_id'] for row in reversed(own) if row['attempt_id']), None)
+            own = [row for row in own if row['attempt_id'] in (None, latest)]
             tracked = [row for row in own if row['kind'] != 'model_registration']
             registrations = [row for row in own if row['kind'] == 'model_registration']
             nodes[node_id] = {"tracking_status": _tracking_status(tracked),
                               "registration_status": _tracking_status(registrations, "registered")
-                              if registrations else "none", "last_error": error(own)}
+                              if registrations else "none", "last_error": error(own), "action": action(own)}
         graph = [row for row in rows if row['node_id'] is None]
         return {"run_id": run_id, "events": counts,
-                "graph": {"tracking_status": _tracking_status(graph), "last_error": error(graph)}, "nodes": nodes}
+                "graph": {"tracking_status": _tracking_status(graph), "last_error": error(graph),
+                          "action": action(graph)}, "nodes": nodes}
 
 
 # -- publishing ------------------------------------------------------------------------------------
@@ -532,31 +586,69 @@ class TrackingPublisher:
         self._handlers = {"graph_run": self._graph_run, "node_run": self._child_run, "attempt_run": self._child_run,
                           "attempt_evidence": self._attempt_evidence, "model_registration": self._registration,
                           "graph_summary": self._graph_summary}
+        self._processing = threading.Lock()   # process() never runs concurrently with itself
+        self._current_lock = threading.Lock()
+        self._current: ClaimedEvent | None = None
 
     def process(self, lease, *, limit: int = 16) -> int:
-        """Publish up to ``limit`` due events; children whose parents are acknowledged meanwhile are included."""
+        """Publish up to ``limit`` due events, one claim at a time, so a claim never waits behind another event's
+        upload and the claim being sent is the only one ``renew_current`` must keep alive (8.3 review Important 1).
+        Children whose parents are acknowledged meanwhile are included. Never concurrent with itself."""
         processed = 0
-        while processed < limit:
-            batch = self.outbox.claim_pending(lease, limit=limit - processed)
-            if not batch:
-                break
-            for claimed in batch:
-                self._publish(claimed)
+        with self._processing:
+            while processed < limit:
+                batch = self.outbox.claim_pending(lease, limit=1)
+                if not batch:
+                    break
+                (claimed,) = batch
+                with self._current_lock:
+                    self._current = claimed
+                try:
+                    self._publish(claimed)
+                finally:
+                    with self._current_lock:
+                        self._current = None
                 processed += 1
         return processed
 
+    def renew_current(self) -> bool:
+        """Extend the claim of the event being sent now (the controller's lease heartbeat calls this while a long
+        upload or create runs). False when nothing is in flight or the claim is no longer ours."""
+        with self._current_lock:
+            claimed = self._current
+        if claimed is None:
+            return False
+        try:
+            self.outbox.renew_claim(claimed.event_id, claim_token=claimed.claim_token, owner=claimed.owner)
+        except ValueError:
+            return False
+        return True
+
     def _publish(self, claimed: ClaimedEvent) -> None:
+        try:
+            self._send(claimed)
+        except StaleTrackingClaim:
+            return   # the claim expired or was replaced: the current claimant settles the event, never us
+
+    def _send(self, claimed: ClaimedEvent) -> None:
         outbox, event = self.outbox, claimed.event
-        plan = self.store.get_run(event.run_id)['plan']
+        try:
+            plan = self.store.get_run(event.run_id)['plan']
+        except Exception as exc:   # one poisoned run never aborts the others (8.3 review Minor 7)
+            outbox.retry(claimed.event_id, f"{UNREADABLE_RUN}: {_describe(exc)}", claim_token=claimed.claim_token,
+                         permanent=True)
+            return
         try:
             if plan.simulation:
                 identity = self.sink.publish(claimed.event_id, event, self._stage(claimed))
             else:
-                reason = self._destination_issue(plan)
+                reason = self._destination_issue(plan) or self._tracker_issue()
                 if reason is not None:
                     outbox.defer(claimed.event_id, reason, claim_token=claimed.claim_token)
                     return
                 identity = self._handlers[event.kind](claimed, self._stage(claimed))
+        except StaleTrackingClaim:
+            raise
         except _Uncertain as exc:
             outbox.retry(claimed.event_id, TRACKING_UNCERTAIN + ": " + _describe(exc.__cause__),
                          claim_token=claimed.claim_token, uncertain=True)
@@ -578,6 +670,18 @@ class TrackingPublisher:
         except ValueError as exc:
             return redact(str(exc))
         return None if actual == destination.public_settings_sha256 else DESTINATION_DIFFERS
+
+    def _tracker_issue(self) -> str | None:
+        """Build a lazy tracker before any intent can be recorded (8.3 review Minor 3): a construction failure is a
+        destination problem, deferred untried, never an uncertain create."""
+        build = getattr(type(self.tracker), "build", None)
+        if build is None:
+            return None
+        try:
+            build(self.tracker)
+        except Exception as exc:
+            return redact(f"{TRACKER_UNAVAILABLE}: {_describe(exc)}")
+        return None
 
     # -- local evidence, verified against the hashes fixed at enqueue time ----------------------------
 
@@ -648,7 +752,8 @@ class TrackingPublisher:
 
     def _create(self, claimed, op, create):
         self.outbox.record_intent(claimed.event_id, {"op": op, "key": claimed.event.idempotency_key,
-                                                     "at": self.outbox.clock()}, claim_token=claimed.claim_token)
+                                                     "at": self.outbox.clock()}, claim_token=claimed.claim_token,
+                                  owner=claimed.owner)
         try:
             return create()
         except Exception as exc:

@@ -83,6 +83,10 @@ RESERVE = ('INSERT INTO budget_reservations (attempt_id,run_id,node_id,job_id,re
 DISPOSE = ('INSERT INTO attempt_dispositions (attempt_id,run_id,node_id,job_id,disposition,counted,detail,created) '
            'VALUES (?,?,?,?,?,?,?,?)')
 UNPRICED_ATTEMPT = "a pre-Task-8 attempt could not be priced; it reserves the run's whole approved budget"
+LEDGER_INTEGRITY = ('ledger integrity check failed; no node was failed, and the run waits until an operator restores '
+                    'or removes the record')
+TEST_ACKNOWLEDGEMENT = ('acknowledge_tracking is a test hook; attempt evidence is acknowledged only by the tracking '
+                        "outbox's receipt")
 
 # -- Task 8.2: readiness, dispositions and safe release ---------------------------------------------
 FailureKind = Literal['remote_failed', 'output_invalid', 'refused_before_launch', 'failed_before_submit',
@@ -100,6 +104,11 @@ PARTIAL_REFUSED = 'partial selection is not allowed'
 # 8.2 review M-4: an uncounted settlement already written for the attempt answers these failure kinds.
 SETTLED_AS = {'released_before_contact': frozenset({'failed_before_submit'}),
               'returned_unlaunched': frozenset({'canceled', 'refused_before_launch'})}
+
+
+class LedgerIntegrityError(ValueError):
+    """Run-wide ledger evidence no longer verifies while a gated ``prepare_ready`` resolves bindings (8.2 review
+    M-2): nothing is failed; the controller shows it as the ready nodes' wait reason."""
 
 
 @dataclass(frozen=True)
@@ -432,11 +441,16 @@ class GraphStore:
             return ControllerLease(run_id, token)
 
     def _controller(self, db, lease):
+        """The run row under a current run lease. A lease bound to an owner is valid only while that owner lease is
+        (8.2 review M3): ``release_owner`` or the owner's expiry fences its run leases at once (D14)."""
         if not isinstance(lease, ControllerLease):
             raise ValueError('controller lease required')
+        now = self.clock()
         row = db.execute('SELECT r.* FROM graph_runs r JOIN controller_leases c ON r.id=c.run_id '
-                         'WHERE c.run_id=? AND c.lease_token=? AND c.expires>?',
-                         (lease.run_id, lease.lease_token, self.clock())).fetchone()
+                         'LEFT JOIN controller_owner o ON o.id=1 '
+                         'WHERE c.run_id=? AND c.lease_token=? AND c.expires>? '
+                         'AND (c.owner_token IS NULL OR (o.lease_token=c.owner_token AND o.expires>?))',
+                         (lease.run_id, lease.lease_token, now, now)).fetchone()
         if row is None:
             raise ValueError('stale controller lease')
         return row
@@ -523,7 +537,8 @@ class GraphStore:
 
         Without ``node_ids`` (the pre-Task-8 behaviour, unchanged) every PENDING node is tried and a compile error
         is recorded on the node, which stays PENDING. With ``node_ids`` only those the ledger finds ``ready`` now
-        are compiled (others are skipped untouched), and a compile refusal fails the node and blocks its subtree.
+        are compiled (others are skipped untouched), and a compile refusal fails the node and blocks its subtree; a
+        run-wide resolver failure raises ``LedgerIntegrityError`` and fails nothing (8.2 review M-2).
         """
         with self.jobs.connection() as db:   # a fenced controller is refused even when nothing is left to prepare
             if node_ids is not None:
@@ -549,7 +564,17 @@ class GraphStore:
             if gated is not None and entry.node.id not in gated:
                 continue
             try:
-                operation = compile_node(run['plan'], entry.node.id, self.bindings_for(run['id'], entry.node.id))
+                bindings = self.bindings_for(run['id'], entry.node.id)
+            except ValueError as exc:
+                if gated is not None:
+                    # The resolver re-verifies run-wide ledger evidence (completed producers, persisted targets,
+                    # active jobs' facts). A record that no longer verifies is not this node's refusal: fail
+                    # nothing and let the controller hold the run for an operator (8.2 review M-2).
+                    raise LedgerIntegrityError(f'{LEDGER_INTEGRITY}: {exc}') from exc
+                self._record_compile_error(controller_lease, run['id'], entry.node.id, exc)
+                continue
+            try:
+                operation = compile_node(run['plan'], entry.node.id, bindings)
                 if isinstance(operation, LocalSelectSpec):
                     body = {'schema_version': 2, 'operation': operation.model_dump(mode='json')}
                     manifest = {**body, 'sha256': digest(canonical(body))}
@@ -559,11 +584,7 @@ class GraphStore:
                 if gated is not None:
                     self._refuse_node(controller_lease, entry.node.id, str(exc))
                     continue
-                with self.jobs.connection() as db:
-                    db.execute('BEGIN IMMEDIATE')
-                    self._controller(db, controller_lease)
-                    db.execute('UPDATE nodes SET error=? WHERE run_id=? AND node_id=? AND job_id IS NULL',
-                               (str(exc), run['id'], entry.node.id))
+                self._record_compile_error(controller_lease, run['id'], entry.node.id, exc)
                 continue
             with self.jobs.connection() as db:
                 db.execute('BEGIN IMMEDIATE')
@@ -586,6 +607,14 @@ class GraphStore:
             prepared.append(job_id)
             self.materialize_job_evidence(job_id)
         return prepared
+
+    def _record_compile_error(self, controller_lease, run_id, node_id, exc):
+        """The pre-Task-8 (ungated) path: the error is recorded and the node stays PENDING."""
+        with self.jobs.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self._controller(db, controller_lease)
+            db.execute('UPDATE nodes SET error=? WHERE run_id=? AND node_id=? AND job_id IS NULL',
+                       (str(exc), run_id, node_id))
 
     def _refuse_node(self, controller_lease, node_id, error):
         """A ready node whose compilation is refused: FAILED, and its subtree BLOCKED (one transaction)."""
@@ -886,6 +915,10 @@ class GraphStore:
             existing = db.execute('SELECT outputs FROM node_outputs WHERE attempt_id=?', (attempt_lease.attempt_id,)).fetchone()
             if existing and existing['outputs'] != payload:
                 raise ValueError('immutable output receipt mismatch')
+            if existing:
+                # Recorded once already (its events with it): a rerun never re-hashes the attempt's evidence, which a
+                # later worker.log may have changed (8.3 review Minor 1), as complete_local_selection's rerun.
+                return
             db.execute('INSERT OR IGNORE INTO node_outputs VALUES (?,?,?,?)',
                        (job['graph_run_id'], job['graph_node_id'], attempt_lease.attempt_id, payload))
             db.execute('INSERT OR IGNORE INTO tracking_outbox (attempt_id,job_id,payload,acknowledged) VALUES (?,?,?,0)',
@@ -975,8 +1008,15 @@ class GraphStore:
             self._track(db, self._attempt_chain(db, run, row, lease.attempt_id, 'COMPLETED', outputs_json=payload))
         return outputs
 
+    # Tests only (8.3 review Minor 6): the controller and the outbox never open the gate without evidence.
+    test_acknowledgement = False
+
     def acknowledge_tracking(self, attempt_lease):
-        """Trusted tracking adapter calls only after durable tracking receipt succeeds."""
+        """A test hook that opens the tracking gate without any evidence. Refused unless
+        ``GraphStore.test_acknowledgement`` is set (``tests/conftest.py`` sets it); in production only the tracking
+        outbox's ``record_receipt`` of an ``attempt_evidence`` event opens the gate."""
+        if not type(self).test_acknowledgement:
+            raise ValueError(TEST_ACKNOWLEDGEMENT)
         with self.jobs.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             self.jobs.validate_lease(db, attempt_lease)
@@ -1077,8 +1117,10 @@ class GraphStore:
                 db.execute("UPDATE budget_reservations SET status='VOID' WHERE attempt_id=?", (row['attempt_id'],))
             self._dispose(db, run['id'], row, row['attempt_id'], kind, counted, row['error'])
             self._settle_node(db, run, row, kind, counted)
-            self._track(db, self._attempt_chain(db, run, row, row['attempt_id'], 'CANCELED' if canceled else 'FAILED',
-                                                disposition=kind, error=row['error']))
+            if counted:   # an attempt that provably never ran gets no MLflow attempt run (8.3 review Minor 10)
+                self._track(db, self._attempt_chain(db, run, row, row['attempt_id'],
+                                                    'CANCELED' if canceled else 'FAILED', disposition=kind,
+                                                    error=row['error']))
             return kind
 
     def _settle_node(self, db, run, row, kind, counted, error=None):

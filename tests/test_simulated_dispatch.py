@@ -691,16 +691,20 @@ def test_simulated_attempt_crashed_while_running_settles_once_by_reconcile(tmp_p
     assert (outcome.status, outcome.uncertain, outcome.error) == ("FAILED", False, sd.SIMULATION_STOPPED)
     assert not held(w)
     result = accepted_result(w.state, job_id, claimed["launch_id"], claimed["lease"].attempt_id)
-    assert (result.status, result.error) == ("FAILED", sd.SIMULATION_STOPPED)
-    assert d.failure_kind(job_id) == "remote_failed"   # provably settled, so retryable within max_attempts
-    assert w.store.classify_attempt(w.ctl, job_id, "remote_failed") == "remote_failed"
-    assert w.store.requeue_retry(w.ctl, job_id)
-    spy.fail = None
-    before = artifact_entries(w.store)
-    retried = claim_job(w, job_id)
-    assert d.run_claimed(retried, None, approval=w.approval).status == "COMPLETED"
-    assert spy.calls == [launch_dir(w, claimed), launch_dir(w, retried)]   # a new attempt; the crashed one never re-ran
-    assert len(artifact_entries(w.store)) == len(before) + 1
+    assert (result.status, result.error, result.engine_version) == ("FAILED", sd.SIMULATION_STOPPED, None)
+    # 8.4 review Important 1: the result reconcile published itself proves only that the actor stopped, as an
+    # operator's confirmation does on the real path: counted and terminal (D4), never a retry. A suspended original
+    # actor that resumes therefore cannot overlap a second attempt of the same node.
+    assert d.failure_kind(job_id) == "failed_before_submit"
+    assert w.store.classify_attempt(w.ctl, job_id, "failed_before_submit") == "failed_before_submit"
+    assert w.store.attempt_disposition(job_id)["counted"] == 1
+    w.clock.advance(600)
+    assert not w.store.requeue_retry(w.ctl, job_id)   # max_attempts=2, and still no retry
+    assert w.store.get_run(w.run_id)["nodes"][0]["status"] == "FAILED"
+    assert spy.calls == [launch_dir(w, claimed)]   # the worker ran once, and the crashed attempt never re-ran
+    # A FAILED result the simulated worker itself published stays a retryable remote failure.
+    worker_failed = result.model_copy(update={"engine_version": sd.ENGINE_VERSION, "error": "simulated failure"})
+    assert not sd._stopped_by_reconcile(worker_failed) and sd._stopped_by_reconcile(result)
 
 
 def test_a_suspended_simulated_actor_cannot_publish_after_reconcile(tmp_path, monkeypatch):
@@ -769,6 +773,8 @@ def refuse(*args, **kwargs):
 socket.socket.connect = refuse
 import tuning_factory.manifest
 tuning_factory.manifest.code_revision = lambda: "0" * 40
+import tuning_factory.graph_store
+tuning_factory.graph_store.GraphStore.test_acknowledgement = True   # as tests/conftest.py does
 import test_simulated_dispatch
 w, outcomes, selection = test_simulated_dispatch.full_chain(Path(sys.argv[1]))
 assert selection.selection.status == "no_winner" and len(outcomes) == 5
@@ -786,3 +792,84 @@ def test_simulated_dispatch_imports_no_network_or_heavy_modules(tmp_path):
     # SimulatedWorker needs no ledger: importing the module loads neither graph_store nor jobs.
     assert subprocess_modules(IMPORT_PROBE, *FORBIDDEN, "tuning_factory.graph_store", "tuning_factory.jobs",
                               cwd=tmp_path) == []
+
+
+# -- 8.4 review fixes (folded into 8.5) -------------------------------------------------------------
+
+def big_root_evidence():
+    """Inspected targets of a 7B-class HF root: 28 layers of seven 3584-wide linear modules (about 10 GB of F32)."""
+    from tuning_factory.graph_planner import ModelTargetEvidence, TargetModuleEvidence
+    modules = tuple(TargetModuleEvidence(name=f"model.layers.{layer}.{name}", input_dimension=3584,
+                                         output_dimension=3584)
+                    for layer in range(28) for name in ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj",
+                                                        "up_proj", "down_proj"))
+    return ModelTargetEvidence(base=inputs.ROOT, modules=modules)
+
+
+def test_simulated_outputs_above_the_size_cap_are_refused_before_launch(tmp_path):
+    """8.4 review Important 2: zero-valued tensors are real bytes (written, then copied by the freeze). Above the cap
+    (1 GiB by default, configurable on the dispatcher) a dry run refuses before begin_launch and writes nothing."""
+    sd = api()
+    assert sd.MAX_SIMULATED_OUTPUT_BYTES == 1024 ** 3
+    w = build(tmp_path, lambda r: [node_train(r, "full", base=r.root, recipe=r.full_recipe)])
+    roots = sd.DirectoryRootSnapshots(write_root_snapshot(tmp_path).parents[2])
+    job_id = prepare(w, "full")
+    operation = w.store.jobs.get(job_id)["manifest"]["operation"]
+    worker = sd.SimulatedWorker()
+    worker.check(operation, artifacts=w.store.artifacts, roots=roots, target_evidence=(inputs.evidence(inputs.ROOT),))
+    with pytest.raises(ValueError, match=sd.SIMULATED_OUTPUT_TOO_LARGE):   # the default cap, a 7B-class base
+        worker.check(operation, artifacts=w.store.artifacts, roots=roots, target_evidence=(big_root_evidence(),))
+    with pytest.raises(ValueError, match="positive number of bytes"):
+        sd.SimulatedOperationDispatcher(w.store, root=w.state, roots=roots, max_output_bytes=0)
+    small = sd.SimulatedOperationDispatcher(w.store, root=w.state, roots=roots, max_output_bytes=16)
+    claimed = claim_job(w, job_id)
+    outcome = small.run_claimed(claimed, None, approval=w.approval)
+    assert outcome.status == "FAILED" and sd.SIMULATED_OUTPUT_TOO_LARGE in outcome.error
+    assert attempt(w, claimed)["launch_started"] == 0 and not held(w)   # abandon_unlaunched: nothing launched
+    assert not launch_dir(w, claimed).exists()
+    assert small.failure_kind(job_id) == "refused_before_launch"
+
+
+def test_a_filesystem_without_hard_links_is_refused_before_launch(tmp_path, monkeypatch):
+    """8.4 review Minor 2: the exclusive result publish needs hard links; they are probed before begin_launch."""
+    sd = api()
+    w = build(tmp_path, lambda r: [node_train(r, "train")])
+    assert sd.hard_links_supported(tmp_path / "probe")
+    claimed = claim(w, "train")
+
+    def no_links(source, target):
+        raise OSError("hard links are not supported here")
+
+    monkeypatch.setattr(sd.os, "link", no_links)
+    outcome = dispatcher(w).run_claimed(claimed, None, approval=w.approval)
+    assert outcome.status == "FAILED" and sd.NO_HARD_LINKS in outcome.error
+    assert attempt(w, claimed)["launch_started"] == 0 and not held(w)
+    assert not launch_dir(w, claimed).exists()
+
+
+@pytest.mark.parametrize("module", ["simulated", "runner"])
+def test_attempt_heartbeats_survive_a_transient_database_error(tmp_path, module):
+    """8.4 review Minor 3: a locked database once must not silently end the heartbeat (the attempt would go stale)."""
+    import sqlite3
+    w = build(tmp_path, lambda r: [node_train(r, "train")])
+    if module == "simulated":
+        owner = dispatcher(w)
+    else:
+        from tuning_factory.attempt_runner import OperationAttemptRunner
+        owner = OperationAttemptRunner(w.store, root=w.state)
+    owner.heartbeat_seconds = 0.01
+    beats, errors = threading.Event(), []
+
+    def heartbeat(lease):
+        if len(errors) < 2:
+            errors.append(lease)
+            raise sqlite3.OperationalError("database is locked")
+        beats.set()
+
+    owner.jobs = SimpleNamespace(heartbeat=heartbeat)
+    stop = owner._heartbeat(SimpleNamespace(job_id="j"))
+    try:
+        assert beats.wait(30)   # it kept beating after two failures
+    finally:
+        stop.set()
+    assert len(errors) == 2

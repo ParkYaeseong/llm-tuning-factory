@@ -215,7 +215,8 @@ class ExecutorProvider(Protocol):
                 ) -> AbstractContextManager[ResolvedDestination]: ...
 
     def recover(self, profile_id: str, approved_revision: str, *, pinned: PublicExecutorProfile,
-                pinned_facts: ResourceObservation, manifest_sha256: str) -> AbstractContextManager[object]: ...
+                pinned_facts: ResourceObservation, manifest_sha256: str, runtime_profile: str | None = None
+                ) -> AbstractContextManager[object]: ...
 
 
 def _check_pinned(profile_id, approved_revision, pinned):

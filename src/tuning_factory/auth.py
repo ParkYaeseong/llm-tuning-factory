@@ -69,6 +69,15 @@ def credentials_configured():
                 or (os.environ.get("MLFLOW_OIDC_TOKEN_URL") and os.environ.get("MLFLOW_OIDC_CLIENT_SECRET")))
 
 
+def current_auth_mode():
+    """The MLflow auth scope of this process, never a credential: ``oidc``, ``token`` or ``none``. The same condition
+    as ``credentials_configured``; ``tracking`` re-exports it for ``tracking_settings_sha256`` (D11)."""
+    if not credentials_configured():
+        return "none"
+    oidc = os.environ.get("MLFLOW_OIDC_TOKEN_URL") and os.environ.get("MLFLOW_OIDC_CLIENT_SECRET")
+    return "oidc" if oidc else "token"
+
+
 def require_secure_tracking(uri):
     """Bearer tokens and OIDC secrets never travel over plain HTTP; unauthenticated servers are unaffected."""
     if uri and credentials_configured() and urlsplit(str(uri)).scheme != "https":

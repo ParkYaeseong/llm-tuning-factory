@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -474,6 +475,9 @@ class OperationAttemptRunner:
                     self.jobs.heartbeat(lease)
                 except ValueError:
                     return   # ownership or state changed; later mutations stay fenced
+                except Exception as exc:   # e.g. a locked database: keep beating, never stop silently (8.4 Minor 3)
+                    logging.getLogger(__name__).warning("attempt heartbeat failed; retrying: %s",
+                                                        type(exc).__name__)
 
         threading.Thread(target=beat, daemon=True).start()
         return stop

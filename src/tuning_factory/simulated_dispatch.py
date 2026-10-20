@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import math
 import os
 import struct
@@ -105,6 +106,12 @@ TARGETS_REQUIRED = "simulated {kind} requires inspected base target evidence"
 NO_EXECUTOR = "simulated dispatch never uses an executor"
 SIMULATION_STOPPED = "simulated execution stopped before its result; settled by reconcile without re-running it"
 RESULT_PUBLISHED = "a result is already published for this launch; reconcile the same attempt"
+# 8.4 review Important 2: zero-valued placeholders of a real-size base are still real bytes on disk (written, then
+# copied by the freeze), so a dry run refuses before launch above this cap (configurable on the dispatcher).
+SIMULATED_OUTPUT_TOO_LARGE = ("simulated outputs would exceed the dry-run size cap; simulate a smaller base or raise "
+                              "the cap")
+MAX_SIMULATED_OUTPUT_BYTES = 1024 ** 3
+NO_HARD_LINKS = "the state directory's filesystem has no hard links; a simulated result cannot be published exclusively"
 SIMULATED_MARKER = "simulated.json"
 REMOTE_ATTEMPT = "remote-attempt.json"   # graph_store.REMOTE_ATTEMPT; here a local record of no contact
 ENGINE_VERSION = "simulated"
@@ -202,9 +209,45 @@ def _publish_exclusive(path: Path, data: bytes) -> bool:
             os.link(temporary, path)
         except FileExistsError:
             return False
+        _fsync_directory(path.parent)
         return True
     finally:
         os.unlink(temporary)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make a new directory entry durable where the platform allows opening a directory (not on Windows)."""
+    if os.name == "nt":
+        return
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def hard_links_supported(directory: Path) -> bool:
+    """Whether ``directory``'s filesystem supports the hard links ``_publish_exclusive`` relies on (8.4 review Minor 2):
+    probed before ``begin_launch``, so such a filesystem is refused before anything runs."""
+    directory.mkdir(parents=True, exist_ok=True)
+    descriptor, source = tempfile.mkstemp(prefix=".link-probe.", dir=directory)
+    os.close(descriptor)
+    target = source + ".link"
+    try:
+        os.link(source, target)
+    except OSError:
+        return False
+    else:
+        os.unlink(target)
+        return True
+    finally:
+        os.unlink(source)
+
+
+def _tensor_bytes(files) -> int:
+    """The bytes of every zero-valued tensor in a layout (the files that would be written, then frozen)."""
+    return sum(4 * math.prod(shape) for _, content in files if isinstance(content, _Tensors)
+               for shape in content.shapes.values())
 
 
 def _json_file(value) -> bytes:
@@ -272,9 +315,13 @@ class SimulatedWorker:
     """
 
     def check(self, operation, *, artifacts: ModelArtifactStore, roots: RootSnapshotSource | None,
-              target_evidence: tuple[ModelTargetEvidence, ...]) -> None:
-        """Refuse what the simulated worker cannot invent; the dispatcher calls it before ``begin_launch``."""
-        self._layout(validated_operation(operation), artifacts.verifier(), roots, tuple(target_evidence))
+              target_evidence: tuple[ModelTargetEvidence, ...],
+              max_output_bytes: int = MAX_SIMULATED_OUTPUT_BYTES) -> None:
+        """Refuse what the simulated worker cannot invent, or outputs above ``max_output_bytes`` of tensors
+        (``SIMULATED_OUTPUT_TOO_LARGE``); the dispatcher calls it before ``begin_launch``."""
+        layout = self._layout(validated_operation(operation), artifacts.verifier(), roots, tuple(target_evidence))
+        if _tensor_bytes(layout.files) > max_output_bytes:
+            raise ValueError(SIMULATED_OUTPUT_TOO_LARGE)
 
     def execute(self, operation, launch_dir: Path, request: WorkerRequest, resolved: ResolvedModelInputs, *,
                 artifacts: ModelArtifactStore, roots: RootSnapshotSource | None,
@@ -433,11 +480,17 @@ class SimulatedWorker:
 
 # -- the dispatcher ------------------------------------------------------------------------------
 
+def _stopped_by_reconcile(result: OperationResult) -> bool:
+    """The FAILED result ``reconcile`` publishes for an actor that stopped without one (no engine ever ran it)."""
+    return result.status == "FAILED" and result.error == SIMULATION_STOPPED and result.engine_version is None
+
+
 class SimulatedOperationDispatcher:
     """The simulated ``OperationDispatcher`` of 8.5's controller for simulation plans; the executor is always None."""
     heartbeat_seconds = 10
 
-    def __init__(self, graph_store: GraphStore, *, root: Path, roots: RootSnapshotSource | None = None):
+    def __init__(self, graph_store: GraphStore, *, root: Path, roots: RootSnapshotSource | None = None,
+                 max_output_bytes: int = MAX_SIMULATED_OUTPUT_BYTES):
         from .graph_store import GraphStore
         if not isinstance(graph_store, GraphStore):
             raise TypeError("the simulated dispatcher requires the GraphStore ledger")
@@ -446,6 +499,9 @@ class SimulatedOperationDispatcher:
         if self.root != self.jobs.path.parent.resolve():
             raise ValueError("simulated dispatcher root must be the state directory that holds jobs.db")
         self.roots = roots
+        if isinstance(max_output_bytes, bool) or not isinstance(max_output_bytes, int) or max_output_bytes < 1:
+            raise ValueError("the simulated output cap must be a positive number of bytes")
+        self.max_output_bytes = max_output_bytes
         self.worker = SimulatedWorker()
 
     # -- public interface (the OperationAttemptRunner protocol) ---------------------------------
@@ -563,8 +619,10 @@ class SimulatedOperationDispatcher:
             return "refused_before_launch"
         if locked:
             return "uncertain"
-        if result is not None:
+        if result is not None and not _stopped_by_reconcile(result):
             return "remote_failed" if result.status == "FAILED" else "output_invalid"
+        # No result, or only the one reconcile published for an actor that stopped without its own: as the real
+        # path after an operator confirms the stop, counted and terminal (D4; 8.4 review Important 1).
         return "failed_before_submit"
 
     def outputs_for(self, job_id: str) -> OperationOutcome:
@@ -719,7 +777,10 @@ class SimulatedOperationDispatcher:
         if not isinstance(operation, EvaluateOperation):   # from the trusted resolver hook, as compile used
             bindings = self.graph.bindings_for(job["graph_run_id"], job["graph_node_id"])
             evidence, producers = tuple(bindings.base_targets), tuple(bindings.producers)
-        self.worker.check(operation, artifacts=self.graph.artifacts, roots=self.roots, target_evidence=evidence)
+        self.worker.check(operation, artifacts=self.graph.artifacts, roots=self.roots, target_evidence=evidence,
+                          max_output_bytes=self.max_output_bytes)
+        if not hard_links_supported(self._job_dir(job["id"]) / "launches"):
+            raise ValueError(NO_HARD_LINKS)
         return manifest, operation, evidence, producers
 
     def _check_datasets(self, manifest, operation) -> None:
@@ -768,6 +829,9 @@ class SimulatedOperationDispatcher:
                     self.jobs.heartbeat(lease)
                 except ValueError:
                     return   # ownership or state changed; later mutations stay fenced
+                except Exception as exc:   # e.g. a locked database: keep beating, never stop silently (8.4 Minor 3)
+                    logging.getLogger(__name__).warning("attempt heartbeat failed; retrying: %s",
+                                                        type(exc).__name__)
 
         threading.Thread(target=beat, daemon=True).start()
         return stop
