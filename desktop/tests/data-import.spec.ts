@@ -94,6 +94,9 @@ test("CSV question, context and answer map to instruction, input and output", as
   expect(await workflowCalls(page, "dataset_import_preview")).toEqual([{ source_id: SOURCE, mapping: mapping() }]);
   await expect(page.getByLabel("원본 형식", { exact: true })).toHaveValue("csv");
   await expect(page.locator("#import-preview .import-issues li")).toHaveCount(0);
+  const state = page.locator("#import-preview-state");
+  await expect(state).toContainText("열 확인");
+  await expect(state).toContainText("열을 연결한 뒤 미리보기를 누르세요.");
   await expect(page.locator("#import-mapping")).toContainText("열 3개");
   // The source rows are shown escaped beside the column choices.
   await expect(page.locator("#import-mapping table.import-samples tbody tr")).toHaveCount(5);
@@ -101,6 +104,9 @@ test("CSV question, context and answer map to instruction, input and output", as
   await expect(registerButton(page)).toBeDisabled();
 
   await mapColumns(page, { 지시문: "question", 입력: "context", 정답: "answer" });
+  // Mapping columns after the discovery is the expected next step, not a change that makes a preview stale.
+  await expect(state).toContainText("열 확인");
+  await expect(state).not.toContainText("다시 미리보아야");
   await preview(page);
   const previews = await workflowCalls(page, "dataset_import_preview");
   expect(previews).toHaveLength(2);
@@ -170,12 +176,13 @@ test("row errors show their source row numbers and block registration", async ({
   await preview(page);
   const items = page.locator("#import-preview .import-issues li");
   await expect(items).toHaveCount(2);
-  await expect(items.nth(0).locator(".import-issue-where")).toHaveText("3행");
-  await expect(items.nth(0)).toContainText("이 행을 연결한 열로 학습 형식에 맞게 바꿀 수 없습니다.");
-  await items.nth(0).getByText("원문 보기").click();
-  await expect(items.nth(0)).toContainText("'answer'");
-  await expect(items.nth(1).locator(".import-issue-where")).toHaveText("헤더");
-  await expect(items.nth(1)).toContainText("CSV 헤더에 같은 이름의 열이 있습니다.");
+  // File-level issues are listed before row issues.
+  await expect(items.nth(0).locator(".import-issue-where")).toHaveText("헤더");
+  await expect(items.nth(0)).toContainText("CSV 헤더에 같은 이름의 열이 있습니다.");
+  await expect(items.nth(1).locator(".import-issue-where")).toHaveText("3행");
+  await expect(items.nth(1)).toContainText("이 행을 연결한 열로 학습 형식에 맞게 바꿀 수 없습니다.");
+  await items.nth(1).getByText("원문 보기").click();
+  await expect(items.nth(1)).toContainText("'answer'");
   await expect(page.locator("#import-preview")).toContainText("문제 2건");
   await expect(registerButton(page)).toBeDisabled();
   await page.locator("#import-register-form").getByLabel("데이터 ID", { exact: true }).fill("qa");
@@ -518,6 +525,15 @@ test("KTO labels are sent as exact label sets and a one-sided set is refused fir
   await expect(page.locator("#import-mapping")).toContainText("좋은 응답과 나쁜 응답으로 볼 값을 모두 입력하거나 둘 다 비워 두세요.");
   await expect(page.getByLabel("나쁜 응답으로 볼 값", { exact: true })).toBeFocused();
   expect(await calls(page, { action: "dataset_import_preview" })).toHaveLength(1);
+  // A value on both sides, or twice on one side, is refused with its reason before any call.
+  await page.getByLabel("나쁜 응답으로 볼 값", { exact: true }).fill("나쁨, 좋음");
+  await previewButton(page).click();
+  await expect(page.locator("#import-mapping")).toContainText("좋은 응답과 나쁜 응답에 같은 값이 있습니다: 좋음");
+  await expect(page.getByLabel("나쁜 응답으로 볼 값", { exact: true })).toBeFocused();
+  await page.getByLabel("나쁜 응답으로 볼 값", { exact: true }).fill("나쁨, 나쁨");
+  await previewButton(page).click();
+  await expect(page.locator("#import-mapping")).toContainText("같은 값을 두 번 입력했습니다: 나쁨");
+  expect(await calls(page, { action: "dataset_import_preview" })).toHaveLength(1);
   await page.getByLabel("나쁜 응답으로 볼 값", { exact: true }).fill("나쁨");
   await preview(page);
   expect((await workflowCalls(page, "dataset_import_preview"))[1].mapping).toEqual(kto({ fields: { instruction: ["question"],
@@ -564,4 +580,223 @@ test("leaving the page while a step runs keeps that step's result", async ({ pag
   await expect(page.locator("#import-registered")).toContainText("qa2 · v1 · 66666666");
   await expect(page.locator("#import-split").getByLabel("학습 데이터 ID", { exact: true })).toHaveValue("qa2-train");
   await expect(page.locator("#import-split").getByLabel("시험 데이터 ID", { exact: true })).toHaveValue("qa2-test");
+});
+
+/** Creates a project from the overview panel and opens its import page through the project page's link. */
+async function importForNewProject(page: Page, name: string) {
+  await page.locator('#app [data-tour="project-start"]').getByLabel("프로젝트 이름").fill(name);
+  await page.locator('#app [data-tour="project-start"]').getByRole("button", { name: "만들기", exact: true }).click();
+  await idle(page);
+  await page.locator("#project-form").getByRole("button", { name: "CSV·JSON 가져오기", exact: true }).click();
+  await expect(heading(page)).toHaveText("데이터 가져오기");
+}
+async function splitAndCommit(page: Page) {
+  const split = page.locator("#import-split");
+  await split.getByRole("button", { name: "분할 미리보기", exact: true }).click();
+  await idle(page);
+  await split.getByRole("button", { name: "분할 등록", exact: true }).click();
+  await idle(page);
+}
+
+test("registering again keeps the committed split and the same version is not offered twice", async ({ page }) => {
+  await openWorkbench(page, { definitions: true, workflow: { dataset_import_source: sourceOk,
+    dataset_import_preview: [discovery(), mappedPreview("2".repeat(64))],
+    dataset_import_register: [registered("qa", "1"), registered("qa", "2", "5".repeat(64))],
+    dataset_split_preview: ok({ plan_sha256: PLAN, counts: { train: 8, validation: 1, test: 1 }, outputs: splitOutputs() }),
+    dataset_split_commit: ok({ plan_sha256: PLAN, outputs: splitOutputs() }) } });
+  await importForNewProject(page, "다시 등록");
+  await importFile(page);
+  await mapColumns(page, { 지시문: "question", 입력: "context", 정답: "answer" });
+  await preview(page);
+  await register(page, "qa", "1");
+  await splitAndCommit(page);
+  const link = page.locator("#import-link");
+  await expect(link).toContainText(`학습 · qa-train · v1 · ${"7".repeat(8)}`);
+  // The registered preview, ID and version are not offered again; a programmatic submit sends nothing either.
+  await expect(registerButton(page)).toBeDisabled();
+  await expect(page.locator("#import-register-actions")).toContainText("이미 등록했습니다");
+  await page.locator("#import-register-form").evaluate(form => (form as HTMLFormElement).requestSubmit());
+  await idle(page);
+  expect(await calls(page, { action: "dataset_import_register" })).toHaveLength(1);
+  await expect(page.locator("#import-split-committed")).toContainText("qa-train · v1");
+  await expect(link).toContainText(`학습 · qa-train · v1 · ${"7".repeat(8)}`);
+  await expect(link).not.toContainText("학습 · qa · v1");
+  // Another version is a new registration: typing it enables 등록 at once, and its split starts over.
+  await page.locator("#import-register-form").getByLabel("버전", { exact: true }).fill("2");
+  await expect(registerButton(page)).toBeEnabled();
+  await registerButton(page).click();
+  await idle(page);
+  await expect(page.locator("#import-registered")).toContainText(`qa · v2 · ${"5".repeat(8)}`);
+  await expect(page.locator("#import-split-committed")).toHaveCount(0);
+  await expect(link).toContainText(`학습 · qa · v2 · ${"5".repeat(8)}`);
+});
+
+test("an answer naming the registered version again keeps its split", async ({ page }) => {
+  const other = { instruction: ["question"], input: ["answer"], output: ["answer"] };
+  await openWorkbench(page, { workflow: { dataset_import_source: sourceOk,
+    dataset_import_preview: [discovery(), mappedPreview("2".repeat(64)), mappedPreview("3".repeat(64), { mapping: mapping({ fields: other }) })],
+    dataset_import_register: registered("qa", "1"),
+    dataset_split_preview: ok({ plan_sha256: PLAN, counts: { train: 8, validation: 1, test: 1 }, outputs: splitOutputs() }),
+    dataset_split_commit: ok({ plan_sha256: PLAN, outputs: splitOutputs() }) } });
+  await readyToRegister(page);
+  await register(page, "qa", "1");
+  await splitAndCommit(page);
+  // Another preview may be registered (the server decides); an answer that names the same version keeps the split.
+  await mapColumns(page, { 입력: "answer" });
+  await preview(page);
+  await expect(registerButton(page)).toBeEnabled();
+  await registerButton(page).click();
+  await idle(page);
+  expect(await calls(page, { action: "dataset_import_register" })).toHaveLength(2);
+  await expect(page.locator("#import-split-committed")).toContainText("qa-train · v1");
+  await expect(page.locator("#import-split").getByLabel("학습 데이터 ID", { exact: true })).toHaveValue("qa-train");
+});
+
+test("linking again after the project was saved says nothing new was added", async ({ page }) => {
+  await openWorkbench(page, { definitions: true, workflow: { dataset_import_source: sourceOk,
+    dataset_import_preview: [discovery(), mappedPreview("2".repeat(64))], dataset_import_register: registered() } });
+  await importForNewProject(page, "저장 후 다시 연결");
+  await importFile(page);
+  await mapColumns(page, { 지시문: "question", 입력: "context", 정답: "answer" });
+  await preview(page);
+  await register(page);
+  const link = page.locator("#import-link");
+  await link.getByRole("button", { name: "프로젝트에 연결", exact: true }).click();
+  await idle(page);
+  await expect(link).toContainText("저장 전 연결: train");
+  await link.getByRole("button", { name: "프로젝트에서 저장하기", exact: true }).click();
+  await idle(page);
+  await page.locator("#project-form").getByRole("button", { name: "저장", exact: true }).click();
+  await idle(page);
+  expect(await calls(page, { action: "project_save" })).toHaveLength(1);
+  await page.locator("#project-form").getByRole("button", { name: "CSV·JSON 가져오기", exact: true }).click();
+  await expect(heading(page)).toHaveText("데이터 가져오기");
+  await expect(link.locator("#import-staged")).toHaveCount(0);
+  await link.getByRole("button", { name: "프로젝트에 연결", exact: true }).click();
+  await idle(page);
+  const note = link.locator("#import-link-note");
+  await expect(note).toHaveText("이미 연결된 데이터 버전은 다시 추가하지 않았습니다.");
+  await expect(note).toBeFocused();
+  await expect(link.locator("#import-staged")).toHaveCount(0);
+  expect(await calls(page, { action: "project_save" })).toHaveLength(1);
+});
+
+test("what is typed while the file dialog is open is kept", async ({ page }) => {
+  await openWorkbench(page, { holds: ["pick_file"], native: { pick_file: "C:\\data\\other.csv" },
+    workflow: { dataset_import_source: sourceOk, dataset_import_preview: [discovery(), mappedPreview("2".repeat(64))] } });
+  await readyToRegister(page);
+  await sourceCard(page).getByRole("button", { name: "파일 찾기" }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__held("pick_file"))).toBe(1);
+  // The dialog has no parent window, so the page stays usable meanwhile.
+  const form = page.locator("#import-register-form");
+  await form.getByLabel("더미·합성 데이터입니다").check();
+  await form.getByLabel("이 데이터를 선택한 GPU로 전송해도 됩니다").check();
+  await page.evaluate(() => (window as any).__release("pick_file"));
+  await expect(sourceCard(page).getByLabel("파일 경로", { exact: true })).toHaveValue("C:\\data\\other.csv");
+  await expect(form.getByLabel("더미·합성 데이터입니다")).toBeChecked();
+  await expect(form.getByLabel("이 데이터를 선택한 GPU로 전송해도 됩니다")).toBeChecked();
+});
+
+test("previews stay bounded: file problems first, capped columns, choices and samples", async ({ page }) => {
+  const many = Array.from({ length: 600 }, (_, index) => `col${String(index).padStart(3, "0")}`);
+  const row = (n: number) => Object.fromEntries(many.map(field => [field, `${field}-${n}`]));
+  const rows = Array.from({ length: 60 }, (_, index) => issue("invalid_row", "'col001'", "/mapping", { row_number: index + 1 }));
+  const sizeLimit = issue("size_limit", "canonical dataset exceeds 32 MiB limit", "/mapping");
+  const eight = [1, 2, 3, 4, 5, 6, 7, 8];
+  await openWorkbench(page, { workflow: { dataset_import_source: sourceOk, dataset_import_preview: [
+    discovery({ source_fields: many, source_samples: eight.map(row) }),
+    invalid([...rows, sizeLimit], previewData({ source_fields: many, source_samples: eight.map(row),
+      samples: eight.map(n => ({ instruction: `질문 ${n}`, output: `답 ${n}` })), mapping: mapping({ fields: { instruction: ["col000"], output: ["col001"] } }) }))] } });
+  await openImport(page);
+  await importFile(page);
+  const mappingCard = page.locator("#import-mapping");
+  await expect(mappingCard.getByLabel("지시문", { exact: true }).locator("option")).toHaveCount(501);
+  await expect(mappingCard).toContainText("열이 600개라 앞 500개만 고를 수 있습니다.");
+  await expect(mappingCard.locator("table.import-samples thead th")).toHaveCount(31);
+  await expect(mappingCard).toContainText("열 600개 중 앞 30개만 표시합니다.");
+  await expect(mappingCard.locator("table.import-samples tbody tr")).toHaveCount(5);
+  await mapColumns(page, { 지시문: "col000", 정답: "col001" });
+  await preview(page);
+  const items = page.locator("#import-preview .import-issues li");
+  await expect(items.first()).toHaveAttribute("data-code", "size_limit");
+  await expect(items.first().locator(".import-issue-where")).toHaveText("파일");
+  await expect(items.first()).toContainText("데이터가 32 MiB 한도를 넘습니다.");
+  await expect(items.nth(1).locator(".import-issue-where")).toHaveText("1행");
+  await expect(items.last()).toHaveText("외 11건");
+  await expect(page.locator("#import-preview table.import-samples tbody tr")).toHaveCount(5);
+});
+
+test("split refusals point at their fields", async ({ page }) => {
+  await openWorkbench(page, { workflow: { dataset_import_source: sourceOk,
+    dataset_import_preview: [discovery(), mappedPreview("2".repeat(64))], dataset_import_register: registered(),
+    dataset_split_preview: [invalid([issue("practice_reserved", PRACTICE_REFUSAL, "/plan/outputs/train/dataset_id")]),
+      ok({ plan_sha256: PLAN, counts: { train: 8, validation: 1, test: 1 }, outputs: splitOutputs() })],
+    dataset_split_commit: conflict([issue("version_exists", "immutable dataset version already registered without this provenance", "/plan_sha256")]) } });
+  await readyToRegister(page);
+  await register(page);
+  const split = page.locator("#import-split");
+  await split.getByRole("button", { name: "분할 미리보기", exact: true }).click();
+  await idle(page);
+  await expect(page.locator("#import-out-train-issues")).toContainText(PRACTICE_REFUSAL);
+  await expect(split.getByLabel("학습 데이터 ID", { exact: true })).toBeFocused();
+  await expect(split.getByLabel("학습 데이터 ID", { exact: true })).toHaveAttribute("aria-invalid", "true");
+  await split.getByRole("button", { name: "분할 미리보기", exact: true }).click();
+  await idle(page);
+  await expect(page.locator("#import-out-train-issues")).toHaveCount(0);
+  await split.getByRole("button", { name: "분할 등록", exact: true }).click();
+  await idle(page);
+  await expect(page.locator("#import-split-version-issues")).toContainText("이미 등록된 버전입니다. 다른 버전을 입력하세요.");
+  await expect(split.getByLabel("분할 버전", { exact: true })).toBeFocused();
+});
+
+test("registered and split versions show their data flags", async ({ page }) => {
+  await openWorkbench(page, { workflow: { dataset_import_source: sourceOk,
+    dataset_import_preview: [discovery(), mappedPreview("2".repeat(64))], dataset_import_register: registered(),
+    dataset_split_preview: ok({ plan_sha256: PLAN, counts: { train: 8, validation: 1, test: 1 }, outputs: splitOutputs() }),
+    dataset_split_commit: ok({ plan_sha256: PLAN, outputs: splitOutputs() }) } });
+  await readyToRegister(page);
+  await page.locator("#import-register-form").getByLabel("더미·합성 데이터입니다").check();
+  await register(page);
+  await expect(page.locator("#import-registered")).toContainText("합성 데이터 · GPU 전송 미허용");
+  await expect(page.locator("#import-split")).toContainText("분할 결과도 합성 데이터 · GPU 전송 미허용");
+  await splitAndCommit(page);
+  await expect(page.locator("#import-split-committed")).toContainText("분할 결과도 합성 데이터 · GPU 전송 미허용");
+});
+
+test("split output IDs must differ from each other and from the source", async ({ page }) => {
+  await openWorkbench(page, { workflow: { dataset_import_source: sourceOk,
+    dataset_import_preview: [discovery(), mappedPreview("2".repeat(64))], dataset_import_register: registered() } });
+  await readyToRegister(page);
+  await register(page);
+  const split = page.locator("#import-split");
+  await split.getByLabel("검증 데이터 ID", { exact: true }).fill("qa-train");
+  await split.getByRole("button", { name: "분할 미리보기", exact: true }).click();
+  await expect(split).toContainText("학습·검증·시험 데이터 ID는 서로 달라야 합니다.");
+  await expect(split.getByLabel("검증 데이터 ID", { exact: true })).toBeFocused();
+  await split.getByLabel("검증 데이터 ID", { exact: true }).fill("qa-validation");
+  await split.getByLabel("학습 데이터 ID", { exact: true }).fill("qa");
+  await split.getByRole("button", { name: "분할 미리보기", exact: true }).click();
+  await expect(split).toContainText("등록한 원본(qa · v1)과 같은 ID·버전은 쓸 수 없습니다.");
+  await expect(split.getByLabel("학습 데이터 ID", { exact: true })).toBeFocused();
+  expect(await calls(page, { action: "dataset_split_preview" })).toEqual([]);
+});
+
+test("a changed preview is reported once and names keep their direction", async ({ page }) => {
+  const hebrew = "\u05E9\u05D0\u05DC\u05D4";                     // a right-to-left column and file name
+  const path = `C:\\data\\${hebrew}.csv`;
+  await openWorkbench(page, { workflow: { dataset_import_source: sourceOk,
+    dataset_import_preview: [discovery({ source_fields: ["answer", "context", hebrew] }), mappedPreview("2".repeat(64))],
+    dataset_import_register: conflict([issue("preview_changed", "import preview changed; inspect the mapping again", "/preview_sha256")]) } });
+  await openImport(page);
+  await importFile(page, path);
+  await expect(page.locator(".import-source-facts bdi")).toHaveText(path);
+  await expect(page.locator("#import-mapping table.import-samples thead th bdi")).toHaveCount(3);
+  await mapColumns(page, { 지시문: hebrew, 입력: "context", 정답: "answer" });
+  await preview(page);
+  await register(page, "qa", "1");
+  const changed = "미리본 뒤 원본이나 설정이 바뀌었습니다. 다시 미리보세요.";
+  const card = await page.locator("#import-register").textContent();
+  expect(card!.split(changed).length - 1).toBe(1);
+  await expect(page.locator("#import-preview-state")).toContainText(changed);
+  await expect(registerButton(page)).toBeDisabled();
 });

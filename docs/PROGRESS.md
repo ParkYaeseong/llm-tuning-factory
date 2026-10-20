@@ -4532,6 +4532,90 @@ Not verified or still open:
 - 10.6 navigates here after a submit (`ctx.navigate("runs", runId)`, outside its task); 10.8 adds the `graph-runs`
   tutorial step. Wait reasons are matched by English prefixes: a backend wording change shows the original text.
 
+## Task 10.3 review fixes: kept splits, bounded previews, 2026-10-21
+
+Commit `fix: keep committed splits on re-registration and bound import previews`, written in
+`D:\llm-tuning-factory-wt95` (branch `codex/task-10.3-fix`) on `f6493a1`, then rebased onto `2b98a4c` (the 10.4 review
+fixes and 10.7; only this file conflicted, every entry is kept, this one last). It lands the independent review of
+`f6493a1` ("Ready with fixes": one Important, nothing Critical) and its recommendations. Changed:
+`desktop/src/views/data-import.ts`, `desktop/tests/data-import.spec.ts` and this file. No other file changed (no
+Rust, Python, package or lock file).
+
+What changed:
+- Important: a second 등록 no longer throws the committed split away.
+  - Before, 등록 stayed enabled after a registration, and the identical request is an idempotent `ok` on the
+    server. Every `ok` reset the split, so 프로젝트에 연결 then bound the unsplit version as 학습.
+  - Now 등록 is disabled with "이미 등록했습니다 · 다른 ID나 버전을 입력하면 새 버전으로 등록합니다." while the shown
+    preview, ID and version are the registered ones. ID and version update the button while typing.
+  - An `ok` resets the split only when it names another version than the one registered.
+- 프로젝트에 연결 says "이미 연결된 데이터 버전은 다시 추가하지 않았습니다." and focuses that note when nothing was
+  added, also after the project was saved. The note used to render only inside the unsaved-bindings block.
+- 파일 찾기 reads the page again after the dialog answers. The dialog has no parent window, so what was typed or
+  ticked meanwhile is no longer reverted.
+- Previews are bounded on the client.
+  - File-level issues are listed before row issues, so a `size_limit` that the server appends last is never cut off
+    by the 50-item limit.
+  - Sample tables show at most 30 columns ("열 N개 중 앞 30개만 표시합니다.") and 5 rows.
+  - The column and group-column choices list at most 500 columns, plus the chosen one, with a note.
+- Split issues show under their fields and focus the first one, as the register step does.
+  - Server pointers under `/plan` place `practice_reserved` at an output ID.
+  - A commit `version_exists` is shown and focused at 분할 버전.
+  - Client checks use the same placement.
+- The registered version shows its flags (e.g. "합성 데이터 · GPU 전송 미허용"). The split card and the committed
+  split say that the split outputs inherit them (`dataset_splits.commit_split`).
+- New client checks with Korean reasons, before any call:
+  - a KTO value on both sides, or twice on one side;
+  - duplicate split output IDs;
+  - a split output with the source's ID and version.
+- `preview_changed` is said once in the register card: by the button's reason, not again as an issue.
+- Paths and column names are isolated for bidirectional text: `<bdi>` in markup, isolate marks in `<option>` text.
+- `project-store`'s `canonical()` is not exported, so `stable()` stays.
+
+Actual verification:
+- RED first, before any `src` edit: the nine new or extended tests failed for the reasons above.
+  - The KTO test sent overlapping labels.
+  - 등록 stayed enabled after a commit.
+  - There was no `#import-link-note`.
+  - The checkboxes ticked during the held picker were unchecked.
+  - The column choices numbered 601.
+  - There was no `#import-out-train-issues`.
+  - There were no flags.
+  - Duplicate output IDs were sent.
+  - There was no `<bdi>`.
+- Test 3 now expects the header issue before the row issue: the order changed on purpose.
+- The discovery pin (test 1: "열 확인" after the discovery, and still so after mapping columns) passes on the old code.
+  It fails with the reviewer's mutant, which deletes the `"discovery"` branch.
+- Mutants, each run against the spec:
+  - The guard that resets the split only for another version survived at first. It is unreachable through the UI
+    once the same request is blocked (a real server refuses the same version for another preview). The test
+    "an answer naming the registered version again keeps its split" then pinned it and fails against that mutant.
+  - The other 18 mutants each failed a test. They covered:
+    - the registered block and live ID/version;
+    - the note placement and the picker capture;
+    - issue order, column cap, choice cap and sample cap;
+    - split issue placement and focus;
+    - flags;
+    - duplicate and source-equal split IDs;
+    - overlapping and duplicate labels;
+    - the single `preview_changed` message and `<bdi>`.
+- Playwright from `desktop/`, against wt95's own Vite on port 1431 (scratch config with `reuseExistingServer: false`
+  under `%TEMP%`):
+  - `npx playwright test` **160 passed** on `f6493a1` (151 + 9 new) and **183 passed** after the rebase onto
+    `2b98a4c` (that tree's 174 + 9 new);
+  - the spec (22 tests) passed three times in a row;
+  - `npm run build` passes.
+- From the root (main venv, `PYTHONPATH` = wt95's `src`): `pytest -q` **1715 passed, 1 skipped** on `f6493a1` and again
+  after the rebase (no Python change here or upstream);
+  Ruff (`src tests`) passes; `check_secrets.py` reports 0 findings with the change staged; `git diff --exit-code`
+  of `src/`, `containers/`, `pyproject.toml`, `uv.lock`, `desktop/package.json`, `desktop/package-lock.json` and
+  `desktop/src-tauri/` against the base is clean. Cargo was not rerun (no Rust change).
+- Every changed file is LF only.
+
+Still open:
+- The split source is only a version registered on this page. A version registered elsewhere cannot be split
+  anywhere in the UI yet. That includes ShareGPT data, which only the legacy JSON form registers.
+- Real WebView2 bidirectional rendering and the real `rfd` dialog: Task 11.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

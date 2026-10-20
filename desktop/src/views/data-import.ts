@@ -36,6 +36,8 @@ export interface ImportDraft {
   previewChanged: boolean;                                       // registration answered preview_changed
   datasetId: string; datasetIdAuto: boolean; version: string; synthetic: boolean; exportAllowed: boolean;
   registerIssues: WorkflowIssue[]; registered: DatasetRef | null; registeredFields: string[];
+  registeredKey: string | null;                                  // the preview, ID and version that were registered
+  registeredFlags: { synthetic: boolean; export_allowed: boolean } | null;   // as registered (split outputs inherit them)
   split: SplitDraft;
 }
 
@@ -57,8 +59,14 @@ const STALE: Record<"format" | "mapping" | "changed", string> = {
   changed: "미리본 뒤 원본이나 설정이 바뀌었습니다. 다시 미리보세요.",
 };
 const SPLIT_STALE = "분할 조건이 바뀌어 다시 미리보아야 합니다.";
+const REGISTERED = "이미 등록했습니다 · 다른 ID나 버전을 입력하면 새 버전으로 등록합니다.";
+const ALREADY_BOUND = "이미 연결된 데이터 버전은 다시 추가하지 않았습니다.";
+// Previews are bounded on the client too: a wide or long source must not make the page unusable.
 const ISSUE_LIMIT = 50;
 const CELL_LIMIT = 200;
+const SAMPLE_LIMIT = 5;
+const TABLE_COLUMNS = 30;
+const COLUMN_CHOICES = 500;
 
 export function emptySplit(datasetId = ""): SplitDraft {
   return { percents: { train: 80, validation: 10, test: 10 }, seed: 42, groupField: "", version: "1",
@@ -71,7 +79,7 @@ export function emptyDraft(): ImportDraft {
     kind: "instruction", columns: {}, trueLabels: "", falseLabels: "", sourceFields: [], sourceSamples: [], preview: null,
     previewIssues: [], previewStatus: null, previewSent: null, previewChanged: false, datasetId: "", datasetIdAuto: true,
     version: "1", synthetic: false, exportAllowed: false, registerIssues: [], registered: null, registeredFields: [],
-    split: emptySplit() };
+    registeredKey: null, registeredFlags: null, split: emptySplit() };
 }
 
 const labels = (text: string) => text.split(",").map(label => label.trim()).filter(Boolean);
@@ -143,6 +151,23 @@ function cell(value: unknown) {
   const text = value === undefined ? "—" : typeof value === "string" ? value : JSON.stringify(value);
   return escapeHtml(text.length > CELL_LIMIT ? `${text.slice(0, CELL_LIMIT)}…` : text);
 }
+/** A source name (path, column) isolated from the surrounding text's direction: `<bdi>` in markup; first-strong
+ * isolate marks in `<option>` text, which cannot hold markup. */
+const isolated = (name: string) => `<bdi>${escapeHtml(name)}</bdi>`;
+const isolatedText = (name: string) => `⁨${name}⁩`;
+const flagsText = (flags: { synthetic: boolean; export_allowed: boolean }) =>
+  `${flags.synthetic ? "합성 데이터" : "사용자 데이터"} · GPU 전송 ${flags.export_allowed ? "허용" : "미허용"}`;
+/** Column choices: the first COLUMN_CHOICES source columns, plus the chosen one when it lies beyond them. */
+function columnChoices(fields: string[], current: string): [string, string][] {
+  const shown = fields.slice(0, COLUMN_CHOICES).map(field => [field, isolatedText(field)] as [string, string]);
+  if (current && !shown.some(([field]) => field === current))
+    shown.push([current, fields.includes(current) ? isolatedText(current) : `${isolatedText(current)} · 원본에서 찾지 못함`]);
+  return shown;
+}
+const choicesNote = (fields: string[]) => fields.length > COLUMN_CHOICES
+  ? `<p class="muted import-cap">열이 ${fields.length}개라 앞 ${COLUMN_CHOICES}개만 고를 수 있습니다. 필요한 열이 뒤에 있으면 열을 줄인 파일로 가져오세요.</p>` : "";
+/** What the register request names: the shown preview, the ID and the version. */
+const registerKey = () => stable({ preview_sha256: draft.preview?.preview_sha256 ?? null, dataset_id: draft.datasetId, version: draft.version });
 function setFormat(format: ImportMapping["source_format"]) {
   draft.format = format;
   if (format !== "csv" && draft.encoding === "cp949") draft.encoding = "utf-8";
@@ -167,6 +192,8 @@ function registerBlock(): string | null {
   if (state === "none" || state === "discovery") return "열을 연결하고 문제 없는 미리보기를 확인해야 등록할 수 있습니다.";
   if (state !== "fresh") return STALE[state];
   if (draft.previewStatus !== "ok" || draft.previewIssues.length || !draft.preview) return "미리보기의 문제를 고친 뒤 다시 미리보세요.";
+  // Registering the same preview, ID and version again would only answer the same version (idempotent on the server).
+  if (draft.registered && draft.registeredKey === registerKey()) return REGISTERED;
   return null;
 }
 /** The shown preview mapped no column: it only discovered the columns (every row fails, so rows are not problems). */
@@ -183,14 +210,20 @@ function buildPlan(): { plan: SplitPlan } | { issue: WorkflowIssue; focus: strin
   const points = basisPoints(split.percents);
   if (!points) return refuse("/plan/train_basis_points", "비율은 0~100의 정수로, 합계가 100%가 되어야 합니다.", "import-split-train");
   if (!Number.isSafeInteger(split.seed)) return refuse("/plan/seed", "시드는 정수로 입력하세요.", "import-seed");
-  if (!LOCAL_ID.test(split.version)) return refuse("/plan/outputs", `분할 버전은 ${ID_RULE}`, "import-split-version");
+  if (!LOCAL_ID.test(split.version)) return refuse("/plan/version", `분할 버전은 ${ID_RULE}`, "import-split-version");
   const outputs: SplitPlan["outputs"] = {};
+  const source = draft.registered!;
   for (const role of ROLES) {
     if (!points[role]) continue;
-    if (!LOCAL_ID.test(split.outputs[role])) return refuse(`/plan/outputs/${role}/dataset_id`, `${ROLE_LABEL[role]} 데이터 ID는 ${ID_RULE}`, `import-out-${role}`);
-    outputs[role] = { dataset_id: split.outputs[role], version: split.version };
+    const id = split.outputs[role];
+    if (!LOCAL_ID.test(id)) return refuse(`/plan/outputs/${role}/dataset_id`, `${ROLE_LABEL[role]} 데이터 ID는 ${ID_RULE}`, `import-out-${role}`);
+    if (Object.values(outputs).some(output => output?.dataset_id === id))
+      return refuse(`/plan/outputs/${role}/dataset_id`, "학습·검증·시험 데이터 ID는 서로 달라야 합니다.", `import-out-${role}`);
+    if (id === source.dataset_id && split.version === source.version)
+      return refuse(`/plan/outputs/${role}/dataset_id`, `등록한 원본(${source.dataset_id} · v${source.version})과 같은 ID·버전은 쓸 수 없습니다.`, `import-out-${role}`);
+    outputs[role] = { dataset_id: id, version: split.version };
   }
-  return { plan: { dataset: { ...draft.registered! }, seed: split.seed, train_basis_points: points.train,
+  return { plan: { dataset: { ...source }, seed: split.seed, train_basis_points: points.train,
     validation_basis_points: points.validation, test_basis_points: points.test,
     group_field: split.groupField ? [split.groupField] : null, outputs } };
 }
@@ -216,10 +249,13 @@ function textControl(id: string, label: string, value: string, options: { issues
 }
 const numberText = (value: number) => Number.isFinite(value) ? String(value) : "";
 
-/** File-level and row issues with their place: "3행" (1-based source row, header excluded), "헤더" or "파일". */
+/** File-level and row issues with their place: "3행" (1-based source row, header excluded), "헤더" or "파일". File-level
+ * issues come first, so one the server appends after every row issue (`size_limit`) is never cut off by the limit. */
 function previewIssueList(issues: WorkflowIssue[]) {
   if (!issues.length) return "";
-  const items = rowIssues(issues).slice(0, ISSUE_LIMIT).map(({ row, issue }) => {
+  const placed = rowIssues(issues);
+  const ordered = [...placed.filter(({ row }) => row === null), ...placed.filter(({ row }) => row !== null)];
+  const items = ordered.slice(0, ISSUE_LIMIT).map(({ row, issue }) => {
     const { text, original } = localize(issue);
     const where = row !== null ? `${row}행` : issue.code === "duplicate_header" || /header/i.test(issue.message) ? "헤더" : "파일";
     const source = original === null ? "" : `<details><summary>원문 보기</summary><span class="issue-original">${escapeHtml(original)}</span></details>`;
@@ -229,10 +265,14 @@ function previewIssueList(issues: WorkflowIssue[]) {
   return `<ul class="issue-list import-issues" aria-label="미리보기 문제">${items.join("")}</ul>`;
 }
 
-function sampleTable(title: string, columns: [string, string][], rows: Record<string, unknown>[]) {
+/** The first SAMPLE_LIMIT rows and TABLE_COLUMNS columns, with a note when columns were left out. */
+function sampleTable(noun: string, unit: string, allColumns: [string, string][], allRows: Record<string, unknown>[]) {
+  const rows = allRows.slice(0, SAMPLE_LIMIT), columns = allColumns.slice(0, TABLE_COLUMNS);
   if (!rows.length || !columns.length) return "";
-  return `<div class="import-table"><p class="import-table-title">${escapeHtml(title)}</p><div class="table-scroll"><table class="import-samples" aria-label="${escapeHtml(title)}">
-    <thead><tr><th>행</th>${columns.map(([, label]) => `<th>${escapeHtml(label)}</th>`).join("")}</tr></thead>
+  const title = `${noun} 앞 ${rows.length}${unit}`;
+  const note = allColumns.length > columns.length ? `<p class="muted import-cap">열 ${allColumns.length}개 중 앞 ${columns.length}개만 표시합니다.</p>` : "";
+  return `<div class="import-table"><p class="import-table-title">${escapeHtml(title)}</p>${note}<div class="table-scroll"><table class="import-samples" aria-label="${escapeHtml(title)}">
+    <thead><tr><th>행</th>${columns.map(([, label]) => `<th>${isolated(label)}</th>`).join("")}</tr></thead>
     <tbody>${rows.map((row, index) => `<tr><td class="import-row">${index + 1}</td>${columns.map(([key]) => `<td>${cell(row[key])}</td>`).join("")}</tr>`).join("")}</tbody></table></div></div>`;
 }
 
@@ -245,7 +285,7 @@ function projectBanner(ctx: ViewContext, projectId: string) {
 function sourceCard(ctx: ViewContext) {
   const pathIssues = issuesAt(draft.sourceIssues, "/path");
   const others = draft.sourceIssues.filter(issue => !pathIssues.includes(issue));
-  const facts = draft.source ? `<p class="import-source-facts">가져온 원본 · <span class="mono">${escapeHtml(draft.sourcePath)}</span> · SHA256 <span class="mono">${short(draft.source.source_sha256)}</span> · ${size(draft.source.size)}</p>` : "";
+  const facts = draft.source ? `<p class="import-source-facts">가져온 원본 · <span class="mono">${isolated(draft.sourcePath)}</span> · SHA256 <span class="mono">${short(draft.source.source_sha256)}</span> · ${size(draft.source.size)}</p>` : "";
   return `<section class="card import-source" data-tour="data-import" aria-labelledby="import-source-title"><div class="section-title"><h3 id="import-source-title">1. 원본 파일</h3>${draft.source ? statusPill("good", "가져옴") : ""}</div>
     <p>이 PC의 CSV·JSON·JSONL 파일(32 MiB 이하)을 고르세요. 원본은 바뀌지 않는 사본으로 보관하고, 고른 열만 학습 형식으로 바꿉니다. 최상위 열만 연결할 수 있으며, ShareGPT 대화(messages·conversations) 파일은 데이터 화면의 ‘새 데이터 버전 등록’에서 JSON으로 등록하세요.</p>
     <form id="import-source-form" novalidate>${busyFieldset(ctx)}<div class="import-path-row">
@@ -271,8 +311,7 @@ function mappingCard(ctx: ViewContext) {
   const { required, optional } = CANONICAL_FIELDS[draft.kind];
   const column = (name: string, needed: boolean) => {
     const current = draft.columns[name] ?? "";
-    const options: [string, string][] = [["", needed ? "열 선택" : "연결 안 함"], ...draft.sourceFields.map(field => [field, field] as [string, string])];
-    if (current && !draft.sourceFields.includes(current)) options.push([current, `${current} · 원본에서 찾지 못함`]);
+    const options: [string, string][] = [["", needed ? "열 선택" : "연결 안 함"], ...columnChoices(draft.sourceFields, current)];
     const label = FIELD_LABELS[name] ?? name;
     return `<label class="field"><span>${escapeHtml(label)} <small${needed ? ' class="import-required"' : ""}>${needed ? "필수" : "선택"}</small></span><select id="import-col-${name}" aria-label="${escapeHtml(label)}" data-import-column="${name}" data-import-derived>${options.map(([value, title]) =>
       `<option value="${escapeHtml(value)}"${value === current ? " selected" : ""}>${escapeHtml(title)}</option>`).join("")}</select></label>`;
@@ -284,9 +323,9 @@ function mappingCard(ctx: ViewContext) {
   const intro = found ? `원본에서 열 ${found}개를 찾았습니다. 학습 형식의 항목마다 원본 열을 고르세요.`
     : "원본의 열을 읽지 못했습니다. 형식·구분자·문자 인코딩을 확인하고 다시 미리보세요.";
   return `<section class="card" id="import-mapping" aria-labelledby="import-mapping-title"><div class="section-title"><h3 id="import-mapping-title">3. 열 연결</h3>${found ? `<span class="count">열 ${found}개</span>` : ""}</div>
-    <p>${escapeHtml(intro)}</p>
+    <p>${escapeHtml(intro)}</p>${choicesNote(draft.sourceFields)}
     ${busyFieldset(ctx)}<div class="grid import-columns">${required.map(name => column(name, true)).join("")}${optional.map(name => column(name, false)).join("")}</div>${kto}</fieldset>
-    ${sampleTable(`원본 앞 ${draft.sourceSamples.length}행`, draft.sourceFields.map(field => [field, field]), draft.sourceSamples)}</section>`;
+    ${sampleTable("원본", "행", draft.sourceFields.map(field => [field, field]), draft.sourceSamples)}</section>`;
 }
 
 /** The preview's state line (patched region `import-preview-state`): passed, problems, or why it must run again. */
@@ -306,9 +345,9 @@ function previewCard() {
   const shown = preview && !discovered() ? preview : null;
   const facts = shown ? `<p class="import-facts">행 ${shown.row_count}개${shown.canonical_sha256 ? ` · 변환 결과 SHA256 <span class="mono">${short(shown.canonical_sha256)}</span> · ${size(shown.canonical_size ?? 0)}` : ""}</p>` : "";
   const fields = [...CANONICAL_FIELDS[draft.previewSent?.kind ?? draft.kind].required, ...CANONICAL_FIELDS[draft.previewSent?.kind ?? draft.kind].optional];
-  const keys = shown ? [...new Set([...fields.filter(name => shown.samples.some(sample => name in sample)),
-    ...shown.samples.flatMap(sample => Object.keys(sample))])] : [];
-  const samples = shown ? sampleTable(`변환 결과 앞 ${shown.samples.length}건`, keys.map(key => [key, FIELD_LABELS[key] ?? key]), shown.samples) : "";
+  const rows = shown ? shown.samples.slice(0, SAMPLE_LIMIT) : [];
+  const keys = [...new Set([...fields.filter(name => rows.some(sample => name in sample)), ...rows.flatMap(sample => Object.keys(sample))])];
+  const samples = shown ? sampleTable("변환 결과", "건", keys.map(key => [key, FIELD_LABELS[key] ?? key]), shown.samples) : "";
   return `<section class="card" id="import-preview" aria-labelledby="import-preview-title"><div class="section-title"><h3 id="import-preview-title">4. 미리보기</h3>
     <div class="actions">${button("미리보기", "wf:data-import:preview", "", unavailable)}</div></div>
     <div id="import-preview-state" role="status">${previewStatusHtml()}</div>${facts}${previewIssueList(shownPreviewIssues())}${samples}</section>`;
@@ -327,14 +366,14 @@ function registerCard(ctx: ViewContext) {
   return `<section class="card" id="import-register" aria-labelledby="import-register-title"><div class="section-title"><h3 id="import-register-title">5. 등록</h3>${draft.registered ? statusPill("good", "등록함") : ""}</div>
     <p>미리본 결과 그대로 데이터 버전을 등록합니다. 등록한 버전은 바뀌지 않으며, 같은 ID와 버전에 다른 내용을 등록할 수 없습니다.</p>
     <form id="import-register-form" novalidate>${busyFieldset(ctx)}<div class="grid">
-      ${textControl("import-dataset-id", "데이터 ID", draft.datasetId, { issues: idIssues, help: "영문·숫자·_·-·." })}
-      ${textControl("import-version", "버전", draft.version, { issues: versionIssues })}</div>
+      ${textControl("import-dataset-id", "데이터 ID", draft.datasetId, { issues: idIssues, help: "영문·숫자·_·-·.", derived: true })}
+      ${textControl("import-version", "버전", draft.version, { issues: versionIssues, derived: true })}</div>
       <label class="check"><input id="import-synthetic" type="checkbox"${draft.synthetic ? " checked" : ""}> 더미·합성 데이터입니다</label>
       <label class="check"><input id="import-export" type="checkbox"${draft.exportAllowed ? " checked" : ""}> 이 데이터를 선택한 GPU로 전송해도 됩니다</label>
       ${issueList(others)}
       <div class="actions" id="import-register-actions">${registerActionsHtml()}</div>
     </fieldset></form>
-    ${draft.registered ? `<p id="import-registered" class="import-result" tabindex="-1">등록했습니다 · <b>${ref(draft.registered)}</b></p>` : ""}</section>`;
+    ${draft.registered ? `<p id="import-registered" class="import-result" tabindex="-1">등록했습니다 · <b>${ref(draft.registered)}</b>${draft.registeredFlags ? ` · ${flagsText(draft.registeredFlags)}` : ""}</p>` : ""}</section>`;
 }
 
 /** The split preview's counts and the commit button (patched region `import-split-state`). */
@@ -351,23 +390,37 @@ function splitStateHtml() {
   return `${result}<div class="actions">${button("분할 등록", "wf:data-import:split-commit", "primary", !canCommit)}${committedNow ? '<span class="muted">이 분할은 등록했습니다.</span>' : ""}</div>`;
 }
 
+/** The split field an issue belongs to: server pointers under `/plan`, the commit's version clash, client checks. */
+function splitFieldFor(issue: WorkflowIssue): string | null {
+  const under = (pointer: string) => issuesAt([issue], pointer).length > 0;
+  if (issue.code === "version_exists" || under("/plan/version") || ROLES.some(role => under(`/plan/outputs/${role}/version`))) return "import-split-version";
+  for (const role of ROLES) {
+    if (under(`/plan/${role}_basis_points`)) return `import-split-${role}`;
+    if (under(`/plan/outputs/${role}`)) return `import-out-${role}`;
+  }
+  return under("/plan/seed") ? "import-seed" : null;
+}
+
 function splitCard(ctx: ViewContext) {
   const split = draft.split;
   const registered = draft.registered!;
+  const at = (field: string) => split.issues.filter(issue => splitFieldFor(issue) === field);
+  const others = split.issues.filter(issue => splitFieldFor(issue) === null);
   const percent = (role: BindingRole) => textControl(`import-split-${role}`, `${ROLE_LABEL[role]} 비율(%)`, numberText(split.percents[role]),
-    { type: "number", derived: true, extra: ' min="0" max="100" step="1" inputmode="numeric"' });
-  const groupOptions: [string, string][] = [["", "없음"], ...draft.registeredFields.map(field => [field, field] as [string, string])];
-  const committed = split.committed ? `<div id="import-split-committed" class="import-result" tabindex="-1"><p>분할을 등록했습니다.</p><ul class="import-outputs">${ROLES.filter(role => split.committed!.outputs[role]).map(role =>
+    { type: "number", derived: true, issues: at(`import-split-${role}`), extra: ' min="0" max="100" step="1" inputmode="numeric"' });
+  const groupOptions: [string, string][] = [["", "없음"], ...columnChoices(draft.registeredFields, split.groupField)];
+  const flags = draft.registeredFlags ? flagsText(draft.registeredFlags) : null;
+  const committed = split.committed ? `<div id="import-split-committed" class="import-result" tabindex="-1"><p>분할을 등록했습니다.${flags ? ` 분할 결과도 ${flags}입니다.` : ""}</p><ul class="import-outputs">${ROLES.filter(role => split.committed!.outputs[role]).map(role =>
     `<li>${ROLE_LABEL[role]} · <b>${ref(split.committed!.outputs[role]!)}</b></li>`).join("")}</ul></div>` : "";
   return `<section class="card" id="import-split" aria-labelledby="import-split-title"><div class="section-title"><h3 id="import-split-title">6. 분할 (선택)</h3>${split.committed ? statusPill("good", "분할 등록함") : ""}</div>
-    <p>등록한 ‘${ref(registered)}’을 학습·검증·시험 데이터로 나눕니다. 같은 입력의 행(묶음 열을 고르면 같은 묶음 값의 행도)은 항상 같은 쪽에 들어가고, 같은 시드는 같은 결과를 냅니다. 0%인 역할은 만들지 않습니다.</p>
+    <p>등록한 ‘${ref(registered)}’을 학습·검증·시험 데이터로 나눕니다. 같은 입력의 행(묶음 열을 고르면 같은 묶음 값의 행도)은 항상 같은 쪽에 들어가고, 같은 시드는 같은 결과를 냅니다. 0%인 역할은 만들지 않습니다.${flags ? ` 분할 결과도 ${flags}으로 등록됩니다.` : ""}</p>
     <form id="import-split-form" novalidate>${busyFieldset(ctx)}
       <div class="import-triple">${ROLES.map(percent).join("")}</div>
-      <div class="grid import-split-grid">${textControl("import-seed", "시드", numberText(split.seed), { type: "number", derived: true, extra: ' step="1" inputmode="numeric"' })}
-      ${selectControl("import-group", "묶음 열", split.groupField, groupOptions)}</div>
-      <div class="import-triple import-split-grid">${ROLES.map(role => textControl(`import-out-${role}`, `${ROLE_LABEL[role]} 데이터 ID`, split.outputs[role], { derived: true })).join("")}</div>
-      <div class="grid import-split-grid">${textControl("import-split-version", "분할 버전", split.version, { derived: true })}</div>
-      ${issueList(split.issues)}
+      <div class="grid import-split-grid">${textControl("import-seed", "시드", numberText(split.seed), { type: "number", derived: true, issues: at("import-seed"), extra: ' step="1" inputmode="numeric"' })}
+      ${selectControl("import-group", "묶음 열", split.groupField, groupOptions)}</div>${choicesNote(draft.registeredFields)}
+      <div class="import-triple import-split-grid">${ROLES.map(role => textControl(`import-out-${role}`, `${ROLE_LABEL[role]} 데이터 ID`, split.outputs[role], { derived: true, issues: at(`import-out-${role}`) })).join("")}</div>
+      <div class="grid import-split-grid">${textControl("import-split-version", "분할 버전", split.version, { derived: true, issues: at("import-split-version") })}</div>
+      ${issueList(others)}
       <div class="actions"><button type="submit" data-focus-key="import-split-preview"${disabledIf(unavailable)}>분할 미리보기</button></div>
     </fieldset></form>
     <div id="import-split-state" class="import-split-state">${splitStateHtml()}</div>${committed}</section>`;
@@ -389,7 +442,6 @@ function linkCard(ctx: ViewContext, projectId: string) {
   const issues = link.projectId === projectId ? link.issues : [];
   const note = link.projectId === projectId ? link.note : null;
   const staged = unsaved.length ? `<div id="import-staged" class="import-staged" tabindex="-1"><p><b>저장 전 연결: ${unsaved.map(binding => escapeHtml(binding.binding_id)).join(", ")}</b></p>
-    ${note ? `<p class="muted">${escapeHtml(note)}</p>` : ""}
     <div class="table-scroll"><table><thead><tr><th>연결 ID</th><th>역할</th><th>데이터 버전</th></tr></thead><tbody>${unsaved.map(binding =>
       `<tr data-binding="${escapeHtml(binding.binding_id)}"><td class="mono">${escapeHtml(binding.binding_id)}</td><td>${escapeHtml(ROLE_LABEL[binding.role] ?? binding.role)}</td><td>${ref(binding.dataset)}</td></tr>`).join("")}</tbody></table></div></div>` : "";
   return `<section class="card" id="import-link" aria-labelledby="import-link-title"><div class="section-title"><h3 id="import-link-title">7. 프로젝트에 연결</h3></div>
@@ -397,7 +449,7 @@ function linkCard(ctx: ViewContext, projectId: string) {
     <p class="muted">연결은 프로젝트 초안에만 더해집니다. 프로젝트 화면에서 저장해야 반영됩니다.</p>
     ${issueList(issues)}
     <div class="actions">${button("프로젝트에 연결", "wf:data-import:link", "primary", !refs.length || unavailable)}${button("프로젝트에서 저장하기", `nav:project:${projectId}`, "quiet")}</div>
-    ${staged}</section>`;
+    ${note ? `<p id="import-link-note" class="muted import-link-note" tabindex="-1">${escapeHtml(note)}</p>` : ""}${staged}</section>`;
 }
 
 function render(ctx: ViewContext) {
@@ -494,6 +546,8 @@ async function pick(ctx: ViewContext) {
   try {
     const path = await pickFile("import");
     if (!path) return;
+    // The file dialog has no parent window, so the page stayed usable: what was typed meanwhile is newer than the draft.
+    capture();
     draft.path = path;
     const format = guessFormat(path);
     if (format) setFormat(format);
@@ -513,7 +567,7 @@ function adoptSource(path: string, source: ImportSource) {
   if (format) setFormat(format);
   Object.assign(draft, { source, sourcePath: path, sourceIssues: [], columns: {}, sourceFields: [], sourceSamples: [],
     preview: null, previewIssues: [], previewStatus: null, previewSent: null, previewChanged: false, registerIssues: [],
-    registered: null, registeredFields: [], split: emptySplit() });
+    registered: null, registeredFields: [], registeredKey: null, registeredFlags: null, split: emptySplit() });
   if (draft.datasetIdAuto || !draft.datasetId) { draft.datasetId = idFromPath(path); draft.datasetIdAuto = true; }
 }
 
@@ -561,12 +615,27 @@ async function importSource(ctx: ViewContext) {
   if (focus && where.still()) focusById(focus);
 }
 
+/** Why the KTO label sets cannot be sent (the server's rule: both sides or neither, each value once, no value on both
+ * sides), with the field to fix; null when they can. */
+function labelRefusal(): { message: string; focus: string } | null {
+  const yes = labels(draft.trueLabels), no = labels(draft.falseLabels);
+  if (Boolean(yes.length) !== Boolean(no.length))
+    return { message: "좋은 응답과 나쁜 응답으로 볼 값을 모두 입력하거나 둘 다 비워 두세요.", focus: yes.length ? "import-false-labels" : "import-true-labels" };
+  for (const [values, focus] of [[yes, "import-true-labels"], [no, "import-false-labels"]] as const) {
+    const twice = values.find((value, index) => values.indexOf(value) !== index);
+    if (twice !== undefined) return { message: `같은 값을 두 번 입력했습니다: ${twice}`, focus };
+  }
+  const both = yes.filter(value => no.includes(value));
+  return both.length ? { message: `좋은 응답과 나쁜 응답에 같은 값이 있습니다: ${both.join(", ")}`, focus: "import-false-labels" } : null;
+}
+
 async function preview(ctx: ViewContext) {
   if (ctx.busy || !draft.source) return;
   capture();
-  if (draft.kind === "kto" && Boolean(labels(draft.trueLabels).length) !== Boolean(labels(draft.falseLabels).length)) {
-    labelIssues = [clientIssue("/mapping/boolean_labels", "좋은 응답과 나쁜 응답으로 볼 값을 모두 입력하거나 둘 다 비워 두세요.")];
-    ctx.render(); focusById(labels(draft.trueLabels).length ? "import-false-labels" : "import-true-labels"); return;
+  const refused = draft.kind === "kto" ? labelRefusal() : null;
+  if (refused) {
+    labelIssues = [clientIssue("/mapping/boolean_labels", refused.message)];
+    ctx.render(); focusById(refused.focus); return;
   }
   labelIssues = [];
   await ctx.task("미리보는 중", runPreview);
@@ -592,16 +661,24 @@ async function register(ctx: ViewContext) {
   await ctx.task("데이터 버전 등록 중", async () => {
     const result = await imports.register(request);
     if (result.status === "ok" && result.data) {
-      draft.registered = { ...result.data.dataset }; draft.registeredFields = [...draft.sourceFields]; draft.registerIssues = [];
-      draft.split = emptySplit(result.data.dataset.dataset_id);
+      const dataset = { ...result.data.dataset };
+      // The same version answered again (registration is idempotent) keeps its split, committed or not.
+      if (!draft.registered || stable(draft.registered) !== stable(dataset)) {
+        draft.registeredFields = [...draft.sourceFields];
+        draft.split = emptySplit(dataset.dataset_id);
+      }
+      draft.registered = dataset; draft.registerIssues = [];
+      draft.registeredKey = stable({ preview_sha256: request.preview_sha256, dataset_id: request.dataset_id, version: request.version });
+      draft.registeredFlags = { synthetic: request.synthetic, export_allowed: request.export_allowed };
       focus = "import-registered";
       ctx.notify("데이터 버전을 등록했습니다.");
       await ctx.reloadCatalog();
       return;
     }
     if (notAvailable(result)) unavailable = true;
-    draft.registerIssues = result.issues;
+    // A changed preview is said once, by the preview's state line and the register button's reason.
     if (result.issues.some(issue => issue.code === "preview_changed")) draft.previewChanged = true;
+    draft.registerIssues = result.issues.filter(issue => issue.code !== "preview_changed");
     focus = issuesAt(result.issues, "/version").length ? "import-version" : issuesAt(result.issues, "/dataset_id").length ? "import-dataset-id" : null;
   });
   if (focus && where.still()) focusById(focus);
@@ -615,6 +692,7 @@ async function previewSplit(ctx: ViewContext) {
     draft.split.issues = [built.issue];
     ctx.render(); focusById(built.focus); return;
   }
+  const where = here(ctx);
   await ctx.task("분할 미리보는 중", async () => {
     const result = await imports.splitPreview(built.plan);
     if (notAvailable(result)) unavailable = true;
@@ -622,6 +700,13 @@ async function previewSplit(ctx: ViewContext) {
     split.sent = built.plan; split.issues = result.issues;
     split.preview = result.status === "ok" && result.data ? result.data : null;
   });
+  focusSplitIssue(where);
+}
+
+/** After a refused split step, the first field an issue names takes the focus (as the register step does). */
+function focusSplitIssue(where: { still(): boolean }) {
+  const field = draft.split.issues.map(splitFieldFor).find(Boolean);
+  if (field && where.still()) focusById(field);
 }
 
 async function commitSplit(ctx: ViewContext) {
@@ -646,6 +731,7 @@ async function commitSplit(ctx: ViewContext) {
     if (result.issues.some(issue => issue.code === "preview_changed" || issue.code === "preview_unknown")) { split.preview = null; split.sent = null; }
   });
   if (focus && where.still()) focusById(focus);
+  else focusSplitIssue(where);
 }
 
 /** Stages the registered or split versions as bindings of the project draft; the project page saves them (D4). */
@@ -653,7 +739,7 @@ async function stage(ctx: ViewContext) {
   const projectId = ctx.arg;
   const refs = pendingRefs();
   if (ctx.busy || !projectId || !refs.length) return;
-  let staged = false;
+  let staged: string | null = null;
   const where = here(ctx);
   await ctx.task("프로젝트에 연결하는 중", async () => {
     link = { projectId, issues: [], note: null };
@@ -671,10 +757,11 @@ async function stage(ctx: ViewContext) {
     for (const item of refs.filter(item => !bound(item.dataset)))
       added.push({ binding_id: bindingIdFor(item.role, [...project.spec.datasets, ...added]), role: item.role, dataset: { ...item.dataset } });
     if (added.length) ctx.store.edit(projectId, spec => { spec.datasets = [...spec.datasets, ...added]; });
-    if (added.length < refs.length) link.note = "이미 연결된 데이터 버전은 다시 추가하지 않았습니다.";
-    staged = true;
+    if (added.length < refs.length) link.note = ALREADY_BOUND;
+    staged = added.length > 0 ? "import-staged" : "import-link-note";
   });
-  if (staged && where.still()) focusById("import-staged");
+  // The new bindings, or (when every version was bound already, even saved) the note saying so.
+  if (staged && where.still()) focusById(staged);
 }
 
 export const view: View = {
