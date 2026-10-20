@@ -28,18 +28,19 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from .benchmarks import EvaluationRecord
-from .dataset_splits import _dataset
+from .dataset_splits import load_dataset
 from .evaluation import CommonEvaluator
 from .model_artifacts import (
     HFRootRef,
     ModelArtifactRef,
     ModelArtifactStore,
     ModelDescriptor,
-    _files,
-    _read_json,
-    _tensor_header,
     check_link_free,
+    directory_inventory_sha256,
     is_tokenizer_file,
+    list_files,
+    read_json,
+    tensor_header,
 )
 from .model_ops import (
     POLICY_F32_V1,
@@ -168,7 +169,7 @@ def _base_snapshot(launch_dir: Path, result: OperationResult, identity: tuple[st
     """``base-snapshot/``: exactly config.json and tokenizer files, each in the evidence, with the base's
     config hash and tokenizer fingerprint."""
     snapshot = Path(launch_dir) / BASE_SNAPSHOT
-    names = {relative for relative, _ in _files(snapshot)}
+    names = {relative for relative, _ in list_files(snapshot)}
     if any(not (name == "config.json" or is_tokenizer_file(name)) for name in names) or any(
             f"{BASE_SNAPSHOT}/{name}" not in result.evidence for name in names):
         raise ValueError("base snapshot holds files outside the accepted config/tokenizer evidence")
@@ -188,8 +189,8 @@ def _place(source: Path, target: Path) -> None:
 
 
 def _tensors(directory: Path):
-    return tuple(sorted((tensor for relative, file in _files(directory) if relative.endswith(".safetensors")
-                         for tensor in _tensor_header(file, relative)), key=lambda item: (item.file, item.name)))
+    return tuple(sorted((tensor for relative, file in list_files(directory) if relative.endswith(".safetensors")
+                         for tensor in tensor_header(file, relative)), key=lambda item: (item.file, item.name)))
 
 
 def _synthetic(verifier, refs, *flags) -> bool:
@@ -212,18 +213,18 @@ def _train_output(operation: TrainOperation, result, launch_dir: Path, verifier,
                      if path.is_file() and _payload_name(path.name, adapter=adapter))
     for name in payload:
         _place(output / name, workspace / name)
-    for relative, file in _files(snapshot):
+    for relative, file in list_files(snapshot):
         if is_tokenizer_file(relative) or adapter and relative == "config.json":
             _place(file, workspace / relative)
     metadata = None
     if adapter:
         options = config.finetuning_options
         metadata = adapter_metadata_from_config(
-            _read_json(workspace / "adapter_config.json"), method=config.training_method,
+            read_json(workspace / "adapter_config.json"), method=config.training_method,
             quantization_bit=config.quantization_bit if config.training_method == "qlora" else None,
             loraplus_lr_ratio=options.loraplus_lr_ratio, loraplus_lr_embedding=options.loraplus_lr_embedding)
     else:
-        trained, original = _read_json(workspace / "config.json"), _read_json(snapshot / "config.json")
+        trained, original = read_json(workspace / "config.json"), read_json(snapshot / "config.json")
         if not isinstance(trained, Mapping) or trained.get("vocab_size") != original.get("vocab_size"):
             raise ValueError(VOCABULARY_CHANGED)
     root = policy.base if isinstance(policy.base, HFRootRef) else verifier.verify(policy.base).root
@@ -242,7 +243,7 @@ def _train_output(operation: TrainOperation, result, launch_dir: Path, verifier,
 
 def operation_receipt(result: OperationResult, launch_dir: Path, operation) -> dict:
     """``operation-receipt.json`` of a merge/materialize, checked against this operation."""
-    receipt = _read_json(_evidence_file(result, launch_dir, OPERATION_RECEIPT))
+    receipt = read_json(_evidence_file(result, launch_dir, OPERATION_RECEIPT))
     model = MergeReceipt if isinstance(operation, MergeOperation) else MaterializeReceipt
     inner = model.model_validate(receipt.get("receipt") if isinstance(receipt, Mapping) else None)
     if (receipt.get("schema_version"), receipt.get("kind"), receipt.get("output"), inner.policy_id) != (
@@ -255,7 +256,7 @@ def _model_op_output(operation, result, launch_dir: Path, verifier, ids: dict) -
     receipt = operation_receipt(result, launch_dir, operation)
     inner, output = receipt["receipt"], Path(launch_dir) / MODEL_OP_PARENT / "output"
     merge = isinstance(operation, MergeOperation)
-    names = [relative for relative, _ in _files(output)]
+    names = [relative for relative, _ in list_files(output)]
     if sorted(inner.output_files) != names or any(
             not (_payload_name(name, adapter=merge) or is_tokenizer_file(name) or name == "config.json")
             for name in names):
@@ -267,7 +268,7 @@ def _model_op_output(operation, result, launch_dir: Path, verifier, ids: dict) -
         first, refs = inputs[0], operation.models
         variants = {(item.adapter.method, item.adapter.quantization_bit) for item in inputs}
         method, bit = variants.pop() if len(variants) == 1 else ("lora", None)
-        metadata = adapter_metadata_from_config(_read_json(output / "adapter_config.json"), method=method,
+        metadata = adapter_metadata_from_config(read_json(output / "adapter_config.json"), method=method,
                                                 quantization_bit=bit)
         if metadata.rank != inner.output_rank:
             raise ValueError("merged adapter rank differs from its receipt")
@@ -322,7 +323,7 @@ def inspected_targets(result: OperationResult, launch_dir: Path, ref: ModelArtif
     from .graph_planner import ModelTargetEvidence
     if TARGET_INVENTORY not in result.evidence:
         return ()
-    inventory = _read_json(_evidence_file(result, launch_dir, TARGET_INVENTORY))
+    inventory = read_json(_evidence_file(result, launch_dir, TARGET_INVENTORY))
     if not isinstance(inventory, Mapping) or inventory.get("schema_version") != 1:
         raise ValueError("invalid target inventory")
     evidence = ModelTargetEvidence(base=ref, modules=tuple(inventory.get("modules") or ()))
@@ -336,8 +337,9 @@ def freeze_operation_output(operation, result: OperationResult, *, job_id: str, 
 
     Returns ``(ref, inspected_targets)``. A merge/materialize must freeze exactly its receipted inventory, and
     every full model the worker inspects (materialize; full/freeze training in the primary runtime) must carry
-    its verified target inventory. Both are checked before the store is written where the identity is already
-    known (a receipted output); a training output's targets are verified against the identity freezing gives.
+    its verified target inventory. Both are checked against the identity the store will give these exact bytes
+    (the descriptor hash and ``directory_inventory_sha256``) before the store is written, so a refused output
+    never leaves an artifact.
     """
     operation = validated_operation(operation)
     launch_dir = Path(launch_dir)
@@ -351,18 +353,18 @@ def freeze_operation_output(operation, result: OperationResult, *, job_id: str, 
             operation, result, job_id=job_id, attempt_id=attempt_id, manifest_sha256=manifest_sha256,
             launch_dir=launch_dir, resolved=resolved, approved_cache=approved_cache, workspace=workspace,
             dataset_synthetic=dataset_synthetic)
-        expected = targets = None
-        if model_op:
-            expected = ModelArtifactRef(artifact_id=digest(canonical(descriptor.model_dump(mode="json"))),
-                                        inventory_sha256=operation_receipt(result, launch_dir, operation)[
-                                            "output_inventory_sha256"])
-            targets = inspected_targets(result, launch_dir, expected, descriptor)
+        expected = ModelArtifactRef(artifact_id=digest(canonical(descriptor.model_dump(mode="json"))),
+                                    inventory_sha256=directory_inventory_sha256(source))
+        if model_op and expected.inventory_sha256 != operation_receipt(result, launch_dir, operation)[
+                "output_inventory_sha256"]:
+            raise ValueError("model-operation output inventory differs from operation-receipt.json")
+        targets = inspected_targets(result, launch_dir, expected, descriptor)
         ref = approved_cache.freeze(source, descriptor)
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
-    if model_op and ref != expected:
-        raise ValueError("frozen output inventory differs from operation-receipt.json")
-    return ref, targets if model_op else inspected_targets(result, launch_dir, ref, descriptor)
+    if ref != expected:   # only if the bytes changed between the checks and the copy into the store
+        raise ValueError("frozen output differs from the identity checked before freezing")
+    return ref, targets
 
 
 # -- evaluation records -------------------------------------------------------------------------
@@ -401,7 +403,7 @@ def evaluation_record(operation: EvaluateOperation, result: OperationResult, *, 
             or not all(isinstance(item, str) for item in predictions)):
         raise ValueError("predictions differ from the benchmark's ordered samples")
     ordinals = validate_sample_ids(benchmark, snapshot_dataset(registry, benchmark.dataset))
-    record, rows, schema = _dataset(registry, benchmark.dataset)
+    record, rows, schema = load_dataset(registry, benchmark.dataset)
     references = None
     if benchmark.evaluator_kind not in {"json", "pipeline"}:
         references = [_reference(rows[ordinal], schema) for ordinal in ordinals]

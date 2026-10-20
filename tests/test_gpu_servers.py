@@ -207,7 +207,8 @@ def test_graph_plan_and_claim_accept_truthful_server_facts(tmp_path):
     lease = store.acquire_controller(run["id"])
     store.prepare_ready(lease)
     claimed = store.claim_ready(facts, lease)
-    assert claimed and claimed["lease"].resource_id == facts.exclusivity_key
+    # A simulation plan claims in the simulation namespace, never the server itself (Task 8.1).
+    assert claimed and claimed["lease"].resource_id == "simulation:" + facts.exclusivity_key
 
 
 def test_native_strings_keep_provider_keys_independent_and_key_changes_invalidate_identity():

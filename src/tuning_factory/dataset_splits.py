@@ -98,13 +98,17 @@ def _input_schema(rows, formatting):
             if formatting == "sharegpt" else None}
 
 
-def _dataset(registry, ref):
+def load_dataset(registry, ref):
+    """``(record, rows, input schema)`` of a registered dataset whose bytes match ``ref``."""
     ref = DatasetRef.model_validate(ref.model_dump() if isinstance(ref, DatasetRef) else ref)
     record = registry.get_dataset(ref.dataset_id, ref.version)
     if record["sha256"] != ref.sha256:
         raise ValueError("dataset reference hash mismatch")
     rows, formatting, _ = parse_dataset(registry.dataset_path(record).read_bytes(), record.get("kind", "instruction"))
     return record, rows, _input_schema(rows, formatting)
+
+
+_dataset = load_dataset   # the pre-Task-8 private name, kept as an alias
 
 
 def assert_no_input_overlap(train_refs, heldout_refs, *, registry=None):

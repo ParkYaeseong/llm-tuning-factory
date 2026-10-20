@@ -239,7 +239,7 @@ def _open_regular(path: Path):
             raise ValueError("artifact file changed while reading")
 
 
-def _files(directory: Path):
+def list_files(directory: Path):
     _check_ancestors(directory)
     if not directory.is_dir():
         raise ValueError("artifact source is not a directory")
@@ -261,6 +261,9 @@ def _files(directory: Path):
     if len(paths) != len(set(paths)):
         raise ValueError("artifact paths collide on Windows")
     return sorted(result)
+
+
+_files = list_files   # the pre-Task-8 private name, kept as an alias
 
 
 def _inventory(directory: Path) -> tuple[_FileEntry, ...]:
@@ -293,12 +296,15 @@ def _json(data):
         raise ValueError("invalid artifact JSON metadata") from exc
 
 
-def _read_json(path: Path):
+def read_json(path: Path):
     with _open_regular(path) as stream:
         raw = stream.read(JSON_LIMIT + 1)
     if len(raw) > JSON_LIMIT:
         raise ValueError("artifact JSON metadata exceeds size limit")
     return _json(raw)
+
+
+_read_json = read_json
 
 
 def is_tokenizer_file(relative: str) -> bool:
@@ -339,7 +345,7 @@ def directory_inventory_sha256(directory: str | Path) -> str:
     return digest(_inventory_bytes(_inventory(Path(directory).absolute())))
 
 
-def _tensor_header(path: Path, relative: str) -> tuple[TensorMetadata, ...]:
+def tensor_header(path: Path, relative: str) -> tuple[TensorMetadata, ...]:
     with _open_regular(path) as stream:
         prefix = stream.read(8)
         if len(prefix) != 8:
@@ -378,6 +384,9 @@ def _tensor_header(path: Path, relative: str) -> tuple[TensorMetadata, ...]:
     if not tensors or position != data_size:
         raise ValueError("safetensors tensor geometry does not cover payload")
     return tuple(tensors)
+
+
+_tensor_header = tensor_header
 
 
 def _validate_adapter(directory: Path, adapter: AdapterMetadata):

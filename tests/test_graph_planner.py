@@ -838,3 +838,55 @@ def test_ppo_continuation_through_selection_is_refused_at_planning(tmp_path):
     with pytest.raises(ValueError, match="PPO adapter continuation is unsupported"):
         _static_routes(nodes["child"], nodes, {item.revision_sha256: item for item in recipes}, {},
                        (SimpleNamespace(runtime=SimpleNamespace(profile="ppo")),))
+
+
+# -- Task 8.1: planning refusals the worker would otherwise raise after launch ----------------------
+
+def destination_revisions(choices):
+    """What real planning additionally requires: frozen transport and tracking destination revisions."""
+    from tuning_factory.graph_planner import TrackingDestination
+    return choices.model_copy(update={
+        "executors": tuple(item.model_copy(update={"transport_settings_sha256": "1" * 64})
+                           for item in choices.executors),
+        "tracking_destination": TrackingDestination(profile_id="mlflow", revision="1",
+                                                    public_settings_sha256="2" * 64)})
+
+
+@pytest.mark.parametrize("simulation", [True, False])
+@pytest.mark.parametrize("change,message", [
+    ({"generation_mode": "sample"}, "v2 evaluation supports greedy causal-LM generation benchmarks only"),
+    ({"precision": "fp32"}, "fp32 benchmark precision cannot be enforced by the pinned engine"),
+    ({"semantic_model_kind": "reward_model"}, "v2 evaluation supports greedy causal-LM generation benchmarks only"),
+])
+def test_planning_refuses_benchmarks_the_pinned_engine_cannot_enforce(tmp_path, change, message, simulation):
+    from tuning_factory.benchmarks import BenchmarkSpec
+    from tuning_factory.graph_planner import BenchmarkRevision
+    registry, project, choices, facts, store, ref, producer, benchmark = evaluation_fixture(tmp_path)
+    choices = destination_revisions(choices)
+    plan_graph(project, choices, (facts,), simulation=simulation)   # the greedy bf16 causal-LM benchmark plans
+    changed = BenchmarkSpec.model_validate({**benchmark.model_dump(mode="json"), **change})
+    graph = dict(project.spec.graph)
+    graph["nodes"] = [dict(graph["nodes"][0], benchmark_revision=changed.fingerprint()), *graph["nodes"][1:]]
+    choices = choices.model_copy(update={"benchmarks": (BenchmarkRevision(spec=changed,
+                                                                          revision_sha256=changed.fingerprint()),)})
+    with pytest.raises(ValueError) as refused:
+        plan_graph(revise(project, graph), choices, (facts,), simulation=simulation)
+    assert str(refused.value) == message   # the worker's exact words (training.check_generation_benchmark)
+
+
+@pytest.mark.parametrize("simulation", [True, False])
+def test_planning_refuses_a_zero_or_nonfinite_runpod_price(tmp_path, simulation):
+    from test_gpu_servers import observation, settings
+    _, project, choices, facts = fixture(tmp_path)
+    choices = destination_revisions(choices)
+    assert plan_graph(project, choices, (facts,), simulation=simulation).max_estimated_cost_usd == 8
+    with pytest.raises(ValueError, match="^RunPod resource facts require a positive live hourly price$"):
+        plan_graph(project, choices, (facts.model_copy(update={"total_hourly_cost_usd": 0}),), simulation=simulation)
+    for price in (float("inf"), float("nan")):
+        forged = ResourceFacts.model_construct(**{**dict(facts), "total_hourly_cost_usd": price})
+        with pytest.raises(ValueError, match="finite|positive live hourly price"):
+            plan_graph(project, choices, (forged,), simulation=simulation)
+    server = observation()   # an SSH server the operator prices at 0 still plans
+    profile = settings().profile(server, profile_id=choices.executors[0].profile_id, revision="1")
+    plan = plan_graph(project, choices.model_copy(update={"executors": (profile,)}), (server,), simulation=simulation)
+    assert plan.max_estimated_cost_usd == 0

@@ -8,6 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ACTIVE = {'PROVISIONING', 'RUNNING', 'EVALUATING'}
+# Lock namespaces that never stand for hardware (with the literal 'mock-cpu'): a graph's local selection and
+# simulated attempts. They never quarantine a hardware claim, and they block only an identical lock name.
+NON_HARDWARE = ('local:', 'simulation:')
+GRAPH_LAUNCH_REFUSED = 'graph run is not running; launch refused'
 RECEIPT_CHUNK = 500  # Stay far below SQLite's variable limit.
 TERMINAL = {'FAILED', 'CANCELED', 'COMPLETED'}
 TRANSITIONS = {
@@ -214,7 +218,8 @@ class JobStore:
         with self.connection() as db:
             return [self.decode(r) for r in db.execute('SELECT * FROM jobs ORDER BY created')]
 
-    def _validate_lease(self, db, lease):
+    def validate_lease(self, db, lease):
+        """The job row joined with its current attempt, inside the caller's transaction; else 'stale attempt lease'."""
         if not isinstance(lease, AttemptLease):
             raise ValueError('current attempt lease required')
         row = db.execute('SELECT j.*,a.resource_id,a.launch_id,a.launch_started,a.legacy FROM jobs j '
@@ -224,6 +229,21 @@ class JobStore:
         if row is None:
             raise ValueError('stale attempt lease')
         return row
+
+    _validate_lease = validate_lease   # the pre-Task-8 name, kept as an alias
+
+    def validated_attempt(self, lease):
+        """``validate_lease`` on its own connection, as a plain dict."""
+        with self.connection() as db:
+            return dict(self.validate_lease(db, lease))
+
+    def holds_lock(self, lease):
+        """Whether this current attempt still holds its resource lease (a final attempt has released it)."""
+        with self.connection() as db:
+            self.validate_lease(db, lease)
+            row = db.execute('SELECT 1 FROM resource_leases WHERE job_id=? AND attempt_id=? AND resource_id=?',
+                             (lease.job_id, lease.attempt_id, lease.resource_id)).fetchone()
+        return row is not None
 
     def current_lease(self, job_id):
         """Trusted control-plane hook for explicit reconciliation, never execution restart."""
@@ -240,7 +260,7 @@ class JobStore:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
             if isinstance(subject, AttemptLease) or (row and (row['active_attempt_id'] or row['attempts'])):
-                self._validate_lease(db, subject)
+                self.validate_lease(db, subject)
             if row is not None and row['status'] == status:
                 return
             if row is None or status not in TRANSITIONS.get(row['status'], set()):
@@ -271,7 +291,7 @@ class JobStore:
         for locked, observed in held:
             if resource == locked:
                 return True
-            if provider is None or locked == 'mock-cpu':
+            if provider is None or locked == 'mock-cpu' or locked.startswith(NON_HARDWARE):
                 continue
             if not locked.startswith(provider):
                 return True
@@ -348,7 +368,7 @@ class JobStore:
         with self.connection() as db:
             held = [row[0] for row in db.execute('SELECT gpu FROM gpu_locks')]
             held += [row[0] for row in db.execute('SELECT resource_id FROM preparation_reservations')]
-        return any(locked != 'mock-cpu' and not locked.startswith(provider) for locked in held)
+        return any(locked != 'mock-cpu' and not locked.startswith((provider, *NON_HARDWARE)) for locked in held)
 
     def resource_blocked(self, facts):
         """Shared check for verified hardware (facts or inspection), active jobs and preparation reservations."""
@@ -418,7 +438,7 @@ class JobStore:
     def heartbeat(self, lease):
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = self._validate_lease(db, lease)
+            row = self.validate_lease(db, lease)
             if row['status'] not in ACTIVE:
                 raise ValueError('attempt lease is not active')
             db.execute('UPDATE jobs SET updated=? WHERE id=?', (time.time(), lease.job_id))
@@ -426,15 +446,20 @@ class JobStore:
     def set_run_id(self, lease, run_id):
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            self._validate_lease(db, lease)
+            self.validate_lease(db, lease)
             db.execute('UPDATE jobs SET run_id=? WHERE id=?', (run_id, lease.job_id))
 
     def begin_launch(self, lease):
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = self._validate_lease(db, lease)
+            row = self.validate_lease(db, lease)
             if row['launch_started'] or row['legacy'] or row['status'] != 'PROVISIONING':
                 raise ValueError('launch already started or uncertain; reconcile the same attempt')
+            if row['graph_run_id'] is not None:
+                # The point of no return: a pause or cancel that committed after the claim wins (Task 8 D12).
+                run = db.execute('SELECT status FROM graph_runs WHERE id=?', (row['graph_run_id'],)).fetchone()
+                if run is None or run['status'] != 'RUNNING':
+                    raise ValueError(GRAPH_LAUNCH_REFUSED)
             db.execute('UPDATE job_attempts SET launch_started=1 WHERE attempt_id=?', (lease.attempt_id,))
             return row['launch_id']
 
@@ -443,7 +468,7 @@ class JobStore:
         Fail the attempt and free its lock; a started, legacy or non-provisioning attempt is untouched."""
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = self._validate_lease(db, lease)
+            row = self.validate_lease(db, lease)
             if row['launch_started'] or row['legacy'] or row['status'] != 'PROVISIONING':
                 return False
             now = time.time()
@@ -456,7 +481,7 @@ class JobStore:
         """Explicit trusted actor handoff; does not authorize another remote launch."""
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = self._validate_lease(db, lease)
+            row = self.validate_lease(db, lease)
             return self._takeover(db, lease, row)
 
     def _takeover(self, db, lease, row):
@@ -485,7 +510,7 @@ class JobStore:
     def release_gpu(self, lease, *, execution_stopped=False):
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = self._validate_lease(db, lease)
+            row = self.validate_lease(db, lease)
             if not execution_stopped or row['status'] in ACTIVE:
                 raise ValueError('current attempt termination confirmation required')
             self._release(db, lease)
@@ -521,7 +546,7 @@ class JobStore:
             raise ValueError('invalid reconciled terminal status')
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = self._validate_lease(db, lease)
+            row = self.validate_lease(db, lease)
             if row['status'] != 'FAILED':
                 raise ValueError('only failed jobs may be reconciled')
             db.execute('UPDATE jobs SET status=?,error=?,updated=? WHERE id=?', (status, error, time.time(), lease.job_id))

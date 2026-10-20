@@ -9,6 +9,7 @@ performed here. Worker preflight must repeat byte verification before execution.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,9 +19,10 @@ from pydantic import Field, model_validator
 
 from .benchmarks import BenchmarkSpec, EvaluationRecord, SelectionResult
 from .config import GraphTrainingConfig, StrictModel
-from .dataset_splits import _dataset, assert_no_input_overlap, input_fingerprint
+from .dataset_splits import assert_no_input_overlap, input_fingerprint, load_dataset
 from .executor_profiles import (
     PublicExecutorProfile,
+    ResourceFacts,
     ResourceObservation,
     approval_destination,
     observation_key,
@@ -63,7 +65,9 @@ from .projects import DatasetRef, LocalId, ProjectSpec, Revision, Sha256
 from .recipes import RecipeSpec, recipe_training_options
 from .registry import Registry, canonical, digest
 from .runtime_profiles import engine_profile
-from .training import OFT_UNFREEZABLE, PPO_CONTINUATION, requires_frozen_reference
+from .training import OFT_UNFREEZABLE, PPO_CONTINUATION, check_generation_benchmark, requires_frozen_reference
+
+RUNPOD_PRICE_REQUIRED = "RunPod resource facts require a positive live hourly price"
 
 
 class DatasetSnapshot(StrictModel):
@@ -75,7 +79,7 @@ class DatasetSnapshot(StrictModel):
 
 
 def snapshot_dataset(registry: Registry, ref: DatasetRef) -> DatasetSnapshot:
-    record, rows, schema = _dataset(registry, ref)
+    record, rows, schema = load_dataset(registry, ref)
     return DatasetSnapshot(dataset=ref, kind=record.get("kind", "instruction"),
         input_fingerprints=tuple(input_fingerprint(row, record.get("kind", "instruction"), **schema) for row in rows),
         synthetic=record.get("synthetic", False), export_allowed=record.get("export_allowed", False))
@@ -427,6 +431,10 @@ def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: Execu
     issues = _definition_issues(project_revision.spec, graph, choices.recipes, choices.datasets)
     if issues:
         raise ValueError("; ".join(f"{i.code}: {i.message}" for i in issues))
+    # A RunPod price is observed live; 0 or a non-finite value would void the budget (SSH operators may price 0).
+    if any(isinstance(item, ResourceFacts) and not (math.isfinite(item.total_hourly_cost_usd)
+                                                    and item.total_hourly_cost_usd > 0) for item in facts):
+        raise ValueError(RUNPOD_PRICE_REQUIRED)
     recipes = _unique(choices.recipes, lambda x: x.revision_sha256, "recipe revision")
     benchmarks = _unique(choices.benchmarks, lambda x: x.revision_sha256, "benchmark revision")
     datasets = _unique(choices.datasets, lambda x: _dataset_key(x.dataset), "dataset snapshot")
@@ -473,6 +481,7 @@ def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: Execu
             if node.benchmark_revision not in benchmarks:
                 raise ValueError("missing pinned benchmark revision")
             benchmark = benchmarks[node.benchmark_revision].spec
+            check_generation_benchmark(benchmark)   # what the worker would refuse after launch (plan Q8)
             if roles.get(_dataset_key(benchmark.dataset)) not in {"validation", "test"}:
                 raise ValueError("evaluation requires a held-out project dataset")
             validate_sample_ids(benchmark, datasets[_dataset_key(benchmark.dataset)])

@@ -624,3 +624,18 @@ def test_verification_cache_distinguishes_both_parts_of_artifact_identity(tmp_pa
     store.verify(child)
     assert len(scans) == 3
     assert len(set(scans)) == 3
+
+
+def test_operation_outputs_uses_only_public_helpers():
+    import ast
+
+    from tuning_factory import dataset_splits, operation_outputs
+    module = api()
+    tree = ast.parse(Path(operation_outputs.__file__).read_text(encoding='utf-8'))
+    private = sorted(f'{node.module}.{alias.name}' for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+                     and (node.module or '').rsplit('.', 1)[-1] in {'model_artifacts', 'dataset_splits'}
+                     for alias in node.names if alias.name.startswith('_'))
+    assert private == []
+    for public, alias in (('list_files', '_files'), ('read_json', '_read_json'), ('tensor_header', '_tensor_header')):
+        assert getattr(module, alias) is getattr(module, public)   # the private names are aliases, never copies
+    assert dataset_splits._dataset is dataset_splits.load_dataset

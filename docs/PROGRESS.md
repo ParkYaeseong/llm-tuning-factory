@@ -944,8 +944,9 @@ CPU and with fakes:
   `BenchmarkSpec.fingerprint()` (F11 fixed) and rebuilds idempotently after a crash.
 - Final receipt `811d4177…b673` (29/29 checks, source `478e2a41…e5d2` of commit 7120193). After the 7.4 follow-up
   (Windows name aliases and uploaded-input protection on download) it was `a9bece24…e45d` (source `247003f6…6c7f`).
-  After the 8.3 short-name follow-up it was `97fa2c89…df3b` (source `0ae3419b…b67a`). After the 7.5 review fixes,
-  the current receipt is `042bf8fe…9c0b` (29/29 checks, source `6b57e120…9b5f`).
+  After the 8.3 short-name follow-up it was `97fa2c89…df3b` (source `0ae3419b…b67a`). After the 7.5 review fixes
+  it was `042bf8fe…9c0b` (source `6b57e120…9b5f`). After Task 8.1, the current receipt is `5cc24562…63be` (29/29
+  checks, source `0d405733…373a`; see "Task 8.1 ledger foundations").
 
 Not verified (needs explicit GPU/host authorization):
 - Any real GPU or host.
@@ -1004,6 +1005,151 @@ Task 8 interface (`attempt_runner`):
     does. `operation_outputs.build_output_descriptor` can serve one that freezes `simulation=True` descriptors.
   - Planning-time refusal of fp32/sample/reward benchmarks (Q8).
   - Persisting `inspected_targets`.
+
+## Task 8.1 ledger foundations, 2026-10-20
+
+Commit `feat: fence graph controllers and reserve budgets in the graph ledger`, on `088a07d`. It implements plan
+§4 "8.1" (decisions D1–D14 as accepted) plus the coordinator's two follow-ups from the `088a07d` re-review.
+
+What changed:
+- Lock namespaces (F1, D3):
+  - `jobs.NON_HARDWARE = ("local:", "simulation:")`, plus the literal `mock-cpu`, never quarantine a hardware claim.
+    They block only an identical lock name, and `foreign_provider_lock` ignores them.
+  - Cross-provider and unknown (`legacy-unknown:`) locks quarantine exactly as before.
+  - A simulation plan claims `simulation:<exclusivity key>`, so it never holds or waits for the real Pod or server.
+- Public ledger APIs (coordinator item 3):
+  - `JobStore.validate_lease`, with `_validate_lease` kept as the same object, plus `validated_attempt` and
+    `holds_lock` (follow-up 1).
+  - `GraphStore.bindings_for(run_id, node_id)` replaces `_bindings`, which is removed. 8.1 keeps today's root-only
+    default.
+  - `model_artifacts.list_files`/`read_json`/`tensor_header` and `dataset_splits.load_dataset`, with the private
+    names kept as aliases.
+  - `attempt_runner`, `runner.reconcile`, `graph_store`, `graph_planner` and `operation_outputs` now use only the
+    public names. `attempt_runner` no longer opens JobStore connections or reads its tables.
+- Additive migration, in one `BEGIN IMMEDIATE` in `GraphStore.__init__`:
+  - new tables `controller_owner`, `budget_reservations` and `attempt_dispositions`;
+  - new nullable columns `controller_leases.owner_token` and `nodes.retry_not_before`/`wait_reason`/`updated`;
+  - a RESERVED reservation backfilled for every pre-existing graph attempt. The cost comes from the manifest's pinned
+    facts; a select costs 0.
+
+  No existing row changes.
+- Owner lease:
+  - `acquire_owner`, `renew_owner`, `release_owner` and `owner_state` (never the token), with `controller already
+    running` and `stale controller owner lease`.
+  - Owner IDs must fully match `[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}`. The TTL must be positive and finite.
+  - `acquire_controller(..., owner=)` validates the owner in the same transaction. It replaces a run lease that
+    expired or that another owner token holds, and never an unexpired owner-less lease. `owner=None` is unchanged.
+  - `GraphStore(clock=)` drives graph runs, leases, reservations and dispositions. Job rows and events keep
+    `time.time()`.
+- Run state machine:
+  - pause: only RUNNING → PAUSED;
+  - resume: only PAUSED → RUNNING (`canceled graph cannot resume` stays);
+  - cancel: from RUNNING or PAUSED.
+
+  Repeating the current state is a no-op. COMPLETED and FAILED refuse all three.
+- Pause gate (D12): `begin_launch` refuses a graph job whose run is not RUNNING (`graph run is not running; launch
+  refused`) and leaves `launch_started=0`. `run_claimed` can therefore raise it. The attempt stays PROVISIONING
+  with its lock until the controller calls `return_unlaunched`.
+- `claim_ready`:
+  - With facts it skips selects; with None it claims only selects (F2).
+  - It skips a job whose counted attempts (`job_attempts` minus `counted=0` dispositions) reached `max_attempts`.
+  - It skips a job whose cost would push the reservations above the approved total × (1 + 1e-9).
+  - It inserts the reservation in the claim transaction. `reserved_budget(run_id)` reports the RESERVED sum.
+- `return_unlaunched(controller_lease, attempt_lease, *, reason)`:
+  - Only for a PROVISIONING, unstarted, non-legacy attempt of the lease's run.
+  - It frees the lock, voids the reservation and records `returned_unlaunched` (uncounted).
+  - RUNNING or PAUSED run: RETRYING → QUEUED, node READY. `active_attempt_id` is cleared, as `reset_for_resume`
+    does, so the old lease no longer validates.
+  - CANCELED run: the job and node become CANCELED, and the attempt token is rotated.
+- Planning (Q8, D13), simulation included:
+  - EvaluateNode calls `training.check_generation_benchmark`, so the worker's exact messages are raised at planning.
+  - RunPod facts priced ≤ 0 or non-finite are refused: `RunPod resource facts require a positive live hourly
+    price`. An SSH price of 0 still plans. `ResourceFacts` is unchanged, so stored plans stay readable.
+  - The price rule sits after the definition issues, so the OFT refusal is still reported first.
+- Orphan artifacts (follow-up 2, Minor A):
+  - `freeze_operation_output` now computes the store identity before freezing (descriptor hash plus
+    `directory_inventory_sha256(source)`).
+  - It compares a merge/materialize inventory with `operation-receipt.json` (`model-operation output inventory differs
+    from operation-receipt.json`) and verifies every target inventory against that identity. Only then does it freeze.
+  - The comparison after freezing stays, as a guard against bytes changing during the copy.
+  - So "a refused output never leaves an artifact" (7.5) now holds for the two cases that froze first. The cost is
+    one extra hash pass over each model output.
+
+Deviations from the plan:
+- `prepare_ready` validates its controller lease first (read only). Before, a fenced lease with nothing left to
+  prepare returned `[]`; test 7 requires `stale controller lease`.
+- Follow-up 1 adds `JobStore.holds_lock` (not in the plan's interface list) and removes `attempt_runner._holds_lock`.
+  An AST test asserts that `attempt_runner` uses no `_`-prefixed JobStore/GraphStore member, no `.connection(` and no
+  `resource_leases`.
+- Follow-up 2 changes the freeze order in `operation_outputs` and adds two runner tests (six cases).
+- `tests/test_gpu_servers.py::test_graph_plan_and_claim_accept_truthful_server_facts` now expects `simulation:` plus
+  the server key. That plan is a simulation, and 8.1 specifies the simulation namespace.
+- `graph_planner` also imports `load_dataset` instead of `_dataset`; it was the other private importer.
+- `tests/test_graph_store.py` gains an autouse fixture that makes `socket.socket.connect` raise, for all its tests.
+- The price rule checks every RunPod snapshot passed to `plan_graph`, not only the ones an allowed resource uses.
+- Test placement: 1–13 and a `holds_lock` test are in `test_graph_store.py`, 14–15 in `test_graph_planner.py`, 16 in
+  `test_model_artifacts.py`, and 17 with the follow-up tests in `test_operation_runner.py`.
+
+Actual verification (main tree, no other agent's uncommitted changes):
+- RED, before any `src` edit: 27 of the 29 new cases failed for the intended reasons:
+  - missing APIs (`validate_lease`, `holds_lock`, `clock=`, `return_unlaunched`, `GRAPH_LAUNCH_REFUSED`,
+    `bindings_for`, the public helpers);
+  - missing tables;
+  - a `local:` or simulated lock quarantining a GPU claim;
+  - a select returned for a GPU observation;
+  - a real-key simulation claim;
+  - planning that did not raise;
+  - an orphan artifact after the receipt or target refusals.
+
+  Two cases passed already, as guards: test 3 and the materialize forged-targets case, which was already refused
+  before freezing. Test 12 first failed on a test-fixture bug (a missing subdirectory), fixed before implementing.
+- Mutations, through a pytest plugin in `%TEMP%` with no `src` edit:
+
+  | Mutation | Tests that fail |
+  |---|---|
+  | `begin_launch` without the gate | 9 |
+  | `_reserved` returns 0 | 5 and 12 |
+  | `_counted_attempts` returns 0 | 12 |
+  | `NON_HARDWARE = ()` | 1, 2, 9, 11 and 13 |
+- GREEN:
+  - The plan's command (`test_graph_store`, `test_graph_planner`, `test_jobs`, `test_reconciliation`,
+    `test_operation_runner`, `test_gpu_servers`, `test_desktop_servers`) gave **313 passed** (285 at `088a07d`).
+  - `tests/test_model_artifacts.py` gave 88 passed.
+  - `uv run pytest -q` gave **1152 passed, 1 skipped** (1123 + 29).
+- Ruff (`src tests`) is clean, and `check_secrets.py` reports 0 findings. Both GPU locks are unchanged.
+  `git ls-files --eol` prints nothing outside LF, every changed file is CR-free, and the main env has no
+  torch/peft/transformers/safetensors/huggingface_hub.
+- CPU acceptance (`-I`):
+  - It exited 0 twice with byte-identical receipts, and all **29** checks passed.
+  - Max errors are unchanged: merge delta 7.78e-9, materialize delta 9.17e-9, parent→child 6.42e-9, logits
+    3.35e-8/2.98e-8.
+  - The frozen dispatched inventories are unchanged (merge `cc5fbab0…b54c`, materialize `e124a915…8682`, 14 target
+    modules).
+  - Receipt SHA256 `5cc245621ed3177723659929c760469224cb2439c142b9c366cabd8e004d63be`, source_sha256
+    `0d4057330d93584d8b8d25e9d8a522e6b45f7e30f376b798948612d37537373a`, lock_sha256
+    `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`.
+  - `model_downloaded`, `gpu_used`, `institution_data_used` and `production_promotable` are false.
+  - It supersedes `042bf8fe…9c0b`.
+- Module sizes: `graph_store.py` 594 (389), `jobs.py` 561 (536), `attempt_runner.py` 438 (447),
+  `operation_outputs.py` 414 (412), `graph_planner.py` 999 (990).
+
+Not verified or still open:
+- No GPU, SSH, network, provider or MLflow. Everything ran on fakes, local files and SQLite.
+- Multi-process contention is untested. The races are in-process threads on one SQLite file.
+- 8.2–8.5 scope is untouched: the resolver (D1), readiness, failure propagation, `requeue_retry`/backoff,
+  `release_uncontacted` (D9), `finalize_run`, the tracking outbox, providers and the controller loop.
+  - Nothing writes the new node columns or the run statuses COMPLETED/FAILED yet.
+  - `record_outputs` still refuses `inspected_targets`.
+- The controller (8.5) must catch `GRAPH_LAUNCH_REFUSED` from `run_claimed` and call `return_unlaunched`.
+- Minor B (coordinator, for 8.2's safe release): a crash between `transition(CANCELED)` and `release_gpu` in
+  `_launch` leaves a CANCELED attempt holding its lock. `reconcile` refuses it, because only FAILED/COMPLETED
+  attempts are eligible.
+- Owner fencing applies at run-lease replacement: `_controller` does not read the owner lease. An old owner's run
+  lease stays valid until a new owner replaces it or it expires (plan design; 8.5 renews both).
+- The live RunPod price observation (the second half of D13) is 8.4.
+- The backfill assumes every graph manifest parses. `prepare_ready` is their only writer; a malformed one would
+  stop the store from opening.
+- Legacy `JobStore.claim` still counts graph attempts against `Policy.max_concurrent` (D2, unchanged).
 
 ---
 

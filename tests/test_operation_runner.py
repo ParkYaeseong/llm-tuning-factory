@@ -1072,3 +1072,75 @@ def test_runner_requires_the_ledger_state_directory(tmp_path):
         api().OperationAttemptRunner(store, root=tmp_path / "elsewhere")
     with pytest.raises(TypeError):
         api().OperationAttemptRunner(store.jobs, root=tmp_path / "state")
+
+
+# -- 13. Task 8.1: public ledger boundaries and refusals that leave no artifact ----------------------
+
+def test_runner_uses_public_bindings_for(tmp_path, monkeypatch):
+    w = world(tmp_path, monkeypatch, ("continue",))
+    original = getattr(GraphStore, "bindings_for", None)
+    assert original is not None, "GraphStore.bindings_for is the public trusted-resolver hook"
+    seen = []
+
+    def spy(self, run_id, node_id):
+        seen.append((run_id, node_id))
+        return original(self, run_id, node_id)
+
+    monkeypatch.setattr(GraphStore, "bindings_for", spy)
+    outcome = run(w)
+    assert outcome.status == "COMPLETED", outcome.error
+    assert seen == [(w.run["id"], "continue")]   # the continuation evidence comes from the same hook compile used
+    assert not hasattr(GraphStore, "_bindings")
+
+
+def test_attempt_runner_uses_only_public_ledger_members():
+    import ast
+    source = Path(api().__file__).read_text(encoding="utf-8")
+    private = sorted({node.attr for node in ast.walk(ast.parse(source))
+                      if isinstance(node, ast.Attribute) and node.attr.startswith("_")
+                      and not node.attr.startswith("__") and isinstance(node.value, ast.Attribute)
+                      and node.value.attr in {"jobs", "graph", "graph_store"}})
+    assert private == []
+    assert "resource_leases" not in source and ".connection(" not in source   # no JobStore tables or SQL here
+
+
+def forge_evidence(directory, name, data):
+    """A worker that rewrites one evidence file and keeps the records consistent (what a forger would do)."""
+    (directory / name).write_bytes(data)
+    for record, key in (("artifacts.json", None), ("result.json", "evidence")):
+        content = json.loads((directory / record).read_bytes())
+        (content[key] if key else content)[name] = digest(data)
+        (directory / record).write_bytes(canonical(content))
+
+
+@pytest.mark.parametrize("kinds", [("merge",), ("full",)])
+def test_model_op_output_differing_from_its_receipt_leaves_no_artifact(tmp_path, monkeypatch, kinds):
+    w = world(tmp_path, monkeypatch, kinds)
+    before = artifact_entries(w.store)
+
+    def forge_receipt(directory):
+        receipt = json.loads((directory / "operation-receipt.json").read_bytes())
+        forge_evidence(directory, "operation-receipt.json", canonical({**receipt, "output_inventory_sha256": "f" * 64}))
+
+    w.host.after_worker = forge_receipt
+    outcome = run(w)
+    assert (outcome.status, outcome.uncertain, outcome.outputs) == ("FAILED", False, None)
+    assert "output inventory differs from operation-receipt.json" in outcome.error
+    assert artifact_entries(w.store) == before and not held_locks(w)
+
+
+@pytest.mark.parametrize("kinds,engine", [(("full_train",), {"method": "full"}), (("full",), {})])
+def test_forged_target_inventory_of_a_full_model_leaves_no_artifact(tmp_path, monkeypatch, kinds, engine):
+    w = world(tmp_path, monkeypatch, kinds, **engine)
+    before = artifact_entries(w.store)
+
+    def forge_targets(directory):
+        inventory = json.loads((directory / "target-inventory.json").read_bytes())
+        inventory["modules"][0]["output_dimension"] += 1
+        forge_evidence(directory, "target-inventory.json", canonical(inventory))
+
+    w.host.after_worker = forge_targets
+    outcome = run(w)
+    assert (outcome.status, outcome.uncertain, outcome.outputs) == ("FAILED", False, None)
+    assert "inspected base dimensions differ from verified tensor inventory" in outcome.error
+    assert artifact_entries(w.store) == before and not held_locks(w)

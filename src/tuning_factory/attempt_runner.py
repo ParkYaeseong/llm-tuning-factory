@@ -101,7 +101,9 @@ class OperationAttemptRunner:
     # -- public interface (Task 8) --------------------------------------------------------------
 
     def run_claimed(self, claimed: dict, executor, *, approval: ApprovalGrant) -> OperationOutcome:
-        """Run one claimed attempt once. Raises ValueError for a stale lease or an attempt already launched."""
+        """Run one claimed attempt once. Raises ValueError for a stale lease, an attempt already launched, or a
+        graph run that is not RUNNING (``GRAPH_LAUNCH_REFUSED``: the attempt stays unlaunched and holds its lock
+        until the controller returns it with ``GraphStore.return_unlaunched``)."""
         lease = claimed.get("lease") if isinstance(claimed, dict) else None
         if not isinstance(lease, AttemptLease):
             raise ValueError("a claimed attempt lease is required")
@@ -132,7 +134,7 @@ class OperationAttemptRunner:
             raise ValueError("recover stale active attempts before reconciling; only FAILED or COMPLETED attempts "
                              "are eligible")
         lease = self.jobs.current_lease(job_id)
-        if not self._holds_lock(lease):
+        if not self.jobs.holds_lock(lease):
             raise ValueError("attempt is final: its lock is released, so reconcile never reopens it; use outputs_for "
                              "to rebuild a completed attempt's outputs")
         if job["status"] == "COMPLETED":
@@ -260,9 +262,7 @@ class OperationAttemptRunner:
         """Inspected targets and producer stages for an adapter continuation, from the resolver compile used."""
         if not (isinstance(operation, TrainOperation) and operation.model_input.initialization == "continue_adapter"):
             return (), ()
-        run = self.graph.get_run(job["graph_run_id"])
-        entry = next(item for item in run["plan"].nodes if item.node.id == job["graph_node_id"])
-        bindings = self.graph._bindings(run["plan"], entry, run["id"])   # the trusted controller hook
+        bindings = self.graph.bindings_for(job["graph_run_id"], job["graph_node_id"])   # the trusted resolver hook
         return bindings.base_targets, bindings.producers
 
     def _dataset_bytes(self, ref) -> bytes:
@@ -406,16 +406,7 @@ class OperationAttemptRunner:
     # -- ledger and file helpers ----------------------------------------------------------------
 
     def _attempt(self, lease: AttemptLease) -> dict:
-        with self.jobs.connection() as db:
-            return dict(self.jobs._validate_lease(db, lease))
-
-    def _holds_lock(self, lease: AttemptLease) -> bool:
-        """Whether this attempt still holds its resource lease (JobStore has no public query for it yet)."""
-        with self.jobs.connection() as db:
-            self.jobs._validate_lease(db, lease)
-            row = db.execute("SELECT 1 FROM resource_leases WHERE job_id=? AND attempt_id=? AND resource_id=?",
-                             (lease.job_id, lease.attempt_id, lease.resource_id)).fetchone()
-        return row is not None
+        return self.jobs.validated_attempt(lease)
 
     def _heartbeat(self, lease: AttemptLease) -> threading.Event:
         stop = threading.Event()

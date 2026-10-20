@@ -292,7 +292,7 @@ class Factory:
         verify_manifest(manifest)
         directory = self.directory(job_id)
         with self.store.connection() as db:
-            attempt = self.store._validate_lease(db, lease)
+            attempt = self.store.validate_lease(db, lease)
         receipt_path = directory / "remote-attempt.json"
         if attempt["launch_id"] and receipt_path.is_file():
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))

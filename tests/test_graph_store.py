@@ -1,8 +1,34 @@
+import json
+import socket
+import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from dataclasses import replace
 
 import pytest
 
 from tuning_factory.jobs import JobStore
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """The graph ledger never opens a connection: every test here runs on local SQLite and files only."""
+    def refuse(*args, **kwargs):
+        raise AssertionError('graph ledger tests must not open a network connection')
+    monkeypatch.setattr(socket.socket, 'connect', refuse)
+
+
+class FakeClock:
+    """Wall-clock compatible: it starts at time.time(), because attempt heartbeats are written in wall time."""
+    def __init__(self, start=None):
+        self.now = time.time() if start is None else start
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
 
 
 def queued(store, key, count=1, priority=0):
@@ -280,3 +306,602 @@ def test_durable_typed_model_and_tracking_ledger(tmp_path):
     with pytest.raises(ValueError, match='lease'):
         reopened.record_outputs(lease, output)
     reopened.record_outputs(new['lease'], output)
+
+
+# -- Task 8.1: ledger foundations ------------------------------------------------------------------
+
+TRACKING = {'profile_id': 'mlflow', 'revision': '1', 'public_settings_sha256': '2' * 64}
+
+
+def ledger_plan(tmp_path, pods=('pod1',), *, max_attempts=1, max_concurrent=1, simulation=True):
+    """Independent train nodes ``train.<n>``, one per Pod, at $8/h for 1800 s ($4 per attempt)."""
+    from test_graph_planner import fixture, revise
+
+    from tuning_factory.graph_planner import NodeResources, TrackingDestination, plan_graph
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    registry, project, choices, facts = fixture(tmp_path)
+    template = dict(project.spec.graph['nodes'][0])
+    executors, observations, resources, nodes = [], [], [], []
+    for index, pod in enumerate(pods, 1):
+        executors.append(choices.executors[0].model_copy(update={
+            'profile_id': f'p{index}', 'pod_id': pod, 'transport_settings_sha256': '1' * 64}))
+        observations.append(facts.model_copy(update={'pod_id': pod}))
+        nodes.append(dict(template, id=f'train.{index}', executor_profile_ids=[f'p{index}']))
+        resources.append(NodeResources(node_id=f'train.{index}', timeout_seconds=1800))
+    graph = dict(project.spec.graph, nodes=nodes, max_concurrent=max_concurrent,
+                 retry_policy={'max_attempts': max_attempts})
+    choices = choices.model_copy(update={'executors': tuple(executors), 'node_resources': tuple(resources),
+                                         'tracking_destination': TrackingDestination(**TRACKING)})
+    plan = plan_graph(revise(project, graph), choices, tuple(observations), simulation=simulation)
+    return registry, plan, tuple(observations)
+
+
+def ledger_world(tmp_path, pods=('pod1',), *, clock=None, runs=1, **options):
+    from types import SimpleNamespace
+
+    from tuning_factory.graph_planner import ApprovalGrant
+    from tuning_factory.graph_store import GraphStore
+    registry, plan, facts = ledger_plan(tmp_path, pods, **options)
+    extra = {} if clock is None else {'clock': clock}
+    store = GraphStore(tmp_path / 'jobs.db', registry=registry, **extra)
+    submitted = [store.submit(plan, f'run-{index}', ApprovalGrant.for_plan(plan)) for index in range(runs)]
+    return SimpleNamespace(store=store, plan=plan, facts=facts, runs=submitted, run_id=submitted[0]['id'])
+
+
+def reservations(store, run_id=None):
+    with store.jobs.connection() as db:
+        rows = db.execute('SELECT * FROM budget_reservations' + (' WHERE run_id=?' if run_id else '')
+                          + ' ORDER BY created,attempt_id', (run_id,) if run_id else ()).fetchall()
+    return [dict(row) for row in rows]
+
+
+def dispositions(store):
+    with store.jobs.connection() as db:
+        return [dict(row) for row in db.execute('SELECT * FROM attempt_dispositions ORDER BY rowid')]
+
+
+def node_status(store, run_id, node_id):
+    return next(node['status'] for node in store.get_run(run_id)['nodes'] if node['node_id'] == node_id)
+
+
+def events(store, job_id):
+    with store.jobs.connection() as db:
+        return [row['status'] for row in db.execute('SELECT status FROM events WHERE job_id=? ORDER BY rowid',
+                                                    (job_id,))]
+
+
+def test_local_selection_lock_never_blocks_gpu_claims(tmp_path):
+    from test_gpu_servers import observation
+    store = JobStore(tmp_path / 'jobs.db')
+    queued(store, 'select')
+    assert store.claim('local:run1', max_concurrent=4)['lease'].resource_id == 'local:run1'
+    server = observation()
+    assert not store.gpu_locked('existing_runpod:pod1')
+    assert not store.resource_blocked(server)
+    assert not store.foreign_provider_lock('existing_runpod:pod1')
+    assert not store.foreign_provider_lock(server.exclusivity_key)
+    queued(store, 'train')
+    claimed = store.claim('existing_runpod:pod1', max_concurrent=4)
+    assert claimed and claimed['lease'].resource_id == 'existing_runpod:pod1'
+    assert store.gpu_locked('local:run1')   # a second selection of the same run still waits for the first
+
+
+def test_simulation_namespace_is_isolated_from_hardware_locks(tmp_path):
+    from test_gpu_servers import observation
+    server = observation()
+    store = JobStore(tmp_path / 'jobs.db')
+    for key in ('real', 'simulated', 'second-simulated', 'ssh-simulated'):
+        queued(store, key)
+    assert store.claim('existing_runpod:pod1', max_concurrent=8)
+    assert not store.gpu_locked('simulation:existing_runpod:pod1')
+    assert store.claim('simulation:existing_runpod:pod1', max_concurrent=8)
+    assert store.claim('simulation:existing_runpod:pod1', max_concurrent=8) is None   # simulations share keys
+    assert store.claim('simulation:' + server.exclusivity_key, max_concurrent=8)
+    other = JobStore(tmp_path / 'other.db')
+    queued(other, 'simulated')
+    queued(other, 'real')
+    assert other.claim('simulation:' + server.exclusivity_key, max_concurrent=8)
+    assert not other.resource_blocked(server)   # a simulated lock on the server never blocks the real one
+    assert not other.gpu_locked('existing_runpod:pod1')
+    assert not other.foreign_provider_lock('existing_runpod:pod1')
+    assert not other.foreign_provider_lock(server.exclusivity_key)
+    assert other.claim('existing_runpod:pod1', max_concurrent=8)
+
+
+def test_unknown_and_cross_provider_locks_still_quarantine(tmp_path):
+    from test_gpu_servers import observation
+    server = observation()
+    for held, blocks_pod, blocks_server in (('legacy-unknown:old', True, True), ('unknown-profile', True, True),
+                                            ('existing_runpod:pod1', True, True),
+                                            ('existing_runpod:pod2', False, True),
+                                            (server.exclusivity_key, True, True), ('mock-cpu', False, False)):
+        store = JobStore(tmp_path / (held.replace(':', '_') + '.db'))
+        queued(store, 'held')
+        assert store.claim(held, max_concurrent=4)
+        assert store.gpu_locked('existing_runpod:pod1') is blocks_pod, held
+        assert store.resource_blocked(server) is blocks_server, held
+        foreign_pod = held not in {'existing_runpod:pod1', 'existing_runpod:pod2', 'mock-cpu'}
+        assert store.foreign_provider_lock('existing_runpod:pod1') is foreign_pod, held
+        assert store.foreign_provider_lock(server.exclusivity_key) is (
+            held not in {server.exclusivity_key, 'mock-cpu'}), held
+
+
+def test_public_lease_api_matches_private(tmp_path):
+    store = JobStore(tmp_path / 'jobs.db')
+    queued(store, 'one')
+    claimed = store.claim('existing_runpod:pod1')
+    lease = claimed['lease']
+    assert JobStore._validate_lease is JobStore.validate_lease
+    with store.connection() as db:
+        public, private = dict(store.validate_lease(db, lease)), dict(store._validate_lease(db, lease))
+    assert public == private == store.validated_attempt(lease)
+    assert (public['id'], public['launch_id'], public['launch_started'], public['resource_id']) == (
+        claimed['id'], claimed['launch_id'], 0, 'existing_runpod:pod1')
+    stale = replace(lease, lease_token='0' * 32)
+    with pytest.raises(ValueError, match='stale attempt lease'):
+        store.validated_attempt(stale)
+    with store.connection() as db, pytest.raises(ValueError, match='stale attempt lease'):
+        store.validate_lease(db, stale)
+    with pytest.raises(ValueError, match='current attempt lease required'):
+        store.validated_attempt(claimed['id'])
+
+
+def test_holds_lock_is_a_public_fenced_query(tmp_path):
+    store = JobStore(tmp_path / 'jobs.db')
+    queued(store, 'one')
+    lease = store.claim('existing_runpod:pod1')['lease']
+    assert store.holds_lock(lease) is True
+    with pytest.raises(ValueError, match='stale attempt lease'):
+        store.holds_lock(replace(lease, lease_token='0' * 32))
+    store.transition(lease, 'FAILED')
+    assert store.holds_lock(lease) is True   # a failed attempt keeps its lock until execution provably stopped
+    store.release_gpu(lease, execution_stopped=True)
+    assert store.holds_lock(lease) is False
+
+
+HEAD_DDL = '''
+    CREATE TABLE IF NOT EXISTS jobs (
+      id TEXT PRIMARY KEY, request_key TEXT UNIQUE NOT NULL, manifest TEXT NOT NULL,
+      status TEXT NOT NULL, priority INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+      cancel_requested INTEGER NOT NULL DEFAULT 0, error TEXT, run_id TEXT,
+      created REAL NOT NULL, updated REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS gpu_locks (gpu TEXT PRIMARY KEY, job_id TEXT UNIQUE NOT NULL);
+    CREATE TABLE IF NOT EXISTS events (
+      job_id TEXT NOT NULL, status TEXT NOT NULL, timestamp REAL NOT NULL, detail TEXT);
+    CREATE TABLE IF NOT EXISTS job_attempts (
+      attempt_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, lease_token TEXT NOT NULL,
+      resource_id TEXT NOT NULL, launch_id TEXT UNIQUE, launch_started INTEGER NOT NULL DEFAULT 0,
+      legacy INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS resource_leases (
+      resource_id TEXT PRIMARY KEY, job_id TEXT UNIQUE NOT NULL, attempt_id TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS job_destinations (
+      job_id TEXT PRIMARY KEY, receipt TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS resource_observations (
+      attempt_id TEXT PRIMARY KEY, facts TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS preparation_reservations (
+      reservation_id TEXT PRIMARY KEY, owner_token TEXT NOT NULL,
+      resource_id TEXT UNIQUE NOT NULL, profile TEXT NOT NULL, facts TEXT NOT NULL,
+      status TEXT NOT NULL, created REAL NOT NULL);
+    ALTER TABLE jobs ADD COLUMN graph_run_id TEXT;
+    ALTER TABLE jobs ADD COLUMN graph_node_id TEXT;
+    ALTER TABLE jobs ADD COLUMN active_attempt_id TEXT;
+    CREATE TABLE IF NOT EXISTS graph_runs (
+      id TEXT PRIMARY KEY, request_id TEXT UNIQUE NOT NULL, plan TEXT NOT NULL,
+      approval TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS nodes (
+      run_id TEXT NOT NULL, node_id TEXT NOT NULL, status TEXT NOT NULL,
+      job_id TEXT UNIQUE, manifest TEXT, error TEXT, PRIMARY KEY(run_id,node_id));
+    CREATE TABLE IF NOT EXISTS edges (
+      run_id TEXT NOT NULL, parent_id TEXT NOT NULL, child_id TEXT NOT NULL,
+      PRIMARY KEY(run_id,parent_id,child_id));
+    CREATE TABLE IF NOT EXISTS node_outputs (
+      run_id TEXT NOT NULL, node_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
+      outputs TEXT NOT NULL, PRIMARY KEY(run_id,node_id,attempt_id));
+    CREATE TABLE IF NOT EXISTS controller_leases (
+      run_id TEXT PRIMARY KEY, lease_token TEXT NOT NULL, expires REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS tracking_outbox (
+      attempt_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, payload TEXT NOT NULL,
+      acknowledged INTEGER NOT NULL DEFAULT 0);
+'''   # jobs.py:43-71 and graph_store.py:53-71 at 088a07d, verbatim (the ALTERs are JobStore's own migration)
+HEAD_COLUMNS = {
+    'jobs': '*', 'gpu_locks': '*', 'events': '*', 'job_attempts': '*', 'resource_leases': '*',
+    'job_destinations': '*', 'resource_observations': '*', 'preparation_reservations': '*', 'graph_runs': '*',
+    'nodes': 'run_id,node_id,status,job_id,manifest,error', 'edges': '*', 'node_outputs': '*',
+    'controller_leases': 'run_id,lease_token,expires', 'tracking_outbox': '*'}
+
+
+def head_rows(path):
+    with closing(sqlite3.connect(path)) as db:
+        return {table: db.execute(f'SELECT {columns} FROM {table} ORDER BY rowid').fetchall()
+                for table, columns in HEAD_COLUMNS.items()}
+
+
+def dump(path):
+    with closing(sqlite3.connect(path)) as db:
+        return list(db.iterdump())
+
+
+def test_pre_task8_state_db_migrates_additively(tmp_path):
+    from tuning_factory.graph_planner import ApprovalGrant, NodeExecutionEvidence, NodeModelBinding
+    from tuning_factory.graph_store import ControllerLease, GraphStore, NodeOutputs
+    from tuning_factory.jobs import AttemptLease
+    from tuning_factory.model_artifacts import ModelArtifactRef
+    from tuning_factory.registry import canonical, digest
+    registry, plan, (first, second) = ledger_plan(tmp_path, ('pod1', 'pod2'), max_concurrent=2, simulation=False)
+
+    def manifest(node_id, facts):
+        body = {'schema_version': 2, 'operation': {'kind': 'train', 'id': node_id, 'resources': {
+            'facts': facts.model_dump(mode='json'), 'timeout_seconds': 1800}}}
+        return canonical({**body, 'sha256': digest(canonical(body))}).decode()
+
+    m1, m2 = manifest('train.1', first), manifest('train.2', second)
+    binding = NodeModelBinding(node_id='train.1', model=ModelArtifactRef(artifact_id='a' * 64,
+                                                                         inventory_sha256='b' * 64))
+    payload = canonical({'model': binding.model_dump(mode='json'), 'evaluation': None,
+                         'inspected_targets': []}).decode()
+    path = tmp_path / 'state' / 'jobs.db'
+    path.parent.mkdir()
+    expires = time.time() + 3600
+    with closing(sqlite3.connect(path)) as db, db:
+        db.executescript(HEAD_DDL)
+        db.execute('INSERT INTO graph_runs VALUES (?,?,?,?,?,?)', ('run1', 'request', plan.model_dump_json(),
+                   ApprovalGrant.for_plan(plan).model_dump_json(), 'RUNNING', 1.0))
+        db.executemany('INSERT INTO nodes VALUES (?,?,?,?,?,?)', [
+            ('run1', 'train.1', 'COMPLETED', 'job1', m1, None), ('run1', 'train.2', 'RUNNING', 'job2', m2, None)])
+        db.executemany('INSERT INTO jobs (id,request_key,manifest,status,priority,attempts,cancel_requested,error,'
+                       'run_id,created,updated,graph_run_id,graph_node_id,active_attempt_id) '
+                       'VALUES (?,?,?,?,0,1,0,NULL,NULL,1,2,?,?,?)', [
+                           ('job1', 'graph:run1:train.1', m1, 'COMPLETED', 'run1', 'train.1', 'att1'),
+                           ('job2', 'graph:run1:train.2', m2, 'PROVISIONING', 'run1', 'train.2', 'att2')])
+        db.executemany('INSERT INTO job_attempts VALUES (?,?,?,?,?,?,0,?)', [
+            ('att1', 'job1', 'token1', 'existing_runpod:pod1', 'launch1', 1, 1.0),
+            ('att2', 'job2', 'token2', 'existing_runpod:pod2', 'launch2', 0, 2.0)])
+        db.execute("INSERT INTO gpu_locks VALUES ('existing_runpod:pod2','job2')")
+        db.execute("INSERT INTO resource_leases VALUES ('existing_runpod:pod2','job2','att2')")
+        db.executemany('INSERT INTO events VALUES (?,?,?,?)', [
+            ('job1', status, 1.0, None) for status in ('PENDING', 'QUEUED', 'PROVISIONING', 'RUNNING',
+                                                       'EVALUATING', 'COMPLETED')])
+        db.execute('INSERT INTO node_outputs VALUES (?,?,?,?)', ('run1', 'train.1', 'att1', payload))
+        db.execute('INSERT INTO tracking_outbox VALUES (?,?,?,0)', ('att1', 'job1', payload))
+        db.execute('INSERT INTO controller_leases VALUES (?,?,?)', ('run1', 'old-token', expires))
+    before = head_rows(path)
+
+    store = GraphStore(path, registry=registry)
+    with closing(sqlite3.connect(path)) as db:
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        columns = {table: {row[1] for row in db.execute(f'PRAGMA table_info({table})')}
+                   for table in ('controller_leases', 'nodes')}
+    assert {'controller_owner', 'budget_reservations', 'attempt_dispositions'} <= tables
+    assert 'owner_token' in columns['controller_leases']
+    assert {'retry_not_before', 'wait_reason', 'updated'} <= columns['nodes']
+    assert head_rows(path) == before   # existing rows are valid unchanged
+
+    expected = ((NodeExecutionEvidence(node_id='train.1', plan_sha256=plan.sha256, job_id='job1', attempt_id='att1',
+                                       manifest_sha256=json.loads(m1)['sha256'], status='completed',
+                                       tracking_acknowledged=False), NodeOutputs(model=binding)),)
+
+    def serialized(ledger):
+        return canonical([[evidence.model_dump(mode='json'), {
+            'model': outputs.model.model_dump(mode='json') if outputs.model else None,
+            'evaluation': outputs.evaluation.model_dump(mode='json') if outputs.evaluation else None,
+            'inspected_targets': [item.model_dump(mode='json') for item in outputs.inspected_targets]}]
+            for evidence, outputs in ledger])
+    assert serialized(store.ledger('run1')) == serialized(expected)   # what the pre-Task-8 code computed
+
+    migrated = dump(path)
+    reopened = GraphStore(path, registry=registry)
+    assert dump(path) == migrated   # a second open changes nothing
+    assert serialized(reopened.ledger('run1')) == serialized(expected)
+
+    assert [(row['attempt_id'], row['run_id'], row['node_id'], row['job_id'], row['resource_id'],
+             row['max_cost_usd'], row['status']) for row in reservations(store)] == [
+        ('att1', 'run1', 'train.1', 'job1', 'existing_runpod:pod1', 4.0, 'RESERVED'),
+        ('att2', 'run1', 'train.2', 'job2', 'existing_runpod:pod2', 4.0, 'RESERVED')]
+    assert store.reserved_budget('run1') == 8.0
+    assert store.jobs.holds_lock(AttemptLease('job2', 'att2', 'token2', 'existing_runpod:pod2'))
+    store.heartbeat_controller(ControllerLease('run1', 'old-token'))   # the NULL-owner run lease still validates
+    owner = store.acquire_owner('controller-a')
+    with pytest.raises(ValueError, match='controller lease already held'):
+        store.acquire_controller('run1', owner=owner)   # and is never stolen while it is unexpired
+
+
+def test_owner_lease_excludes_a_second_controller_and_expires(tmp_path):
+    from tuning_factory.graph_store import GraphStore
+    clock = FakeClock()
+    store = GraphStore(tmp_path / 'jobs.db', clock=clock)
+    assert store.owner_state() is None
+    acquired = clock.now
+    first = store.acquire_owner('controller-a.host:1', ttl_seconds=30)
+    with pytest.raises(ValueError, match='controller already running'):
+        store.acquire_owner('controller-b', ttl_seconds=30)
+    with pytest.raises(ValueError, match='controller already running'):
+        GraphStore(tmp_path / 'jobs.db', clock=clock).acquire_owner('controller-a.host:1')
+    clock.advance(20)
+    store.renew_owner(first, ttl_seconds=30)
+    state = store.owner_state()
+    assert state == {'owner_id': 'controller-a.host:1', 'acquired': acquired, 'heartbeat': clock.now,
+                     'expires': clock.now + 30}
+    assert first.lease_token not in json.dumps(state)
+    clock.advance(31)
+    with pytest.raises(ValueError, match='stale controller owner lease'):
+        store.renew_owner(first)   # a lapsed owner must acquire again
+    second = store.acquire_owner('controller-b', ttl_seconds=30)
+    for call in (lambda: store.renew_owner(first), lambda: store.release_owner(first)):
+        with pytest.raises(ValueError, match='stale controller owner lease'):
+            call()
+    assert store.owner_state()['owner_id'] == 'controller-b'
+    store.release_owner(second)
+    third = store.acquire_owner('controller-c')
+    assert store.owner_state()['owner_id'] == 'controller-c' and third.lease_token != second.lease_token
+    for owner_id in ('', '-starts-with-dash', 'has space', 'trailing\n', 'x' * 129, None):
+        with pytest.raises(ValueError, match='owner'):
+            GraphStore(tmp_path / 'other.db', clock=clock).acquire_owner(owner_id)
+    for ttl in (0, -1, float('inf'), float('nan')):
+        with pytest.raises(ValueError, match='TTL'):
+            GraphStore(tmp_path / 'other.db', clock=clock).acquire_owner('controller-d', ttl_seconds=ttl)
+
+
+def test_owner_takes_over_run_leases_of_an_expired_owner(tmp_path):
+    clock = FakeClock()
+    w = ledger_world(tmp_path, clock=clock, runs=2)
+    store, facts = w.store, w.facts[0]
+    run, other = w.runs[0]['id'], w.runs[1]['id']
+    a = store.acquire_owner('controller-a', ttl_seconds=30)
+    ctl_a = store.acquire_controller(run, ttl_seconds=300, owner=a)
+    legacy = store.acquire_controller(other, ttl_seconds=300)   # the pre-Task-8 API: no owner
+    clock.advance(31)
+    with pytest.raises(ValueError, match='stale controller owner lease'):
+        store.acquire_controller(run, owner=a)
+    with pytest.raises(ValueError, match='controller lease already held'):
+        store.acquire_controller(run)   # an owner-less caller never steals an owner's unexpired run lease
+    b = store.acquire_owner('controller-b', ttl_seconds=600)
+    ctl_b = store.acquire_controller(run, ttl_seconds=300, owner=b)   # A's run lease is unexpired but A is fenced
+    with pytest.raises(ValueError, match='controller lease already held'):
+        store.acquire_controller(run, owner=b)
+    store.prepare_ready(ctl_b)
+    claimed = store.claim_ready(facts, ctl_b)
+    for call in (lambda: store.prepare_ready(ctl_a), lambda: store.claim_ready(facts, ctl_a),
+                 lambda: store.takeover_attempt(ctl_a, claimed['id'])):
+        with pytest.raises(ValueError, match='stale controller lease'):
+            call()
+    assert store.takeover_attempt(ctl_b, claimed['id'])['launch_id'] == claimed['launch_id']
+    with pytest.raises(ValueError, match='controller lease already held'):
+        store.acquire_controller(other, owner=b)   # a NULL-owner unexpired lease is never stolen
+    store.heartbeat_controller(legacy)
+    clock.advance(301)
+    store.renew_owner(b)
+    store.acquire_controller(other, owner=b)
+    with pytest.raises(ValueError, match='stale controller lease'):
+        store.heartbeat_controller(legacy)
+
+
+def test_run_state_machine(tmp_path):
+    w = ledger_world(tmp_path, runs=4)
+    store = w.store
+    first, paused, completed, failed = (run['id'] for run in w.runs)
+
+    def status(run_id):
+        return store.get_run(run_id)['status']
+
+    store.pause(first)
+    store.pause(first)   # idempotent
+    assert status(first) == 'PAUSED'
+    store.resume(first)
+    store.resume(first)   # idempotent
+    assert status(first) == 'RUNNING'
+    store.cancel(first)
+    store.cancel(first)   # idempotent
+    assert status(first) == 'CANCELED'
+    with pytest.raises(ValueError, match='only a running graph can pause'):
+        store.pause(first)
+    with pytest.raises(ValueError, match='canceled graph cannot resume'):
+        store.resume(first)
+    assert status(first) == 'CANCELED'
+    assert {node['status'] for node in store.get_run(first)['nodes']} == {'CANCELED'}
+    store.pause(paused)
+    store.cancel(paused)
+    assert status(paused) == 'CANCELED'
+    with store.jobs.connection() as db:   # 8.2 writes the finished statuses
+        db.execute("UPDATE graph_runs SET status='COMPLETED' WHERE id=?", (completed,))
+        db.execute("UPDATE graph_runs SET status='FAILED' WHERE id=?", (failed,))
+    for run_id, final in ((completed, 'COMPLETED'), (failed, 'FAILED')):
+        for call, message in ((store.pause, 'only a running graph can pause'),
+                              (store.resume, 'only a paused graph can resume'),
+                              (store.cancel, 'a finished graph cannot be canceled')):
+            with pytest.raises(ValueError, match=message):
+                call(run_id)
+            assert status(run_id) == final
+        assert {node['status'] for node in store.get_run(run_id)['nodes']} == {'PENDING'}
+    with pytest.raises(ValueError, match='unknown graph run'):
+        store.pause('missing')
+
+
+def test_begin_launch_refuses_when_graph_paused_or_canceled(tmp_path):
+    from tuning_factory.jobs import GRAPH_LAUNCH_REFUSED
+    assert GRAPH_LAUNCH_REFUSED == 'graph run is not running; launch refused'
+    w = ledger_world(tmp_path, ('pod1', 'pod2'), runs=2)
+    store = w.store
+    run, other = w.runs[0]['id'], w.runs[1]['id']
+    ctl = store.acquire_controller(run)
+    store.prepare_ready(ctl)
+    claimed = store.claim_ready(w.facts[0], ctl)
+    store.pause(run)
+    with pytest.raises(ValueError, match='graph run is not running; launch refused'):
+        store.jobs.begin_launch(claimed['lease'])
+    assert store.jobs.validated_attempt(claimed['lease'])['launch_started'] == 0
+    store.resume(run)
+    assert store.jobs.begin_launch(claimed['lease']) == claimed['launch_id']
+    ctl_other = store.acquire_controller(other)
+    store.prepare_ready(ctl_other)
+    canceled = store.claim_ready(w.facts[1], ctl_other)
+    store.cancel(other)
+    with pytest.raises(ValueError, match='graph run is not running; launch refused'):
+        store.jobs.begin_launch(canceled['lease'])
+    assert store.jobs.validated_attempt(canceled['lease'])['launch_started'] == 0
+    queued(store.jobs, 'legacy')   # a legacy job's launch never consults graph runs
+    legacy = store.jobs.claim('existing_runpod:pod9', max_concurrent=8)
+    assert store.jobs.begin_launch(legacy['lease']) == legacy['launch_id']
+
+
+def test_return_unlaunched_requeues_without_counting(tmp_path):
+    w = ledger_world(tmp_path, runs=2)
+    store, facts = w.store, w.facts[0]
+    run, other = w.runs[0]['id'], w.runs[1]['id']
+    ctl = store.acquire_controller(run)
+    store.prepare_ready(ctl)
+    claimed = store.claim_ready(facts, ctl)
+    lease = claimed['lease']
+    assert store.return_unlaunched(ctl, lease, reason='paused before launch') == 'QUEUED'
+    job = store.jobs.get(claimed['id'])
+    assert (job['status'], job['active_attempt_id']) == ('QUEUED', None)
+    assert events(store, claimed['id'])[-3:] == ['PROVISIONING', 'RETRYING', 'QUEUED']
+    assert node_status(store, run, 'train.1') == 'READY'
+    assert not store.jobs.gpu_locked(lease.resource_id)
+    assert [(row['attempt_id'], row['status']) for row in reservations(store)] == [(lease.attempt_id, 'VOID')]
+    assert store.reserved_budget(run) == 0
+    assert [(row['attempt_id'], row['job_id'], row['node_id'], row['disposition'], row['counted'], row['detail'])
+            for row in dispositions(store)] == [(lease.attempt_id, claimed['id'], 'train.1', 'returned_unlaunched',
+                                                 0, 'paused before launch')]
+    with pytest.raises(ValueError, match='stale attempt lease'):
+        store.jobs.validated_attempt(lease)   # the returned attempt is over: its actor is fenced
+    again = store.claim_ready(facts, ctl)   # max_attempts=1, but the returned attempt was not counted
+    assert again and again['lease'].attempt_id != lease.attempt_id
+    store.pause(run)
+    assert store.return_unlaunched(ctl, again['lease'], reason='paused') == 'QUEUED'
+    assert node_status(store, run, 'train.1') == 'READY'
+    store.resume(run)
+    third = store.claim_ready(facts, ctl)
+    store.cancel(run)
+    assert store.return_unlaunched(ctl, third['lease'], reason='canceled before launch') == 'CANCELED'
+    assert store.jobs.get(third['id'])['status'] == 'CANCELED'
+    assert events(store, third['id'])[-1] == 'CANCELED'
+    assert node_status(store, run, 'train.1') == 'CANCELED'
+    assert not store.jobs.gpu_locked(third['lease'].resource_id)
+    with pytest.raises(ValueError, match='stale attempt lease'):
+        store.jobs.validated_attempt(third['lease'])
+    assert {row['status'] for row in reservations(store, run)} == {'VOID'}
+    assert [row['counted'] for row in dispositions(store)] == [0, 0, 0]
+    ctl_other = store.acquire_controller(other)
+    store.prepare_ready(ctl_other)
+    started = store.claim_ready(facts, ctl_other)
+    with pytest.raises(ValueError, match='current graph attempt required'):
+        store.return_unlaunched(ctl, started['lease'], reason='wrong run')   # another run's attempt
+    store.jobs.begin_launch(started['lease'])
+    with pytest.raises(ValueError, match='unlaunched'):
+        store.return_unlaunched(ctl_other, started['lease'], reason='too late')
+    assert store.jobs.holds_lock(started['lease']) and len(dispositions(store)) == 3
+
+
+def test_claim_ready_separates_local_selection_from_gpu_claims(tmp_path):
+    from test_graph_planner import evaluation_fixture, revise
+
+    from tuning_factory.benchmarks import EvaluationRecord
+    from tuning_factory.graph_planner import (
+        ApprovalGrant,
+        NodeEvaluationBinding,
+        NodeExecutionEvidence,
+        TrackingDestination,
+        VerifiedBindings,
+        plan_graph,
+    )
+    from tuning_factory.graph_store import GraphStore
+    registry, project, choices, facts, artifacts, ref, producer, benchmark = evaluation_fixture(tmp_path)
+    executor = choices.executors[0].model_copy(update={'transport_settings_sha256': '1' * 64})
+    choices = choices.model_copy(update={'executors': (executor,),
+                                         'tracking_destination': TrackingDestination(**TRACKING)})
+    project = revise(project, dict(project.spec.graph, max_concurrent=2))
+    plan = plan_graph(project, choices, (facts,), simulation=False)
+    store = GraphStore(tmp_path / 'jobs.db', registry=registry, artifact_store=artifacts)
+
+    def resolver(plan, node_id, ledger):
+        """A trusted Task 8-style resolver that supplies a completed evaluation, so the selection compiles."""
+        record = EvaluationRecord(model=ref, benchmark_sha256=benchmark.fingerprint(), metrics={'accuracy': 1.0},
+                                  status='completed', synthetic=False, simulation=False,
+                                  producer_attempt_id='a' * 32)
+        evidence = NodeExecutionEvidence(node_id='eval', plan_sha256=plan.sha256, job_id='j' * 32,
+                                         attempt_id='a' * 32, manifest_sha256='d' * 64, status='completed',
+                                         tracking_acknowledged=True)
+        return VerifiedBindings(registry=registry, artifact_store=artifacts, destination_profile=executor,
+                                producers=(producer,), tracking_destination=plan.execution_choices.tracking_destination,
+                                evaluations=(NodeEvaluationBinding(node_id='eval', evaluation=record,
+                                                                   tracking_acknowledged=True, producer=evidence),))
+
+    store.binding_resolver = resolver
+    for request in ('gpu-first', 'select-first'):
+        run = store.submit(plan, request, ApprovalGrant.for_plan(plan))
+        ctl = store.acquire_controller(run['id'])
+        assert len(store.prepare_ready(ctl)) == 2
+        with store.jobs.connection() as db:   # the selection outranks the evaluation
+            db.execute("UPDATE jobs SET priority=10 WHERE graph_run_id=? AND graph_node_id='select'", (run['id'],))
+        if request == 'gpu-first':
+            gpu = store.claim_ready(facts, ctl)   # a GPU observation never hands back the local selection
+            assert gpu and gpu['manifest']['operation']['kind'] == 'evaluate'
+            local = store.claim_ready(None, ctl)
+        else:
+            local = store.claim_ready(None, ctl)
+            gpu = store.claim_ready(facts, ctl)   # a held local selection lock never blocks a GPU claim
+            assert gpu and gpu['manifest']['operation']['kind'] == 'evaluate'
+        assert local['manifest']['operation']['kind'] == 'select'
+        assert local['lease'].resource_id == 'local:' + run['id']
+        assert gpu['lease'].resource_id == facts.exclusivity_key
+        assert store.claim_ready(None, ctl) is None and store.claim_ready(facts, ctl) is None
+        assert sorted(row['max_cost_usd'] for row in reservations(store, run['id'])) == [0.0, 2.0]
+        for claimed in (gpu, local):
+            assert store.jobs.abandon_unlaunched(claimed['lease'], 'the test frees the locks')
+
+
+def test_claim_reserves_budget_atomically_and_refuses_over_budget(tmp_path):
+    pods = ('pod1', 'pod2', 'pod3', 'pod4')
+    w = ledger_world(tmp_path / 'budget', pods, max_concurrent=4)
+    store, run = w.store, w.run_id
+    assert w.plan.max_estimated_cost_usd == 16
+    ctl = store.acquire_controller(run)
+    store.prepare_ready(ctl)
+    with store.jobs.connection() as db:   # two attempts' worth is already reserved in this run
+        db.execute("INSERT INTO budget_reservations VALUES ('phantom',?,'train.1','phantom','simulation:none',8.0,"
+                   "'RESERVED',0)", (run,))
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        claims = list(pool.map(lambda facts: store.claim_ready(facts, ctl), w.facts))
+    claimed = [item for item in claims if item is not None]
+    assert len(claimed) == 2 and store.reserved_budget(run) == 16
+    rows = {row['attempt_id']: row for row in reservations(store, run)}
+    for item in claimed:   # one reservation per attempt, inserted with its claim
+        row = rows[item['lease'].attempt_id]
+        assert (row['job_id'], row['node_id'], row['resource_id'], row['max_cost_usd'], row['status']) == (
+            item['id'], item['graph_node_id'], item['lease'].resource_id, 4.0, 'RESERVED')
+    with store.jobs.connection() as db:
+        db.execute("UPDATE budget_reservations SET status='VOID' WHERE attempt_id='phantom'")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        claims = list(pool.map(lambda facts: store.claim_ready(facts, ctl), w.facts))
+    assert sum(item is not None for item in claims) == 2 and store.reserved_budget(run) == 16
+    assert len(reservations(store, run)) == 5
+
+    w = ledger_world(tmp_path / 'attempts', max_attempts=1)
+    store, run, facts = w.store, w.run_id, w.facts[0]
+    ctl = store.acquire_controller(run)
+    store.prepare_ready(ctl)
+    first = store.claim_ready(facts, ctl)
+    store.return_unlaunched(ctl, first['lease'], reason='uncounted')
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        claims = list(pool.map(lambda _: store.claim_ready(facts, ctl), range(4)))
+    (second,) = [item for item in claims if item is not None]
+    assert store.jobs.abandon_unlaunched(second['lease'], 'refused before launch')   # counted, terminal
+    store.jobs.reset_for_resume(second['id'])   # a manual requeue cannot exceed max_attempts
+    with store.jobs.connection() as db:   # isolate the attempt rule from the budget rule
+        db.execute("UPDATE budget_reservations SET status='VOID' WHERE attempt_id=?", (second['lease'].attempt_id,))
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        assert list(pool.map(lambda _: store.claim_ready(facts, ctl), range(4))) == [None] * 4
+    assert store.reserved_budget(run) == 0 and store.jobs.get(second['id'])['status'] == 'QUEUED'
+
+
+def test_simulation_plan_claims_in_simulation_namespace(tmp_path):
+    w = ledger_world(tmp_path)
+    store = w.store
+    ctl = store.acquire_controller(w.run_id)
+    store.prepare_ready(ctl)
+    claimed = store.claim_ready(w.facts[0], ctl)
+    assert claimed['lease'].resource_id == 'simulation:existing_runpod:pod1'
+    assert reservations(store)[0]['resource_id'] == 'simulation:existing_runpod:pod1'
+    queued(store.jobs, 'legacy')
+    legacy = store.jobs.claim('existing_runpod:pod1', max_concurrent=4)   # the real Pod is not held
+    assert legacy and legacy['lease'].resource_id == 'existing_runpod:pod1'
