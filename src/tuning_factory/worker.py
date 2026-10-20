@@ -30,6 +30,7 @@ from .registry import canonical, digest, file_digest
 from .runtime_profiles import engine_profile, operation_profile
 from .training import CanceledError, LlamaFactoryBackend
 from .worker_protocol import (
+    CACHE_ENTRY_INVALID,
     OPERATION_KINDS,
     OperationResult,
     StartMarker,
@@ -147,12 +148,25 @@ def evaluation_preflight_bound(benchmark, paths, gpu_count=1):
 
 
 def verify_model_cache(root, artifact_id, inventory_sha256):
-    """Fixed-argv cache check for the SSH transport (7.4): exit 0 only for a verified entry; never deletes."""
+    """Fixed-argv cache check for the SSH transport (7.4); never deletes.
+
+    Exit 0: verified. CACHE_ENTRY_INVALID: the entry was read and fails verification (hash, layout, link).
+    1: it could not be read (missing, permissions, I/O), so nothing is known about it. 2: invalid identifiers.
+    """
     try:
-        verify_cached_artifact(Path(root), ModelArtifactRef(artifact_id=artifact_id,
-                                                            inventory_sha256=inventory_sha256))
+        ref = ModelArtifactRef(artifact_id=artifact_id, inventory_sha256=inventory_sha256)
+    except ValueError as exc:
+        print(f"invalid model cache identifiers: {exc}", file=sys.stderr)
+        return 2
+    try:
+        verify_cached_artifact(Path(root), ref)
+    except ValueError as exc:
+        unreadable = isinstance(exc.__cause__, OSError)   # verify_artifact_directory wraps OSError
+        print(f"model cache entry {'could not be read' if unreadable else 'failed verification'}: {exc}",
+              file=sys.stderr)
+        return 1 if unreadable else CACHE_ENTRY_INVALID
     except Exception as exc:
-        print(f"model cache entry failed verification: {exc}", file=sys.stderr)
+        print(f"model cache entry could not be checked: {exc}", file=sys.stderr)
         return 1
     return 0
 

@@ -776,9 +776,13 @@ def test_v2_verify_model_cache_is_a_fixed_argv_entry(tmp_path, monkeypatch, caps
     argv = ["worker", "--verify-model-cache", str(store.root), ref.artifact_id, ref.inventory_sha256]
     monkeypatch.setattr("sys.argv", argv)
     assert worker.main() == 0
+    from tuning_factory.worker_protocol import CACHE_ENTRY_INVALID
     (store.root / ref.artifact_id / ref.inventory_sha256 / "files" / "model.safetensors").write_bytes(b"corrupt")
-    assert worker.main() == 1
+    assert worker.main() == CACHE_ENTRY_INVALID   # a verified mismatch has its own exit status (7.4 review)
     assert "hash" in capsys.readouterr().err
+    # An entry that cannot be read (here: missing) is not evidence of corruption: the generic failure status.
+    assert worker.verify_model_cache(store.root, "1" * 64, "2" * 64) == 1
+    assert worker.verify_model_cache(store.root, "not-an-id", "2" * 64) == 2
     directory = tmp_path / JOB_ID / LAUNCH_ID
     for invalid in (["worker", str(directory), "5", "--request", "0" * 64],
                     ["worker", str(directory), "--request", "not-a-sha256"],
@@ -797,10 +801,10 @@ def test_v2_verify_model_cache_is_a_fixed_argv_entry(tmp_path, monkeypatch, caps
 RUNPOD_ROOT = "/workspace/factory-desktop"
 
 
-def reply(status=0):
+def reply(status=0, stderr=b""):
     """A paramiko-shaped exec_command reply whose remote command has already exited."""
     channel = SimpleNamespace(exit_status_ready=lambda: True, recv_exit_status=lambda: status)
-    return None, SimpleNamespace(channel=channel), SimpleNamespace(read=lambda: b"")
+    return None, SimpleNamespace(channel=channel), SimpleNamespace(read=lambda: stderr)
 
 
 class LinuxSFTP(FakeSFTP):
@@ -854,20 +858,27 @@ class GPUHost:
         self.commands.append(command)
         args = shlex.split(command)
         if "--verify-model-cache" in args:
+            import contextlib
+            import io
             directory, artifact_id, inventory = args[args.index("--verify-model-cache") + 1:]
-            return reply(worker.verify_model_cache(self.sftp.path(directory), artifact_id, inventory))
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                status = worker.verify_model_cache(self.sftp.path(directory), artifact_id, inventory)
+            return reply(status, stderr.getvalue().encode())
         if args[0] == "mv":
             assert args[:3] == ["mv", "-T", "--"] and len(args) == 5
             if self.before_move:
                 self.before_move()
             source, target = self.sftp.path(args[3]), self.sftp.path(args[4])
             if target.exists():
-                return reply(1)   # rename(2) refuses a non-empty destination directory
+                return reply(1, b"mv: cannot move: Directory not empty")   # rename(2) never replaces it
             source.rename(target)
             return reply(0)
         if args[0] == "cp":
             assert args[:3] == ["cp", "-P", "--"] and len(args) == 5
-            shutil.copyfile(self.sftp.path(args[3]), self.sftp.path(args[4]))
+            try:   # -P: a link is copied as a link, never followed
+                shutil.copyfile(self.sftp.path(args[3]), self.sftp.path(args[4]), follow_symlinks=False)
+            except OSError as exc:
+                return reply(1, f"cp: {exc}".encode())
             return reply(0)
         return self.launch(args)
 
@@ -960,7 +971,7 @@ def test_v2_run_operation_publishes_cache_launches_once_and_collects(tmp_path, m
     # The weights reached the worker only through the verified remote cache, moved into place (never linked).
     ref = t.launch.sft_ref
     verify_cached_artifact(t.host.sftp.path(t.cache), ref)
-    assert not t.host.sftp.path(f"{t.cache}/.incoming/{LAUNCH_ID}/{ref.artifact_id}/{ref.inventory_sha256}").exists()
+    assert not t.host.sftp.path(f"{t.cache}/.incoming/{LAUNCH_ID}/0/{ref.artifact_id}/{ref.inventory_sha256}").exists()
     assert not any(path.startswith(t.remote + "/") and path.endswith(".safetensors") for path in t.host.sftp.puts)
     bound = t.host.sftp.path(t.remote + "/train.bound.yaml").read_text()
     assert t.host.sftp.path(t.cache).as_posix() in bound and t.launch.store.root.as_posix() not in bound
@@ -970,8 +981,12 @@ def test_v2_run_operation_publishes_cache_launches_once_and_collects(tmp_path, m
     assert record.get("pod_id") == ("pod1" if provider == "runpod" else None)
     assert not t.host.sftp.path(t.remote + "/remote-attempt.json").exists()
     assert (t.launch.directory / "output" / "adapter_model.safetensors").read_bytes() == b"unit-test fixture; not weights"
-    assert json.loads((t.launch.directory / "result.json").read_bytes()) == json.loads(
-        (t.launch.directory / "remote-result.json").read_bytes())
+    # Callers use the returned result; it is kept as remote-result.json evidence, and the host's result.json is
+    # never downloaded over the control plane's records. Records are written atomically (no temporary left).
+    assert json.loads((t.launch.directory / "remote-result.json").read_bytes()) == json.loads(
+        t.host.sftp.path(t.remote + "/result.json").read_bytes())
+    assert not (t.launch.directory / "result.json").exists()
+    assert not any(path.name.endswith(".tmp") for path in t.launch.directory.iterdir())
 
 
 def test_v2_requires_persisted_launch_identity(tmp_path, monkeypatch):
@@ -1035,8 +1050,8 @@ def test_v2_existing_result_is_collected_not_relaunched(tmp_path, monkeypatch):
 def test_v2_cache_reused_only_after_remote_hash_verification(tmp_path, monkeypatch, case):
     t = v2_transport(tmp_path, monkeypatch)
     ref = t.launch.sft_ref
-    staging = f"{t.cache}/.incoming/{LAUNCH_ID}"
-    incoming = f"{staging}/{ref.artifact_id}/{ref.inventory_sha256}"
+    slot = f"{t.cache}/.incoming/{LAUNCH_ID}/0"   # the first free incoming slot of this launch
+    incoming = f"{slot}/{ref.artifact_id}/{ref.inventory_sha256}"
 
     def verify(root):
         return shlex.join([t.executor.remote_python, "-m", "tuning_factory.worker", "--verify-model-cache", root,
@@ -1064,15 +1079,15 @@ def test_v2_cache_reused_only_after_remote_hash_verification(tmp_path, monkeypat
             assert (seeded / "files" / "model.safetensors").read_bytes() == b"corrupt cache entry"
             assert not any(path.startswith(t.cache) for path in t.host.sftp.puts)
         else:                   # the rejected upload is kept for inspection
-            assert verify(staging) in t.host.commands and t.host.sftp.path(incoming).is_dir()
+            assert verify(slot) in t.host.commands and t.host.sftp.path(incoming).is_dir()
         return
     assert run_v2(t)["status"] == "COMPLETED"
     cache_puts = [path for path in t.host.sftp.puts if path.startswith(t.cache)]
     if case == "verified":
         assert cache_puts == [] and verify(t.cache) in t.host.commands and move not in t.host.commands
     else:
-        assert cache_puts and all(path.startswith(staging + "/") for path in cache_puts)
-        assert t.host.commands.index(verify(staging)) < t.host.commands.index(move)
+        assert cache_puts and all(path.startswith(slot + "/") for path in cache_puts)
+        assert t.host.commands.index(verify(slot)) < t.host.commands.index(move)
         if case == "missing":
             assert not t.host.sftp.path(incoming).exists()
         else:   # another publisher won the race: its entry is verified, ours is left for manual cleanup
@@ -1088,14 +1103,34 @@ def test_v2_cache_check_that_cannot_run_is_not_reported_as_corruption(tmp_path, 
     def missing_runtime(command, timeout):
         if "--verify-model-cache" in command:
             t.host.commands.append(command)
-            return reply(127)   # e.g. the private runtime is not prepared on this host
+            # `python -m` exits 1 on ImportError, like the worker on an unreadable entry: neither is corruption.
+            return reply(1, b"/runtime/venv/bin/python: No module named tuning_factory.worker\n" + b"x" * 400)
         return original(command, timeout)
     t.host.exec_command = missing_runtime
-    with pytest.raises(RuntimeError, match="remote model cache check could not run"):
+    with pytest.raises(RuntimeError) as error:
         run_v2(t)
+    message = str(error.value)
+    assert message.startswith("remote model cache check could not run (exit 1): /runtime/venv/bin/python: No module")
+    assert "remove it" not in message and len(message) < 300   # stderr is kept, bounded to 200 characters
     assert (seeded / "files" / "model.safetensors").is_file() and t.host.launches == []
     with pytest.raises(TypeError, match="CachedTransfer"):
         t.executor.publish_cached_artifact(t.launch.sft_ref, launch_id=LAUNCH_ID)
+
+
+def test_remote_cache_command_timeout_closes_the_channel(monkeypatch):
+    import itertools
+
+    from tuning_factory import remote_model_cache
+    closed = []
+    channel = SimpleNamespace(exit_status_ready=lambda: False, close=lambda: closed.append(True))
+    client = SimpleNamespace(exec_command=lambda command, timeout: (None, SimpleNamespace(channel=channel),
+                                                                     SimpleNamespace(read=lambda: b"")))
+    clock = itertools.count(0, 10)
+    monkeypatch.setattr(remote_model_cache, "time", SimpleNamespace(monotonic=lambda: next(clock),
+                                                                    sleep=lambda _: None))
+    with pytest.raises(TimeoutError, match="remote model cache command timed out"):
+        remote_model_cache.run_fixed(client, ["mv", "-T", "--", "/a", "/b"], timeout=25)
+    assert closed == [True]
 
 
 def test_v2_launch_directory_with_weights_is_refused(tmp_path, monkeypatch):
@@ -1263,20 +1298,30 @@ def test_v2_worker_refuses_cache_roots_under_links(tmp_path, monkeypatch, variab
     assert launch.calls == []
 
 
+def finished_output(t, finished="e" * 32):
+    """A finished launch's remote output as the engine left it: the frozen weights, but its own re-saved
+    tokenizer and config bytes (the frozen artifact takes those byte-for-byte from the effective base)."""
+    output = f"{t.base}/jobs/{JOB_ID}/{finished}/output"
+    shutil.copytree(t.transfers[0].local_location / "files", t.host.sftp.path(output))
+    for name in ("tokenizer.json", "config.json"):
+        path = t.host.sftp.path(output) / name
+        path.write_bytes(path.read_bytes() + b"\n")
+    return output
+
+
 def test_publish_cached_artifact_seeds_from_remote_outputs_and_verifies(tmp_path, monkeypatch):
     from tuning_factory.operation_runner import verify_cached_artifact
     t = v2_transport(tmp_path, monkeypatch)
     ref, transfer, finished = t.launch.sft_ref, t.transfers[0], "e" * 32
-    output = f"{t.base}/jobs/{JOB_ID}/{finished}/output"
-    shutil.copytree(transfer.local_location / "files", t.host.sftp.path(output))
-    (t.host.sftp.path(output) / "tokenizer.json").unlink()   # what the output lacks comes from the control plane
+    output = finished_output(t, finished)
     t.executor.publish_cached_artifact(transfer, source_remote_dir=output)
     verify_cached_artifact(t.host.sftp.path(t.cache), ref)
+    # Only weight payload files with the frozen size are copied on the host; everything else is uploaded.
+    incoming = f"{t.cache}/.incoming/{finished}/0/{ref.artifact_id}/{ref.inventory_sha256}"
+    assert [command for command in t.host.commands if command.startswith("cp ")] == [
+        shlex.join(["cp", "-P", "--", output + "/model.safetensors", incoming + "/files/model.safetensors"])]
     assert sorted(path.rsplit("/", 1)[-1] for path in t.host.sftp.puts) == [
-        "descriptor.json", "inventory.json", "tokenizer.json"]
-    incoming = f"{t.cache}/.incoming/{finished}/{ref.artifact_id}/{ref.inventory_sha256}"
-    assert shlex.join(["cp", "-P", "--", output + "/model.safetensors", incoming + "/files/model.safetensors"]) in (
-        t.host.commands)
+        "config.json", "descriptor.json", "inventory.json", "tokenizer.json", "tokenizer_config.json"]
     # A verified entry is reused without any transfer; a source outside this executor's launches is refused.
     t.host.sftp.puts.clear()
     t.executor.publish_cached_artifact(transfer, source_remote_dir=output)
@@ -1286,6 +1331,135 @@ def test_publish_cached_artifact_seeds_from_remote_outputs_and_verifies(tmp_path
             t.executor.publish_cached_artifact(transfer, source_remote_dir=outside)
     with pytest.raises(ValueError, match="launch identity"):
         t.executor.publish_cached_artifact(transfer)
+
+
+def test_publish_uploads_a_remote_weight_whose_size_differs(tmp_path, monkeypatch):
+    from tuning_factory.operation_runner import verify_cached_artifact
+    t = v2_transport(tmp_path, monkeypatch)
+    output = finished_output(t)
+    weights = t.host.sftp.path(output) / "model.safetensors"
+    weights.write_bytes(weights.read_bytes() + b"engine re-save")
+    t.executor.publish_cached_artifact(t.transfers[0], source_remote_dir=output)
+    verify_cached_artifact(t.host.sftp.path(t.cache), t.launch.sft_ref)
+    assert not any(command.startswith("cp ") for command in t.host.commands)
+    assert any(path.endswith("/files/model.safetensors") for path in t.host.sftp.puts)
+
+
+def test_failed_publish_never_blocks_a_retry(tmp_path, monkeypatch):
+    from tuning_factory.operation_runner import verify_cached_artifact
+    t = v2_transport(tmp_path, monkeypatch)
+    ref, finished = t.launch.sft_ref, "e" * 32
+    output = finished_output(t, finished)
+    original = t.host.sftp.put
+
+    def corrupting(source, target):
+        original(source, target)
+        if target.endswith("/tokenizer.json"):
+            t.host.sftp.path(target).write_bytes(b"corrupted in transit")
+    t.host.sftp.put = corrupting
+    with pytest.raises(ValueError, match="uploaded model cache entry failed remote verification"):
+        t.executor.publish_cached_artifact(t.transfers[0], source_remote_dir=output)
+    first = t.host.sftp.path(f"{t.cache}/.incoming/{finished}/0/{ref.artifact_id}/{ref.inventory_sha256}")
+    assert first.is_dir() and not t.host.sftp.path(t.entry).exists()   # kept for inspection, nothing published
+    t.host.sftp.put = original
+    t.executor.publish_cached_artifact(t.transfers[0], source_remote_dir=output)   # the next free slot
+    verify_cached_artifact(t.host.sftp.path(t.cache), ref)
+    assert first.is_dir() and t.host.sftp.path(f"{t.cache}/.incoming/{finished}/1").is_dir()
+    # The run_operation path uses the same retry-safe slots: an old slot of its launch blocks nothing.
+    other = v2_transport(tmp_path / "launch", monkeypatch)
+    other.host.sftp.path(f"{other.cache}/.incoming/{LAUNCH_ID}/0/stale").mkdir(parents=True)
+    assert run_v2(other)["status"] == "COMPLETED"
+    assert other.host.sftp.path(f"{other.cache}/.incoming/{LAUNCH_ID}/0/stale").is_dir()
+
+
+def test_publish_validates_the_whole_inventory_before_any_remote_change(tmp_path, monkeypatch):
+    from tuning_factory.execution import CachedTransfer
+    t = v2_transport(tmp_path, monkeypatch)
+    ref = t.launch.sft_ref
+    tampered = tmp_path / "tampered" / ref.artifact_id / ref.inventory_sha256
+    shutil.copytree(t.transfers[0].local_location, tampered)
+    inventory = json.loads((tampered / "inventory.json").read_bytes())
+    inventory[0]["path"] = "../outside"
+    (tampered / "inventory.json").write_bytes(canonical(inventory))
+    with pytest.raises(ValueError, match="inventory"):
+        t.executor.publish_cached_artifact(CachedTransfer(ref=ref, local_location=tampered), launch_id=LAUNCH_ID)
+    assert t.host.commands == [] and t.host.sftp.puts == [] and not t.host.sftp.path(t.cache).exists()
+
+
+def test_v2_existing_remote_launch_directory_is_uncertain(tmp_path, monkeypatch):
+    t = v2_transport(tmp_path, monkeypatch)
+    t.host.sftp.path(t.remote).mkdir(parents=True)   # another controller created it first (no marker yet)
+    with pytest.raises(ExecutionUncertain, match="remote launch directory already exists"):
+        run_v2(t)
+    assert t.host.launches == [] and list(t.host.sftp.path(t.remote).iterdir()) == []
+    assert not any(path.startswith(t.remote + "/") for path in t.host.sftp.puts)
+
+
+def test_v2_download_never_replaces_control_plane_records(tmp_path, monkeypatch):
+    t = v2_transport(tmp_path, monkeypatch)
+
+    def host_records(directory):
+        for name in ("remote-attempt.json", "remote-result.json", "remote-artifacts.json", "result.tmp"):
+            (directory / name).write_text('{"forged": true}')
+    t.host.after_worker = host_records
+    result = run_v2(t)
+    record = json.loads((t.launch.directory / "remote-attempt.json").read_bytes())
+    assert record["launch_id"] == LAUNCH_ID and "forged" not in record
+    assert json.loads((t.launch.directory / "remote-result.json").read_bytes())["attempt_id"] == result["attempt_id"]
+    assert "forged" not in json.loads((t.launch.directory / "remote-artifacts.json").read_bytes())
+    assert not (t.launch.directory / "result.json").exists() and not (t.launch.directory / "result.tmp").exists()
+
+
+@pytest.mark.parametrize("name,mode", [("C:evil", stat.S_IFDIR | 0o755), ("data:stream", stat.S_IFREG | 0o644),
+                                       ("..", stat.S_IFDIR | 0o755)])
+def test_download_refuses_names_that_escape_the_launch_directory(tmp_path, name, mode):
+    class Listing:
+        def listdir_attr(self, path):
+            return [SimpleNamespace(filename=name, st_mode=mode)]
+
+        def get(self, source, target):
+            pytest.fail("an unsafe remote name was transferred")
+
+    local = tmp_path / "launch"
+    executor = SSHExecutor("test-host", 22, "root", "unused", client=FakeSSH(tmp_path / "remote"))
+    with pytest.raises(ValueError, match="unsafe remote artifact name"):
+        executor.download(Listing(), "/remote", local)
+    assert list(local.iterdir()) == []
+
+
+def test_v2_methods_require_a_validated_injected_connection(tmp_path, monkeypatch):
+    from tuning_factory import execution, remote_model_cache
+    t = v2_transport(tmp_path, monkeypatch)
+    assert execution.CachedTransfer is remote_model_cache.CachedTransfer   # the public name stays importable
+    unconfigured = SSHExecutor("test-host", 22, "root", "unused", client=t.host, pod={"id": "pod1"},
+                               remote_root=RUNPOD_ROOT + "/jobs")
+    opened = []
+    monkeypatch.setattr(t.host, "open_sftp", lambda: opened.append(True) or t.host.sftp)
+    with pytest.raises(ValueError, match="model cache"):
+        unconfigured.publish_cached_artifact(t.transfers[0], launch_id=LAUNCH_ID)
+    assert opened == []   # validated before any SFTP session is opened
+
+    class OwnClient:
+        def load_system_host_keys(self):
+            pass
+
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, *args, **kwargs):
+            pass
+
+        def open_sftp(self):
+            pytest.fail("a v2 method used an executor-owned connection")
+
+    monkeypatch.setattr(execution.paramiko, "SSHClient", OwnClient)
+    owned = SSHExecutor("test-host", 22, "root", "unused", remote_root=RUNPOD_ROOT + "/jobs",
+                        model_cache_root=RUNPOD_ROOT + "/model-cache")
+    for call in (lambda: owned.run_operation(t.job, t.launch.directory, t.launch.request, t.transfers, lambda: False),
+                 lambda: owned.collect_operation_result(t.job, t.launch.directory, t.launch.request),
+                 lambda: owned.publish_cached_artifact(t.transfers[0], launch_id=LAUNCH_ID)):
+        with pytest.raises(ValueError, match="injected SSH connection"):
+            call()
 
 
 def test_v2_recovery_executor_collects_but_never_launches_or_publishes(tmp_path, monkeypatch):

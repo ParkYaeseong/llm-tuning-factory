@@ -1,13 +1,13 @@
 """Infrastructure policy and execution adapters; no implicit paid actions."""
 import json
 import math
+import os
 import re
 import shlex
 import stat
 import time
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import httpx
@@ -17,8 +17,8 @@ from pydantic import Field
 from .config import StrictModel
 from .gpu_servers import SSHServerFacts, safe_remote_root, validate_server_binding
 from .manifest import verify_manifest
-from .model_artifacts import ARTIFACT_LAYOUT, ModelArtifactRef, check_link_free
 from .registry import canonical, digest, file_digest
+from .remote_model_cache import CachedTransfer, ensure_cached, remote_exists  # CachedTransfer is re-exported
 from .worker_protocol import COMMAND, RESULT, START_MARKER, OperationResult, WorkerRequest, is_v2_directory
 
 
@@ -32,12 +32,14 @@ class ExecutionUncertain(RuntimeError):
 
 HEX32 = re.compile(r"[0-9a-f]{32}")
 ALREADY_STARTED = "remote launch already started for this attempt; reconcile instead of relaunching"
+LAUNCH_DIRECTORY_EXISTS = "remote launch directory already exists for this attempt; reconcile instead of relaunching"
 FOREIGN_RESULT = "remote result belongs to a different attempt"
-CORRUPT_CACHE = "remote model cache entry failed verification; remove it after inspection"
-V2_LOCAL_RECORDS = ("remote-attempt.json",)   # control-plane records in a v2 launch directory; never uploaded
+INJECTED_CONNECTION = "v2 operations require an injected SSH connection owned by desktop_runtime.connection()"
+# Control-plane records of a v2 launch directory: never uploaded, never taken from the host by a download.
+V2_CONTROL_RECORDS = frozenset({"result.json", "result.tmp", "remote-attempt.json", "remote-attempt.json.tmp",
+                                "remote-result.json", "remote-result.json.tmp", "remote-artifacts.json",
+                                "remote-artifacts.json.tmp"})
 PINNED_FILES = (COMMAND, "manifest.json", "model-inputs.json")   # come back from the host byte-identical
-CACHE_COMMAND_TIMEOUT = 3600   # hashing a multi-GB cache entry; the check is read-only and launches nothing
-_ARTIFACT_PATH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*")
 
 
 def _refuse_v2_directory(directory: Path, action: str = "launch", entry: str = "run_operation") -> None:
@@ -46,43 +48,14 @@ def _refuse_v2_directory(directory: Path, action: str = "launch", entry: str = "
         raise ValueError(f"v2 operation directories {action} only through {entry}; refusing the v1 {action} path")
 
 
-def _remote_exists(sftp, path: str) -> bool:
-    try:
-        sftp.lstat(path)
-    except OSError as exc:
-        if exc.errno == 2:
-            return False
-        raise
-    return True
-
-
-def _remote_regular(sftp, path: str) -> bool:
-    try:
-        return stat.S_ISREG(sftp.lstat(path).st_mode)
-    except OSError as exc:
-        if exc.errno == 2:
-            return False
-        raise
-
-
-@dataclass(frozen=True)
-class CachedTransfer:
-    """One staged artifact that the executor caches on the GPU host before a v2 launch (7.5 builds it).
-
-    ``local_location`` is the control-plane entry ``<store>/<artifact_id>/<inventory_sha256>`` holding
-    ``files/``, ``descriptor.json`` and ``inventory.json``.
-    """
-    ref: ModelArtifactRef
-    local_location: Path
-
-    def checked(self) -> "CachedTransfer":
-        ref = ModelArtifactRef.model_validate(self.ref)
-        location = Path(self.local_location).absolute()
-        check_link_free(location)
-        if ((location.parent.name, location.name) != (ref.artifact_id, ref.inventory_sha256) or not location.is_dir()
-                or {item.name for item in location.iterdir()} != ARTIFACT_LAYOUT):
-            raise ValueError("transfer is not a control-plane model cache entry for its artifact")
-        return CachedTransfer(ref=ref, local_location=location)
+def _write_json_atomic(path: Path, value) -> None:
+    """Write a control-plane record via ``<name>.tmp`` and replace, so a crash never leaves a partial record."""
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(value, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
 
 
 class Policy(StrictModel):
@@ -235,6 +208,8 @@ class SSHExecutor(ExecutionBackend):
             safe_remote_root(remote_root)
         elif not re.fullmatch(r"/[a-zA-Z0-9_/-]+", remote_root) or ".." in remote_root:
             raise ValueError("remote_root must be a safe absolute Linux path")
+        # v2 methods only run on an injected connection whose owner (desktop_runtime.connection) closes it.
+        self.connection_injected = client is not None
         self.client = client or paramiko.SSHClient()
         if client is None:
             self.client.load_system_host_keys()
@@ -300,21 +275,26 @@ class SSHExecutor(ExecutionBackend):
             elif path.is_file():
                 sftp.put(str(path), target)
 
-    def download(self, sftp, remote, local, hashes=None, root=None):
+    def download(self, sftp, remote, local, hashes=None, root=None, skip=()):
+        """Hash-verified copy of a remote tree. ``skip`` names top-level control-plane records that a download
+        must never replace (v2); a name that could leave ``root`` on Windows (``:``, a drive) is refused."""
         root = root or local
         local.mkdir(parents=True, exist_ok=True)
         # Preserve small top-level evidence before descending into large checkpoints.
         entries = sorted(sftp.listdir_attr(remote), key=lambda item: (stat.S_ISDIR(item.st_mode), item.filename))
         for entry in entries:
-            if entry.filename in {".", ".."} or "/" in entry.filename or "\\" in entry.filename:
+            if (entry.filename in {"", ".", ".."} or "/" in entry.filename or "\\" in entry.filename
+                    or ":" in entry.filename):
                 raise ValueError("unsafe remote artifact name")
-            if local == root and entry.filename == "cancel":
-                continue  # Mutable control signal, never a model artifact.
+            if local == root and (entry.filename == "cancel" or entry.filename in skip):
+                continue  # Mutable control signal or a control-plane record, never a model artifact.
             source, target = remote + "/" + entry.filename, local / entry.filename
+            if not target.resolve().is_relative_to(Path(root).resolve()):
+                raise ValueError("unsafe remote artifact name")
             if stat.S_ISLNK(entry.st_mode):
                 raise ValueError("remote symlink artifact rejected")
             if stat.S_ISDIR(entry.st_mode):
-                self.download(sftp, source, target, hashes, root)
+                self.download(sftp, source, target, hashes, root, skip)
             elif stat.S_ISREG(entry.st_mode):
                 expected = (hashes or {}).get(target.relative_to(root).as_posix())
                 if expected and target.is_file() and file_digest(target) == expected:
@@ -474,19 +454,23 @@ class SSHExecutor(ExecutionBackend):
 
     def run_operation(self, job_directory, launch_directory, request, transfers, canceled):
         """Launch one v2 attempt at ``<root>/<job_id>/<launch_id>`` (the persisted launch ID, never a new one)
-        and return its identity-checked result for any terminal status.
+        and return its identity-checked result for any terminal status. Callers use this returned result
+        (also kept as ``remote-result.json``); the host's ``result.json`` is never downloaded.
 
-        Local checks come first (identities, command/manifest, staged transfers), then the attempt record.
-        A remote start marker or result means the attempt already started: that raises ExecutionUncertain
-        before anything else, so a used launch directory is reconciled. A launch directory holding weights or
-        links is refused before any upload. Cache entries are reused only after remote verification, or
-        published (verified, then ``mv -T``); the launch files are uploaded without start/result markers, and
-        one worker launch appends to ``worker.log``. From the launch until a trusted result, any failure,
-        including the timeout + 60 s deadline, is ExecutionUncertain: reconcile, never relaunch.
+        Local checks come first (connection, identities, command/manifest, staged transfers), then the
+        attempt record. A remote start marker or result means the attempt already started: that raises
+        ExecutionUncertain before anything else, so a used launch directory is reconciled. A launch directory
+        holding weights or links is refused before any upload. Cache entries are reused only after remote
+        verification, or published (``remote_model_cache.ensure_cached``). The remote launch directory is
+        created exclusively (an existing one is uncertain, e.g. another controller), the launch files are
+        uploaded without start/result markers or control-plane records, and one worker launch appends to
+        ``worker.log``. From the launch until a trusted result, any failure, including the timeout + 60 s
+        deadline, is ExecutionUncertain: reconcile, never relaunch.
         """
         from .operation_runner import WEIGHT_SUFFIXES
         if self.recovery_only:
             raise ValueError("recovery-only executor cannot launch an operation")
+        self._require_injected_connection()
         job, launch, request, command_sha256, kind = self._v2_attempt(job_directory, launch_directory, request)
         transfers = self._v2_transfers(launch, transfers)
         cache = self._cache_root()
@@ -498,7 +482,7 @@ class SSHExecutor(ExecutionBackend):
             if self._stored_record(stored) != record:
                 raise ValueError("remote attempt record differs from the persisted launch identity")
         else:
-            stored.write_text(json.dumps({**record, "created": time.time()}), encoding="utf-8")
+            _write_json_atomic(stored, {**record, "created": time.time()})
         submitted = finished = False
         try:
             with self.client.open_sftp() as sftp:
@@ -514,10 +498,15 @@ class SSHExecutor(ExecutionBackend):
                     if root:
                         self.mkdir(sftp, root)   # each component an ordinary directory: never under a link
                 for transfer in transfers:
-                    self._ensure_cached(sftp, transfer, request.launch_id)
-                if self._remote_launch_state(sftp, remote):   # publishing can take long; check again
-                    raise ExecutionUncertain(ALREADY_STARTED)
-                self.upload(sftp, launch, remote, exclude=V2_LOCAL_RECORDS)
+                    ensure_cached(self, sftp, transfer, request.launch_id)
+                self.mkdir(sftp, remote.rsplit("/", 1)[0])
+                try:
+                    sftp.mkdir(remote)   # exclusive: of two controllers, only one ever uploads and launches
+                except OSError:
+                    if remote_exists(sftp, remote):
+                        raise ExecutionUncertain(LAUNCH_DIRECTORY_EXISTS) from None
+                    raise
+                self.upload(sftp, launch, remote, exclude=V2_CONTROL_RECORDS)
                 command = ["env", *self._environment(), "FACTORY_MODEL_CACHE=" + cache, self.remote_python, "-m",
                            "tuning_factory.worker", remote, "--request", command_sha256]
                 # Append, so a duplicate start (refused by the worker's O_EXCL marker) never truncates the log.
@@ -539,7 +528,9 @@ class SSHExecutor(ExecutionBackend):
 
     def collect_operation_result(self, job_directory, launch_directory, request):
         """Collect a v2 attempt's result; never launches (recovery-safe). None while there is no result: a start
-        marker alone means the worker may still be running, so the attempt stays uncertain."""
+        marker alone means the worker may still be running, so the attempt stays uncertain. Like
+        ``run_operation`` it returns the trusted result and never downloads the host's ``result.json``."""
+        self._require_injected_connection()
         job, launch, request, command_sha256, kind = self._v2_attempt(job_directory, launch_directory, request)
         remote = f"{self.root}/{job.name}/{request.launch_id}"
         record = self._stored_record(launch / "remote-attempt.json")
@@ -561,14 +552,19 @@ class SSHExecutor(ExecutionBackend):
     def publish_cached_artifact(self, transfer, *, source_remote_dir=None, launch_id=None):
         """Make one artifact a verified remote cache entry; a verified entry is reused, none is ever replaced.
 
-        ``source_remote_dir`` (a finished launch's remote output, after 7.5 froze it locally) seeds the entry
-        on the host, so a destination never re-uploads its own outputs; that launch names the incoming
-        directory. Without it the control-plane copy is uploaded under ``launch_id``'s incoming directory.
+        ``source_remote_dir`` (a finished launch's remote output, after 7.5 froze it locally) lets weight payload
+        files with the frozen size be copied on the host; metadata, configs and tokenizer files are uploaded
+        from the control plane (see ``remote_model_cache.ensure_cached``). That launch, or ``launch_id``, names
+        the incoming slots; a failed publish leaves its slot for inspection and never blocks a retry.
+        Everything is validated before an SFTP session is opened.
         """
         if self.recovery_only:
             raise ValueError("recovery-only executor cannot publish model cache entries")
+        self._require_injected_connection()
         if not isinstance(transfer, CachedTransfer):
             raise TypeError("model transfers must be CachedTransfer entries")
+        self._cache_root()
+        transfer = transfer.checked()   # layout and every inventory path, before any remote change
         if source_remote_dir is not None:
             match = re.fullmatch(re.escape(self.root) + r"/[0-9a-f]{32}/([0-9a-f]{32})"
                                  r"(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*", source_remote_dir)
@@ -580,7 +576,16 @@ class SSHExecutor(ExecutionBackend):
         if not isinstance(launch_id, str) or not HEX32.fullmatch(launch_id):
             raise ValueError("publishing a model cache entry requires its 32-hex launch identity")
         with self.client.open_sftp() as sftp:
-            self._ensure_cached(sftp, transfer, launch_id, source_remote_dir)
+            ensure_cached(self, sftp, transfer, launch_id, source_remote_dir)
+
+    def _require_injected_connection(self):
+        if not self.connection_injected:
+            raise ValueError(INJECTED_CONNECTION)
+
+    def _cache_root(self):
+        if self.model_cache_root is None:
+            raise ValueError("v2 operations require a configured remote model cache")
+        return self.model_cache_root
 
     def _v2_attempt(self, job_directory, launch_directory, request):
         """Persisted identities and local launch files: (job, launch, request, command sha256, operation kind)."""
@@ -631,7 +636,7 @@ class SSHExecutor(ExecutionBackend):
     def _remote_launch_state(self, sftp, remote):
         """True when a start marker or a result exists: the attempt started and is reconciled, never relaunched.
         Both are only existence facts here; ``start.json`` claims nothing that is trusted."""
-        return any(_remote_exists(sftp, remote + "/" + name) for name in (START_MARKER, RESULT))
+        return any(remote_exists(sftp, remote + "/" + name) for name in (START_MARKER, RESULT))
 
     @staticmethod
     def _accept_result(raw, request, kind):
@@ -650,16 +655,21 @@ class SSHExecutor(ExecutionBackend):
         return result
 
     def _collect_operation(self, sftp, remote, launch, raw, result):
-        """Transfer a trusted result's files: the pinned launch files are unchanged and every file is verified."""
+        """Transfer a trusted result's files: the pinned launch files are unchanged, control-plane records are
+        never taken from the host, every file is hash-verified, and the evidence records are written last."""
         for name, label in ((COMMAND, "command"), ("manifest.json", "manifest")):
             with sftp.open(remote + "/" + name, "rb") as stream:
                 if stream.read() != (launch / name).read_bytes():
                     raise ValueError(f"remote {label} differs from the original attempt")
-        hashes = self.save_remote_evidence(sftp, remote, launch, raw)
+        with sftp.open(remote + "/artifacts.json", "rb") as stream:
+            inventory = json.loads(stream.read())
+        if not isinstance(inventory, dict):
+            raise ValueError("remote artifact inventory is invalid")
+        hashes = {name: value for name, value in inventory.items() if name != "cancel"}
         # So a download can never replace the attempt's own command, manifest or staged model inputs.
         if any(hashes.get(name) != file_digest(launch / name) for name in PINNED_FILES):
             raise ValueError("remote artifact inventory differs from the original attempt files")
-        self.download(sftp, remote, launch, hashes)
+        self.download(sftp, remote, launch, hashes, skip=V2_CONTROL_RECORDS)
         for name, expected in hashes.items():
             path = (launch / name).resolve()
             if not path.is_relative_to(launch) or file_digest(path) != expected:
@@ -668,84 +678,5 @@ class SSHExecutor(ExecutionBackend):
             path = (launch / name).resolve()
             if not path.is_relative_to(launch) or not path.is_file() or file_digest(path) != expected:
                 raise ValueError("remote result evidence differs from the transferred files")
-
-    def _cache_root(self):
-        if self.model_cache_root is None:
-            raise ValueError("v2 operations require a configured remote model cache")
-        return self.model_cache_root
-
-    def _status(self, argv, timeout=CACHE_COMMAND_TIMEOUT):
-        """Run one fixed argv (quoted with shlex.join, never a free-form command) and return its exit status."""
-        _, stdout, _ = self.client.exec_command(shlex.join(argv), timeout=timeout)
-        channel = stdout.channel
-        deadline = time.monotonic() + timeout
-        while not channel.exit_status_ready():
-            if time.monotonic() >= deadline:
-                channel.close()
-                raise TimeoutError("remote model cache command timed out; inspect the remote GPU host")
-            time.sleep(1)
-        return channel.recv_exit_status()
-
-    def _verified(self, root, ref):
-        """The worker's fixed-argv cache check of ``<root>/<artifact_id>/<inventory_sha256>``; it never deletes.
-        Exit 1 is a failed verification; any other failure is not evidence about the entry."""
-        status = self._status([self.remote_python, "-m", "tuning_factory.worker", "--verify-model-cache", root,
-                               ref.artifact_id, ref.inventory_sha256])
-        if status not in (0, 1):
-            raise RuntimeError(f"remote model cache check could not run (exit {status}); prepare the runtime first")
-        return status == 0
-
-    def _ensure_cached(self, sftp, transfer, key, source=None):
-        """Reuse a verified entry, or publish one: fill ``.incoming/<launch_id>``, verify it remotely, then rename
-        it into place with ``mv -T`` (real directories, no link, never replacing a non-empty entry)."""
-        transfer = transfer.checked()
-        ref, cache = transfer.ref, self._cache_root()
-        final = f"{cache}/{ref.artifact_id}/{ref.inventory_sha256}"
-        self.mkdir(sftp, cache)
-        if _remote_exists(sftp, final):
-            if not self._verified(cache, ref):
-                raise ValueError(CORRUPT_CACHE)   # fail closed; an operator inspects and removes it
-            return
-        staging = f"{cache}/.incoming/{key}"
-        entry = f"{staging}/{ref.artifact_id}/{ref.inventory_sha256}"
-        self.mkdir(sftp, f"{staging}/{ref.artifact_id}")
-        try:
-            sftp.mkdir(entry)
-        except OSError:
-            if _remote_exists(sftp, entry):
-                raise ValueError("remote incoming model cache entry already exists; inspect and remove it "
-                                 "manually") from None
-            raise
-        if source is None:
-            self.upload(sftp, transfer.local_location, entry)
-        else:
-            self._copy_remote_output(sftp, transfer.local_location, source, entry)
-        if not self._verified(staging, ref):
-            raise ValueError("uploaded model cache entry failed remote verification; the incoming copy is kept "
-                             "for inspection")
-        self.mkdir(sftp, f"{cache}/{ref.artifact_id}")
-        if self._status(["mv", "-T", "--", entry, final], 60) != 0:
-            # A concurrent publisher may have won: its entry must verify. Ours is left for manual cleanup.
-            if not _remote_exists(sftp, final):
-                raise RuntimeError("remote model cache publish failed; the incoming copy is kept for inspection")
-            if not self._verified(cache, ref):
-                raise ValueError(CORRUPT_CACHE)
-
-    def _copy_remote_output(self, sftp, local, source, entry):
-        """Seed an incoming entry from a finished launch's remote output: payload files present there are copied
-        on the host (fixed argv); metadata and anything the output lacks come from the control-plane entry."""
-        for name in ("descriptor.json", "inventory.json"):
-            sftp.put(str(local / name), entry + "/" + name)
-        self.mkdir(sftp, entry + "/files")
-        for item in json.loads((local / "inventory.json").read_bytes()):
-            relative = item.get("path") if isinstance(item, dict) else None
-            if not isinstance(relative, str) or not _ARTIFACT_PATH.fullmatch(relative):
-                raise ValueError("model artifact path cannot be copied safely on the remote host")
-            target = entry + "/files/" + relative
-            self.mkdir(sftp, target.rsplit("/", 1)[0])
-            origin = source + "/" + relative
-            if _remote_regular(sftp, origin):
-                if self._status(["cp", "-P", "--", origin, target]) != 0:
-                    raise RuntimeError("remote model cache copy failed")
-            else:
-                sftp.put(str(local / "files" / relative), target)
+        _write_json_atomic(launch / "remote-artifacts.json", inventory)
+        _write_json_atomic(launch / "remote-result.json", raw)

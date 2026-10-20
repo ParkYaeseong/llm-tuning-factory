@@ -28,6 +28,9 @@ OperationKind = Literal["train", "evaluate", "merge", "materialize"]
 OPERATION_KINDS = ("train", "evaluate", "merge", "materialize")   # the worker's dispatch allowlist
 COMMAND, START_MARKER, RESULT = "command.json", "start.json", "result.json"
 COMMAND_LIMIT = 64 * 1024
+# ``worker --verify-model-cache`` exit status for an entry that was read and failed verification (EX_DATAERR).
+# 0 is verified; 1 (also `python -m` on ImportError) and 2 (usage) are failures to check, never corruption.
+CACHE_ENTRY_INVALID = 65
 _EVIDENCE_NAME = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$")
 
 

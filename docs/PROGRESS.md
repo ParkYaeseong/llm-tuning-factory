@@ -608,6 +608,56 @@ Actual verification:
 - No real SSH, GPU, download or institution data: every remote action ran against `GPUHost`, a local-tree fake. It runs
   the real `worker --verify-model-cache` and the real `worker.main_v2` against the published cache.
 
+7.4 review fixes (commit `fix: publish verified caches from launch outputs and harden remote transfer`):
+- Publishing from a launch output (important). `cp -P` of every file present in the output failed for real training
+  outputs, because the engine re-saves tokenizer files (and config) while 7.5 freezes them from the effective base.
+  The failed incoming copy then blocked every retry. Now, in the new module `remote_model_cache.py` (`ensure_cached`):
+  - Only weight payload files (`WEIGHT_SUFFIXES`) are copied on the host, and only when `lstat` shows a regular
+    file with exactly the frozen size. Metadata, configs, tokenizer files and anything else are uploaded from the
+    control-plane entry.
+  - Every inventory path, size and hash is validated (`CachedTransfer.checked`) before any remote change.
+  - Each publish uses a fresh slot `<cache>/.incoming/<launch_id>/<n>`: the first `n` that an exclusive `mkdir`
+    creates (at most 100). A failed slot is kept for inspection and never blocks a later attempt. The slot is then
+    verified and moved into place with `mv -T`, as before.
+- The remote launch directory is created with an exclusive `sftp.mkdir` after its parents. An existing launch
+  directory raises `ExecutionUncertain` (`remote launch directory already exists for this attempt; reconcile instead
+  of relaunching`), so of two racing controllers only one uploads and launches.
+- Exit codes: `worker --verify-model-cache` exits `CACHE_ENTRY_INVALID` (65) for an entry that was read and failed
+  verification, 1 for one that could not be read (missing, permissions; also `python -m` on ImportError) and 2 for
+  invalid identifiers. The executor treats only 65 as corrupt. Any other status raises `remote model cache check could
+  not run (exit N): <stderr[:200]>`, and `run_fixed` keeps stderr for every fixed-argv command. The 7.3 test that
+  expected exit 1 for a corrupt entry now expects 65.
+- Control-plane records: a v2 download never takes `result.json`, `result.tmp`, `remote-attempt.json`,
+  `remote-result.json`, `remote-artifacts.json` (or their `.tmp`) from the host. `remote-artifacts.json` and
+  `remote-result.json` are written after the verified download. Callers use the returned result dict; the host's
+  `result.json` is never downloaded.
+- `download` (v1 and v2) refuses names containing `:` and any target outside the root, so a remote `C:evil` cannot
+  create directories outside the launch.
+- `remote-attempt.json` and the evidence records are written via `<name>.tmp` and replace.
+- Connection ownership is enforced: the v2 methods refuse an executor that opened its own connection (`v2 operations
+  require an injected SSH connection owned by desktop_runtime.connection()`). `publish_cached_artifact` validates the
+  cache root, the transfer and the source before it opens SFTP.
+- Module split: `CachedTransfer`, `ensure_cached`, `run_fixed`, `verified` and the remote `lstat` helpers live in
+  `remote_model_cache.py` (180 lines). `execution.CachedTransfer` is re-exported, and a test pins it.
+  `execution.py` is 683 lines.
+- Fake fidelity: `GPUHost`'s `cp` honours `-P` (`follow_symlinks=False`), its verify stub returns the worker's real
+  stderr, and new tests cover the `run_fixed` timeout (the channel is closed) and differing remote bytes.
+
+Verification after the 7.4 review fixes:
+- RED first: 17 tests failed. They covered the reviewer's reproduction (a remote `tokenizer.json`/`config.json`
+  differing from the frozen bytes makes publishing fail), retry blocking, validation order, the launch-directory race,
+  forged control records, `C:evil`/`data:stream` names, exit codes, stderr, the timeout and connection ownership.
+- GREEN: the sub-plan set (`test_remote_worker`, `test_desktop_runtime`, `test_execution`, `test_gpu_servers`) gave
+  **212 passed**. `uv run pytest -q --ignore=tests/test_operation_runner.py` gave **1038 passed, 1 skipped**. The plain
+  `uv run pytest -q` also collects the concurrent 7.5 agent's untracked, in-progress `tests/test_operation_runner.py`,
+  whose 30 failures are its own RED tests (1038 passed, 30 failed, 1 skipped, and no other failure).
+- Ruff (`src tests`) is clean, both GPU locks are unchanged, and the main `.venv` has no torch.
+- The CPU acceptance (`-I`) exited 0 twice with byte-identical receipts and all **28** checks passed. Max errors and the
+  dispatched inventories (`cc5fbab0…b54c`, `e124a915…8682`) are unchanged. Receipt SHA256
+  `191e83abd63a5d265fd68b9878d33f60f0d807e51c1c877f857b09d9a00630a7`, source_sha256
+  `6de616686f3bc25a63000931a303e3a435f762a4abe960b0bdc98be5be97942d` (equal to the tree), lock_sha256
+  `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437` unchanged. This supersedes the 7.4 receipt above.
+
 Still open for Task 7 GPU work:
 - Hardware and numerics: merge/materialize tolerances at real model sizes on CUDA (TF32 off); memory (FP32 loads;
   about 3 base loads per merge); a BF16 storage policy (none yet; F32 doubles size).
@@ -619,8 +669,10 @@ Still open for Task 7 GPU work:
 - SSH transport on a real host (7.4 is software-only): SFTP `lstat` link semantics, GNU `mv -T`/`cp -P` on the cache
   filesystem (the incoming copy and the cache must be on one filesystem; `mv` would otherwise copy), the
   `--verify-model-cache` runtime at multi-GB sizes (the check's timeout is 3600 s), cache publishing on a RunPod
-  network volume and on a lab server, and a real lost launch response. Abandoned `.incoming/<launch_id>` copies and
-  corrupt entries are never removed automatically and need operator cleanup.
+  network volume and on a lab server, and a real lost launch response. Abandoned `.incoming/<launch_id>/<n>` slots
+  and corrupt entries are never removed automatically and need operator cleanup. If a launch output holds a weight
+  file with the frozen size but different bytes, publishing from that output fails closed; publishing without
+  `source_remote_dir` uploads the frozen copy instead.
 - Attempt runner (7.5, including F11): create `state/jobs/<job_id>/launches/<launch_id>/`, write `command.json`,
   build `CachedTransfer`s from the approved cache, call `run_operation` (it returns the result for every terminal
   status; `ExecutionUncertain` keeps the lock) and reconcile with `collect_operation_result`, seed the cache from
