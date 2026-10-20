@@ -592,6 +592,7 @@ class Acceptance:
         lineage = OperationLineage(project_id="cpu-acceptance", project_revision="0" * 64, node_id="operation",
                                    plan_sha256="0" * 64, simulation=True)
         launches = self.work / "launches" / ("a" * 32)
+        dispatched = {}
 
         def run(operation, launch_id):
             directory = launches / launch_id
@@ -603,6 +604,7 @@ class Acceptance:
                                        model_cache=self.store.root)
             self.receipts[f"execute_{operation.kind}"] = json.loads(
                 (directory / "operation-receipt.json").read_text(encoding="utf-8"))
+            dispatched[operation.kind] = (operation, directory, result)
             return directory, result
 
         def adapters():
@@ -647,6 +649,34 @@ class Acceptance:
 
         self.record("execute_operation_merge_end_to_end", merge)
         self.record("execute_operation_materialize_end_to_end", materialize)
+
+        def freeze():
+            """Task 7.5: the control plane freezes the real dispatched outputs with exact lineage."""
+            from tuning_factory.operation_outputs import freeze_operation_output
+            from tuning_factory.operation_runner import ResolvedModelInputs
+            frozen = {}
+            for kind in ("merge", "materialize"):
+                operation, directory, result = dispatched[kind]
+                resolved = ResolvedModelInputs.model_validate_json((directory / "model-inputs.json").read_bytes())
+                ref, targets = freeze_operation_output(
+                    operation, result, job_id="a" * 32, attempt_id="d" * 32, manifest_sha256="0" * 64,
+                    launch_dir=directory, resolved=resolved, approved_cache=self.store)
+                frozen[kind] = (ref, self.store.verify(ref), targets)
+            (merge_ref, merged, _), (full_ref, full, targets) = frozen["merge"], frozen["materialize"]
+            adapters = {model.identity for model in self.op_adapters}
+            return {"passed": merge_ref.inventory_sha256 == self.receipts["execute_merge"]["output_inventory_sha256"]
+                    and full_ref.inventory_sha256 == self.receipts["execute_materialize"]["output_inventory_sha256"]
+                    and merged.adapter.rank == 5 and merged.effective_base == self.base_ref
+                    and set(merged.parents) == adapters | {self.base_ref} and merged.producer_attempt_id == "d" * 32
+                    and (full.storage_kind, full.quantization_bit, full.effective_base) == (
+                        "full_model", None, self.base_ref)
+                    and set(full.parents) == {self.op_adapters[0].identity, self.base_ref}
+                    and len(targets) == 1 and targets[0].base == full_ref and len(targets[0].modules) == 14,
+                    "merge_inventory_sha256": merge_ref.inventory_sha256,
+                    "materialize_inventory_sha256": full_ref.inventory_sha256,
+                    "target_modules": len(targets[0].modules) if targets else 0}
+
+        self.record("freeze_dispatched_outputs", freeze)
 
     def run(self):
         from unittest import mock

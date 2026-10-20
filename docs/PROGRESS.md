@@ -223,7 +223,7 @@ Unverified for the tutorial: the real Tauri/WebView2 rendering and layout of the
 after a 1 s fallback; screen readers may not announce step 1 when the tour opens; the tour must be updated when Task 10
 redesigns screens (the `data-tour` contract tests catch this).
 
-Remaining Tasks 7–11 (Tasks 6A/6B are complete in software): model-operation CPU acceptance,
+Remaining Tasks 8–11 (Tasks 6A/6B and 7 are complete in software; see "Task 7 complete" below):
 persistent multi-Pod controller/tracking repair, secure desktop API/broker, Windows UI/installer and Git sharing.
 These foundations are not end-to-end workflow, Windows 0.4.0 or live GPU acceptance. Actual serial handoff,
 multi-Pod concurrency and merge/reevaluation on GPU require separate concrete resource/data authorization.
@@ -658,6 +658,37 @@ Verification after the 7.4 review fixes:
   `6de616686f3bc25a63000931a303e3a435f762a4abe960b0bdc98be5be97942d` (equal to the tree), lock_sha256
   `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437` unchanged. This supersedes the 7.4 receipt above.
 
+7.4 follow-up (commit `fix: refuse Windows name aliases and protect uploaded inputs on download`):
+- Windows name aliases. NTFS is case-insensitive and Win32 strips a trailing dot or space, so a Linux host could plant
+  `REMOTE-ATTEMPT.JSON`, `remote-attempt.json ` or `command.json.` and overwrite local control files. `download` now
+  checks every name of a remote directory before writing anything in it, and refuses:
+  - reserved characters and control codes, a trailing dot or space, and device names (`NUL.json`, `COM1`, …);
+  - two names equal under `casefold`;
+  - a symlink;
+  - a name equal to a skipped control-plane record (`cancel`, the v2 records) or to a protected path only under
+    `casefold`, including through an aliased parent directory (`Data/dataset.json`).
+  It deliberately does not restrict names to a portable character set. A test keeps engine output names working,
+  e.g. TensorBoard `runs/Oct20_12-34-56_<host>/events.out.tfevents.…` and `checkpoint-10/…`.
+- Uploaded inputs are protected. `remote-attempt.json` records an `uploaded` inventory (relative path → SHA256 of every
+  file the upload sends, with the same exclusions as the upload). Before any download, the host's `artifacts.json` must
+  list exactly those hashes for all of them: command, manifest, model inputs, `train.yaml`, `data/*` and benchmark data.
+  The download never replaces them. This replaces the three-file check. v2 uploads also exclude `artifacts.json` and
+  `worker.log` (worker-written names).
+
+Verification after the follow-up:
+- RED first: 16 tests failed (11 alias forms, engine output names, a case-alias integration test and three
+  host-forged inputs with a matching inventory).
+- GREEN: the sub-plan set gave **228 passed**. In a clean detached worktree (HEAD `7115a99` plus only this change; the
+  concurrent 7.5 agent's uncommitted source edits are absent there), `uv run pytest -q` gave **1054 passed, 1 skipped**.
+  In the shared tree, `uv run pytest -q --ignore=tests/test_operation_runner.py` gave the result recorded in the commit
+  report.
+- Ruff is clean, `check_secrets.py` reports 0 findings, and the eol check prints nothing.
+- The CPU acceptance (`-I`, script and sources from the clean worktree) exited 0 twice with byte-identical receipts and
+  all **28** checks passed. Max errors and inventories (`cc5fbab0…b54c`, `e124a915…8682`) are unchanged. Receipt
+  SHA256 `d2d3e6a4839e0a5fba59d8555a10a6bb9d2b817bd7df5feaa61992ec19929943`, source_sha256
+  `9569eb811e42b501e2726029e03eb967c845162ace1b490d708357d5850caa6d` (equal to this commit's tree), lock_sha256
+  `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437` unchanged. This supersedes the receipt above.
+
 Still open for Task 7 GPU work:
 - Hardware and numerics: merge/materialize tolerances at real model sizes on CUDA (TF32 off); memory (FP32 loads;
   about 3 base loads per merge); a BF16 storage policy (none yet; F32 doubles size).
@@ -673,14 +704,182 @@ Still open for Task 7 GPU work:
   and corrupt entries are never removed automatically and need operator cleanup. If a launch output holds a weight
   file with the frozen size but different bytes, publishing from that output fails closed; publishing without
   `source_remote_dir` uploads the frozen copy instead.
-- Attempt runner (7.5, including F11): create `state/jobs/<job_id>/launches/<launch_id>/`, write `command.json`,
-  build `CachedTransfer`s from the approved cache, call `run_operation` (it returns the result for every terminal
-  status; `ExecutionUncertain` keeps the lock) and reconcile with `collect_operation_result`, seed the cache from
-  finished outputs with `publish_cached_artifact(source_remote_dir=…)`, upload benchmark bytes with
-  `operation_dispatch.write_benchmark_data`, read
-  outputs from `output/` (train) or `model-op/output` (merge/materialize), bind `target-inventory.json` to the frozen
-  ref, and compare the frozen `inventory_sha256` with `operation-receipt.json`.
+- Attempt runner (7.5, including F11): done in 7.5, below.
 - Real DPO/KTO references and PPO remain unverified.
+
+Task 7.5 (2026-10-20, sub-plan §3 7.5): control-plane attempt runner, verified outputs and F11.
+- New `attempt_runner.py` (420 lines): `OperationAttemptRunner(graph_store, root=)` and `OperationOutcome`. New
+  `operation_outputs.py` (392 lines): output freezing and evaluation records. Neither imports torch; both import no
+  worker module. `run_claimed(claimed, executor, *, approval)` mirrors `Factory.run_claimed`:
+  1. Refusals before launch call `abandon_unlaunched` (lock freed, `error.txt`, FAILED outcome) and never reach the
+     executor. They cover a non-v2 or non-graph job, a local selection, an unresolved operation, simulation, a changed
+     source hash, a recovery-only, local or cacheless executor, an untyped approval or one that fails
+     `validate_plan`, resources outside the node's approved alternatives, a destination missing from the approved
+     revisions, an executor that is not the pinned destination (SSH: same profile and `observation_fits`; Pod: same
+     ID; both `validate_config` against the pinned budget), a lease on another resource, manifest datasets that
+     differ from the registry or are not `export_allowed`, and a claimed launch ID that differs from the persisted
+     one.
+  2. `begin_launch` reserves the launch once. It then prepares `jobs/<job>/launches/<launch_id>/`: `manifest.json`,
+     `prepare(...)` (train) or `write_benchmark_data` (evaluate), `stage_model_inputs` (continuation evidence and
+     producers come from the same `GraphStore._bindings` resolver that compiled the node), and `command.json`, the
+     canonical `WorkerRequest` with the persisted attempt and launch IDs. `CachedTransfer`s come from the approved
+     store.
+  3. `transition RUNNING` → `executor.run_operation`. The returned dict is the only result used. It is re-checked
+     against the request and kept as `launches/<launch_id>.result.json` beside the launch directory, which downloads
+     never reach. A non-result, or a foreign one, is `ExecutionUncertain`.
+  4. COMPLETED: `transition EVALUATING` → outputs → `transition COMPLETED` → `release_gpu`. FAILED or CANCELED
+     results, and failures before submission, release the lock. `ExecutionUncertain` keeps it (`uncertain=True`). A
+     cancellation requested before a late completion wins (v1 semantics), and nothing is frozen.
+  5. The destination's model cache is seeded with `publish_cached_artifact(source_remote_dir=<remote launch>/output`
+     or `/model-op/output)`. This is best effort, recorded in `launches/<launch_id>.cache-seed.json`, and skipped
+     for recovery executors.
+- Outputs (`operation_outputs`). The result must be COMPLETED for exactly this launch, attempt, manifest, operation
+  and kind (`remote result belongs to a different attempt`), and every evidence file must match.
+  - Train: payload allowlist (adapter config/weights, or `config.json` + `model.safetensors` | shards + index, plus
+    `value_head.safetensors` and `generation_config.json`). README, checkpoints, `training_args.bin` and optimizer
+    states are dropped. Tokenizer files, and an adapter's `config.json`, come byte-for-byte from the effective base.
+  - Engine tokenizer files must keep the base's vocabulary, added tokens and special-token ids (`engine tokenizer
+    output changes the vocabulary; refusing artifact`). Only facts present in both snapshots are compared; a re-saved
+    `pad_token` assignment is allowed. Full models must also keep `config.json` `vocab_size`.
+  - Train descriptors: `effective_base = policy.base`; `parents` = the policy base artifact plus the policy adapter
+    (sorted); the root is the policy's; `has_value_head` for rm/ppo; `adapter_metadata_from_config` of the engine's
+    `adapter_config.json`; synthetic if the dataset or any bound input is.
+  - Merge: rank = Σ ranks (checked against the receipt and the file). `parents` = the inputs plus the base artifact.
+    The method and quantization are the inputs' if uniform, else `lora`/None.
+  - Materialize: `full_model`, `quantization_bit=None`, `parents` = adapter + base artifact.
+  - `model-op/output` is frozen as it is; its files must equal the receipt's and the allowlist, and the frozen
+    `inventory_sha256` must equal `operation-receipt.json`'s `output_inventory_sha256`.
+  - Full-model outputs (materialize; full/freeze training in the primary runtime) bind `target-inventory.json` to the
+    frozen ref through `verify_inspected_targets`. They return it as `OperationOutcome.inspected_targets`; the
+    `NodeOutputs` carry none, because `record_outputs` still refuses them.
+  - OFT outputs are refused at freezing (OFT handoff is unsupported).
+- Evaluate: predictions only from the worker (`ordered_sample_ids` must equal the benchmark's). References are the
+  registered rows' `output` or final assistant turn, in benchmark order; the engine's labels are never used. Metrics
+  are `CommonEvaluator().evaluate(..., evaluator_kind)`. The output is `EvaluationRecord(benchmark_sha256 =
+  BenchmarkSpec.fingerprint(), status="completed", producer_attempt_id=attempt)` in
+  `NodeEvaluationBinding(tracking_acknowledged=False, producer=None)`.
+- F11 (graph_store.py deviation): `record_outputs` compares `BenchmarkSpec.model_validate(operation["benchmark"])
+  .fingerprint()`. The end-to-end test runs evaluate → `record_outputs` → `acknowledge_tracking` → ledger →
+  `compile_node` select → `resolve_local_selection`. It failed at `record_outputs` (`evaluation receipt differs from
+  attempt ledger`) before the fix.
+- Recovery: `reconcile(job_id, executor)` never launches.
+  - FAILED: collect the same launch, then `reconcile_result`. It returns None while there is no result, or when the
+    launch was reserved but `remote-attempt.json` was never written (unprovable; operator `release-lock
+    --confirm-execution-stopped`). A FAILED attempt whose launch was never reserved is released.
+  - COMPLETED: outputs are rebuilt and a lock still held is released.
+  - `outputs_for(job_id)` rebuilds identical outputs from local files; freezing is content-addressed.
+  - Crash tests (a `BaseException` escapes every handler) cover: before `begin_launch` (the same attempt resumes after
+    takeover and launches once, or reconcile releases it), after `begin_launch` and before contact (uncertain; never
+    relaunched), after the result, after the freeze, after COMPLETED and after the release. Each of the last four
+    reconciles to one training call, one launch and one frozen artifact, and `record_outputs` accepts the rebuilt
+    outputs twice.
+- Worker (operation_dispatch.py deviation, 20 lines): train writes `base-snapshot/` (the bound policy base's
+  `config.json` and tokenizer files, listed in the result evidence). The control plane has no HF root files, so this is
+  how an adapter trained on an HF root gets the exact base bytes. The bytes are accepted only if their config hash and
+  tokenizer fingerprint equal the base's.
+- Cleanup: graph_planner reuses `training.requires_frozen_reference` (988 lines, from 990). model_ops.py is unchanged
+  (916).
+- CPU acceptance gains `freeze_dispatched_outputs`: the real PEFT/transformers merge and materialize outputs freeze
+  through `freeze_operation_output`, with inventories equal to their receipts and 14 verified target modules.
+
+Deviations from the sub-plan:
+- The runner lives in `attempt_runner.py` and `operation_outputs.py`, not in `operation_runner.py`. The 7.3 layering
+  test forbids `graph_store`/`jobs` imports there.
+- `build_output_descriptor` gains `workspace=` (an empty directory the caller owns, where train outputs are
+  assembled) and `dataset_synthetic=`. New helpers: `freeze_operation_output` and `evaluation_record`.
+- `reconcile` returns None while uncertain and also handles a COMPLETED attempt whose lock a crash kept.
+- The runner reads continuation evidence through the private `GraphStore._bindings` (the trusted resolver hook)
+  rather than growing graph_store.
+- The operation_dispatch.py worker change above, and the new CPU acceptance check (29 checks).
+
+Actual verification:
+- RED: `tests/test_operation_runner.py` failed on the missing module (30 tests). Once the runner existed, the F11 test
+  failed exactly at `record_outputs`. The invalid-executor-result test failed under a mutation of `_accept`.
+- GREEN: `tests/test_operation_runner.py` **36 passed**. The sub-plan set plus graph tests (`test_model_inputs`,
+  `test_model_ops_contract`, `test_remote_worker`, `test_operation_runner`, `test_graph_store`, `test_graph_planner`)
+  gave **372 passed**. `uv run pytest -q` gave **1074 passed, 1 skipped** (1038 + 36).
+- Ruff (`src tests`) is clean and `check_secrets.py` reports 0 findings. `git ls-files --eol` prints nothing outside
+  LF, both GPU locks are unchanged, and the main `.venv` has no torch/peft/transformers/safetensors/huggingface_hub.
+- Tests that rely on the 7.4 publish contract of commit 7115a99: `test_outputs_seed_the_remote_cache_from_their_launch`
+  (both cases; the train case fails under the earlier copy-everything publish, because the engine re-saves the
+  tokenizer) and `test_runner_launches_on_an_ssh_server_destination`.
+- CPU acceptance (`-I`) exited 0 twice with byte-identical receipts and all **29** checks passed. Max errors are
+  unchanged (merge delta 7.78e-9, materialize delta 9.17e-9, parent→child 6.42e-9, logits 3.35e-8/2.98e-8). The
+  frozen dispatched outputs keep the 7.3 inventories (merge `cc5fbab0…b54c`, materialize `e124a915…8682`). Receipt
+  SHA256 `a9bece24ded6e84c0637007e7fe78288d61f9125d944a9add348b13b8c7ee45d`, source_sha256
+  `247003f6a987096bcbee4739a3a4ffb4aeaf2836f3c75622c0b42f5e28b96c7f` (equal to the tree), lock_sha256
+  `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`. `model_downloaded`, `gpu_used`,
+  `institution_data_used` and `production_promotable` are false. This supersedes every earlier Task 7 receipt.
+- No real SSH, GPU, model download or institution data. Every remote action ran on `GPUHost`, which runs the real
+  `worker.main_v2` with fixture engines and model operations that write small, well-formed safetensors.
+
+## Task 7 complete (software), 2026-10-20
+
+Task 7 is complete in software: 7.1–7.5 and their review fixes. Verified on the CPU and with fakes:
+- A hash-locked CPU runtime with `cat` merge and `safe_merge` materialization numerics, F32 policy `model-ops-f32-v1`.
+- Path-free staging, and binding of only typed roles to hash-verified cache paths. The rules for exact
+  continuation, frozen reference, PPO reward and tokenizer are enforced twice.
+- Worker protocol v2: hash-verified `command.json`, an `O_EXCL` start marker and one deadline.
+- An SSH transport with a verified, content-addressed remote cache, one launch per attempt and identity-fenced
+  results.
+- A control-plane runner that freezes outputs with exact lineage, computes evaluation receipts under
+  `BenchmarkSpec.fingerprint()` (F11 fixed) and rebuilds idempotently after a crash.
+- Final receipt `a9bece24…e45d` (29/29 checks).
+
+Not verified (needs explicit GPU/host authorization):
+- Any real GPU or host.
+- Real LLaMA-Factory 0.9.5 training on `train.bound.yaml` (the engine output layout, including where it writes its
+  tokenizer, is a fixture assumption) and real `predict_bound` generation.
+- Real DPO/KTO frozen references and PPO with a typed reward.
+- Merge/materialize tolerances, memory and time at real model sizes on CUDA. There is no BF16 storage policy.
+- `renameat2(RENAME_NOREPLACE)` on the host filesystem; SFTP `lstat` link semantics; `mv -T`/`cp -P` across the
+  incoming and cache directories; `--verify-model-cache` at multi-GB sizes; cache seeding on a RunPod volume or a lab
+  server; a real lost launch response.
+- HF root download on the host.
+- Planning-time `ModelTargetEvidence` and tokenizer fingerprints for HF roots still have no producer (plan Q3/Q4).
+
+Task 8 interface (`attempt_runner`):
+- Construction: `OperationAttemptRunner(graph_store, root=<the state directory that holds jobs.db>)`.
+- Inputs to `run_claimed(claimed, executor, *, approval)`:
+  - `claimed`: the dict from `GraphStore.claim_ready` (or `takeover_attempt`) holding the `AttemptLease`.
+  - `executor`: from `desktop_runtime.executor_for(..., runtime_profile=operation.resources.runtime.profile,
+    model_ops=kind in {merge, materialize})`, inside its `connection()` context. The v2 methods require that
+    injected client.
+  - `approval`: the run's `ApprovalGrant`.
+- Output: `OperationOutcome(job_id, attempt_id, status, uncertain, outputs, inspected_targets, error)`.
+  - COMPLETED: the lock is released. `outputs` is `NodeOutputs(model=...)` or `NodeOutputs(evaluation=...)` with no
+    inspected targets. Task 8 calls `record_outputs(lease, outputs)`, enqueues tracking, and persists
+    `inspected_targets` through its own verifier (`record_outputs` still refuses them).
+  - FAILED with `uncertain=False`, or CANCELED: the lock is released and the attempt is final.
+  - FAILED with `uncertain=True`: the lock is kept. Never claim, launch or create a new attempt; call
+    `reconcile(job_id, executor)`.
+- Exceptions:
+  - `run_claimed` raises ValueError for a stale lease, and for `launch already started or uncertain; reconcile the
+    same attempt` (`begin_launch`). Both mean the attempt is not this actor's to launch.
+  - `reconcile` raises ValueError for an attempt still active (run `JobStore.recover` first) and for a foreign remote
+    result (the attempt stays uncertain).
+  - Uncertainty itself is never raised: `ExecutionUncertain` becomes `uncertain=True`.
+- `reconcile(job_id, executor)` accepts recovery-only executors.
+  - It returns None while no result exists. That includes a reserved launch with no remote record, which needs
+    operator `release-lock --confirm-execution-stopped`.
+  - It returns an outcome when it finishes the attempt. For a COMPLETED attempt it rebuilds the outputs and releases
+    a lock that is still held.
+- `outputs_for(job_id)`: a COMPLETED attempt only. It returns identical outputs on every call; `record_outputs` is
+  idempotent for them.
+- Idempotency guarantees:
+  - `begin_launch` runs once per attempt.
+  - Three guards stop a second remote start: the executor's exclusive remote launch directory, its
+    start/result check, and the worker's `O_EXCL` start marker.
+  - The result is persisted before freezing.
+  - Freezing is content-addressed.
+  - A crash at any step resumes (before `begin_launch`) or reconciles (after it), without a second launch or a second
+    artifact.
+- A heartbeat runs every 10 s during `run_claimed`. There are no MLflow calls, scheduling or retries in the runner.
+- Open for Task 8:
+  - A simulated dispatcher for dry-run graphs (plan §6 Q21): the runner refuses simulation manifests, as the worker
+    does. `operation_outputs.build_output_descriptor` can serve one that freezes `simulation=True` descriptors.
+  - Planning-time refusal of fp32/sample/reward benchmarks (Q8).
+  - Persisting `inspected_targets`.
 
 ---
 

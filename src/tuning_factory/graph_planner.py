@@ -63,7 +63,7 @@ from .projects import DatasetRef, LocalId, ProjectSpec, Revision, Sha256
 from .recipes import RecipeSpec, recipe_training_options
 from .registry import Registry, canonical, digest
 from .runtime_profiles import engine_profile
-from .training import PPO_CONTINUATION
+from .training import PPO_CONTINUATION, requires_frozen_reference
 
 
 class DatasetSnapshot(StrictModel):
@@ -750,9 +750,7 @@ def compile_node(plan: GraphPlan, node_id: str, verified_bindings: VerifiedBindi
             if model_input.reward_model is not None and model_input.reward_model != reward:
                 raise ValueError("conflicting typed reward bindings")
             model_input = ModelInput.model_validate({**model_input.model_dump(), "reward_model": reward})
-        reference_required = recipe.training_stage == "kto" or (recipe.training_stage == "dpo"
-            and recipe.stage_options.pref_loss not in {"orpo", "simpo"})
-        if reference_required:
+        if requires_frozen_reference(recipe):
             if model_input.frozen_reference is not None and model_input.frozen_reference != model_input.policy:
                 raise ValueError("frozen reference must be the exact policy parent")
             model_input = ModelInput.model_validate({**model_input.model_dump(), "frozen_reference": model_input.policy})

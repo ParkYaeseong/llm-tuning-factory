@@ -8,6 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
+from .benchmarks import BenchmarkSpec
 from .graph_planner import (
     ApprovalGrant,
     GraphPlan,
@@ -306,7 +307,9 @@ class GraphStore:
             if (operation['kind'] != 'evaluate' or evaluation.node_id != job['graph_node_id']
                     or evaluation.evaluation.producer_attempt_id != attempt_lease.attempt_id
                     or evaluation.evaluation.model.model_dump(mode='json') != operation['model']
-                    or evaluation.evaluation.benchmark_sha256 != digest(canonical(operation['benchmark']))):
+                    # The same identity compile_node's select path and BenchmarkRevision use (plan F11).
+                    or evaluation.evaluation.benchmark_sha256
+                    != BenchmarkSpec.model_validate(operation['benchmark']).fingerprint()):
                 raise ValueError('evaluation receipt differs from attempt ledger')
             if evaluation.producer is not None or evaluation.tracking_acknowledged:
                 raise ValueError('completion/tracking evidence must be derived from ledger')

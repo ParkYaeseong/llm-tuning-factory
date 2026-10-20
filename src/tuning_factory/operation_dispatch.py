@@ -23,7 +23,7 @@ import yaml
 
 from . import model_ops as default_model_ops
 from .capabilities import STAGES
-from .model_artifacts import check_link_free, directory_inventory_sha256
+from .model_artifacts import check_link_free, directory_inventory_sha256, is_tokenizer_file
 from .model_ops import (
     POLICY_F32_V1,
     LocalModel,
@@ -54,6 +54,9 @@ from .worker_protocol import OperationResult, WorkerRequest
 MODEL_OP_PARENT = "model-op"   # merge/materialize: exclusive output parent, created by the execution itself
 MODEL_BINDING, PREFLIGHT = "model-binding.json", "device-preflight.json"
 OPERATION_RECEIPT, TARGET_INVENTORY = "operation-receipt.json", "target-inventory.json"
+# train: the bound policy base's config.json and tokenizer files. The control plane copies them into the
+# output artifact (it holds no HF root files) after checking them against the base's own fingerprints.
+BASE_SNAPSHOT = "base-snapshot"
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 _SMALL_FILE = 16 * 1024 * 1024
 _clock = time.monotonic   # the one monotonic clock of the operation deadline (replaced in tests)
@@ -171,6 +174,20 @@ def _write_target_inventory(directory: Path, output: Path, ops) -> None:
         item.model_dump(mode="json") for item in modules]}))
 
 
+def _write_base_snapshot(directory: Path, base: Path) -> list[str]:
+    """Copy the bound policy base's config.json and tokenizer files (never weights) to ``base-snapshot/``."""
+    names = []
+    for path in sorted(base.rglob("*")):
+        relative = path.relative_to(base).as_posix()
+        if path.is_file() and (relative == "config.json" or is_tokenizer_file(relative)):
+            check_link_free(path)   # verified link-free already; tokenizer.json may exceed the small-file limit
+            target = directory / BASE_SNAPSHOT / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _write_new(target, path.read_bytes())
+            names.append(f"{BASE_SNAPSHOT}/{relative}")
+    return names
+
+
 def _inspects_full_output(operation, profile: dict) -> bool:
     # The inspector needs the pinned model-operation libraries, which only the primary runtime has.
     return isinstance(operation, MaterializeOperation) or (
@@ -211,7 +228,8 @@ def _execute_train(operation: TrainOperation, directory: Path, budget: _Budget, 
                        "train.log")
     backend.validate_outputs(directory, config)
     backend.validate_training_result(directory, config)
-    names = ["train.yaml", "train.bound.yaml", MODEL_BINDING, "binding-evidence.json", PREFLIGHT]
+    names = ["train.yaml", "train.bound.yaml", MODEL_BINDING, "binding-evidence.json", PREFLIGHT,
+             *_write_base_snapshot(directory, verified.path("policy_base"))]
     if _inspects_full_output(operation, profile):
         _write_target_inventory(directory, directory / "output", ops)
         names.append(TARGET_INVENTORY)
