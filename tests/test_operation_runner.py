@@ -1144,3 +1144,108 @@ def test_forged_target_inventory_of_a_full_model_leaves_no_artifact(tmp_path, mo
     assert (outcome.status, outcome.uncertain, outcome.outputs) == ("FAILED", False, None)
     assert "inspected base dimensions differ from verified tensor inventory" in outcome.error
     assert artifact_entries(w.store) == before and not held_locks(w)
+
+
+# -- 14. Task 8.2: failure kinds from persisted records and the safe release of a canceled attempt -------
+
+def node_status(w):
+    return next(node["status"] for node in w.store.get_run(w.run["id"])["nodes"] if node["node_id"] == "train")
+
+
+@pytest.mark.parametrize("case,kind", [
+    ("completed", None), ("remote_failed", "remote_failed"), ("freeze_refused", "output_invalid"),
+    ("refused", "refused_before_launch"), ("before_submit", "failed_before_submit"), ("uncertain", "uncertain"),
+    ("canceled", "canceled"), ("gate_then_recover", "refused_before_launch")])
+def test_runner_failure_kind_classifies_from_persisted_records(tmp_path, monkeypatch, case, kind):
+    from tuning_factory.jobs import GRAPH_LAUNCH_REFUSED
+    engine = ({"fail": "engine exited with status 1"} if case == "remote_failed" else
+              {"tokenizer": changed_tokenizer("added_token")} if case == "freeze_refused" else {})
+    w = world(tmp_path, monkeypatch, graph_options={"export_allowed": case != "refused"}, **engine)
+    if case == "uncertain":
+        w.host.mode = "lose_start_response"
+    elif case == "canceled":
+        w.host.after_worker = lambda directory: w.store.jobs.cancel(w.job_id)
+    elif case == "before_submit":   # fails after begin_launch, before the executor is called
+        def unreadable(ref):
+            raise OSError("dataset bytes unreadable")
+        monkeypatch.setattr(w.runner, "_dataset_bytes", unreadable)
+    if case == "gate_then_recover":   # paused at the gate, then a stale recover fails it: it never launched
+        w.store.pause(w.run["id"])
+        with pytest.raises(ValueError, match=GRAPH_LAUNCH_REFUSED):
+            run(w)
+        w.store.resume(w.run["id"])
+        w.store.jobs.recover(stale_after_seconds=-1)
+        assert held_locks(w)
+    else:
+        run(w)
+    assert w.runner.failure_kind(w.job_id) == kind
+    assert w.host.launches == ([] if case in {"refused", "before_submit", "gate_then_recover"} else w.host.launches)
+    if kind in (None, "uncertain"):
+        with pytest.raises(ValueError):
+            w.store.classify_attempt(w.ctl, w.job_id, "remote_failed")   # completed, or still holding its lock
+        return
+    assert w.store.classify_attempt(w.ctl, w.job_id, kind) == kind   # the store agrees with the runner
+    counted = 0 if case == "gate_then_recover" else 1
+    assert w.store.attempt_disposition(w.job_id)["counted"] == counted and not held_locks(w)
+    expected = "CANCELED" if kind == "canceled" else "RUNNING" if case == "gate_then_recover" else "FAILED"
+    assert node_status(w) == expected   # max_attempts=1: only the uncounted attempt can be retried
+
+
+@pytest.mark.parametrize("release", ["reconcile", "classify"])
+def test_crash_between_cancel_and_release_is_released_on_its_accepted_result(tmp_path, monkeypatch, release):
+    """7.5 re-review Minor B: CANCELED always follows an accepted result in ``_launch``, so execution stopped."""
+    w = world(tmp_path, monkeypatch)
+    w.host.after_worker = lambda directory: w.store.jobs.cancel(w.job_id)
+    crash_once(monkeypatch, w.store.jobs, "release_gpu", lambda args: True, after=False)
+    with pytest.raises(Crash):
+        run(w)
+    assert w.store.jobs.get(w.job_id)["status"] == "CANCELED" and held_locks(w)
+    assert (launch_dir(w).parent / (w.claimed["launch_id"] + ".result.json")).is_file()
+    assert w.runner.failure_kind(w.job_id) == "canceled"
+    if release == "reconcile":
+        outcome = w.runner.reconcile(w.job_id, w.executor)
+        assert (outcome.status, outcome.uncertain, outcome.outputs) == ("CANCELED", False, None)
+        assert not held_locks(w)
+    assert w.store.classify_attempt(w.ctl, w.job_id, "canceled") == "canceled"
+    assert not held_locks(w) and node_status(w) == "CANCELED"
+    assert w.runner.failure_kind(w.job_id) == "canceled" and len(w.host.launches) == 1
+    with pytest.raises(ValueError, match="attempt is final"):
+        w.runner.reconcile(w.job_id, w.executor)
+
+
+@pytest.mark.parametrize("evidence", ["missing", "other_launch"])
+def test_a_canceled_attempt_without_an_accepted_result_keeps_its_lock(tmp_path, monkeypatch, evidence):
+    w = world(tmp_path, monkeypatch)
+    w.host.after_worker = lambda directory: w.store.jobs.cancel(w.job_id)
+    crash_once(monkeypatch, w.store.jobs, "release_gpu", lambda args: True, after=False)
+    with pytest.raises(Crash):
+        run(w)
+    record = launch_dir(w).parent / (w.claimed["launch_id"] + ".result.json")
+    if evidence == "missing":
+        record.unlink()
+    else:   # a result naming another launch proves nothing about this one
+        record.write_bytes(canonical({**json.loads(record.read_bytes()), "launch_id": "e" * 32}))
+    assert w.runner.failure_kind(w.job_id) == "uncertain"
+    assert w.runner.reconcile(w.job_id, w.executor) is None and held_locks(w)
+    with pytest.raises(ValueError, match="holds its lock"):
+        w.store.classify_attempt(w.ctl, w.job_id, "canceled")
+    assert held_locks(w) and w.store.attempt_disposition(w.job_id) is None   # only the operator can release it
+
+
+def test_release_uncontacted_after_a_crash_before_running_launches_once(tmp_path, monkeypatch):
+    w = world(tmp_path, monkeypatch)
+    crash_once(monkeypatch, w.store.jobs, "transition", lambda args: args[1] == "RUNNING", after=False)
+    with pytest.raises(Crash):
+        run(w)
+    attempt = w.store.jobs.validated_attempt(w.lease)
+    assert (attempt["status"], attempt["launch_started"]) == ("PROVISIONING", 1)
+    assert (launch_dir(w) / "command.json").is_file() and not (launch_dir(w) / "remote-attempt.json").exists()
+    assert w.store.release_uncontacted(w.ctl, w.job_id)
+    with pytest.raises(ValueError, match="stale attempt lease"):
+        w.store.jobs.transition(w.lease, "RUNNING")   # the old actor can never reach run_operation
+    assert not held_locks(w) and w.host.commands == [] and w.calls == []
+    assert w.store.requeue_retry(w.ctl, w.job_id)
+    again = w.store.claim_ready(w.facts, w.ctl)   # max_attempts=1: the released attempt was not counted
+    outcome = run(w, claimed=again)
+    assert outcome.status == "COMPLETED", outcome.error
+    assert len(w.host.launches) == 1 and w.calls == ["train.bound.yaml"]

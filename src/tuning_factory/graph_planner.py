@@ -991,9 +991,8 @@ def _compile_select(plan, node, bindings, lineage, outputs, verified):
         verified(expected)
         requested.append(expected)
         evaluations.append(item.evaluation)
-    if failed and len([item for item in evaluations if item.status == "completed" and not item.synthetic
-                       and not item.simulation]) < node.selection.min_success:
-        raise ValueError("insufficient partial success")
+    # Too few survivors is not a compile error (Task 8.2): resolve_local_selection applies the same min_success
+    # rule to the quality-eligible candidates and records a no-winner receipt (insufficient_partial_success).
     return LocalSelectSpec(lineage=lineage, evaluations=tuple(evaluations), requested_models=tuple(requested),
                            failed_parent_node_ids=tuple(sorted(failed)), selection=node.selection,
                            benchmark_sha256=benchmark_sha, merged_models=tuple(merged))

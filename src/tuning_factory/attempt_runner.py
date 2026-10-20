@@ -45,7 +45,7 @@ from .graph_planner import (
     NodeModelBinding,
     snapshot_dataset,
 )
-from .graph_store import GraphStore, NodeOutputs
+from .graph_store import REMOTE_ATTEMPT, FailureKind, GraphStore, NodeOutputs, accepted_result
 from .jobs import ACTIVE, AttemptLease
 from .manifest import source_hash, verify_manifest
 from .operation_dispatch import MODEL_OP_PARENT, write_benchmark_data
@@ -61,8 +61,6 @@ from .operations import EvaluateOperation, TrainOperation
 from .registry import canonical, digest
 from .training import OFT_UNFREEZABLE, CanceledError, LlamaFactoryBackend
 from .worker_protocol import COMMAND, OperationResult, WorkerRequest
-
-REMOTE_ATTEMPT = "remote-attempt.json"
 
 
 @dataclass(frozen=True)
@@ -101,9 +99,10 @@ class OperationAttemptRunner:
     # -- public interface (Task 8) --------------------------------------------------------------
 
     def run_claimed(self, claimed: dict, executor, *, approval: ApprovalGrant) -> OperationOutcome:
-        """Run one claimed attempt once. Raises ValueError for a stale lease, an attempt already launched, or a
-        graph run that is not RUNNING (``GRAPH_LAUNCH_REFUSED``: the attempt stays unlaunched and holds its lock
-        until the controller returns it with ``GraphStore.return_unlaunched``)."""
+        """Run one claimed attempt once. Raises ValueError for a stale lease, an attempt already launched, a graph
+        run that is not RUNNING (``GRAPH_LAUNCH_REFUSED``) or a job-level cancel (``GRAPH_CANCEL_REFUSED``): in the
+        last two cases the attempt stays unlaunched and holds its lock until the controller returns it with
+        ``GraphStore.return_unlaunched``."""
         lease = claimed.get("lease") if isinstance(claimed, dict) else None
         if not isinstance(lease, AttemptLease):
             raise ValueError("a claimed attempt lease is required")
@@ -123,16 +122,16 @@ class OperationAttemptRunner:
         """Finish an uncertain or crashed attempt from its one launch; never launches.
 
         Only an attempt that still holds its lock is eligible: a FAILED attempt kept uncertain, a crashed one that
-        ``JobStore.recover`` marked FAILED, or a COMPLETED one whose release a crash interrupted. An attempt whose
-        lock is released is final and is never reopened (``outputs_for`` rebuilds a completed one's outputs).
-        None: no remote result yet, or no proof whether the launch reached the host (the lock stays held
+        ``JobStore.recover`` marked FAILED, or a COMPLETED or CANCELED one whose release a crash interrupted. An
+        attempt whose lock is released is final and is never reopened (``outputs_for`` rebuilds a completed one's
+        outputs). None: no remote result yet, or no proof whether the launch reached the host (the lock stays held
         until a result appears or an operator confirms that execution stopped).
         """
         job = self.jobs.get(job_id)
         manifest = self._manifest(job)
         if job["status"] in ACTIVE:
-            raise ValueError("recover stale active attempts before reconciling; only FAILED or COMPLETED attempts "
-                             "are eligible")
+            raise ValueError("recover stale active attempts before reconciling; only FAILED, CANCELED or COMPLETED "
+                             "attempts are eligible")
         lease = self.jobs.current_lease(job_id)
         if not self.jobs.holds_lock(lease):
             raise ValueError("attempt is final: its lock is released, so reconcile never reopens it; use outputs_for "
@@ -141,8 +140,16 @@ class OperationAttemptRunner:
             outcome = self.outputs_for(job_id)
             self.jobs.release_gpu(lease, execution_stopped=True)   # idempotent; a crash may have kept it
             return outcome
+        if job["status"] == "CANCELED":
+            # A crash between transition(CANCELED) and release_gpu (7.5 re-review Minor B). In ``_launch`` CANCELED
+            # always follows an accepted result, so execution stopped: release only on that persisted proof for the
+            # attempt's own launch ID; otherwise the lock stays for the operator's release-lock.
+            if accepted_result(self.root, job_id, self._attempt(lease)["launch_id"], lease.attempt_id) is None:
+                return None
+            self.jobs.release_gpu(lease, execution_stopped=True)
+            return OperationOutcome(job_id, lease.attempt_id, "CANCELED", False, None, error=job["error"])
         if job["status"] != "FAILED":
-            raise ValueError("only FAILED or COMPLETED attempts can be reconciled")
+            raise ValueError("only FAILED, CANCELED or COMPLETED attempts can be reconciled")
         attempt = self._attempt(lease)
         if not attempt["launch_started"]:
             error = job["error"] or "attempt stopped before its launch"
@@ -172,6 +179,36 @@ class OperationAttemptRunner:
         if status == "COMPLETED":
             self._seed_cache(executor, operation, launch, outputs)
         return OperationOutcome(job_id, lease.attempt_id, status, False, outputs, targets, error)
+
+    def failure_kind(self, job_id: str) -> FailureKind | None:
+        """How a finished attempt ended, from the ledger and this runner's persisted records; None for COMPLETED.
+
+        - CANCELED: ``canceled`` once its lock is released or its accepted result exists (then
+          ``GraphStore.classify_attempt`` may release it); otherwise ``uncertain``.
+        - FAILED, never launched (``launch_started=0``): ``refused_before_launch``. The store counts a refusal by
+          the runner's checks (lock already released) and not a stale recover of a gated attempt (lock held).
+        - FAILED holding its lock: ``uncertain`` (reconcile the same launch).
+        - FAILED with an accepted result: ``remote_failed`` for a FAILED result, else ``output_invalid``.
+        - FAILED after ``begin_launch`` without a result: ``failed_before_submit``.
+        """
+        job = self.jobs.get(job_id)
+        if job["status"] == "COMPLETED":
+            return None
+        if job["status"] not in {"FAILED", "CANCELED"}:
+            raise ValueError("only a finished attempt has a failure kind")
+        lease = self.jobs.current_lease(job_id)
+        attempt = self._attempt(lease)
+        held = self.jobs.holds_lock(lease)
+        result = accepted_result(self.root, job_id, attempt["launch_id"], lease.attempt_id)
+        if job["status"] == "CANCELED":
+            return "canceled" if not held or result is not None else "uncertain"
+        if not attempt["launch_started"]:
+            return "refused_before_launch"
+        if held:
+            return "uncertain"
+        if result is not None:
+            return "remote_failed" if result.status == "FAILED" else "output_invalid"
+        return "failed_before_submit"
 
     def outputs_for(self, job_id: str) -> OperationOutcome:
         """Rebuild a completed attempt's outputs from local files; identical on every call."""

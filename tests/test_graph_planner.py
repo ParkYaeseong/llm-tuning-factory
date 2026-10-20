@@ -1,4 +1,5 @@
 import pytest
+from pydantic import ValidationError
 
 from tuning_factory.executor_profiles import ExecutorProfile, ResourceFacts
 from tuning_factory.graph_planner import (
@@ -883,8 +884,10 @@ def test_planning_refuses_a_zero_or_nonfinite_runpod_price(tmp_path, simulation)
     with pytest.raises(ValueError, match="^RunPod resource facts require a positive live hourly price$"):
         plan_graph(project, choices, (facts.model_copy(update={"total_hourly_cost_usd": 0}),), simulation=simulation)
     for price in (float("inf"), float("nan")):
+        # 8.1 review M6: plan_graph re-validates the facts, and StrictModel (allow_inf_nan=False) refuses a
+        # non-finite price before the planner's own math.isfinite guard (kept as defence in depth) is reached.
         forged = ResourceFacts.model_construct(**{**dict(facts), "total_hourly_cost_usd": price})
-        with pytest.raises(ValueError, match="finite|positive live hourly price"):
+        with pytest.raises(ValidationError, match="Input should be a finite number"):
             plan_graph(project, choices, (forged,), simulation=simulation)
     server = observation()   # an SSH server the operator prices at 0 still plans
     profile = settings().profile(server, profile_id=choices.executors[0].profile_id, revision="1")

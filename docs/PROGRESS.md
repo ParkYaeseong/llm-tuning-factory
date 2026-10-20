@@ -945,8 +945,9 @@ CPU and with fakes:
 - Final receipt `811d4177…b673` (29/29 checks, source `478e2a41…e5d2` of commit 7120193). After the 7.4 follow-up
   (Windows name aliases and uploaded-input protection on download) it was `a9bece24…e45d` (source `247003f6…6c7f`).
   After the 8.3 short-name follow-up it was `97fa2c89…df3b` (source `0ae3419b…b67a`). After the 7.5 review fixes
-  it was `042bf8fe…9c0b` (source `6b57e120…9b5f`). After Task 8.1, the current receipt is `5cc24562…63be` (29/29
-  checks, source `0d405733…373a`; see "Task 8.1 ledger foundations").
+  it was `042bf8fe…9c0b` (source `6b57e120…9b5f`). After Task 8.1 it was `5cc24562…63be` (source
+  `0d405733…373a`). After Task 8.2, the current receipt is `26a68aee…a117` (29/29 checks, source `58adcdc8…ec17`;
+  see "Task 8.2 readiness, outcomes, failure propagation and safe release").
 
 Not verified (needs explicit GPU/host authorization):
 - Any real GPU or host.
@@ -1150,6 +1151,217 @@ Not verified or still open:
 - The backfill assumes every graph manifest parses. `prepare_ready` is their only writer; a malformed one would
   stop the store from opening.
 - Legacy `JobStore.claim` still counts graph attempts against `Policy.max_concurrent` (D2, unchanged).
+
+## Task 8.2 readiness, outcomes, failure propagation and safe release, 2026-10-20
+
+Commit `feat: resolve ready graph nodes from verified ledger evidence`, on `ac2209c`. It implements plan §4 "8.2"
+(decisions D1–D14 as accepted), the coordinator's 7.5 re-review item Minor B, and the fixes from the independent
+review of `ac2209c` (8.1): I1, M1, M4, M5 and M6.
+
+What changed (`graph_store.py` unless noted):
+- Trusted resolver: `LedgerBindingResolver(store)`, installed as `store.binding_resolver` (the controller in 8.5;
+  tests directly). The store's default stays the root-only bindings, so Task 6/7 behaviour is unchanged.
+  - `outputs`, `completed_nodes` and `evaluations` come from `ledger()`. Each evaluation carries its
+    `NodeExecutionEvidence` as producer, acknowledged only when its tracking row is.
+  - `producers`: the plan's artifacts plus `producer_evidence(current_lease(job), model)` for every completed and
+    acknowledged train/merge/materialize node. Unacknowledged producers are left out, so they are never raised for
+    an unrelated node.
+  - `base_targets`: the plan's evidence plus every persisted `inspected_targets` entry, re-verified with
+    `verify_inspected_targets` against the verified artifact on every read.
+  - `failed_parent_node_ids`: the FAILED/BLOCKED/CANCELED evaluation parents of the selection being compiled (the
+    node itself, or a selection parent whose receipt a child recomputes).
+  - Destination (D1): a prepared node keeps its manifest's executor. Otherwise the resolver picks the approved
+    alternative ordered by (blocked now on the claim resource, this run's unfinished jobs on the same exclusivity
+    key, index). Aliases of one Pod or server therefore share load and lock. "Blocked now" uses
+    `JobStore._resource_blocked` on the resource a claim would take (with the `simulation:` prefix for simulation
+    plans).
+- Readiness: `readiness(run_id)` is a pure read returning `Readiness(node_id, state, reason, failed_parents)` for
+  every node.
+  - `done`: the node already has a job or is finished.
+  - `blocked`: a parent is FAILED, BLOCKED or CANCELED (`parent a failed`), a selection without `allow_partial`
+    has a failed evaluation parent (`partial selection is not allowed`), or a model port is fed by a no-winner
+    selection (`selection produced no winner`).
+  - `waiting`: a parent is unfinished (`waiting for a`) or its attempt evidence is unacknowledged (`waiting for
+    tracking of a`).
+  - `ready`: otherwise. A partial selection is ready once every evaluation parent finished.
+- `prepare_ready(lease, node_ids=None)` is unchanged without `node_ids`. With `node_ids` it compiles only the
+  listed nodes that readiness finds ready now, skips the others untouched, and turns a compile `ValueError` into
+  `fail_node` + `block_descendants` in one transaction. Unknown IDs raise `unknown graph node`.
+- `fail_node` (an unprepared node, or one whose attempt is final with its lock released; idempotent) and
+  `block_descendants` (a fixpoint over the descendants that readiness finds blocked; the reason goes to
+  `nodes.error`).
+- Outputs:
+  - `record_outputs` verifies each `inspected_targets` entry of a train/merge/materialize model output with
+    `verify_inspected_targets`; the verifier's messages pass through. It stores them sorted and deduplicated, so a
+    re-record is idempotent. An evaluation with targets is refused (`evaluation cannot publish inspected targets`),
+    and so is a selection with targets.
+  - `NodeOutputs.selection`: a no-winner selection records a bare receipt that must equal
+    `resolve_local_selection(spec)` with status `no_winner`. The payload gains a `selection` key only then, so
+    every earlier receipt keeps its bytes. `ledger()` returns it.
+  - `complete_local_selection(lease, claimed)`: one `BEGIN IMMEDIATE` validates both leases. Cancel wins over the
+    join, for a run cancel or a job-level cancel: the job and node become CANCELED, the `local:` lock is released,
+    nothing is recorded, and an uncounted `canceled` disposition is written. A pause returns the attempt unlaunched.
+    Otherwise it writes PROVISIONING → RUNNING → EVALUATING → COMPLETED with one `events` row each, then
+    `node_outputs`, the `tracking_outbox` row and the lock release. A rerun returns the recorded receipt.
+- Dispositions and retries:
+  - `classify_attempt(lease, job_id, kind)` writes one immutable `attempt_dispositions` row per attempt. The same
+    kind is idempotent, another raises `attempt disposition is immutable`, and `uncertain` is refused. The kind
+    must match the attempt: CANCELED for `canceled`, FAILED otherwise, `launch_started=0` exactly for
+    `refused_before_launch`.
+  - Counted and retryable: `remote_failed`. Within `max_attempts` it sets `retry_not_before = clock() + backoff`;
+    otherwise the node FAILS and its subtree is BLOCKED.
+  - Counted and terminal: `output_invalid`, `refused_before_launch` (the runner's own checks) and
+    `failed_before_submit`. `canceled` is terminal and cancels the node. Counted attempts keep their reservation.
+  - In a CANCELED run the node becomes CANCELED whatever the kind. A job-level cancel never retries.
+  - `requeue_retry` needs a RUNNING run, a FAILED job without a lock or cancel request, a retryable disposition
+    (`remote_failed`, or uncounted), a due `retry_not_before` on the injected clock and counted attempts below the
+    limit. It moves the job to QUEUED (event `graph retry`, `active_attempt_id` cleared, so the old lease is
+    fenced) and the node to READY.
+  - `attempt_disposition(job_id)` is a read helper for 8.5's settle loop.
+- Safe automatic release (D9): `release_uncontacted(lease, job_id)` acts only on a non-legacy PROVISIONING attempt
+  of the run after `begin_launch`. It rotates the actor token, then checks `jobs/<job>/launches/<persisted
+  launch_id>/remote-attempt.json` (and its `.tmp`, or a symlinked launch directory). If the record is absent, the
+  job FAILS with `attempt stopped before remote contact; released after takeover`, the lock is freed, the
+  reservation voided, an uncounted `released_before_contact` disposition written and the node made retryable at
+  once. Otherwise only the token rotation remains.
+- `recover_stale(lease, stale_before=)`: the run-scoped `JobStore.recover` for RUNNING/EVALUATING attempts of the
+  run, with the same error text. Locks are kept.
+- `finalize_run(lease)`: once every node is finished and no job of the run holds a lock, COMPLETED if every node
+  completed, FAILED if any failed or is blocked, otherwise CANCELED. A CANCELED run stays CANCELED, and tracking
+  never holds it back (D5). Idempotent.
+- `set_wait_reason(lease, node_id, reason)` writes `nodes.wait_reason`.
+- Cancel: `_state` cancel also cancels nodes that are waiting out a retry backoff.
+- `attempt_runner.failure_kind(job_id)` reads the job, the attempt and the persisted
+  `launches/<launch_id>.result.json` (re-read through `graph_store.accepted_result`, which requires the attempt's
+  own launch ID).
+- Minor B (7.5 re-review): a crash between `transition(CANCELED)` and `release_gpu` left the lock held.
+  - `reconcile` now releases a locked CANCELED attempt only when its accepted result exists for its persisted
+    launch ID, and returns a CANCELED outcome. Without it, `reconcile` returns None and the lock stays for the
+    operator's `release-lock`.
+  - `failure_kind` returns `canceled` for it, or `uncertain` without the proof.
+  - `classify_attempt(…, 'canceled')` applies the same proof and releases the lock in its own transaction, so 8.5
+    needs no executor to settle it.
+- `graph_planner._compile_select` (deviation) no longer raises `insufficient partial success`;
+  `resolve_local_selection` already applies that rule and records a no-winner receipt.
+
+Fixes from the independent review of `ac2209c` (8.1):
+- I1 (required): `return_unlaunched` dropped a job-level cancel. A PROVISIONING graph job with `cancel_requested=1`
+  is now returned CANCELED, not requeued: the job and node become CANCELED (descendants BLOCKED in a running run),
+  the token is rotated, the lock freed, the reservation voided and the disposition uncounted. `begin_launch` also
+  refuses a graph-owned job with `cancel_requested=1` with the new `jobs.GRAPH_CANCEL_REFUSED = 'graph job cancel
+  requested; launch refused'`, leaving `launch_started=0`; legacy jobs are unchanged. Tests:
+  `test_return_unlaunched_honours_a_job_level_cancel` and `test_begin_launch_refuses_a_canceled_graph_job`.
+- M1: the backfill is tolerant. A manifest it cannot price (no `resources`, or facts that fail today's schema)
+  reserves its run's whole approved total, or infinity when the stored plan is unreadable. That blocks only that
+  run's further GPU claims, and the node's `wait_reason` names it (`graph_store.UNPRICED_ATTEMPT`). The store still
+  opens, and the run can still be paused and canceled. Test:
+  `test_migration_reserves_an_unpriceable_attempt_without_failing_the_store` (two cases).
+- M4: a FAILED attempt with `launch_started=0` that still holds its lock can only come from a stale `JobStore.recover`
+  of an attempt that the launch gate refused, since it has no heartbeat before `begin_launch`. `failure_kind` reports
+  `refused_before_launch`, as the plan's order says. `classify_attempt` makes it uncounted, voids its reservation,
+  releases the lock and makes the node retryable at once: `begin_launch` never committed, and cannot commit now
+  that the job is FAILED.
+  - The runner's own pre-launch refusals (`abandon_unlaunched` releases the lock in the same transaction) stay
+    counted and terminal, as D4 says for deterministic refusals. The distinguishing fact is structural (the lock is
+    still held), not an error string.
+  - 8.5 must classify such an attempt directly, not reconcile it first: reconcile's unstarted branch releases the
+    lock, and the attempt would then count.
+  - Tests: `test_an_unlaunched_attempt_failed_by_a_stale_recover_is_uncounted` and the runner case
+    `gate_then_recover`.
+- M5: `budget_reservations` and `attempt_dispositions` inserts name their columns. Downgrade is unsupported:
+  pre-8.1 code cannot use a migrated DB, because its positional `INSERT INTO controller_leases VALUES (?,?,?)`
+  fails against the added `owner_token` column.
+- M6: the planner's `math.isfinite` check stays as defence in depth. `test_planning_refuses_a_zero_or_nonfinite_runpod_price`
+  now asserts explicitly that pydantic refuses a non-finite price first (`ValidationError`, `Input should be a
+  finite number`).
+
+Deviations from the plan:
+- `LedgerBindingResolver.__call__(plan, node_id, ledger, *, run_id)`: `bindings_for` passes `run_id`, because one plan
+  can back several runs. It refuses a resolver bound to another store.
+- `recover_stale` also leaves unstarted PROVISIONING attempts alone (the plan named only started ones). 8.5 returns
+  them with `takeover_attempt` + `return_unlaunched`, so they stay uncounted (D4) instead of failing.
+- `release_uncontacted` raises `current graph attempt required` for another run's job (like `takeover_attempt`)
+  rather than returning False.
+- Precedence in `failure_kind`: `launch_started=0` comes first, as in the plan. A FAILED attempt that holds its lock
+  after `begin_launch` is `uncertain`. A CANCELED attempt is `canceled` once released or proven stopped.
+- `finalize_run` also finalizes a PAUSED run whose nodes are all finished. A run with a canceled node and no failure
+  ends CANCELED; the plan named only COMPLETED and FAILED.
+- A `return_unlaunched` CANCELED in a running run (I1) and a job-level cancel of a local selection block the node's
+  subtree.
+- Additions: `attempt_disposition`, `accepted_result`, `REMOTE_ATTEMPT`, `RELEASED_BEFORE_CONTACT`,
+  `GRAPH_CANCEL_REFUSED` and `UNPRICED_ATTEMPT`. `attempt_runner.REMOTE_ATTEMPT` and `FailureKind` now come from
+  `graph_store`.
+- `graph_planner.py` was edited (the `_compile_select` refusal above). Test 6's one-survivor case requires a recorded
+  receipt.
+
+Actual verification (main tree, no other agent's uncommitted changes):
+- RED, before any `src` edit: 43 of the 43 new cases failed for the intended reasons:
+  - 25 readiness cases on the missing `LedgerBindingResolver`, and the SSH alias case first on a fixture bug
+    (`settings()` already passes `remote_root`), fixed before implementing;
+  - 12 runner cases on the missing `failure_kind`, and the crash-release case on the missing `release_uncontacted`;
+  - the two M1 cases on the missing `UNPRICED_ATTEMPT` (the migration aborted the open);
+  - I1 on `QUEUED != CANCELED` (the requeue bug) and on the missing `GRAPH_CANCEL_REFUSED`.
+
+  The M6 assertion passed already: it is a guard that pydantic refuses first. Three test bugs surfaced only once
+  the code existed: a request ID that reused `'run'`, `validated_attempt`'s key (`active_attempt_id`), and a
+  `FakeClock` advance that expired the 3600 s run lease. All three were fixed in the tests.
+- Mutations, through pytest plugins in `%TEMP%` with no `src` edit:
+
+  | Mutation | Tests that fail |
+  |---|---|
+  | readiness treats every parent as acknowledged | 3, 4 and 6 (partial) |
+  | `release_uncontacted` never looks for the record | 12 (record present) |
+  | `return_unlaunched` ignores `cancel_requested` (I1) | both I1 tests |
+  | every attempt has an accepted result | the Minor B negatives (2) and two `failure_kind` cases |
+- GREEN:
+  - The plan's command (`test_graph_readiness`, `test_graph_store`, `test_operation_runner`, `test_graph_planner`)
+    gave **181 passed** (138 at `ac2209c` + 43).
+  - `uv run pytest -q` gave **1195 passed, 1 skipped** (1152 + 43).
+- Ruff (`src tests`) is clean, and `check_secrets.py` reports 0 findings over 730 file versions. Both GPU locks are
+  unchanged, every changed file is CR-free, and the main env imports no torch/peft/transformers/safetensors/
+  huggingface_hub.
+- CPU acceptance (`-I`), run once on the final source:
+  - It exited 0, and all **29** checks passed.
+  - Max errors are unchanged: merge delta 7.78e-9, materialize delta 9.17e-9, parent→child 6.42e-9, logits
+    3.35e-8/2.98e-8.
+  - Receipt SHA256 `26a68aee255e5581d3d53e9f146cdd1bf86e7414321d72ec4d130ffd8a33a117`, source_sha256
+    `58adcdc807bdf93169d128f5c6915a81aec45ca88b6993af6992a4b23f7aec17` (the committed tree, checked on a
+    `git archive` export), lock_sha256 `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`.
+  - `model_downloaded`, `gpu_used`, `institution_data_used` and `production_promotable` are false.
+  - It supersedes `5cc24562…63be`.
+- Module sizes: `graph_store.py` 1229 (594), `attempt_runner.py` 475 (438), `jobs.py` 564 (561),
+  `graph_planner.py` 998 (999).
+
+Not verified or still open:
+- No GPU, SSH, network, provider or MLflow. Everything ran on fakes, local files and SQLite, with in-process threads
+  only.
+- The controller loop is 8.5: settle, `classify_attempt`, `requeue_retry`, `release_uncontacted`, readiness
+  scheduling and `finalize_run` are store primitives that nothing calls on a timer yet. Tracking events are 8.3:
+  `record_outputs` and `complete_local_selection` still write the single pre-8.3 `tracking_outbox` row.
+- For 8.5:
+  - On `GRAPH_LAUNCH_REFUSED` or `GRAPH_CANCEL_REFUSED` from `run_claimed`, call `return_unlaunched` at once. An
+    attempt left PROVISIONING has no heartbeat.
+  - Settle in this order: `attempt_disposition` (already settled?), then `failure_kind`, then `uncertain` →
+    `reconcile`, otherwise `classify_attempt`. Never reconcile a `refused_before_launch` attempt that still holds its
+    lock (M4).
+  - Stale unstarted PROVISIONING attempts: `takeover_attempt` + `return_unlaunched`. Started ones:
+    `release_uncontacted`.
+  - Use `prepare_ready(lease, node_ids=…)` only. The `None` path records errors on unready nodes.
+  - A select whose winner artifact fails verification stays PROVISIONING with its `local:` lock.
+    `complete_local_selection` raises before its transaction; the controller must fail or return it.
+  - Install `LedgerBindingResolver` on the trusted path.
+- M3 (review note for 8.5): owner fencing still applies only when a run lease is replaced. 8.5 should `LEFT JOIN
+  controller_owner` in `_controller` and require `c.owner_token IS NULL OR (o.lease_token=c.owner_token AND
+  o.expires>now)`, so that `release_owner` fences run leases at once (D14).
+- M2 (review note): historical attempts can exhaust an old run's budget. 8.5 should set a `wait_reason` when budget
+  refuses a claim. An unpriced backfilled attempt already names itself (`UNPRICED_ATTEMPT`).
+- The simulated dispatcher (8.4) must write `remote-attempt.json`, or an equivalent record, before it acts. Otherwise
+  `release_uncontacted` treats a simulated attempt as uncontacted.
+- The compiler accepts only one selection parent with failed evaluations per node. Two selection parents with
+  failures would refuse at compile (`unrequested failed evaluation parent`) and fail the node.
+- A stale-recovered unlaunched attempt that a deterministic runner check would also refuse is retried once,
+  uncounted. Its next refusal is counted and terminal, so retries stay bounded.
+- Multi-process contention is untested.
 
 ---
 

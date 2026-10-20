@@ -905,3 +905,104 @@ def test_simulation_plan_claims_in_simulation_namespace(tmp_path):
     queued(store.jobs, 'legacy')
     legacy = store.jobs.claim('existing_runpod:pod1', max_concurrent=4)   # the real Pod is not held
     assert legacy and legacy['lease'].resource_id == 'existing_runpod:pod1'
+
+
+# -- 8.1 review fixes (folded into Task 8.2) --------------------------------------------------------
+
+def test_return_unlaunched_honours_a_job_level_cancel(tmp_path):
+    """I1: a job cancel recorded on a PROVISIONING graph job must never be requeued into a real launch."""
+    from tuning_factory.jobs import GRAPH_LAUNCH_REFUSED
+    w = ledger_world(tmp_path)
+    store, facts, run = w.store, w.facts[0], w.run_id
+    ctl = store.acquire_controller(run)
+    store.prepare_ready(ctl)
+    claimed = store.claim_ready(facts, ctl)
+    lease = claimed['lease']
+    store.jobs.cancel(claimed['id'])   # the CLI and desktop cancel accept any job ID
+    store.pause(run)
+    with pytest.raises(ValueError, match=GRAPH_LAUNCH_REFUSED):
+        store.jobs.begin_launch(lease)
+    assert store.return_unlaunched(ctl, lease, reason='paused before launch') == 'CANCELED'
+    assert store.jobs.get(claimed['id'])['status'] == 'CANCELED' and events(store, claimed['id'])[-1] == 'CANCELED'
+    assert node_status(store, run, 'train.1') == 'CANCELED'
+    assert not store.jobs.gpu_locked(lease.resource_id) and store.reserved_budget(run) == 0
+    assert [(row['disposition'], row['counted']) for row in dispositions(store)] == [('returned_unlaunched', 0)]
+    with pytest.raises(ValueError, match='stale attempt lease'):
+        store.jobs.validated_attempt(lease)
+    store.resume(run)
+    assert store.claim_ready(facts, ctl) is None   # never reclaimed, so the engine never runs
+
+
+def test_begin_launch_refuses_a_canceled_graph_job(tmp_path):
+    """I1: the point of no return also honours a job-level cancel of a graph job; legacy jobs are unchanged."""
+    from tuning_factory.jobs import GRAPH_CANCEL_REFUSED
+    assert GRAPH_CANCEL_REFUSED == 'graph job cancel requested; launch refused'
+    w = ledger_world(tmp_path)
+    store = w.store
+    ctl = store.acquire_controller(w.run_id)
+    store.prepare_ready(ctl)
+    claimed = store.claim_ready(w.facts[0], ctl)
+    store.jobs.cancel(claimed['id'])
+    with pytest.raises(ValueError, match=GRAPH_CANCEL_REFUSED):
+        store.jobs.begin_launch(claimed['lease'])
+    assert store.jobs.validated_attempt(claimed['lease'])['launch_started'] == 0
+    assert store.return_unlaunched(ctl, claimed['lease'], reason='job canceled before launch') == 'CANCELED'
+    queued(store.jobs, 'legacy')
+    legacy = store.jobs.claim('existing_runpod:pod9', max_concurrent=8)
+    store.jobs.cancel(legacy['id'])   # a legacy job keeps its pre-Task-8 launch semantics
+    assert store.jobs.begin_launch(legacy['lease']) == legacy['launch_id']
+
+
+@pytest.mark.parametrize('malformed', ['no_resources', 'invalid_facts'])
+def test_migration_reserves_an_unpriceable_attempt_without_failing_the_store(tmp_path, malformed):
+    """M1: one manifest the backfill cannot price must not stop the state directory from opening; it reserves its
+    run's whole approved total (blocking only that run's further GPU claims) and names the reason."""
+    from tuning_factory.graph_planner import ApprovalGrant
+    from tuning_factory.graph_store import UNPRICED_ATTEMPT, GraphStore
+    from tuning_factory.registry import canonical, digest
+    registry, plan, (first, second) = ledger_plan(tmp_path, ('pod1', 'pod2'), max_concurrent=2, simulation=False)
+    resources = {'facts': first.model_dump(mode='json'), 'timeout_seconds': 1800}
+    if malformed == 'invalid_facts':
+        resources['facts']['gpu_count'] = 0
+    operation = {'kind': 'train', 'id': 'train.1'} | ({} if malformed == 'no_resources' else {'resources': resources})
+    good = {'schema_version': 2, 'operation': {'kind': 'train', 'id': 'train.2', 'resources': {
+        'facts': second.model_dump(mode='json'), 'timeout_seconds': 1800}}}
+    manifests = [canonical({**body, 'sha256': digest(canonical(body))}).decode()
+                 for body in ({'schema_version': 2, 'operation': operation}, good)]
+    path = tmp_path / 'state' / 'jobs.db'
+    path.parent.mkdir()
+    approval = ApprovalGrant.for_plan(plan).model_dump_json()
+    with closing(sqlite3.connect(path)) as db, db:
+        db.executescript(HEAD_DDL)
+        for run, request in (('run1', 'request-1'), ('run2', 'request-2')):
+            db.execute('INSERT INTO graph_runs VALUES (?,?,?,?,?,?)',
+                       (run, request, plan.model_dump_json(), approval, 'RUNNING', 1.0))
+        db.executemany('INSERT INTO nodes VALUES (?,?,?,?,?,?)', [
+            ('run1', 'train.1', 'RUNNING', 'job1', manifests[0], None), ('run1', 'train.2', 'PENDING', None, None, None),
+            ('run2', 'train.2', 'RUNNING', 'job2', manifests[1], None), ('run2', 'train.1', 'PENDING', None, None, None)])
+        db.executemany('INSERT INTO jobs (id,request_key,manifest,status,priority,attempts,cancel_requested,error,'
+                       'run_id,created,updated,graph_run_id,graph_node_id,active_attempt_id) '
+                       'VALUES (?,?,?,?,0,1,0,NULL,NULL,1,2,?,?,?)', [
+                           ('job1', 'graph:run1:train.1', manifests[0], 'FAILED', 'run1', 'train.1', 'att1'),
+                           ('job2', 'graph:run2:train.2', manifests[1], 'FAILED', 'run2', 'train.2', 'att2')])
+        db.executemany('INSERT INTO job_attempts VALUES (?,?,?,?,?,?,0,?)', [
+            ('att1', 'job1', 'token1', 'existing_runpod:pod1', 'launch1', 1, 1.0),
+            ('att2', 'job2', 'token2', 'existing_runpod:pod2', 'launch2', 1, 2.0)])
+    store = GraphStore(path, registry=registry)   # opens: the migration does not roll back
+    assert {row['attempt_id']: row['max_cost_usd'] for row in reservations(store)} == {
+        'att1': plan.max_estimated_cost_usd, 'att2': 4.0}
+    assert node_status(store, 'run1', 'train.1') == 'RUNNING'
+    reason = next(node['wait_reason'] for node in store.get_run('run1')['nodes'] if node['node_id'] == 'train.1')
+    assert reason == UNPRICED_ATTEMPT
+    assert all(node['wait_reason'] is None for node in store.get_run('run2')['nodes'])
+    GraphStore(path, registry=registry)   # a second open changes nothing and still succeeds
+    assert len(reservations(store)) == 2
+    ctl = store.acquire_controller('run1')
+    store.prepare_ready(ctl)
+    assert store.claim_ready(second, ctl) is None   # run1's budget is held whole: no further GPU claim
+    store.pause('run1')
+    store.cancel('run1')   # the run can still be paused and canceled
+    assert store.get_run('run1')['status'] == 'CANCELED'
+    ctl2 = store.acquire_controller('run2')
+    store.prepare_ready(ctl2)
+    assert store.claim_ready(first, ctl2) is not None   # other runs are unaffected

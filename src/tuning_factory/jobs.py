@@ -12,6 +12,7 @@ ACTIVE = {'PROVISIONING', 'RUNNING', 'EVALUATING'}
 # simulated attempts. They never quarantine a hardware claim, and they block only an identical lock name.
 NON_HARDWARE = ('local:', 'simulation:')
 GRAPH_LAUNCH_REFUSED = 'graph run is not running; launch refused'
+GRAPH_CANCEL_REFUSED = 'graph job cancel requested; launch refused'
 RECEIPT_CHUNK = 500  # Stay far below SQLite's variable limit.
 TERMINAL = {'FAILED', 'CANCELED', 'COMPLETED'}
 TRANSITIONS = {
@@ -460,6 +461,8 @@ class JobStore:
                 run = db.execute('SELECT status FROM graph_runs WHERE id=?', (row['graph_run_id'],)).fetchone()
                 if run is None or run['status'] != 'RUNNING':
                     raise ValueError(GRAPH_LAUNCH_REFUSED)
+                if row['cancel_requested']:   # a job-level cancel (CLI/desktop) also wins before the launch
+                    raise ValueError(GRAPH_CANCEL_REFUSED)
             db.execute('UPDATE job_attempts SET launch_started=1 WHERE attempt_id=?', (lease.attempt_id,))
             return row['launch_id']
 
