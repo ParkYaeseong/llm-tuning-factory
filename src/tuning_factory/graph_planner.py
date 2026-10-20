@@ -63,7 +63,7 @@ from .projects import DatasetRef, LocalId, ProjectSpec, Revision, Sha256
 from .recipes import RecipeSpec, recipe_training_options
 from .registry import Registry, canonical, digest
 from .runtime_profiles import engine_profile
-from .training import PPO_CONTINUATION, requires_frozen_reference
+from .training import OFT_UNFREEZABLE, PPO_CONTINUATION, requires_frozen_reference
 
 
 class DatasetSnapshot(StrictModel):
@@ -332,6 +332,8 @@ def _definition_issues(project, graph, recipes, datasets):
             continue
         try:
             recipe = _recipe(node, by_recipe)
+            if recipe.training_method == "oft":   # every graph training output is frozen
+                raise ValueError(OFT_UNFREEZABLE)
             binding = bindings[node.dataset_binding]
             if binding.role != "train":
                 raise ValueError("training requires a train dataset binding")

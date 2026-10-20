@@ -59,7 +59,7 @@ from .operation_runner import (
 )
 from .operations import EvaluateOperation, TrainOperation
 from .registry import canonical, digest
-from .training import CanceledError, LlamaFactoryBackend
+from .training import OFT_UNFREEZABLE, CanceledError, LlamaFactoryBackend
 from .worker_protocol import COMMAND, OperationResult, WorkerRequest
 
 REMOTE_ATTEMPT = "remote-attempt.json"
@@ -118,8 +118,11 @@ class OperationAttemptRunner:
         return self._launch(job, manifest, operation, lease, launch_id, executor)
 
     def reconcile(self, job_id: str, executor) -> OperationOutcome | None:
-        """Finish a FAILED (uncertain) or crashed attempt from its one launch; never launches.
+        """Finish an uncertain or crashed attempt from its one launch; never launches.
 
+        Only an attempt that still holds its lock is eligible: a FAILED attempt kept uncertain, a crashed one that
+        ``JobStore.recover`` marked FAILED, or a COMPLETED one whose release a crash interrupted. An attempt whose
+        lock is released is final and is never reopened (``outputs_for`` rebuilds a completed one's outputs).
         None: no remote result yet, or no proof whether the launch reached the host (the lock stays held
         until a result appears or an operator confirms that execution stopped).
         """
@@ -129,6 +132,9 @@ class OperationAttemptRunner:
             raise ValueError("recover stale active attempts before reconciling; only FAILED or COMPLETED attempts "
                              "are eligible")
         lease = self.jobs.current_lease(job_id)
+        if not self._holds_lock(lease):
+            raise ValueError("attempt is final: its lock is released, so reconcile never reopens it; use outputs_for "
+                             "to rebuild a completed attempt's outputs")
         if job["status"] == "COMPLETED":
             outcome = self.outputs_for(job_id)
             self.jobs.release_gpu(lease, execution_stopped=True)   # idempotent; a crash may have kept it
@@ -143,12 +149,13 @@ class OperationAttemptRunner:
         launch = self._launch_dir(job_id, attempt["launch_id"])
         if not (launch / COMMAND).is_file() or not (launch / REMOTE_ATTEMPT).is_file():
             return None
-        request = WorkerRequest.model_validate_json((launch / COMMAND).read_bytes())
+        operation = validated_operation(manifest["operation"])
+        # From the ledger, never from local files: the executor refuses a command.json that differs from it.
+        request = self._request(lease.attempt_id, attempt["launch_id"], manifest, operation)
         raw = executor.collect_operation_result(self._job_dir(job_id), launch, request)
         if raw is None:
             return None
         result = self._accept(raw, request, launch)
-        operation = validated_operation(manifest["operation"])
         status, error, outputs, targets = result.status, result.error, None, ()
         if status == "COMPLETED":
             try:
@@ -235,15 +242,19 @@ class OperationAttemptRunner:
         evidence, producers = self._continuation_evidence(job, operation)
         resolved = stage_model_inputs(operation, self.graph.artifacts, launch, target_evidence=evidence,
                                       producers=producers)
-        request = WorkerRequest(attempt_id=lease.attempt_id, launch_id=launch.name,
-                                manifest_sha256=manifest["sha256"],
-                                operation_sha256=digest(canonical(manifest["operation"])),
-                                timeout_seconds=operation.resources.timeout_seconds)
+        request = self._request(lease.attempt_id, launch.name, manifest, operation)
         (launch / COMMAND).write_bytes(canonical(request.model_dump(mode="json")))
         store = self.graph.artifacts.root
         transfers = tuple(CachedTransfer(ref=ref, local_location=store / ref.artifact_id / ref.inventory_sha256)
                           for ref in resolved.transfers)
         return request, transfers
+
+    @staticmethod
+    def _request(attempt_id: str, launch_id: str, manifest: dict, operation) -> WorkerRequest:
+        """The attempt's ``WorkerRequest``, derived only from the ledger: attempt, launch and manifest."""
+        return WorkerRequest(attempt_id=attempt_id, launch_id=launch_id, manifest_sha256=manifest["sha256"],
+                             operation_sha256=digest(canonical(manifest["operation"])),
+                             timeout_seconds=operation.resources.timeout_seconds)
 
     def _continuation_evidence(self, job, operation):
         """Inspected targets and producer stages for an adapter continuation, from the resolver compile used."""
@@ -282,6 +293,8 @@ class OperationAttemptRunner:
             raise ValueError("manifest operation is not in its resolved form")
         if operation.lineage.simulation:
             raise ValueError("simulation manifest cannot authorize GPU execution")
+        if isinstance(operation, TrainOperation) and operation.config.training_method == "oft":
+            raise ValueError(OFT_UNFREEZABLE)   # for plans approved before planning refused it
         if manifest.get("source_sha256") != source_hash():
             raise ValueError("source hash differs from immutable manifest; submit a new job")
         if getattr(executor, "recovery_only", False):
@@ -395,6 +408,14 @@ class OperationAttemptRunner:
     def _attempt(self, lease: AttemptLease) -> dict:
         with self.jobs.connection() as db:
             return dict(self.jobs._validate_lease(db, lease))
+
+    def _holds_lock(self, lease: AttemptLease) -> bool:
+        """Whether this attempt still holds its resource lease (JobStore has no public query for it yet)."""
+        with self.jobs.connection() as db:
+            self.jobs._validate_lease(db, lease)
+            row = db.execute("SELECT 1 FROM resource_leases WHERE job_id=? AND attempt_id=? AND resource_id=?",
+                             (lease.job_id, lease.attempt_id, lease.resource_id)).fetchone()
+        return row is not None
 
     def _heartbeat(self, lease: AttemptLease) -> threading.Event:
         stop = threading.Event()

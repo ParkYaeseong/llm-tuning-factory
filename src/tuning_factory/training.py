@@ -26,6 +26,8 @@ ROLE_SLOTS = MappingProxyType({
     "reward_base": "reward_model", "reward_adapter": "reward_model"})
 PPO_CONTINUATION = ("PPO adapter continuation is unsupported: its KL reference would revert to the base; "
                     "materialize the parent first")
+# Every graph training output is frozen as a typed artifact, and OFT exports have no typed adapter contract.
+OFT_UNFREEZABLE = "OFT training is unsupported in graphs: its output cannot be frozen as a typed model artifact"
 
 
 def requires_frozen_reference(config) -> bool:

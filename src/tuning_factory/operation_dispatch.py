@@ -188,7 +188,7 @@ def _write_base_snapshot(directory: Path, base: Path) -> list[str]:
     return names
 
 
-def _inspects_full_output(operation, profile: dict) -> bool:
+def inspects_full_output(operation, profile: dict) -> bool:
     # The inspector needs the pinned model-operation libraries, which only the primary runtime has.
     return isinstance(operation, MaterializeOperation) or (
         isinstance(operation, TrainOperation) and operation.config.training_method in {"full", "freeze"}
@@ -230,7 +230,7 @@ def _execute_train(operation: TrainOperation, directory: Path, budget: _Budget, 
     backend.validate_training_result(directory, config)
     names = ["train.yaml", "train.bound.yaml", MODEL_BINDING, "binding-evidence.json", PREFLIGHT,
              *_write_base_snapshot(directory, verified.path("policy_base"))]
-    if _inspects_full_output(operation, profile):
+    if inspects_full_output(operation, profile):
         _write_target_inventory(directory, directory / "output", ops)
         names.append(TARGET_INVENTORY)
     return names
@@ -353,7 +353,7 @@ def execute_operation(operation, directory: Path, timeout: float, canceled: Call
     caches = (_absolute_root(model_cache, "FACTORY_MODEL_CACHE"), _absolute_root(hf_home, "HF_HOME"))
     roots = tuple(root for root in caches if root is not None)
     profile = operation_profile(operation.kind, operation.resources.runtime.profile)
-    if "model_ops_pins" in profile or _inspects_full_output(operation, profile):
+    if "model_ops_pins" in profile or inspects_full_output(operation, profile):
         drift = model_ops_pin_drift()   # before any work, without importing torch
         if drift:
             raise ValueError(f"{MODEL_OPS_RUNTIME}: {', '.join(drift)}")

@@ -37,13 +37,14 @@ from tuning_factory.graph_planner import (
     snapshot_artifact,
     snapshot_dataset,
 )
-from tuning_factory.graph_schema import GraphSpec
+from tuning_factory.graph_schema import GraphSpec, validate_graph
 from tuning_factory.graph_store import GraphStore
+from tuning_factory.jobs import AttemptLease
 from tuning_factory.model_artifacts import ModelInput, ModelLoadRef
 from tuning_factory.projects import DatasetBinding, DatasetRef, ProjectSpec, Revision
 from tuning_factory.recipes import RecipeSpec
 from tuning_factory.registry import canonical, digest
-from tuning_factory.training import LlamaFactoryBackend
+from tuning_factory.training import OFT_UNFREEZABLE, LlamaFactoryBackend
 
 
 def api():
@@ -76,8 +77,28 @@ TRAIN_ROWS = [{"instruction": "train question", "output": "train answer"}]
 HELD_ROWS = [{"instruction": "held-out first", "output": "positive"},
              {"instruction": "held-out second", "output": "negative"}]
 PREDICTIONS = ("negative", "negative")   # the engine's generations for row:1 and row:0, in benchmark order
-# LLaMA-Factory re-saves the tokenizer: other bytes, the same vocabulary.
-ENGINE_TOKENIZER = {"tokenizer.json": b'{"version": "1.0"}', "tokenizer_config.json": b'{"model_max_length": 64}'}
+BASE_TOKENIZER = {name: json.loads(data) for name, data in inputs.TOKENIZER.items()}
+# LLaMA-Factory re-saves the tokenizer: other bytes and a pad-token assignment, the same vocabulary and special ids.
+ENGINE_TOKENIZER = {
+    "tokenizer.json": json.dumps(BASE_TOKENIZER["tokenizer.json"], indent=2).encode("utf-8"),
+    "tokenizer_config.json": json.dumps({**BASE_TOKENIZER["tokenizer_config.json"], "model_max_length": 64,
+                                         "pad_token": "<unk>", "padding_side": "right"}, indent=2).encode("utf-8"),
+}
+
+
+def changed_tokenizer(case):
+    """The engine tokenizer of one vocabulary change (the base vocabulary is TOKENIZER's)."""
+    tokenizer, config = json.loads(json.dumps(BASE_TOKENIZER["tokenizer.json"])), dict(
+        BASE_TOKENIZER["tokenizer_config.json"])
+    if case == "added_token":
+        tokenizer["added_tokens"].append({"id": 3, "content": "<|new|>", "special": True})
+    elif case == "renumbered":
+        tokenizer["model"]["vocab"] = {"<unk>": 0, "q": 2, "v": 1}
+    elif case == "grown":
+        tokenizer["model"]["vocab"]["w"] = 3
+    elif case == "special_id":
+        config["added_tokens_decoder"] = {"1": {"content": "<unk>", "special": True}}
+    return {"tokenizer.json": canonical(tokenizer), "tokenizer_config.json": canonical(config)}
 ARTIFACT_FILES = ["adapter_config.json", "adapter_model.safetensors", "config.json", "tokenizer.json",
                   "tokenizer_config.json"]
 
@@ -220,6 +241,10 @@ NODES = {
         policy=ModelLoadRef(base=r.base, adapter=r.first), initialization="continue_adapter"), r.profile),
     "full_train": lambda r: train_node("full_train", r.full_recipe, ModelInput(
         policy=ModelLoadRef(base=r.base), initialization="full_weights"), r.profile),
+    "train_hf": lambda r: train_node("train_hf", r.recipe, ModelInput(policy=ModelLoadRef(base=inputs.ROOT),
+                                                                      initialization="new_adapter"), r.profile),
+    "oft_train": lambda r: train_node("oft_train", r.oft_recipe, ModelInput(
+        policy=ModelLoadRef(base=r.base), initialization="new_adapter"), r.profile),
     "eval": lambda r: {"kind": "evaluate", "id": "eval", "label": "Evaluate", "model": r.first.model_dump(mode="json"),
                        "benchmark_revision": r.benchmark.fingerprint(), "executor_profile_ids": [r.profile]},
     "select": lambda r: {"kind": "select", "id": "select", "label": "Select",
@@ -233,7 +258,8 @@ NODES = {
 }
 
 
-def build_graph(tmp_path, kinds, *, simulation=False, export_allowed=True, executor=EXECUTOR, facts=FACTS):
+def graph_definition(tmp_path, kinds, *, export_allowed=True, executor=EXECUTOR):
+    """A project revision and execution choices over frozen base/adapter artifacts in the GraphStore's store."""
     store = GraphStore(tmp_path / "state" / "jobs.db")
     registry, models = store.registry, store.artifacts
     base = models.freeze(*inputs.full_model(tmp_path, "base"))
@@ -244,20 +270,21 @@ def build_graph(tmp_path, kinds, *, simulation=False, export_allowed=True, execu
     recipe = revision(RecipeSpec(recipe_id="r", name="recipe",
                                  hyperparameters={"lora_rank": 2, "lora_target": "q_proj,v_proj"}))
     full_recipe = revision(RecipeSpec(recipe_id="full", name="full", training_method="full"))
+    oft_recipe = revision(RecipeSpec(recipe_id="oft", name="oft", training_method="oft"))
     benchmark = BenchmarkSpec(dataset=held, evaluator_kind="classification", evaluator_version="1",
                               ordered_sample_ids=("row:1", "row:0"), max_new_tokens=8, cutoff_len=64, seed=1,
                               precision="bf16", quantization_bit=None,
                               tokenizer_fingerprint=inputs.ROOT.tokenizer_fingerprint, template="qwen",
                               semantic_model_kind="causal_lm")
     refs = SimpleNamespace(base=base, first=first, second=second, recipe=recipe, full_recipe=full_recipe,
-                           benchmark=benchmark, profile=executor.profile_id)
+                           oft_recipe=oft_recipe, benchmark=benchmark, profile=executor.profile_id)
     graph = GraphSpec.model_validate({"nodes": [NODES[kind](refs) for kind in kinds]})
     project = revision(ProjectSpec(project_id="project.1", name="Project", datasets=(
         DatasetBinding(binding_id="data", role="train", dataset=data),
         DatasetBinding(binding_id="held", role="validation", dataset=held)), graph=graph.model_dump(mode="json")))
     producers = tuple(producer(ref, marker) for marker, ref in (("base", base), ("first", first), ("second", second)))
     choices = ExecutionChoices(
-        recipes=(recipe, full_recipe),
+        recipes=(recipe, full_recipe, oft_recipe),
         benchmarks=(BenchmarkRevision(spec=benchmark, revision_sha256=benchmark.fingerprint()),),
         datasets=(snapshot_dataset(registry, data), snapshot_dataset(registry, held)),
         models=(ModelContext(root=inputs.ROOT, profile=inputs.PROFILE),),
@@ -265,7 +292,13 @@ def build_graph(tmp_path, kinds, *, simulation=False, export_allowed=True, execu
         node_resources=tuple(NodeResources(node_id=node.id, timeout_seconds=900) for node in graph.nodes
                              if node.kind != "select"),
         base_targets=(inputs.evidence(base),), tracking_destination=TRACKING)
-    plan = plan_graph(project, choices, (facts,), simulation=simulation)
+    return SimpleNamespace(store=store, project=project, choices=choices, refs=refs, producers=producers)
+
+
+def build_graph(tmp_path, kinds, *, simulation=False, export_allowed=True, executor=EXECUTOR, facts=FACTS):
+    definition = graph_definition(tmp_path, kinds, export_allowed=export_allowed, executor=executor)
+    store, refs, producers = definition.store, definition.refs, definition.producers
+    plan = plan_graph(definition.project, definition.choices, (facts,), simulation=simulation)
     run = store.submit(plan, "run", ApprovalGrant.for_plan(plan))
     ctl = store.acquire_controller(run["id"], ttl_seconds=3600)
     store.prepare_ready(ctl)
@@ -328,6 +361,25 @@ def held_locks(w):
     return w.store.jobs.gpu_locked(w.lease.resource_id)
 
 
+def forge_manifest(w, mutate):
+    """Re-sign the job's ledger manifest after ``mutate``: it passes verify_manifest but breaks another rule."""
+    body = {key: value for key, value in w.store.jobs.get(w.job_id)["manifest"].items() if key != "sha256"}
+    mutate(body)
+    body["sha256"] = digest(canonical(body))
+    with w.store.jobs.connection() as db:
+        db.execute("UPDATE jobs SET manifest=? WHERE id=?", (canonical(body).decode(), w.job_id))
+
+
+def move_attempt(w, resource):
+    """Rebind the claimed attempt and its lock to another resource; returns a valid lease for it."""
+    lease = w.lease
+    with w.store.jobs.connection() as db:
+        db.execute("UPDATE job_attempts SET resource_id=? WHERE attempt_id=?", (resource, lease.attempt_id))
+        db.execute("UPDATE gpu_locks SET gpu=? WHERE job_id=?", (resource, lease.job_id))
+        db.execute("UPDATE resource_leases SET resource_id=? WHERE attempt_id=?", (resource, lease.attempt_id))
+    return AttemptLease(lease.job_id, lease.attempt_id, lease.lease_token, resource)
+
+
 def recording_executor(calls, **changes):
     class Recording(SSHExecutor):
         def run_operation(self, *args, **kwargs):
@@ -349,15 +401,25 @@ def recording_executor(calls, **changes):
     ("other_price", "price"),
     ("recovery_only", "recovery-only executor cannot launch"),
     ("local_executor", "remote executor"),
+    ("cacheless_executor", "configured remote model cache"),
     ("export_refused", "dataset export has not been authorized"),
+    ("dataset_changed", "dataset registration differs from manifest"),
+    ("dataset_missing", "manifest datasets differ from the operation"),
+    ("source_hash", "source hash differs from immutable manifest"),
+    ("resolved_form", "manifest operation is not in its resolved form"),
+    ("other_resources", "operation resources differ from the approved plan"),
+    ("destination_revision", "operation destination is not an approved destination revision"),
+    ("resource_mismatch", "attempt resource differs from the operation's pinned destination"),
     ("forged_launch", "launch identity"),
 ])
 def test_runner_refuses_select_simulation_unapproved_or_other_destination(tmp_path, monkeypatch, case, message):
+    from tuning_factory import attempt_runner
     options = {"simulation": case == "simulation", "export_allowed": case != "export_refused"}
-    w = world(tmp_path, monkeypatch, graph_options=options)
+    merge_cases = {"resolved_form", "other_resources"}   # an operation without a training config to keep valid
+    w = world(tmp_path, monkeypatch, ("merge",) if case in merge_cases else ("train",), graph_options=options)
     executor_calls = []
     executor = recording_executor(executor_calls)
-    approval, claimed = w.approval, w.claimed
+    approval, claimed, lease = w.approval, w.claimed, w.lease
     if case == "unapproved":
         approval = approval.model_copy(update={"plan_sha256": "0" * 64})
     elif case == "untyped_approval":
@@ -370,6 +432,23 @@ def test_runner_refuses_select_simulation_unapproved_or_other_destination(tmp_pa
         executor.recovery_only = True
     elif case == "local_executor":
         executor = LocalExecutor()
+    elif case == "cacheless_executor":
+        executor = recording_executor(executor_calls, model_cache_root=None)
+    elif case == "dataset_changed":
+        forge_manifest(w, lambda body: body["datasets"][0].update(synthetic=True))
+    elif case == "dataset_missing":
+        forge_manifest(w, lambda body: body.update(datasets=[]))
+    elif case == "source_hash":
+        monkeypatch.setattr(attempt_runner, "source_hash", lambda: "0" * 64)
+    elif case == "resolved_form":
+        forge_manifest(w, lambda body: body["operation"].pop("method"))   # a default the model fills back in
+    elif case == "other_resources":
+        forge_manifest(w, lambda body: body["operation"]["resources"].update(timeout_seconds=901))
+    elif case == "destination_revision":
+        monkeypatch.setattr(attempt_runner, "approval_destination", lambda profile: {"profile_id": "unapproved"})
+    elif case == "resource_mismatch":
+        lease = move_attempt(w, "existing_runpod:pod9")
+        claimed = {**claimed, "lease": lease}
     elif case == "forged_launch":
         claimed = {**claimed, "launch_id": "f" * 32}
     outcome = w.runner.run_claimed(claimed, executor, approval=approval)
@@ -379,7 +458,7 @@ def test_runner_refuses_select_simulation_unapproved_or_other_destination(tmp_pa
     job = w.store.jobs.get(w.job_id)
     assert job["status"] == "FAILED" and message in job["error"]
     assert message in (w.state / "jobs" / w.job_id / "error.txt").read_text(encoding="utf-8")
-    assert not held_locks(w)   # abandon_unlaunched: nothing launched, so the lock is free
+    assert not w.store.jobs.gpu_locked(lease.resource_id)   # abandon_unlaunched: nothing launched, lock freed
     assert not (w.state / "jobs" / w.job_id / "launches").exists()
 
 
@@ -412,6 +491,33 @@ def test_runner_refuses_a_local_selection_before_any_executor_call(tmp_path, mon
     assert "local selection never dispatches to a GPU worker" in outcome.error and executor_calls == []
     assert store.jobs.get(claimed["id"])["status"] == "FAILED"
     assert not store.jobs.gpu_locked(claimed["lease"].resource_id)
+    error = (tmp_path / "state" / "jobs" / claimed["id"] / "error.txt").read_text(encoding="utf-8")
+    assert "local selection never dispatches to a GPU worker" in error
+
+
+def test_planning_refuses_an_oft_train_node_whose_output_must_be_frozen(tmp_path):
+    definition = graph_definition(tmp_path, ("oft_train",))
+    issues = validate_graph(definition.project.spec, definition.choices.recipes, definition.store.registry)
+    assert [issue.message for issue in issues if issue.node_id == "oft_train"] == [OFT_UNFREEZABLE]
+    with pytest.raises(ValueError, match="OFT training is unsupported"):
+        plan_graph(definition.project, definition.choices, (FACTS,), simulation=False)
+
+
+def test_runner_refuses_oft_training_before_launch(tmp_path, monkeypatch):
+    from tuning_factory import graph_planner
+    original = graph_planner._definition_issues
+
+    def before_the_rule(*args):   # a plan approved before planning refused OFT train nodes
+        return [issue for issue in original(*args) if issue.message != OFT_UNFREEZABLE]
+
+    monkeypatch.setattr(graph_planner, "_definition_issues", before_the_rule)
+    w = world(tmp_path, monkeypatch, ("oft_train",))
+    assert w.claimed["manifest"]["operation"]["config"]["training_method"] == "oft"
+    outcome = run(w)
+    assert (outcome.status, outcome.uncertain, outcome.outputs) == ("FAILED", False, None)
+    assert OFT_UNFREEZABLE in outcome.error
+    assert w.host.commands == [] and w.calls == [] and not held_locks(w)   # never launched on the GPU host
+    assert not (w.state / "jobs" / w.job_id / "launches").exists()
 
 
 # -- 2. persisted launch identity ----------------------------------------------------------------
@@ -459,6 +565,36 @@ def test_lost_start_response_never_trains_twice(tmp_path, monkeypatch):
     descriptor = w.store.artifacts.verify(outcome.outputs.model.model)
     assert descriptor.producer_attempt_id == w.lease.attempt_id
     w.store.record_outputs(taken["lease"], outcome.outputs)
+
+
+def test_reconcile_rebuilds_the_request_from_the_ledger(tmp_path, monkeypatch):
+    from tuning_factory.worker_protocol import WorkerRequest
+    w = world(tmp_path, monkeypatch)
+    w.host.mode = "lose_start_response"
+    assert run(w).uncertain
+    w.host.finish()
+    command = launch_dir(w) / "command.json"
+    original = command.read_bytes()
+    forged = WorkerRequest.model_validate_json(original).model_copy(update={"timeout_seconds": 60})
+    command.write_bytes(canonical(forged.model_dump(mode="json")))   # a local file must not redefine the attempt
+    with pytest.raises(ValueError, match="command.json differs from the worker request"):
+        w.runner.reconcile(w.job_id, w.executor)
+    assert w.store.jobs.get(w.job_id)["status"] == "FAILED" and held_locks(w)
+    command.write_bytes(original)
+    assert w.runner.reconcile(w.job_id, w.executor).status == "COMPLETED"
+    assert w.calls == ["train.bound.yaml"] and len(w.host.launches) == 1
+
+
+@pytest.mark.parametrize("engine", [{"fail": "engine exited with status 1"},
+                                    {"tokenizer": changed_tokenizer("added_token")}])
+def test_reconcile_never_reopens_a_final_attempt(tmp_path, monkeypatch, engine):
+    w = world(tmp_path, monkeypatch, **engine)
+    before = artifact_entries(w.store)
+    outcome = run(w)
+    assert (outcome.status, outcome.uncertain) == ("FAILED", False) and not held_locks(w)
+    with pytest.raises(ValueError, match="attempt is final"):
+        w.runner.reconcile(w.job_id, w.executor)   # even though the remote result may say COMPLETED
+    assert w.store.jobs.get(w.job_id)["status"] == "FAILED" and artifact_entries(w.store) == before
 
 
 # -- 4. foreign results are never frozen ---------------------------------------------------------
@@ -538,6 +674,25 @@ def test_train_output_frozen_with_effective_base_lineage_and_base_tokenizer(tmp_
     assert w.calls == ["train.bound.yaml"]
 
 
+def test_train_on_an_hf_root_base_freezes_the_worker_verified_snapshot_bytes(tmp_path, monkeypatch):
+    hub = inputs.fake_hub(monkeypatch, inputs.tiny_snapshot)   # the GPU host downloads the root, as in v1
+    w = world(tmp_path, monkeypatch, ("train_hf",))
+    outcome = run(w)
+    assert outcome.status == "COMPLETED", outcome.error
+    assert [(call["repo_id"], call["revision"]) for call in hub] == [(inputs.ROOT.repo_id, inputs.ROOT.revision)]
+    ref = outcome.outputs.model.model
+    descriptor = w.store.artifacts.verify(ref)
+    assert (descriptor.root, descriptor.effective_base, descriptor.parents) == (inputs.ROOT, inputs.ROOT, ())
+    files = w.store.artifacts.path(ref)
+    assert sorted(path.name for path in files.rglob("*")) == ARTIFACT_FILES
+    assert (files / "config.json").read_bytes() == inputs.CONFIG   # from base-snapshot/, checked against ROOT
+    for name, data in inputs.TOKENIZER.items():
+        assert (files / name).read_bytes() == data
+    result = json.loads((launch_dir(w).parent / (w.claimed["launch_id"] + ".result.json")).read_bytes())
+    assert {"base-snapshot/config.json", "base-snapshot/tokenizer.json"} <= set(result["evidence"])
+    w.store.record_outputs(w.lease, outcome.outputs)
+
+
 def test_continuation_stages_inspected_targets_and_records_both_parents(tmp_path, monkeypatch):
     w = world(tmp_path, monkeypatch, ("continue",))
     outcome = run(w)
@@ -569,16 +724,44 @@ def test_full_training_output_binds_verified_target_inventory(tmp_path, monkeypa
     assert targets.base == ref and verify_inspected_targets(targets, descriptor, ref) == targets
 
 
-def test_engine_tokenizer_vocab_change_refuses_output(tmp_path, monkeypatch):
-    grown = {"tokenizer.json": canonical({"version": "1.0", "added_tokens": [
-        {"id": 32, "content": "<|new|>", "special": True}]}), "tokenizer_config.json": b"{}"}
-    w = world(tmp_path, monkeypatch, tokenizer=grown)
+@pytest.mark.parametrize("case", ["added_token", "renumbered", "grown", "special_id"])
+def test_engine_tokenizer_vocab_change_refuses_output(tmp_path, monkeypatch, case):
+    w = world(tmp_path, monkeypatch, tokenizer=changed_tokenizer(case))
     before = artifact_entries(w.store)
     outcome = run(w)
     assert (outcome.status, outcome.uncertain, outcome.outputs) == ("FAILED", False, None)
     assert "engine tokenizer output changes the vocabulary; refusing artifact" in outcome.error
     assert artifact_entries(w.store) == before
     assert w.store.jobs.get(w.job_id)["status"] == "FAILED" and not held_locks(w)
+
+
+def test_full_training_output_without_target_inventory_is_refused(tmp_path, monkeypatch):
+    w = world(tmp_path, monkeypatch, ("full_train",), method="full")
+    before = artifact_entries(w.store)
+
+    def drop_inventory(directory):   # a worker result that lacks the inventory the primary runtime must write
+        (directory / "target-inventory.json").unlink()
+        for name, key in (("artifacts.json", None), ("result.json", "evidence")):
+            data = json.loads((directory / name).read_bytes())
+            (data[key] if key else data).pop("target-inventory.json")
+            (directory / name).write_bytes(canonical(data))
+
+    w.host.after_worker = drop_inventory
+    outcome = run(w)
+    assert (outcome.status, outcome.uncertain, outcome.outputs) == ("FAILED", False, None)
+    assert "requires its inspected target inventory" in outcome.error
+    assert artifact_entries(w.store) == before and not held_locks(w)
+
+
+def test_engine_tokenizer_check_compares_real_vocabulary_facts(tmp_path):
+    for name, files in (("base", inputs.TOKENIZER), ("engine", ENGINE_TOKENIZER)):
+        (tmp_path / name).mkdir()
+        for file, data in files.items():
+            (tmp_path / name / file).write_bytes(data)
+    original, resaved = (outputs_api().vocabulary(tmp_path / name) for name in ("base", "engine"))
+    assert original == resaved   # other bytes and a pad-token assignment: the same ids
+    assert original["tokenizer.json"] == {"vocab": {"<unk>": 0, "q": 1, "v": 2}, "added": [(0, "<unk>", True)]}
+    assert original["tokenizer_config.json"] == [("0", "<unk>", True)]
 
 
 def test_remote_failure_is_final_and_releases_the_lock(tmp_path, monkeypatch):
@@ -757,7 +940,12 @@ def test_outputs_rebuild_is_idempotent_after_crash(tmp_path, monkeypatch, point)
     with pytest.raises(Crash):
         run(w)
     jobs.recover(stale_after_seconds=-1)   # the restarted controller finds a stale heartbeat
-    outcome = w.runner.reconcile(w.job_id, w.executor)
+    if point == "after_release":   # nothing to reconcile: the attempt is final, its outputs are rebuilt
+        with pytest.raises(ValueError, match="attempt is final"):
+            w.runner.reconcile(w.job_id, w.executor)
+        outcome = w.runner.outputs_for(w.job_id)
+    else:
+        outcome = w.runner.reconcile(w.job_id, w.executor)
     assert (outcome.status, outcome.uncertain) == ("COMPLETED", False)
     assert w.calls == ["train.bound.yaml"] and len(w.host.launches) == 1   # never trained or launched again
     assert jobs.get(w.job_id)["status"] == "COMPLETED" and not held_locks(w)
@@ -771,6 +959,46 @@ def test_outputs_rebuild_is_idempotent_after_crash(tmp_path, monkeypatch, point)
     current = jobs.current_lease(w.job_id)
     w.store.record_outputs(current, outcome.outputs)
     w.store.record_outputs(current, rebuilt[1].outputs)   # the same immutable receipt
+
+
+@pytest.mark.parametrize("path", ["completed", "crash_after_result", "lost_start"])
+def test_heartbeats_during_a_slow_run_never_disturb_the_attempt(tmp_path, monkeypatch, path):
+    """Under load a run outlasts the 10 s heartbeat; here heartbeats fire throughout a slowed run (and around a
+    crash or a lost start response) and must change nothing but the attempt's liveness timestamp."""
+    import threading
+    import time
+    w = world(tmp_path, monkeypatch)
+    jobs, beats = w.store.jobs, []
+    original = jobs.heartbeat
+
+    def counted(lease):
+        beats.append(threading.current_thread().name)
+        return original(lease)
+
+    monkeypatch.setattr(jobs, "heartbeat", counted)
+    monkeypatch.setattr(api().OperationAttemptRunner, "heartbeat_seconds", 0.01)
+    w.host.after_worker = lambda directory: time.sleep(0.3)   # a slow worker: many heartbeats during the run
+    if path == "crash_after_result":
+        crash_once(monkeypatch, jobs, "transition", lambda args: args[1] == "EVALUATING", after=False)
+        with pytest.raises(Crash):
+            run(w)
+        jobs.recover(stale_after_seconds=-1)
+        outcome = w.runner.reconcile(w.job_id, w.executor)
+    elif path == "lost_start":
+        w.host.mode = "lose_start_response"
+        assert run(w).uncertain
+        w.host.finish()
+        outcome = w.runner.reconcile(w.job_id, w.executor)
+    else:
+        outcome = run(w)
+    assert (outcome.status, outcome.uncertain) == ("COMPLETED", False), outcome.error
+    assert w.calls == ["train.bound.yaml"] and len(w.host.launches) == 1
+    assert jobs.get(w.job_id)["status"] == "COMPLETED" and not held_locks(w)
+    if path != "lost_start":
+        assert beats and all(name != threading.main_thread().name for name in beats)   # the heartbeat ran
+    settled = len(beats)
+    time.sleep(0.1)
+    assert len(beats) == settled   # every heartbeat thread stopped with its run
 
 
 def test_crash_after_launch_reservation_stays_uncertain_and_never_relaunches(tmp_path, monkeypatch):
@@ -806,6 +1034,8 @@ def test_crash_before_launch_reservation_resumes_or_releases(tmp_path, monkeypat
     released = other.runner.reconcile(other.job_id, other.executor)
     assert (released.status, released.uncertain, released.outputs) == ("FAILED", False, None)
     assert not held_locks(other) and other.host.commands == []
+    with pytest.raises(ValueError, match="attempt is final"):
+        other.runner.reconcile(other.job_id, other.executor)
 
 
 # -- 11. outputs flow into record_outputs --------------------------------------------------------

@@ -747,8 +747,8 @@ Still open for Task 7 GPU work:
 - Real DPO/KTO references and PPO remain unverified.
 
 Task 7.5 (2026-10-20, sub-plan §3 7.5): control-plane attempt runner, verified outputs and F11.
-- New `attempt_runner.py` (420 lines): `OperationAttemptRunner(graph_store, root=)` and `OperationOutcome`. New
-  `operation_outputs.py` (392 lines): output freezing and evaluation records. Neither imports torch; both import no
+- New `attempt_runner.py` (426 lines at `7120193`): `OperationAttemptRunner(graph_store, root=)` and
+  `OperationOutcome`. New `operation_outputs.py` (397 lines): output freezing and evaluation records. Neither imports torch; both import no
   worker module. `run_claimed(claimed, executor, *, approval)` mirrors `Factory.run_claimed`:
   1. Refusals before launch call `abandon_unlaunched` (lock freed, `error.txt`, FAILED outcome) and never reach the
      executor. They cover a non-v2 or non-graph job, a local selection, an unresolved operation, simulation, a changed
@@ -771,7 +771,8 @@ Task 7.5 (2026-10-20, sub-plan §3 7.5): control-plane attempt runner, verified 
      cancellation requested before a late completion wins (v1 semantics), and nothing is frozen.
   5. The destination's model cache is seeded with `publish_cached_artifact(source_remote_dir=<remote launch>/output`
      or `/model-op/output)`. This is best effort, recorded in `launches/<launch_id>.cache-seed.json`, and skipped
-     for recovery executors.
+     for recovery executors. It runs after `release_gpu` and is never retried: a crash before or during it only
+     skips seeding, and a later operation on that host uploads the frozen copy when it needs it.
 - Outputs (`operation_outputs`). The result must be COMPLETED for exactly this launch, attempt, manifest, operation
   and kind (`remote result belongs to a different attempt`), and every evidence file must match.
   - Train: payload allowlist (adapter config/weights, or `config.json` + `model.safetensors` | shards + index, plus
@@ -791,7 +792,8 @@ Task 7.5 (2026-10-20, sub-plan §3 7.5): control-plane attempt runner, verified 
   - Full-model outputs (materialize; full/freeze training in the primary runtime) bind `target-inventory.json` to the
     frozen ref through `verify_inspected_targets`. They return it as `OperationOutcome.inspected_targets`; the
     `NodeOutputs` carry none, because `record_outputs` still refuses them.
-  - OFT outputs are refused at freezing (OFT handoff is unsupported).
+  - OFT training is refused at planning and before launch (7.5 review fixes below); freezing keeps the same
+    refusal as a last guard.
 - Evaluate: predictions only from the worker (`ordered_sample_ids` must equal the benchmark's). References are the
   registered rows' `output` or final assistant turn, in benchmark order; the engine's labels are never used. Metrics
   are `CommonEvaluator().evaluate(..., evaluator_kind)`. The output is `EvaluationRecord(benchmark_sha256 =
@@ -801,23 +803,24 @@ Task 7.5 (2026-10-20, sub-plan §3 7.5): control-plane attempt runner, verified 
   .fingerprint()`. The end-to-end test runs evaluate → `record_outputs` → `acknowledge_tracking` → ledger →
   `compile_node` select → `resolve_local_selection`. It failed at `record_outputs` (`evaluation receipt differs from
   attempt ledger`) before the fix.
-- Recovery: `reconcile(job_id, executor)` never launches.
-  - FAILED: collect the same launch, then `reconcile_result`. It returns None while there is no result, or when the
+- Recovery: `reconcile(job_id, executor)` never launches, and since the review fixes it takes only an attempt that
+  still holds its lock; a released attempt is final.
+  - FAILED and still locked: collect the same launch, then `reconcile_result`. It returns None while there is no result, or when the
     launch was reserved but `remote-attempt.json` was never written (unprovable; operator `release-lock
     --confirm-execution-stopped`). A FAILED attempt whose launch was never reserved is released.
-  - COMPLETED: outputs are rebuilt and a lock still held is released.
+  - COMPLETED and still locked (a crash before `release_gpu`): outputs are rebuilt and the lock is released.
   - `outputs_for(job_id)` rebuilds identical outputs from local files; freezing is content-addressed.
   - Crash tests (a `BaseException` escapes every handler) cover: before `begin_launch` (the same attempt resumes after
     takeover and launches once, or reconcile releases it), after `begin_launch` and before contact (uncertain; never
     relaunched), after the result, after the freeze, after COMPLETED and after the release. Each of the last four
     reconciles to one training call, one launch and one frozen artifact, and `record_outputs` accepts the rebuilt
     outputs twice.
-- Worker (operation_dispatch.py deviation, 20 lines): train writes `base-snapshot/` (the bound policy base's
+- Worker (operation_dispatch.py deviation, 18 net lines, 362 → 380): train writes `base-snapshot/` (the bound policy base's
   `config.json` and tokenizer files, listed in the result evidence). The control plane has no HF root files, so this is
   how an adapter trained on an HF root gets the exact base bytes. The bytes are accepted only if their config hash and
   tokenizer fingerprint equal the base's.
-- Cleanup: graph_planner reuses `training.requires_frozen_reference` (988 lines, from 990). model_ops.py is unchanged
-  (916).
+- Cleanup: graph_planner reuses `training.requires_frozen_reference` (988 lines at `7120193`, from 990; the review
+  fixes' OFT refusal brings it back to 990). model_ops.py is unchanged (916).
 - CPU acceptance gains `freeze_dispatched_outputs`: the real PEFT/transformers merge and materialize outputs freeze
   through `freeze_operation_output`, with inventories equal to their receipts and 14 verified target modules.
 
@@ -856,9 +859,81 @@ Actual verification:
 - No real SSH, GPU, model download or institution data. Every remote action ran on `GPUHost`, which runs the real
   `worker.main_v2` with fixture engines and model operations that write small, well-formed safetensors.
 
+7.5 review fixes (commit `fix: refuse unfreezable OFT before launch and tighten attempt reconciliation`):
+- Important: a terminal OFT train node was planned, launched on the GPU and failed only when its output was frozen
+  (the reviewer's probe: one launch, then FAILED). One message, `training.OFT_UNFREEZABLE` ("OFT training is
+  unsupported in graphs: its output cannot be frozen as a typed model artifact"), now refuses it:
+  - at planning: `validate_graph` and `plan_graph` report a `train_contract` issue for every OFT train node, because
+    every graph training output is frozen;
+  - in `_verify_before_launch`, through `abandon_unlaunched`, for plans approved before the rule;
+  - at freezing, kept as a last guard.
+- `reconcile` takes only attempts that still hold their lock: FAILED and uncertain, crashed and marked FAILED by
+  `JobStore.recover`, or COMPLETED when a crash interrupted the release. A released attempt is final (`attempt is
+  final: its lock is released, so reconcile never reopens it; use outputs_for …`). Before, a FAILED attempt whose
+  remote result was COMPLETED could be re-collected and turned COMPLETED. The lock check reads `resource_leases`
+  directly; JobStore has no public query for it (noted for Task 8, with `_validate_lease`).
+- Full/freeze outputs of the primary runtime need `target-inventory.json`, as materialize does. The rule is shared
+  with the worker as `operation_dispatch.inspects_full_output` (formerly private). The presence check, and for
+  merge/materialize the target verification against the receipted identity, run before the store is written, so a
+  refused output never leaves an artifact.
+- `reconcile` rebuilds the `WorkerRequest` from the ledger (attempt, launch, manifest, operation timeout) with the
+  builder `_prepare` uses. The executor refuses a local `command.json` that differs (`command.json differs from the
+  worker request`).
+- Tests (22 new; `test_operation_runner.py` has 58):
+  - Pre-launch refusals for a changed source hash, an unresolved operation, resources outside the approved
+    alternatives, a destination outside the approved revisions, a lease on another resource, a cacheless executor,
+    and changed or missing manifest datasets. Each makes no executor call, writes `error.txt` and frees the lock.
+  - Training on an HF-root base, downloaded through the fake hub on the GPU host. The artifact's `config.json` and
+    tokenizer are the worker's `base-snapshot/` bytes, checked against the root's fingerprints; the effective base and
+    root are the HF root, with no parents.
+  - The local-selection refusal now asserts `error.txt`.
+  - The shared fixture tokenizer (`test_model_inputs.TOKENIZER`) now has a real WordLevel vocabulary and a special
+    token. The engine fixture re-saves it with other bytes and a `pad_token` assignment, which is accepted. Four
+    negative cases are refused: an added token, renumbered ids, a grown vocabulary and a changed special-token id.
+  - A full-training output without `target-inventory.json` is refused with no artifact. A final attempt is never
+    reopened, covering both a remote failure and a COMPLETED result that freezing refused. A forged local
+    `command.json` is refused.
+  - Heartbeats every 10 ms through a slowed run, a crash and a lost start response change nothing but liveness,
+    and every heartbeat thread stops with its run.
+- Intermittent, not reproduced: `test_outputs_rebuild_is_idempotent_after_crash[after_result]` failed once in the
+  7.4 agent's full run (clean worktree of `14c1ba4` + `880763a`), and `test_lost_start_response_never_trains_twice`
+  failed once in a shared-tree run of this fix. No traceback survived.
+  - Tried: 116 runs of `[after_result]`, with `[after_freeze]`, the lost-start and ledger tests, in three and four
+    parallel loops alongside full suites and the CPU acceptance, plus seven full suites. There was no failure. No
+    test-order plugin is installed, so the order is fixed.
+  - Checked:
+    - shared state: the one in-process module reload (`test_model_ops_import_is_lightweight`) is deterministic,
+      environment changes go through `monkeypatch`, and no test writes package source;
+    - timing: deadlines are at least 900 s, and `recover(stale_after_seconds=-1)` has a 1 s margin; heartbeats are
+      now covered by the test above;
+    - file locks: Defender real-time protection is off, and temporary names are per-call UUIDs under `tmp_path`;
+    - SQLite: one database per test and a 30 s busy timeout;
+    - `GPUHost`: its worker runs synchronously.
+  - Likely cause (unproven for the worktree run): `source_hash()` re-reads `src/tuning_factory` on every call. A
+    runner test compares it at `prepare_ready`, again before launch, and in the worker, so an edit to the source
+    tree during a run makes exactly the straddling test refuse ("source hash differs"), as designed. The shared-tree
+    failure coincided with the other agent's uncommitted `execution.py` edits: the next run collected 11 more
+    tests.
+- Module sizes: `attempt_runner.py` 447 lines (426 at `7120193`), `operation_outputs.py` 412 (397),
+  `operation_dispatch.py` 380, `graph_planner.py` 990, `model_ops.py` 916 (unchanged).
+
+Verification, in a clean detached worktree of `880763a` (HEAD) plus only this change. The shared tree also held
+another agent's uncommitted `execution.py`/`test_remote_worker.py`/PROGRESS edits until that agent committed them.
+- RED first: 8 tests failed for the intended reasons. The OFT runner test showed a real launch. The other new tests
+  guard behaviour that already held.
+- `tests/test_operation_runner.py` gave **58 passed**. `uv run pytest -q` gave **1123 passed, 1 skipped** (1101 at
+  `880763a` + 22). Ruff (`src tests`) is clean, `check_secrets.py` reports 0 findings, the eol check prints
+  nothing, both GPU locks are unchanged and the main `.venv` has no torch.
+- CPU acceptance (`-I`): exit 0 twice with byte-identical receipts and all **29** checks passed. Max errors and the
+  frozen inventories are unchanged. Receipt SHA256 `042bf8feb403123cb81206801bda0010e676514a2b3d6dc32125d85ca29c9c0b`, source_sha256 `6b57e120ab5479dfa8b99bd69c2c079cb7be035b007e471da2d53840f9aa9b5f` (the tree with this commit),
+  lock_sha256 `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`. It supersedes earlier Task 7
+  receipts.
+
 ## Task 7 complete (software), 2026-10-20
 
-Task 7 is complete in software: 7.1–7.5 and their review fixes. Verified on the CPU and with fakes:
+Task 7 is complete in software: 7.1–7.5 and their review fixes, with the 7.4 follow-up code behind it (`14c1ba4`:
+Windows name aliases and uploaded-input protection on download; `880763a`: 8.3 short-name aliases). Verified on the
+CPU and with fakes:
 - A hash-locked CPU runtime with `cat` merge and `safe_merge` materialization numerics, F32 policy `model-ops-f32-v1`.
 - Path-free staging, and binding of only typed roles to hash-verified cache paths. The rules for exact
   continuation, frozen reference, PPO reward and tokenizer are enforced twice.
@@ -869,7 +944,8 @@ Task 7 is complete in software: 7.1–7.5 and their review fixes. Verified on th
   `BenchmarkSpec.fingerprint()` (F11 fixed) and rebuilds idempotently after a crash.
 - Final receipt `811d4177…b673` (29/29 checks, source `478e2a41…e5d2` of commit 7120193). After the 7.4 follow-up
   (Windows name aliases and uploaded-input protection on download) it was `a9bece24…e45d` (source `247003f6…6c7f`).
-  After the 8.3 short-name follow-up, the current receipt is `97fa2c89…df3b` (29/29 checks, source `0ae3419b…b67a`).
+  After the 8.3 short-name follow-up it was `97fa2c89…df3b` (source `0ae3419b…b67a`). After the 7.5 review fixes,
+  the current receipt is `042bf8fe…9c0b` (29/29 checks, source `6b57e120…9b5f`).
 
 Not verified (needs explicit GPU/host authorization):
 - Any real GPU or host.
@@ -895,20 +971,23 @@ Task 8 interface (`attempt_runner`):
   - COMPLETED: the lock is released. `outputs` is `NodeOutputs(model=...)` or `NodeOutputs(evaluation=...)` with no
     inspected targets. Task 8 calls `record_outputs(lease, outputs)`, enqueues tracking, and persists
     `inspected_targets` through its own verifier (`record_outputs` still refuses them).
-  - FAILED with `uncertain=False`, or CANCELED: the lock is released and the attempt is final.
+  - FAILED with `uncertain=False`, or CANCELED: the lock is released and the attempt is final; `reconcile` refuses
+    it.
   - FAILED with `uncertain=True`: the lock is kept. Never claim, launch or create a new attempt; call
     `reconcile(job_id, executor)`.
 - Exceptions:
   - `run_claimed` raises ValueError for a stale lease, and for `launch already started or uncertain; reconcile the
     same attempt` (`begin_launch`). Both mean the attempt is not this actor's to launch.
-  - `reconcile` raises ValueError for an attempt still active (run `JobStore.recover` first) and for a foreign remote
-    result (the attempt stays uncertain).
+  - `reconcile` raises ValueError for an attempt still active (run `JobStore.recover` first), for a final attempt
+    whose lock is released (`attempt is final: …`), for a local `command.json` that differs from the ledger, and
+    for a foreign remote result (the attempt stays uncertain).
   - Uncertainty itself is never raised: `ExecutionUncertain` becomes `uncertain=True`.
-- `reconcile(job_id, executor)` accepts recovery-only executors.
+- `reconcile(job_id, executor)` accepts recovery-only executors, and only attempts that still hold their lock. It
+  rebuilds the `WorkerRequest` from the ledger.
   - It returns None while no result exists. That includes a reserved launch with no remote record, which needs
     operator `release-lock --confirm-execution-stopped`.
-  - It returns an outcome when it finishes the attempt. For a COMPLETED attempt it rebuilds the outputs and releases
-    a lock that is still held.
+  - It returns an outcome when it finishes the attempt. For a COMPLETED attempt whose release a crash interrupted,
+    it rebuilds the outputs and releases the lock.
 - `outputs_for(job_id)`: a COMPLETED attempt only. It returns identical outputs on every call; `record_outputs` is
   idempotent for them.
 - Idempotency guarantees:

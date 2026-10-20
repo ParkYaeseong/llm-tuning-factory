@@ -47,7 +47,13 @@ def sha(data):
 
 
 CONFIG = canonical({"model_type": "qwen2", "hidden_size": 2})
-TOKENIZER = {"tokenizer.json": b'{"version":"1.0"}', "tokenizer_config.json": b"{}"}
+# A WordLevel vocabulary with one special token, so tokenizer comparisons have real ids to compare.
+TOKENIZER = {
+    "tokenizer.json": canonical({"version": "1.0", "added_tokens": [{"id": 0, "content": "<unk>", "special": True}],
+                                 "model": {"type": "WordLevel", "unk_token": "<unk>",
+                                           "vocab": {"<unk>": 0, "q": 1, "v": 2}}}),
+    "tokenizer_config.json": canonical({"added_tokens_decoder": {"0": {"content": "<unk>", "special": True}}}),
+}
 MODULES = ("model.q_proj", "model.v_proj")
 
 

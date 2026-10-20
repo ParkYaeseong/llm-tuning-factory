@@ -50,10 +50,18 @@ from .model_ops import (
     local_tokenizer_fingerprint,
     verify_inspected_targets,
 )
-from .operation_dispatch import BASE_SNAPSHOT, MODEL_OP_PARENT, OPERATION_RECEIPT, TARGET_INVENTORY
+from .operation_dispatch import (
+    BASE_SNAPSHOT,
+    MODEL_OP_PARENT,
+    OPERATION_RECEIPT,
+    TARGET_INVENTORY,
+    inspects_full_output,
+)
 from .operation_runner import ResolvedModelInputs, operation_sha256, validated_operation
 from .operations import EvaluateOperation, MaterializeOperation, MergeOperation, TrainOperation
-from .registry import file_digest
+from .registry import canonical, digest, file_digest
+from .runtime_profiles import operation_profile
+from .training import OFT_UNFREEZABLE
 from .worker_protocol import OperationResult
 
 FOREIGN_RESULT = "remote result belongs to a different attempt"   # the executor's identity refusal, verbatim
@@ -192,7 +200,7 @@ def _train_output(operation: TrainOperation, result, launch_dir: Path, verifier,
                   dataset_synthetic: bool) -> tuple[Path, ModelDescriptor]:
     config, model_input = operation.config, operation.model_input
     if config.training_method == "oft":
-        raise ValueError("OFT outputs cannot be frozen as typed artifacts; OFT handoff is unsupported")
+        raise ValueError(OFT_UNFREEZABLE)   # refused at planning and before launch; kept as a last guard
     adapter = config.training_method in {"lora", "qlora"}
     policy = model_input.policy
     base_config, base_tokenizer = _base_identity(policy.base, verifier)
@@ -327,27 +335,34 @@ def freeze_operation_output(operation, result: OperationResult, *, job_id: str, 
     """Freeze a model output (idempotent: identical bytes and descriptor give the same reference).
 
     Returns ``(ref, inspected_targets)``. A merge/materialize must freeze exactly its receipted inventory, and
-    a materialized model must carry its verified target inventory.
+    every full model the worker inspects (materialize; full/freeze training in the primary runtime) must carry
+    its verified target inventory. Both are checked before the store is written where the identity is already
+    known (a receipted output); a training output's targets are verified against the identity freezing gives.
     """
     operation = validated_operation(operation)
     launch_dir = Path(launch_dir)
+    model_op = isinstance(operation, (MergeOperation, MaterializeOperation))
+    if TARGET_INVENTORY not in result.evidence and inspects_full_output(
+            operation, operation_profile(operation.kind, operation.resources.runtime.profile)):
+        raise ValueError("a full-model output of the primary runtime requires its inspected target inventory")
     workspace = Path(tempfile.mkdtemp(prefix=".freeze-", dir=launch_dir.parent))
     try:
         source, descriptor = build_output_descriptor(
             operation, result, job_id=job_id, attempt_id=attempt_id, manifest_sha256=manifest_sha256,
             launch_dir=launch_dir, resolved=resolved, approved_cache=approved_cache, workspace=workspace,
             dataset_synthetic=dataset_synthetic)
+        expected = targets = None
+        if model_op:
+            expected = ModelArtifactRef(artifact_id=digest(canonical(descriptor.model_dump(mode="json"))),
+                                        inventory_sha256=operation_receipt(result, launch_dir, operation)[
+                                            "output_inventory_sha256"])
+            targets = inspected_targets(result, launch_dir, expected, descriptor)
         ref = approved_cache.freeze(source, descriptor)
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
-    if isinstance(operation, (MergeOperation, MaterializeOperation)):
-        receipt = operation_receipt(result, launch_dir, operation)
-        if ref.inventory_sha256 != receipt["output_inventory_sha256"]:
-            raise ValueError("frozen output inventory differs from operation-receipt.json")
-    targets = inspected_targets(result, launch_dir, ref, descriptor)
-    if isinstance(operation, MaterializeOperation) and not targets:
-        raise ValueError("a materialized model requires its inspected target inventory")
-    return ref, targets
+    if model_op and ref != expected:
+        raise ValueError("frozen output inventory differs from operation-receipt.json")
+    return ref, targets if model_op else inspected_targets(result, launch_dir, ref, descriptor)
 
 
 # -- evaluation records -------------------------------------------------------------------------
