@@ -4259,10 +4259,12 @@ Actual verification:
   bug or drift today) and fail under their mutations.
 - Twenty-one mutations (each fix above, including the busy counter, the `enter` wait, the message keeping, the
   locked-form skip, the same-page focus rule and `!renderDeferred` in `renderKeepingDrafts`) each made a test fail.
-- From `desktop/`: `npx playwright test` **126 passed** (112 + 14 new); `npm run build` passes.
-- From the root (main venv, `PYTHONPATH` = the worktree's `src`): `pytest -q` **1709 passed, 1 skipped** (1707 + the 2 parity tests); `ruff check src tests`
-  passes; `scripts/check_secrets.py` reports 0 findings with the change staged; the protected-path `git diff
-  --exit-code` is clean; every changed file is CR-free.
+- From `desktop/`: `npx playwright test` **126 passed** on `128f995` (112 + 14 new) and **138 passed** after the
+  rebase onto `4b4c194` (with 10.4's 12); `npm run build` passes on both.
+- From the root (main venv, `PYTHONPATH` = the worktree's `src`): `pytest -q` **1709 passed, 1 skipped** on `128f995`
+  (1707 + the 2 parity tests) and **1715 passed, 1 skipped** after the rebase; `ruff check src tests` passes;
+  `scripts/check_secrets.py` reports 0 findings with the change staged; the protected-path `git diff --exit-code` is
+  clean; every changed file is CR-free.
 
 Not verified or still open:
 - Real WebView2 timing (overlapping tasks, IME composition, touch): Task 11. Full renders during an IME composition
