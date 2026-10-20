@@ -63,6 +63,7 @@ from .projects import DatasetRef, LocalId, ProjectSpec, Revision, Sha256
 from .recipes import RecipeSpec, recipe_training_options
 from .registry import Registry, canonical, digest
 from .runtime_profiles import engine_profile
+from .training import PPO_CONTINUATION
 
 
 class DatasetSnapshot(StrictModel):
@@ -341,6 +342,9 @@ def _definition_issues(project, graph, recipes, datasets):
             reward = node.reward_binding or (node.model_input.reward_model if isinstance(node.model_input, ModelInput) else None)
             if (recipe.training_stage == "ppo") != (reward is not None):
                 raise ValueError("PPO requires a typed reward binding and other stages cannot use one")
+            if (recipe.training_stage == "ppo" and isinstance(node.model_input, ModelInput)
+                    and node.model_input.initialization == "continue_adapter"):
+                raise ValueError(PPO_CONTINUATION)
         except (KeyError, ValueError) as exc:
             issues.append(Issue(code="train_contract", message=str(exc), node_id=node.id))
     nodes = {item.id: item for item in graph.nodes}
@@ -359,6 +363,10 @@ def _definition_issues(project, graph, recipes, datasets):
                         raise ValueError("parent transition requires explicit materialize")
                     if (parent_recipe.training_stage == "ppo") != (child.training_stage == "ppo"):
                         raise ValueError("unsupported primary/legacy PPO artifact route")
+                    # The policy handoff of an adapter parent compiles to continue_adapter (plan §6 Q6).
+                    if (child.training_stage == "ppo" and ref == node.model_input
+                            and parent_recipe.training_method in {"lora", "qlora"}):
+                        raise ValueError(PPO_CONTINUATION)
             except (KeyError, ValueError) as exc:
                 issues.append(Issue(code="parent_transition", message=str(exc), node_id=node.id))
     return issues
@@ -521,6 +529,9 @@ def _static_routes(node, nodes, recipes, artifacts, resources):
                          for source in selected_sources(nodes[evaluation.node_id].model))
         return (value,)
 
+    if isinstance(node, TrainNode) and _recipe(node, recipes).training_stage == "ppo" and any(
+            _continues_adapter(source, nodes, recipes, artifacts) for source in selected_sources(node.model_input)):
+        raise ValueError(PPO_CONTINUATION)
     values = tuple(source for value in values for source in selected_sources(value))
     for value in values:
         if value is None:
@@ -576,6 +587,18 @@ def _static_routes(node, nodes, recipes, artifacts, resources):
                 ranks.append(descriptor.adapter.rank)
         if sum(ranks) > 256:
             raise ValueError("merged rank exceeds 256")
+
+
+def _continues_adapter(source, nodes, recipes, artifacts):
+    """Whether a policy source (already resolved through selections) compiles to continue_adapter."""
+    if isinstance(source, ModelInput):
+        return source.initialization == "continue_adapter"
+    if isinstance(source, NodeOutputRef):
+        parent = nodes[source.node_id]
+        return isinstance(parent, MergeNode) or isinstance(parent, TrainNode) and _recipe(
+            parent, recipes).training_method in {"lora", "qlora", "oft"}
+    snapshot = artifacts.get(_artifact_key(source)) if isinstance(source, ModelArtifactRef) else None
+    return snapshot is not None and snapshot.descriptor.storage_kind == "adapter"
 
 
 class NodeModelBinding(StrictModel):
@@ -716,6 +739,8 @@ def compile_node(plan: GraphPlan, node_id: str, verified_bindings: VerifiedBindi
                     "full_weights" if recipe.training_method in {"full", "freeze"} else "new_adapter"))
         else:
             model_input = ModelInput.model_validate(source.model_dump())
+        if recipe.training_stage == "ppo" and model_input.initialization == "continue_adapter":
+            raise ValueError(PPO_CONTINUATION)
         if node.reward_binding:
             reward = node.reward_binding
             if isinstance(reward, NodeOutputRef):

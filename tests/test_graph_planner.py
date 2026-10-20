@@ -715,3 +715,126 @@ def test_every_selected_root_must_have_a_compatible_child_context(tmp_path, inva
         choices.models[1].model_copy(update={"profile": choices.models[1].profile.model_copy(update={"max_length": 64})}))
     with pytest.raises(ValueError, match="context|cutoff_len"):
         plan_graph(project, choices.model_copy(update={"models": contexts}), (facts,))
+
+
+def ppo_handoff_fixture(tmp_path, parent_method="lora"):
+    from test_model_artifacts import fixture_model, with_value_head
+
+    from tuning_factory.graph_planner import ModelContext, ProducerEvidence, snapshot_artifact
+    from tuning_factory.model_artifacts import ModelArtifactStore
+    from tuning_factory.model_hub import ModelProfile
+    registry, project, choices, facts = fixture(tmp_path)
+    directory, descriptor = fixture_model(tmp_path, marker="reward")
+    descriptor = with_value_head(directory, descriptor)
+    store = ModelArtifactStore(tmp_path / "models")
+    reward = store.freeze(directory, descriptor)
+    producer = ProducerEvidence(model=reward, job_id=descriptor.producer_job_id, attempt_id=descriptor.producer_attempt_id,
+        manifest_sha256=descriptor.producer_manifest_sha256, runtime_profile="ppo", training_stage="rm",
+        status="completed", tracking_acknowledged=True)
+    path = tmp_path / "prompt.json"
+    path.write_bytes(canonical([{"instruction": "question"}]))
+    record = registry.register_dataset("prompt", "1", path, kind="prompt")
+    dataset = DatasetRef(dataset_id="prompt", version="1", sha256=record["sha256"])
+    recipes = tuple(Revision(spec=recipe, revision_sha256=digest(canonical(recipe.model_dump(mode="json"))))
+        for recipe in (RecipeSpec(recipe_id="parent", name="Parent", training_stage="ppo", input_kind="prompt",
+                                  training_method=parent_method),
+                       RecipeSpec(recipe_id="child", name="Child", training_stage="ppo", input_kind="prompt",
+                                  training_method=parent_method if parent_method == "qlora" else "lora")))
+    profile = ModelProfile(repo_id=descriptor.root.repo_id, revision=descriptor.root.revision,
+        config_sha256=descriptor.config_sha256, architecture="qwen2", template="qwen")
+    choices = choices.model_copy(update={"recipes": recipes, "models": (ModelContext(root=descriptor.root, profile=profile),),
+        "datasets": (snapshot_dataset(registry, dataset),), "artifacts": (snapshot_artifact(store, reward, producer),),
+        "node_resources": tuple(NodeResources(node_id=node, timeout_seconds=900, runtime_profile="ppo")
+                                for node in ("parent", "child"))})
+
+    def train(node_id, recipe, model_input):
+        return {"kind": "train", "id": node_id, "label": node_id, "recipe_revision": recipe.revision_sha256,
+                "model_input": model_input, "reward_binding": ModelLoadRef(base=reward).model_dump(mode="json"),
+                "dataset_binding": "prompt", "executor_profile_ids": ["p"]}
+    bindings = [DatasetBinding(binding_id="prompt", role="train", dataset=dataset)]
+    return registry, project, choices, facts, store, producer, descriptor, recipes, train, bindings
+
+
+@pytest.mark.parametrize("parent_method", ["lora", "qlora", "full"])
+def test_ppo_adapter_handoff_to_ppo_is_refused_at_planning(tmp_path, parent_method):
+    from tuning_factory.graph_schema import validate_graph
+    from tuning_factory.training import PPO_CONTINUATION
+    registry, project, choices, facts, _, _, descriptor, recipes, train, bindings = ppo_handoff_fixture(
+        tmp_path, parent_method)
+    root_input = ModelInput(policy=ModelLoadRef(base=descriptor.root), initialization=(
+        "full_weights" if parent_method == "full" else "new_adapter")).model_dump(mode="json")
+    graph = {"nodes": [train("parent", recipes[0], root_input),
+                       train("child", recipes[1], {"node_id": "parent", "output_name": "model"})]}
+    project = revise(project, graph, bindings)
+    issues = [issue for issue in validate_graph(project.spec, choices.recipes, registry)
+              if issue.code == "parent_transition"]
+    if parent_method == "full":
+        # A full PPO parent hands over full weights; the child trains a new adapter on them.
+        assert issues == []
+        plan_graph(project, choices, (facts,))
+        return
+    assert [(issue.node_id, issue.message) for issue in issues] == [("child", PPO_CONTINUATION)]
+    with pytest.raises(ValueError, match="PPO adapter continuation is unsupported"):
+        plan_graph(project, choices, (facts,))
+
+
+def explicit_ppo_continuation(tmp_path):
+    from tuning_factory.graph_planner import ProducerEvidence, snapshot_artifact
+    registry, project, choices, facts, store, producer, descriptor, recipes, train, bindings = ppo_handoff_fixture(tmp_path)
+    directory, adapter_descriptor = adapter_fixture(tmp_path, marker="ppo-adapter")
+    adapter = store.freeze(directory, adapter_descriptor)
+    adapter_producer = ProducerEvidence(model=adapter, job_id="ppo-adapter", attempt_id="ppo-adapter",
+        manifest_sha256=adapter_descriptor.producer_manifest_sha256, runtime_profile="ppo", training_stage="ppo",
+        status="completed", tracking_acknowledged=True)
+    model_input = ModelInput(policy=ModelLoadRef(base=descriptor.root, adapter=adapter),
+                             initialization="continue_adapter").model_dump(mode="json")
+    project = revise(project, {"nodes": [train("child", recipes[1], model_input)]}, bindings)
+    choices = choices.model_copy(update={"artifacts": (*choices.artifacts, snapshot_artifact(
+        store, adapter, adapter_producer)), "node_resources": choices.node_resources[1:]})
+    return registry, project, choices, facts, store, (producer, adapter_producer)
+
+
+def test_explicit_ppo_continue_adapter_is_refused_at_planning(tmp_path):
+    from tuning_factory.graph_schema import validate_graph
+    from tuning_factory.training import PPO_CONTINUATION
+    registry, project, choices, facts, *_ = explicit_ppo_continuation(tmp_path)
+    issues = validate_graph(project.spec, choices.recipes, registry)
+    assert [(issue.code, issue.node_id, issue.message) for issue in issues] == [
+        ("train_contract", "child", PPO_CONTINUATION)]
+    with pytest.raises(ValueError, match="PPO adapter continuation is unsupported"):
+        plan_graph(project, choices, (facts,))
+
+
+def test_compile_refuses_ppo_continue_adapter_from_a_plan_approved_before_the_rule(tmp_path, monkeypatch):
+    from tuning_factory import graph_planner
+    from tuning_factory.graph_planner import VerifiedBindings
+    registry, project, choices, facts, store, producers = explicit_ppo_continuation(tmp_path)
+    # Simulate a plan pinned by a release without the planning-time rule; compilation must still refuse.
+    monkeypatch.setattr(graph_planner, "_definition_issues", lambda *args: [])
+    monkeypatch.setattr(graph_planner, "_static_routes", lambda *args: None)
+    plan = plan_graph(project, choices, (facts,))
+    monkeypatch.undo()
+    with pytest.raises(ValueError, match="PPO adapter continuation is unsupported"):
+        compile_node(plan, "child", VerifiedBindings(registry, store, choices.executors[0], producers=producers))
+
+
+def test_ppo_continuation_through_selection_is_refused_at_planning(tmp_path):
+    from types import SimpleNamespace
+
+    from tuning_factory.graph_planner import _static_routes
+    from tuning_factory.graph_schema import EvaluateNode, NodeOutputRef, SelectNode
+    *_, recipes, train, _ = ppo_handoff_fixture(tmp_path)
+    root = HFRootRef(repo_id="test/tiny", revision="a" * 40, config_sha256="b" * 64, tokenizer_fingerprint="c" * 64)
+    root_input = ModelInput(policy=ModelLoadRef(base=root), initialization="new_adapter").model_dump(mode="json")
+    nodes = {"parent": TrainNode.model_validate({**train("parent", recipes[0], root_input), "reward_binding": None}),
+             "eval": EvaluateNode(id="eval", label="Eval", model=NodeOutputRef(node_id="parent", output_name="model"),
+                                  benchmark_revision="d" * 64, executor_profile_ids=("p",)),
+             "select": SelectNode(id="select", label="Select", evaluations=(
+                 NodeOutputRef(node_id="eval", output_name="evaluation"),),
+                 selection={"metric": "accuracy", "direction": "max"}),
+             "child": TrainNode.model_validate({**train("child", recipes[1], {"node_id": "select",
+                                                                              "output_name": "model"}),
+                                                "reward_binding": None})}
+    with pytest.raises(ValueError, match="PPO adapter continuation is unsupported"):
+        _static_routes(nodes["child"], nodes, {item.revision_sha256: item for item in recipes}, {},
+                       (SimpleNamespace(runtime=SimpleNamespace(profile="ppo")),))
