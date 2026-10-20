@@ -23,6 +23,9 @@ const DESTINATION_WAIT = "같은 실행 자원의 다른 단계가 끝나기를 
 const STOP_CONFIRMED = "원격 서버/Pod에서 해당 실행이 멈춘 것을 확인했습니다";
 const CANCEL_NOTICE = "진행 중인 단계에 취소를 요청합니다. 원격 종료가 확인될 때까지 자원을 해제하지 않습니다.";
 const NO_WINNER = "모든 후보가 기준을 통과하지 못해 최상 모델을 정하지 않았습니다";
+const RESULT_OVERDUE = "no result after the launch's time limit; if its remote execution stopped, " + OPERATOR_CONFIRMATION;
+const LEDGER = "ledger integrity check failed; no node was failed, and the run waits until an operator restores or removes the record";
+const TRACKER_MISSING = "MLflow tracking is not configured for this controller; the real graph run waits for it";
 const SIMULATED = "모의 결과는 실제 품질이 아닙니다";
 const TEXT_METRIC_NOTE = "텍스트 정답 일치 지표 · 의미적 품질 점수가 아닙니다";
 const FORMAT_METRIC_NOTE = "형식 지표 · 품질 지표가 아닙니다";
@@ -177,10 +180,22 @@ test("node states, wait reasons and tracking are shown in Korean with originals 
     node("train-4", { status: "BLOCKED" }),
     node("train-5", { status: "CANCELED", tracking_status: "uncertain" }),
     node("train-6", { status: "READY", tracking_status: "retrying" }),
+    node("eval-2", { label: "다음 평가", kind: "evaluate", wait_reason: "waiting for train-1" }),
+    node("eval-3", { label: "기록 뒤 평가", kind: "evaluate",
+      wait_reason: "waiting for tracking of train-2 (tracking failed: re-arm the tracking event once MLflow is reachable)" }),
   ];
   await openWorkbench(page, { workflow: { graph_runs_list: listOf(entry(run())), controller_status: controllerStatus("running"),
     graph_run_get: detail(run({}, nodes)) } });
   await openRun(page, RUN);
+  // The most common reason: a PENDING step behind an unfinished parent, named by the parent's label.
+  const behind = nodeRow(page, "eval-2").locator('[data-reason="waiting"]');
+  await expect(behind).toContainText("앞 단계 ‘기본 학습’이(가) 끝나기를 기다리는 중입니다");
+  await behind.getByText("원문 보기").click();
+  await expect(behind).toContainText("waiting for train-1");
+  const tracked = nodeRow(page, "eval-3").locator('[data-reason="waiting"]');
+  await expect(tracked).toContainText("앞 단계 ‘train-2’의 MLflow 기록");
+  await expect(tracked).toContainText("기록 다시 시도");
+  await expect(nodeRow(page, "eval-3").locator('[data-reason="error"]')).toHaveCount(0);
   const waiting = nodeRow(page, "eval-1");
   await expect(waiting).toContainText(DESTINATION_WAIT);
   await expect(waiting.getByText("waiting for destination existing_runpod:pod-a")).toBeHidden();
@@ -236,9 +251,14 @@ test("awaiting a late result is different from needing the operator", async ({ p
       job_status: "FAILED", uncertain: true, needs_operator: true, wait_reason: OPERATOR_CONFIRMATION }),
     node("train-c", { label: "결과 기록 실패 단계", status: "RUNNING", job_id: J_C, attempt_id: A_C, attempts: 1, counted_attempts: 1,
       job_status: "COMPLETED", needs_operator: true, wait_reason: OUTPUTS_REFUSED }),
+    // Released already (by another session, the CLI, or before a lost answer): the lock is gone until the next tick.
+    node("train-d", { label: "해제된 단계", status: "RUNNING", job_id: hex("7"), attempt_id: hex("8"), attempts: 1, counted_attempts: 1,
+      job_status: "FAILED", needs_operator: true, wait_reason: RESULT_OVERDUE }),
+    node("train-e", { label: "기록 검사 실패 단계", status: "RUNNING", job_id: hex("9"), attempt_id: hex("0"), attempts: 1,
+      counted_attempts: 1, job_status: "COMPLETED", needs_operator: true, wait_reason: LEDGER }),
   ];
   await openWorkbench(page, { workflow: { graph_runs_list: listOf(entry(run())), controller_status: controllerStatus("running"),
-    graph_run_get: detail(run({}, nodes)) } });
+    graph_run_get: detail(run({}, nodes), { controller: controllerView("absent") }) } });
   await openRun(page, RUN);
   const local = await page.evaluate(seconds => new Date(seconds * 1000).toLocaleString("ko-KR",
     { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }), deadline);
@@ -261,8 +281,20 @@ test("awaiting a late result is different from needing the operator", async ({ p
   await expect(stuck).toContainText("데스크톱에서 해결할 수 없습니다");
   await expect(stuck).toContainText("factory status");
   await expect(stuck.getByRole("button")).toHaveCount(0);
+  const released = operatorItem(page, "train-d");
+  await expect(released).toContainText("잠금이 이미 해제되었습니다");
+  await expect(released).toContainText("컨트롤러를 시작");
+  await expect(released).not.toContainText("데스크톱에서 해결할 수 없습니다");
+  await expect(released.getByRole("button")).toHaveCount(0);
+  await expect(operatorItem(page, "train-e")).toContainText("데스크톱에서 해결할 수 없습니다");
   // Only the uncertain attempt that no late result can settle offers the release.
   await expect(detailCard(page).getByRole("button", { name: /잠금 해제/ })).toHaveCount(1);
+  // A focus or open key names one control in the region (a reason shown in the table and in the operator list).
+  for (const attribute of ["data-focus-key", "data-open-key"]) {
+    const keys = await detailCard(page).locator(`[${attribute}]`).evaluateAll((items, name) => items.map(item => item.getAttribute(name)), attribute);
+    expect(keys.length, attribute).toBeGreaterThan(3);
+    expect(new Set(keys).size, attribute).toBe(keys.length);
+  }
   expect(await calls(page, { action: "graph_release_lock" })).toHaveLength(0);
 });
 
@@ -348,6 +380,9 @@ test("failed tracking can be re-armed and changed evidence is explained", async 
   await expect(first.locator(".run-tracking-action")).toHaveCount(0);
   const second = failure(page, E2);
   await expect(second).toContainText("기록 확인 필요");
+  await expect(second.locator(".run-tracking-error")).toContainText("로컬 증거 파일이 바뀌었습니다");
+  await second.locator(".run-tracking-error").getByText("원문 보기").click();
+  await expect(second.locator(".run-tracking-error")).toContainText("local evidence changed after enqueue: node-outputs.json");
   const action = second.locator(".run-tracking-action");
   await expect(action).toContainText("다시 시도해도 고칠 수 없습니다");
   const [actionBox, buttonBox] = [await action.boundingBox(), await second.getByRole("button", { name: "기록 다시 시도" }).boundingBox()];
@@ -520,7 +555,7 @@ test("the operator release needs the stop confirmation and the typed node label"
   const opener = operatorItem(page, "train-b").getByRole("button", { name: "실행 잠금 해제" });
   await opener.click();
   const dialog = page.getByRole("dialog");
-  for (const text of ["같은 GPU", "다시 실행하지 않습니다", label, J_B, A_B, "release-lock", "--confirm-execution-stopped"])
+  for (const text of ["같은 GPU", "다시 실행하지 않습니다", "취소로 기록", label, J_B, A_B, "release-lock", "--confirm-execution-stopped"])
     await expect(dialog).toContainText(text);
   await expect(page.locator("img")).toHaveCount(0);
   const confirm = dialog.getByRole("button", { name: "잠금 해제", exact: true });
@@ -556,7 +591,8 @@ test("the operator release needs the stop confirmation and the typed node label"
     confirm_execution_stopped: true }]);
   await expect(page.getByText("잠금을 해제했습니다", { exact: false })).toBeVisible();
   const item = operatorItem(page, "train-b");
-  await expect(item).toContainText("잠금 해제를 기록했습니다");
+  await expect(item).toContainText("잠금이 이미 해제되었습니다");
+  await expect(item).not.toContainText("컨트롤러를 시작");
   await expect(item.getByRole("button")).toHaveCount(0);
   await expect(page.locator("img")).toHaveCount(0);
 });
@@ -608,12 +644,54 @@ test("wait reasons cover the controller's texts and every status has a Korean na
     ["dispatch failed: RuntimeError: boom", "error", "보내지 못했습니다"],
     ["settling the attempt failed; retrying next tick: OSError", "error", "정리하지 못했습니다"],
     ["reconcile could not reach the destination: timeout", "error", "확인하지 못했습니다"],
+    // graph_store.readiness and graph_controller._prepare: the most common reasons.
+    ["waiting for train-1", "waiting", "앞 단계 ‘train-1’이(가) 끝나기를 기다리는 중입니다"],
+    ["waiting for tracking of train-1", "waiting", "앞 단계 ‘train-1’의 MLflow 기록이 저장되기를 기다리는 중입니다"],
+    ["waiting for tracking of train-1 (tracking uncertain: re-arm the tracking event once MLflow is reachable)", "waiting", "기록 다시 시도"],
+    [`waiting for tracking of train-1 (tracking failed: ${EVIDENCE_CHANGED_ACTION})`, "waiting", "다시 시도해도 고칠 수 없습니다"],
+    ["returned unlaunched after takeover: the graph run is not running", "waiting", "되돌렸습니다"],
+    // graph_controller._provider_reason: the providers' fixed refusals (executor_profiles.py, desktop_runtime.py).
+    ["observed Pod differs from the approved Pod", "replan", "확인한 Pod가 승인한 Pod와 다릅니다"],
+    ["observed SSH server differs from the approved server", "replan", "확인한 SSH 서버가 승인한 서버와 다릅니다"],
+    ["executor/resource destination mismatch", "replan", "다시 계획하세요"],
+    ["executor profile is not configured in this controller", "error", "컨트롤러에 없습니다"],
+    ["no executor provider is configured for real graph runs", "error", "실제 실행에 쓸 실행 프로필"],
+    ["positive finite live RunPod API price required", "error", "가격"],
+    ["live RunPod Pod lacks its GPU type ID and count", "error", "Pod 정보"],
+    ["live RunPod Pod metadata required", "error", "Pod 정보"],
+    ["Pod must already be running; start it separately", "error", "Pod를 먼저 시작하세요"],
+    ["Pod public TCP SSH mapping required", "error", "SSH 포트"],
+    ["persistent network volume at /workspace required", "error", "네트워크 볼륨"],
+    ["independently verified SSH SHA256 fingerprint required", "error", "SSH 지문"],
+    ["model operation requires the primary runtime with pinned PEFT 0.18.1", "error", "PEFT 0.18.1"],
+    ["GPU runtime source, lock, engine or CUDA preflight mismatch; prepare runtime first", "error", "런타임"],
+    ["simulated destinations serve simulation plans only", "error", "모의 실행"],
+    ["destination unavailable: TimeoutError: the destination did not open within the controller's time limit; it is retried later",
+      "error", "시간 제한 안에 열리지 않았습니다"],
+    // Composite reasons: the 8.1 backfill keeps its notice in front; the budget names it at the end.
+    [`${UNPRICED}; waiting for destination existing_runpod:pod-a`, "budget", DESTINATION_WAIT],
+    [`${BUDGET}; ${UNPRICED}`, "budget", "가격을 알 수 없는 이전 시도"],
+    [`${LEDGER}: ValueError: binding differs`, "operator", "무결성"],
+    // A local selection's own failure (graph_controller._local_selections: `_describe(exc)`).
+    ["ValueError: selection receipt differs", "error", "처리하지 못했습니다"],
   ];
   for (const [original, kind, text] of cases) {
     const localized = reasons.localizeWaitReason(original)!;
     expect(localized, original).toMatchObject({ kind, original });
     expect(localized.text, original).toContain(text);
     expect(localized.text, original).not.toBe(original);
+  }
+  expect(reasons.localizeWaitReason("waiting for train-1", id => ({ "train-1": "기본 학습" } as Record<string, string>)[id]).text)
+    .toBe("앞 단계 ‘기본 학습’이(가) 끝나기를 기다리는 중입니다");
+  expect(reasons.localizeWaitReason(`${UNPRICED}; waiting for destination existing_runpod:pod-a`)!.text).toContain("가격을 알 수 없는 이전 시도");
+  // Korean texts (desktop_runtime.MISSING_KEY) are shown as received.
+  const missingKey = "SSH 개인키 파일을 찾을 수 없습니다. 연결 화면에서 키 파일을 다시 선택하세요.";
+  expect(reasons.localizeWaitReason(missingKey)).toEqual({ text: missingKey, original: missingKey, kind: "error" });
+  for (const [text, korean] of [[TRACKER_MISSING, "MLflow 기록 설정"], ["MLflow outcome is uncertain; searching before any new create: OSError", "불확실"],
+    ["local evidence changed after enqueue: node-outputs.json", "로컬 증거 파일이 바뀌었습니다"]]) {
+    const localized = reasons.localizeRunText(text)!;
+    expect(localized.text, text).toContain(korean);
+    expect(localized.original, text).toBe(text);
   }
   expect(reasons.localizeWaitReason(null)).toBeNull();
   expect(reasons.localizeWaitReason("")).toBeNull();
@@ -622,4 +700,57 @@ test("wait reasons cover the controller's texts and every status has a Korean na
   expect(Object.keys(reasons.RUN_STATUS).sort()).toEqual(["CANCELED", "COMPLETED", "FAILED", "PAUSED", "RUNNING"]);
   for (const key of ["not_started", "pending", "retrying", "saved", "uncertain", "failed", "registered", "none"])
     expect(reasons.TRACKING_STATUS[key], key).toMatch(/[가-힣]/);
+});
+
+test("a finished run from before the tracking outbox is not polled", async ({ page }) => {
+  const finished = (pending: number) => run({ status: "COMPLETED", tracking: { events: { PENDING: pending, ACKNOWLEDGED: 0, FAILED: 0, UNCERTAIN: 0 },
+    graph: "not_started", action: null } }, [node("train-1", { status: "COMPLETED", output: model("d") })]);
+  await openWorkbench(page, { clock: true, workflow: { graph_runs_list: listOf(entry(finished(0))), controller_status: controllerStatus("running"),
+    graph_run_get: [detail(finished(0)), detail(finished(1))] } });
+  await pauseClock(page);
+  await openRun(page, RUN);
+  // Final, no graph tracking and no tracking event at all: nothing will change, so nothing is polled.
+  await expect(detailCard(page).locator(".run-meta")).toContainText("기록 대기열이 생기기 전에 끝난 실행");
+  await page.clock.runFor(9000);
+  expect(await gets(page)).toBe(1);
+  // A tracking event still pending keeps the run followed.
+  await openRun(page, RUN);
+  expect(await gets(page)).toBe(2);
+  await expect(detailCard(page).locator(".run-meta")).not.toContainText("기록 대기열이 생기기 전에 끝난 실행");
+  await page.clock.runFor(3000);
+  await expect.poll(() => gets(page)).toBe(3);
+});
+
+test("the release dialog stops when the node changes while it is open", async ({ page }) => {
+  // A blank label is shown, and typed, as the node ID.
+  const stuck = (attempt: string) => node("train-b", { label: "   ", status: "RUNNING", job_id: J_B, attempt_id: attempt, attempts: 1,
+    counted_attempts: 1, job_status: "FAILED", uncertain: true, needs_operator: true, wait_reason: OPERATOR_CONFIRMATION });
+  await openWorkbench(page, { clock: true, workflow: { graph_runs_list: listOf(entry(run())), controller_status: controllerStatus("running"),
+    graph_run_get: [detail(run({}, [stuck(A_B)])), detail(run({}, [stuck(A_C)]))] } });
+  await pauseClock(page);
+  await openRun(page, RUN);
+  await expect(nodeRow(page, "train-b").locator(".run-node-label b")).toHaveText("train-b");
+  await expect(operatorItem(page, "train-b").locator(".run-operator-head b")).toHaveText("train-b");
+  await operatorItem(page, "train-b").getByRole("button", { name: "실행 잠금 해제" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.locator(".run-release-target b")).toHaveText("train-b");
+  const confirm = dialog.getByRole("button", { name: "잠금 해제", exact: true });
+  const stopped = dialog.getByRole("checkbox", { name: STOP_CONFIRMED });
+  await stopped.check();
+  await dialog.getByRole("textbox").fill("train-b");
+  await expect(confirm).toBeEnabled();
+  // A poll shows another attempt: the shown attempt is no longer the one to release.
+  await page.clock.runFor(3000);
+  await expect.poll(() => gets(page)).toBe(2);
+  await expect(dialog).toContainText("실행 상태가 바뀌었습니다");
+  await expect(confirm).toBeDisabled();
+  await stopped.uncheck();
+  await stopped.check();
+  await expect(confirm).toBeDisabled();
+  await page.keyboard.press("Escape");
+  expect(await calls(page, { action: "graph_release_lock" })).toHaveLength(0);
+  // A new dialog names the current attempt.
+  await operatorItem(page, "train-b").getByRole("button", { name: "실행 잠금 해제" }).click();
+  await expect(page.getByRole("dialog")).toContainText(A_C);
+  await expect(page.getByRole("dialog")).not.toContainText("실행 상태가 바뀌었습니다");
 });

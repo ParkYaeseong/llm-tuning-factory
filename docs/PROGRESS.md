@@ -4467,8 +4467,9 @@ What changed:
   label, kind, status, counted/max attempts, destination, the Korean wait reason (kind in `data-reason`, original in
   "원문 보기"), error, retry time, tracking and registration, output (artifact 8자 or metrics with the text-metric and
   format-metric notes), the selection text (no winner, 병합 모델 선택, 원본 최상 모델 유지, simulated) and the cache-seed
-  note. `wait-reasons.ts` maps every fixed controller prefix (waiting, operator, replan, budget, error; unknown texts as
-  received) plus the tracking actions and the `run_state` refusals.
+  note. `wait-reasons.ts` maps the controller's constant reasons (graph_controller.py:62-89, waiting, operator,
+  replan, budget, error; unknown texts as received) plus the tracking actions and the `run_state` refusals. (Corrected
+  by the review fixes below: the readiness reasons and the providers' refusals were not mapped at first.)
 - Operator states: `awaiting_result` → "결과 대기 · <현지 시각>까지는 다시 실행하지 않습니다", no action.
   `needs_operator && uncertain && !awaiting_result` → "운영자 확인 필요", the reason, "실행 잠금 해제" and the CLI
   alternative (`factory … status --job-id` and `release-lock <job> <attempt> --confirm-execution-stopped`, IDs filled,
@@ -4724,6 +4725,66 @@ Not verified or still open:
   and header reads: Task 11. No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
 - Planning, approval and submission are 10.6: it mounts its panel on this page and passes plan resources to
   `waitingOnSharedProfile`. Recipe overrides and `depends_on` are kept but not editable here.
+
+## Task 10.7 review fixes: readiness wait reasons, released and pre-outbox runs, 2026-10-21
+
+Commit `fix: localize readiness wait reasons and settle released and pre-outbox runs`, written in the main tree on
+`6c8780f` (the 10.3 review fixes) and rebased onto `d731f7f` (10.5) with the Task 11 plan commit; only this file
+conflicted and both entries were kept. It answers the independent review of `2b98a4c` ("Ready with fixes": one Important,
+no safety defect; the release gate held under every probe). Changed: `desktop/src/wait-reasons.ts`,
+`desktop/src/views/graph-runs.{ts,css}`, `desktop/tests/graph-runs.spec.ts` and this file. No Python, Rust, package
+or lock file changed.
+
+What changed:
+- I1. Every string that can become a node wait reason, found by reading `graph_controller.py`, `graph_store.py`,
+  `controller_entry.py`, `executor_profiles.py` (and `desktop_runtime.py`/`runtime_profiles.py`, whose refusals
+  `_provider_reason` passes through), is mapped:
+  - The readiness reasons, after the specific "waiting for …" rules: "waiting for <parent>" → "앞 단계 ‘<label>’이(가)
+    끝나기를 기다리는 중입니다" and "waiting for tracking of <parent>" (with `_prepare`'s "(tracking failed|uncertain:
+    …)" suffix → the 기록 다시 시도 guidance, or the changed-evidence text), both kind `waiting` and named by the parent's
+    label (`localizeWaitReason(reason, labelOf)`).
+  - The providers' refusals: Pod/SSH server differs and destination mismatch as `replan`; profile missing from the
+    controller, no provider for real runs, no live RunPod price, unreadable Pod facts, Pod not running, no SSH
+    mapping, no network volume, no verified fingerprint, the model-operation runtime, a runtime mismatch, simulated
+    destination refusals and the controller's destination timeout as `error`, in Korean.
+  - Composite reasons: the 8.1 backfill's unpriced notice in front of a later reason, and the budget text with the
+    unpriced suffix, show both parts; a local selection's `_describe(exc)` gets a Korean lead. Korean texts
+    (`desktop_runtime.MISSING_KEY`) stay as received.
+- M1. An attempt already released (`needs_operator`, not `uncertain`, an operator-confirmation or overdue reason) shows
+  "잠금이 이미 해제되었습니다 · 컨트롤러가 다음 확인 때 …", plus "컨트롤러를 시작하세요" when the run's controller is
+  not running, whoever released it. The session-only memory of releases is gone; outputs-refused and ledger-integrity
+  reasons keep "데스크톱에서 해결할 수 없습니다".
+- M2. The reason's focus and open keys are scoped (`reason:table:<id>`, `reason:operator:<id>`).
+- M3. A final run with graph tracking `not_started` and no tracking event at all is settled (it ended before the Task 8
+  outbox; nothing will change) and says so; one with any event is still followed.
+- M4. While the release dialog is open, a poll that shows another job or attempt, or a node no longer releasable,
+  disables "잠금 해제" for good and says why; a new dialog names the current attempt.
+- M5. A blank label is shown and typed as the node ID everywhere (table, operator list, dialog, selection and tracking
+  texts). M6. The release texts say a canceled run's attempt settles as canceled; `tracking_failures.last_error` is
+  localized with "원문 보기"; re-arm warnings are dropped when another run is opened.
+
+Actual verification:
+- Against this tree's own Vite on port 1450 through a scratch config under `%TEMP%` (`reuseExistingServer: false`).
+- RED first (7 of 15): test 2 found no `[data-reason="waiting"]` for "waiting for train-1"; test 4's released node said
+  "데스크톱에서 해결할 수 없습니다"; test 7's last error stayed English; test 11's dialog lacked "취소로 기록"; test 13
+  got kind `error` for "waiting for train-1"; the new test 14 found no pre-outbox note; the new test 15 showed a blank
+  label as is.
+- 18 mutations of the fixes (each readiness and tracking rule and its guidance, the unpriced composite and suffix, the
+  Pod replan kind, the exception lead, the labels passed to the reasons, the released branch and both directions of
+  its controller hint, the scoped keys, both pre-outbox conditions, the dialog's poll re-check and its stale gate, the
+  blank-label name and the localized last error): every one failed a test.
+- From `desktop/`: `npx playwright test` **185 passed** on `6c8780f` (183 + 2 new; tests 2, 4, 7, 11 and 13 were
+  extended) and **204 passed** after the rebase (10.5's 202 + 2); the spec passed `--repeat-each=3` (45 of 45) on both;
+  `npm run build` passes on both.
+- From the root: `uv run pytest -q` **1715 passed, 1 skipped** on `6c8780f` and **1716 passed, 1 skipped** after the
+  rebase (10.5's UI contract test); `uv run ruff check src tests` passes;
+  `scripts/check_secrets.py` reports 0 findings with the change staged; `git diff
+  --exit-code src/ desktop/src-tauri/ containers/ pyproject.toml uv.lock desktop/package.json desktop/package-lock.json`
+  is clean; every changed file is CR-free.
+
+Not verified or still open:
+- Wait reasons are still matched by English prefixes; a provider text outside the files read above (a deeper SSH or
+  RunPod client error) shows as received with kind `error`. Real WebView2 and a real controller: Task 11.
 
 ---
 
