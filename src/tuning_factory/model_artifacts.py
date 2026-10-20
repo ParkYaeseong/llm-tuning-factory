@@ -218,6 +218,11 @@ def _check_ancestors(path: Path):
             _not_link(current)
 
 
+def check_link_free(path: str | Path) -> None:
+    """Refuse a symlink or reparse point at ``path`` or at any existing ancestor."""
+    _check_ancestors(Path(path).absolute())
+
+
 @contextmanager
 def _open_regular(path: Path):
     before = _not_link(path)
@@ -468,98 +473,84 @@ def _validate_payload(directory: Path, descriptor: ModelDescriptor, inventory):
         raise ValueError("full model snapshot cannot contain an adapter loader configuration")
 
 
-class ModelArtifactStore:
-    """Content-addressed local copies; every public read verifies both identities."""
+ARTIFACT_LAYOUT = frozenset({"files", "descriptor.json", "inventory.json"})
 
-    def __init__(self, root: str | Path):
+
+def verify_artifact_directory(location: str | Path, ref: ModelArtifactRef) -> ModelDescriptor:
+    """Verify one stored artifact: layout, descriptor identity, inventory and payload; no lineage.
+
+    ``location`` is ``<root>/<artifact_id>/<inventory_sha256>`` holding ``files/``, ``descriptor.json``
+    and ``inventory.json``. Every file is hashed once; links anywhere on the path or inside are refused.
+    """
+    ref = ModelArtifactRef.model_validate(ref)
+    location = Path(location).absolute()
+    try:
+        _check_ancestors(location)
+        if {file.name for file in location.iterdir()} != ARTIFACT_LAYOUT:
+            raise ValueError("unexpected model artifact metadata files")
+        descriptor_raw = _read_json(location / "descriptor.json")
+        inventory_raw = _read_json(location / "inventory.json")
+        descriptor = ModelDescriptor.model_validate(descriptor_raw)
+        # Identity belongs to the canonical content originally stored, not
+        # to defaults added by a newer metadata validator. The normalized
+        # descriptor must still pass all current loader/payload checks below.
+        if digest(canonical(descriptor_raw)) != ref.artifact_id:
+            raise ValueError("model descriptor hash mismatch")
+        if not isinstance(inventory_raw, list):
+            raise ValueError("invalid model artifact inventory")
+        inventory = tuple(_FileEntry.model_validate(entry) for entry in inventory_raw)
+        if digest(_inventory_bytes(inventory)) != ref.inventory_sha256:
+            raise ValueError("model inventory hash mismatch")
+        if _inventory(location / "files") != inventory:
+            raise ValueError("model inventory files/hash mismatch")
+        _validate_payload(location / "files", descriptor, inventory)
+        return descriptor
+    except OSError as exc:
+        raise ValueError("model artifact is missing or inaccessible") from exc
+
+
+class ArtifactVerifier:
+    """Verifies each artifact at most once while it lives; create one per public operation.
+
+    ``lineage=True`` (the control-plane store) also verifies every ancestor and the lineage rules.
+    ``lineage=False`` verifies each entry alone, for a worker cache that holds only the roles an
+    operation binds. ``verify``, ``path``, ``validate_input`` and lineage share one completed-cache, so a
+    shared base is hashed once per operation, and nothing verified survives the instance.
+    """
+
+    def __init__(self, root: str | Path, *, lineage: bool = True, completed: dict | None = None):
         self.root = Path(root).absolute()
         _check_ancestors(self.root)
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.lineage = lineage
+        self._completed = {} if completed is None else completed
 
-    def _location(self, ref: ModelArtifactRef) -> Path:
+    def location(self, ref: ModelArtifactRef) -> Path:
+        ref = ModelArtifactRef.model_validate(ref)
         return self.root / ref.artifact_id / ref.inventory_sha256
 
-    def freeze(self, directory: str | Path, descriptor: ModelDescriptor) -> ModelArtifactRef:
-        descriptor = ModelDescriptor.model_validate(descriptor)
-        source = Path(directory).absolute()
-        sources = _files(source)
-        if self.root == source or self.root.is_relative_to(source):
-            raise ValueError("artifact store must not be inside source directory")
-        _check_ancestors(self.root)
-        completed = {}
-        temporary = Path(tempfile.mkdtemp(prefix=".freeze-", dir=self.root))
-        try:
-            payload = temporary / "files"
-            payload.mkdir()
-            for relative, file in sources:
-                target = payload / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with _open_regular(file) as reader, target.open("xb") as writer:
-                    shutil.copyfileobj(reader, writer, length=1024 * 1024)
-                    writer.flush()
-                    os.fsync(writer.fileno())
-            inventory = _inventory(payload)
-            _validate_payload(payload, descriptor, inventory)
-            self._validate_lineage(descriptor, set(), completed)
-            body = canonical(descriptor.model_dump(mode="json"))
-            inventory_body = _inventory_bytes(inventory)
-            ref = ModelArtifactRef(artifact_id=digest(body), inventory_sha256=digest(inventory_body))
-            for filename, data in (("descriptor.json", body), ("inventory.json", inventory_body)):
-                with (temporary / filename).open("xb") as stream:
-                    stream.write(data)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-            destination = self._location(ref)
-            _check_ancestors(destination)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                temporary.rename(destination)
-            except OSError:
-                if not destination.exists():
-                    raise
-                self._verify(ref, set(), completed)
-            return ref
-        finally:
-            if temporary.exists():
-                shutil.rmtree(temporary)
+    def verify(self, ref: ModelArtifactRef) -> ModelDescriptor:
+        return self._verify(ref, frozenset())
 
-    def _verify(self, ref: ModelArtifactRef, active: set, completed: dict) -> ModelDescriptor:
+    def path(self, ref: ModelArtifactRef) -> Path:
+        self.verify(ref)
+        return self.location(ref) / "files"
+
+    def _verify(self, ref: ModelArtifactRef, active: frozenset) -> ModelDescriptor:
         ref = ModelArtifactRef.model_validate(ref)
         identity = (ref.artifact_id, ref.inventory_sha256)
         if identity in active:
             raise ValueError("cyclic model artifact lineage")
-        if identity in completed:
-            return completed[identity]
-        location = self._location(ref)
-        try:
-            _check_ancestors(location)
-            if {file.name for file in location.iterdir()} != {"files", "descriptor.json", "inventory.json"}:
-                raise ValueError("unexpected model artifact metadata files")
-            descriptor_raw = _read_json(location / "descriptor.json")
-            inventory_raw = _read_json(location / "inventory.json")
-            descriptor = ModelDescriptor.model_validate(descriptor_raw)
-            # Identity belongs to the canonical content originally stored, not
-            # to defaults added by a newer metadata validator. The normalized
-            # descriptor must still pass all current loader/payload checks below.
-            if digest(canonical(descriptor_raw)) != ref.artifact_id:
-                raise ValueError("model descriptor hash mismatch")
-            if not isinstance(inventory_raw, list):
-                raise ValueError("invalid model artifact inventory")
-            inventory = tuple(_FileEntry.model_validate(entry) for entry in inventory_raw)
-            if digest(_inventory_bytes(inventory)) != ref.inventory_sha256:
-                raise ValueError("model inventory hash mismatch")
-            if _inventory(location / "files") != inventory:
-                raise ValueError("model inventory files/hash mismatch")
-            _validate_payload(location / "files", descriptor, inventory)
-            self._validate_lineage(descriptor, active | {identity}, completed)
-            # Cache only fully verified evidence, and only in this operation.
-            completed[identity] = descriptor
-            return descriptor
-        except OSError as exc:
-            raise ValueError("model artifact is missing or inaccessible") from exc
+        if identity in self._completed:
+            return self._completed[identity]
+        descriptor = verify_artifact_directory(self.location(ref), ref)
+        if self.lineage:
+            self.validate_lineage(descriptor, active | {identity})
+        # Cache only fully verified evidence, and only in this operation.
+        self._completed[identity] = descriptor
+        return descriptor
 
-    def _validate_lineage(self, descriptor, active, completed):
-        parents = {ref: self._verify(ref, active, completed) for ref in descriptor.parents}
+    def validate_lineage(self, descriptor: ModelDescriptor, active: frozenset = frozenset()) -> None:
+        parents = {ref: self._verify(ref, frozenset(active)) for ref in descriptor.parents}
         if any(parent.synthetic and not descriptor.synthetic or parent.simulation and not descriptor.simulation
                for parent in parents.values()):
             raise ValueError("synthetic/simulation provenance must be preserved from all parents")
@@ -577,24 +568,13 @@ class ModelArtifactStore:
                 or parent.tokenizer_fingerprint != descriptor.tokenizer_fingerprint):
             raise ValueError("adapter effective base config/tokenizer mismatch")
 
-    def get(self, ref: ModelArtifactRef) -> ModelDescriptor:
-        return self.verify(ref)
-
-    def verify(self, ref: ModelArtifactRef) -> ModelDescriptor:
-        return self._verify(ref, set(), {})
-
-    def path(self, ref: ModelArtifactRef) -> Path:
-        ref = ModelArtifactRef.model_validate(ref)
-        self.verify(ref)
-        return self._location(ref) / "files"
-
-    def _validate_load(self, load: ModelLoadRef, kind: str, require_real: bool, completed: dict):
-        base = self._verify(load.base, set(), completed) if isinstance(load.base, ModelArtifactRef) else load.base
+    def _validate_load(self, load: ModelLoadRef, kind: str, require_real: bool):
+        base = self.verify(load.base) if isinstance(load.base, ModelArtifactRef) else load.base
         if isinstance(base, ModelDescriptor) and base.storage_kind != "full_model":
             raise ValueError("model input base must be a full model")
         effective = base
         if load.adapter is not None:
-            effective = self._verify(load.adapter, set(), completed)
+            effective = self.verify(load.adapter)
             if effective.storage_kind != "adapter":
                 raise ValueError("model input adapter must have adapter storage")
             if effective.effective_base != load.base:
@@ -615,12 +595,11 @@ class ModelArtifactStore:
         model_input = ModelInput.model_validate(model_input)
         if model_input.frozen_reference is not None and model_input.frozen_reference != model_input.policy:
             raise ValueError("frozen reference must bind the exact policy parent")
-        completed = {}
-        policy = self._validate_load(model_input.policy, "causal_lm", require_real, completed)
+        policy = self._validate_load(model_input.policy, "causal_lm", require_real)
         for load, kind in ((model_input.frozen_reference, "causal_lm"),
                            (model_input.reward_model, "reward_model")):
             if load is not None:
-                other = self._validate_load(load, kind, require_real, completed)
+                other = self._validate_load(load, kind, require_real)
                 if other.tokenizer_fingerprint != policy.tokenizer_fingerprint:
                     raise ValueError("reference/reward tokenizer differs from policy")
                 root = other.root if isinstance(other, ModelDescriptor) else other
@@ -628,3 +607,79 @@ class ModelArtifactStore:
                 if root != policy_root:
                     raise ValueError("reference/reward HF root differs from policy")
         return model_input
+
+
+class ModelArtifactStore:
+    """Content-addressed local copies; every public read verifies both identities."""
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root).absolute()
+        _check_ancestors(self.root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def verifier(self, *, lineage: bool = True) -> ArtifactVerifier:
+        """A verifier whose completed-cache spans one public operation (each artifact hashed once)."""
+        return ArtifactVerifier(self.root, lineage=lineage)
+
+    def _location(self, ref: ModelArtifactRef) -> Path:
+        return self.root / ref.artifact_id / ref.inventory_sha256
+
+    def freeze(self, directory: str | Path, descriptor: ModelDescriptor) -> ModelArtifactRef:
+        descriptor = ModelDescriptor.model_validate(descriptor)
+        source = Path(directory).absolute()
+        sources = _files(source)
+        if self.root == source or self.root.is_relative_to(source):
+            raise ValueError("artifact store must not be inside source directory")
+        _check_ancestors(self.root)
+        verifier = ArtifactVerifier(self.root)
+        temporary = Path(tempfile.mkdtemp(prefix=".freeze-", dir=self.root))
+        try:
+            payload = temporary / "files"
+            payload.mkdir()
+            for relative, file in sources:
+                target = payload / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with _open_regular(file) as reader, target.open("xb") as writer:
+                    shutil.copyfileobj(reader, writer, length=1024 * 1024)
+                    writer.flush()
+                    os.fsync(writer.fileno())
+            inventory = _inventory(payload)
+            _validate_payload(payload, descriptor, inventory)
+            verifier.validate_lineage(descriptor)
+            body = canonical(descriptor.model_dump(mode="json"))
+            inventory_body = _inventory_bytes(inventory)
+            ref = ModelArtifactRef(artifact_id=digest(body), inventory_sha256=digest(inventory_body))
+            for filename, data in (("descriptor.json", body), ("inventory.json", inventory_body)):
+                with (temporary / filename).open("xb") as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            destination = self._location(ref)
+            _check_ancestors(destination)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                temporary.rename(destination)
+            except OSError:
+                if not destination.exists():
+                    raise
+                verifier.verify(ref)
+            return ref
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+
+    def _verify(self, ref: ModelArtifactRef, active: set, completed: dict) -> ModelDescriptor:
+        return ArtifactVerifier(self.root, completed=completed)._verify(ref, frozenset(active))
+
+    def get(self, ref: ModelArtifactRef) -> ModelDescriptor:
+        return self.verify(ref)
+
+    def verify(self, ref: ModelArtifactRef) -> ModelDescriptor:
+        return self.verifier().verify(ref)
+
+    def path(self, ref: ModelArtifactRef) -> Path:
+        return self.verifier().path(ref)
+
+    def validate_input(self, model_input: ModelInput, *, require_real: bool = False) -> ModelInput:
+        """Resolve and verify exact storage, semantics, lineage and tokenizer bindings."""
+        return self.verifier().validate_input(model_input, require_real=require_real)

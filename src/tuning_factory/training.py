@@ -43,6 +43,12 @@ def check_model_input_contract(config, model_input: ModelInput) -> ModelInput:
         raise ValueError("PPO requires a typed reward_model binding; other stages cannot bind reward")
     if config.training_stage == "ppo" and model_input.initialization == "continue_adapter":
         raise ValueError(PPO_CONTINUATION)
+    if model_input.initialization == "continue_adapter":
+        if config.training_method not in {"lora", "qlora"}:
+            raise ValueError("adapter continuation requires LoRA/QLoRA")
+    elif model_input.initialization != ("full_weights" if config.training_method in {"full", "freeze"}
+                                        else "new_adapter"):
+        raise ValueError("initialization differs from requested training method")
     if requires_frozen_reference(config):
         if model_input.frozen_reference != model_input.policy:
             raise ValueError("frozen reference must bind the exact policy parent")
@@ -85,6 +91,8 @@ class LlamaFactoryBackend(TrainingBackend):
 
     def prepare(self, config, directory, dataset, model_input=None):
         self.validate_config(config)
+        if isinstance(config, GraphTrainingConfig) and model_input is None:
+            raise ValueError("graph training requires a typed model_input; refusing an executable legacy plan")
         directory = Path(directory)
         (directory / "data").mkdir(parents=True, exist_ok=True)
         kind = STAGES[config.training_stage][1]

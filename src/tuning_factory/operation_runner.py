@@ -5,7 +5,11 @@ approved artifact cache and writes ``model-inputs.json`` (identities only; never
 
 Worker: ``verify_model_paths`` re-derives the roles from the operation and the hash-verified model cache,
 resolves HF roots into link-free local snapshots and repeats every rule. ``bind_training_plan`` replaces
-only the allowlisted role sentinels of the logical LLaMA-Factory template with those verified paths.
+only the allowlisted role sentinels of the logical LLaMA-Factory template with those verified paths,
+inside cache roots that the worker passes from its own configuration.
+
+One ``model_artifacts.ArtifactVerifier`` per public call hashes each distinct artifact once: lineage-aware
+on the control plane, entry-only on the worker (whose cache holds only the bound roles).
 
 Every model directory produced or accepted here is link-free: no symlink or reparse point on the path, on
 its ancestors or inside the tree, because the model readers refuse links. HF roots are therefore
@@ -13,8 +17,8 @@ downloaded with ``snapshot_download(local_dir=...)`` (real files), never bound a
 which are trees of symlinks. Fingerprints are computed on exactly the tree that is bound; the
 ``.cache/huggingface/`` download metadata is walked for links but never fingerprinted.
 
-The PEFT/LLaMA-Factory producer stage of a parent adapter is ledger evidence, not artifact metadata, so
-the SFT-to-preference rule is enforced at compilation and staging only; the worker cannot re-derive it.
+The producer stage of a parent adapter is ledger evidence, not artifact metadata, so the
+SFT-to-preference rule is enforced at compilation and staging only; the worker cannot re-derive it.
 
 Module import touches only the standard library, pydantic, PyYAML and local contracts: no graph_store or
 jobs (the control-plane runner, 7.5) and no torch, transformers or huggingface_hub (imported lazily).
@@ -26,7 +30,7 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -38,24 +42,18 @@ from pydantic import Field, TypeAdapter, model_validator
 from .config import StrictModel
 from .model_artifacts import (
     TOKENIZER_FILES,
+    ArtifactVerifier,
     BaseRef,
     HFRootRef,
     ModelArtifactRef,
     ModelArtifactStore,
     ModelDescriptor,
-    ModelLoadRef,
-    _check_ancestors,
-    _FileEntry,
-    _files,
-    _inventory,
-    _inventory_bytes,
-    _open_regular,
-    _read_json,
-    _validate_payload,
+    check_link_free,
 )
 from .model_ops import (
     check_continuation,
     check_full_model_directory,
+    local_config_sha256,
     local_tokenizer_fingerprint,
     validate_merge_inputs,
     verify_inspected_targets,
@@ -72,9 +70,18 @@ HF_ROOTS = "factory-roots"   # under HF_HOME: one link-free local_dir per <owner
 # Loader files only: no custom code (trust_remote_code is False), no pickled weights, no consolidated copies.
 HF_ALLOW_PATTERNS = ("config.json", "generation_config.json", *sorted(TOKENIZER_FILES), "chat_templates/*",
                      "model.safetensors", "model.safetensors.index.json", "model-*.safetensors")
+# TRL's ValueHead (Linear(hidden, 1)) as LLaMA-Factory loads it from the reward path.
+VALUE_HEAD_TENSORS = frozenset({"v_head.summary.weight", "v_head.summary.bias"})
 RELATIVE_PATHS = MappingProxyType({"dataset_dir": "./data", "output_dir": "./output"})
+# Arguments that LLaMA-Factory 0.9.5 / HF TrainingArguments read as filesystem locations. Model slots hold
+# verified absolute cache paths, RELATIVE_PATHS hold the attempt's own data/output, all others are refused.
+PATH_KEYS = frozenset({
+    *ROLE_SLOTS.values(), "adapter_folder", "cache_dir", "tokenized_path", "dataset_dir", "media_dir",
+    "image_dir", "video_dir", "audio_dir", "reward_model_adapters", "export_dir", "export_quantization_dataset",
+    "output_dir", "logging_dir", "resume_from_checkpoint", "deepspeed", "fsdp_config", "ray_storage_path",
+})
 OUTSIDE = "bound model path is outside the approved model caches"
-_PATH_LIKE = re.compile(r"^(?:/|\\|~|\.{1,2}(?:[/\\]|$)|[A-Za-z]:[/\\])")
+_PATH_LIKE = re.compile(r"^(?:/|\\|~|\.{1,2}(?:[/\\]|$)|[A-Za-z]:[/\\])")   # catch-all for unknown keys
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf")
 
 
@@ -142,21 +149,9 @@ def _operation(operation):
     return TypeAdapter(OperationSpec).validate_python(value)
 
 
-def _cached(verify: Callable[[ModelArtifactRef], ModelDescriptor]):
-    """One verification per artifact and public call (a descriptor never outlives the call)."""
-    seen = {}
-
-    def describe(ref: ModelArtifactRef) -> ModelDescriptor:
-        ref = ModelArtifactRef.model_validate(ref)
-        if _key(ref) not in seen:
-            seen[_key(ref)] = verify(ref)
-        return seen[_key(ref)]
-    return describe
-
-
 # -- role derivation and rules shared by staging and the worker ----------------------------------
 
-def _role_refs(operation, describe) -> list[tuple[str, int, BaseRef]]:
+def _role_refs(operation, verifier: ArtifactVerifier) -> list[tuple[str, int, BaseRef]]:
     if isinstance(operation, TrainOperation):
         model_input, refs = operation.model_input, []
         for prefix, load in (("policy", model_input.policy), ("reference", model_input.frozen_reference),
@@ -167,10 +162,10 @@ def _role_refs(operation, describe) -> list[tuple[str, int, BaseRef]]:
                     refs.append((f"{prefix}_adapter", 0, load.adapter))
         return refs
     if isinstance(operation, MergeOperation):
-        first = describe(operation.models[0])
+        first = verifier.verify(operation.models[0])
         return [("operation_base", 0, first.effective_base),
                 *(("operation_adapter", index, ref) for index, ref in enumerate(operation.models))]
-    descriptor = describe(operation.model)
+    descriptor = verifier.verify(operation.model)
     if descriptor.storage_kind == "adapter":
         return [("operation_base", 0, descriptor.effective_base), ("operation_adapter", 0, operation.model)]
     if isinstance(operation, MaterializeOperation):
@@ -178,87 +173,58 @@ def _role_refs(operation, describe) -> list[tuple[str, int, BaseRef]]:
     return [("operation_base", 0, operation.model)]
 
 
-def _staged(role: str, index: int, ref: BaseRef, describe) -> StagedModel:
+def _staged(role: str, index: int, ref: BaseRef, verifier: ArtifactVerifier) -> StagedModel:
     if isinstance(ref, HFRootRef):
         return StagedModel(role=role, index=index, source="hf_root", hf_root=ref, storage_kind="full_model",
                            config_sha256=ref.config_sha256, tokenizer_fingerprint=ref.tokenizer_fingerprint)
-    descriptor = describe(ref)
+    descriptor = verifier.verify(ref)
     return StagedModel(role=role, index=index, source="artifact", artifact=ref, storage_kind=descriptor.storage_kind,
                        config_sha256=descriptor.config_sha256, tokenizer_fingerprint=descriptor.tokenizer_fingerprint)
 
 
-def _check_load(load: ModelLoadRef, kind: str, describe) -> None:
-    """model_artifacts' exact-load rules, without lineage (the worker cache holds only the roles)."""
-    base = describe(load.base) if isinstance(load.base, ModelArtifactRef) else load.base
-    if isinstance(base, ModelDescriptor) and base.storage_kind != "full_model":
-        raise ValueError("model input base must be a full model")
-    effective = base
-    if load.adapter is not None:
-        effective = describe(load.adapter)
-        if effective.storage_kind != "adapter":
-            raise ValueError("model input adapter must have adapter storage")
-        if effective.effective_base != load.base:
-            raise ValueError("adapter effective base differs from model input base")
-        if (effective.config_sha256, effective.tokenizer_fingerprint) != (base.config_sha256,
-                                                                           base.tokenizer_fingerprint):
-            raise ValueError("adapter/base config or tokenizer differs")
-    semantic = effective.semantic_kind if isinstance(effective, ModelDescriptor) else "causal_lm"
-    if semantic != kind:
-        raise ValueError(f"model input requires semantic kind {kind}")
+def _tokenizer(ref: BaseRef, verifier: ArtifactVerifier) -> str:
+    return ref.tokenizer_fingerprint if isinstance(ref, HFRootRef) else verifier.verify(ref).tokenizer_fingerprint
 
 
-def _root(ref: BaseRef, describe) -> HFRootRef:
-    return ref if isinstance(ref, HFRootRef) else describe(ref).root
-
-
-def _training_rules(operation: TrainOperation, roles: dict, describe):
+def _training_rules(operation: TrainOperation, verifier: ArtifactVerifier):
     config, model_input = operation.config, operation.model_input
-    check_model_input_contract(config, model_input)
-    if model_input.initialization == "continue_adapter":
-        if config.training_method not in {"lora", "qlora"}:
-            raise ValueError("adapter continuation requires LoRA/QLoRA")
-    elif model_input.initialization != ("full_weights" if config.training_method in {"full", "freeze"}
-                                        else "new_adapter"):
-        raise ValueError("initialization differs from requested training method")
-    for load, kind in ((model_input.policy, "causal_lm"), (model_input.frozen_reference, "causal_lm"),
-                       (model_input.reward_model, "reward_model")):
-        if load is not None:
-            _check_load(load, kind, describe)
+    check_model_input_contract(config, model_input)   # reward iff PPO, PPO continuation, initialization, reference
     # LLaMA-Factory loads the tokenizer from each base path it is given (plan F1).
-    policy = roles[("policy_base", 0)]
-    for role in ("reference_base", "reward_base"):
-        staged = roles.get((role, 0))
-        if staged is not None and staged.tokenizer_fingerprint != policy.tokenizer_fingerprint:
+    policy = _tokenizer(model_input.policy.base, verifier)
+    for role, load in (("reference_base", model_input.frozen_reference), ("reward_base", model_input.reward_model)):
+        if load is not None and _tokenizer(load.base, verifier) != policy:
             raise ValueError(f"{role} tokenizer differs from policy")
-    policy_root = _root(model_input.policy.base, describe)
-    for load in (model_input.frozen_reference, model_input.reward_model):
-        if load is not None and _root(load.base, describe) != policy_root:
-            raise ValueError("reference/reward HF root differs from policy")
+    # Exact loads, semantics, roots and (on the control plane) lineage, through the shared verifier.
+    verifier.validate_input(model_input, require_real=not operation.lineage.simulation)
     reward, reward_type = model_input.reward_model, None
     if reward is not None:
         # A LoRA reward is loaded onto the policy's own base (plan F5).
         if reward.adapter is not None and reward.base != model_input.policy.base:
             raise ValueError("LoRA reward requires the exact policy effective base")
-        head = describe(reward.adapter or reward.base)
-        if not any(tensor.file == "value_head.safetensors" and tensor.name.startswith("v_head.")
-                   for tensor in head.tensors):
-            raise ValueError("PPO reward requires reward_model semantics with a value_head.safetensors value head")
+        head = {tensor.name for tensor in verifier.verify(reward.adapter or reward.base).tensors
+                if tensor.file == "value_head.safetensors"}
+        if not VALUE_HEAD_TENSORS <= head:
+            raise ValueError("PPO reward requires reward_model semantics with a value_head.safetensors value head "
+                             "(v_head.summary.weight and v_head.summary.bias)")
         reward_type = "lora" if reward.adapter is not None else "full"
     base = model_input.policy.base
     if (config.training_method == "qlora" and isinstance(base, ModelArtifactRef)
-            and describe(base).quantization_bit is not None):
+            and verifier.verify(base).quantization_bit is not None):
         raise ValueError("QLoRA requires an unquantized full effective base")
     reference_bit = (config.quantization_bit if model_input.frozen_reference is not None
                      and config.training_method == "qlora" else None)   # plan §6 Q5
     return reference_bit, reward_type
 
 
-def _derive(operation, describe) -> ResolvedModelInputs:
+def _derive(operation, verifier: ArtifactVerifier) -> ResolvedModelInputs:
     """Roles and descriptor-level rules of one operation; identical on the control plane and the worker."""
     require_real = not operation.lineage.simulation
-    models = tuple(_staged(role, index, ref, describe) for role, index, ref in _role_refs(operation, describe))
+    reference_bit = reward_type = None
+    if isinstance(operation, TrainOperation):
+        reference_bit, reward_type = _training_rules(operation, verifier)
+    models = tuple(_staged(role, index, ref, verifier) for role, index, ref in _role_refs(operation, verifier))
     roles = {(item.role, item.index): item for item in models}
-    if require_real and any(not describe(item.artifact).eligible_for_real_use
+    if require_real and any(not verifier.verify(item.artifact).eligible_for_real_use
                             for item in models if item.artifact is not None):
         raise ValueError("synthetic/simulation artifact is ineligible for real use")
     for item in models:
@@ -266,17 +232,14 @@ def _derive(operation, describe) -> ResolvedModelInputs:
         if item.storage_kind == "adapter" and base is not None and (
                 item.config_sha256, item.tokenizer_fingerprint) != (base.config_sha256, base.tokenizer_fingerprint):
             raise ValueError("adapter/base config or tokenizer differs")
-    reference_bit = reward_type = None
-    if isinstance(operation, TrainOperation):
-        reference_bit, reward_type = _training_rules(operation, roles, describe)
-    elif isinstance(operation, MergeOperation):
-        validate_merge_inputs(operation.models, [describe(ref) for ref in operation.models], operation.weights,
-                              require_real=require_real)
+    if isinstance(operation, MergeOperation):
+        validate_merge_inputs(operation.models, [verifier.verify(ref) for ref in operation.models],
+                              operation.weights, require_real=require_real)
     elif isinstance(operation, MaterializeOperation):
         from .graph_planner import check_materializable
-        check_materializable(describe(operation.model))
+        check_materializable(verifier.verify(operation.model))
         base = roles[("operation_base", 0)]
-        if base.artifact is not None and describe(base.artifact).quantization_bit is not None:
+        if base.artifact is not None and verifier.verify(base.artifact).quantization_bit is not None:
             raise ValueError("materialization requires unquantized effective base weights")
     return ResolvedModelInputs(operation_kind=operation.kind, operation_sha256=operation_sha256(operation),
                                models=models, transfers=_transfers(models),
@@ -297,22 +260,21 @@ def _parent_stage(operation: TrainOperation, parent: ModelDescriptor, producers)
             raise ValueError("SFT to preference training requires explicit materialize")
 
 
-def _continuation(operation, describe, evidence_for) -> None:
+def _continuation(operation, verifier: ArtifactVerifier, evidence_for) -> None:
     if not isinstance(operation, TrainOperation) or operation.model_input.initialization != "continue_adapter":
         return
     policy = operation.model_input.policy
-    parent = describe(policy.adapter)
-    check_continuation(operation.config, parent.adapter, evidence_for(policy.base))
+    check_continuation(operation.config, verifier.verify(policy.adapter).adapter, evidence_for(policy.base))
 
 
-def _verified_evidence(evidence, base: BaseRef, describe):
+def _verified_evidence(evidence, base: BaseRef, verifier: ArtifactVerifier):
     from .graph_planner import ModelTargetEvidence
     evidence = ModelTargetEvidence.model_validate(evidence)
     if evidence.base != base:
         raise ValueError("inspected target evidence belongs to another base")
     if isinstance(base, ModelArtifactRef):
         # Artifact-base evidence must be the complete linear inventory of the verified full model.
-        verify_inspected_targets(evidence, describe(base), base)
+        verify_inspected_targets(evidence, verifier.verify(base), base)
     return evidence
 
 
@@ -342,21 +304,17 @@ def stage_model_inputs(operation, approved_cache: ModelArtifactStore, staging_ro
     operation = _operation(operation)
     if not isinstance(approved_cache, ModelArtifactStore):
         raise TypeError("staging requires the approved control-plane ModelArtifactStore")
-    if isinstance(operation, TrainOperation):
-        check_model_input_contract(operation.config, operation.model_input)
-        # Lineage-aware verification of every load (frozen reference, reward root/tokenizer, adapter base).
-        approved_cache.validate_input(operation.model_input, require_real=not operation.lineage.simulation)
-    describe = _cached(approved_cache.verify)
-    resolved = _derive(operation, describe)
+    verifier = approved_cache.verifier()   # lineage-aware; each artifact hashed once in this call
+    resolved = _derive(operation, verifier)
     if isinstance(operation, TrainOperation) and operation.model_input.initialization == "continue_adapter":
-        _parent_stage(operation, describe(operation.model_input.policy.adapter), tuple(producers))
+        _parent_stage(operation, verifier.verify(operation.model_input.policy.adapter), tuple(producers))
 
     def evidence_for(base):
         matches = [item for item in target_evidence if item.base == base]
-        return _verified_evidence(matches[0], base, describe) if len(matches) == 1 else None
-    _continuation(operation, describe, evidence_for)
+        return _verified_evidence(matches[0], base, verifier) if len(matches) == 1 else None
+    _continuation(operation, verifier, evidence_for)
     root = Path(staging_root).absolute()
-    _check_ancestors(root)
+    check_link_free(root)
     root.mkdir(parents=True, exist_ok=True)
     if any(path.suffix in _WEIGHT_SUFFIXES for path in root.rglob("*")):
         raise ValueError("attempt directory must not contain model weights; stage them through the model cache")
@@ -366,38 +324,12 @@ def stage_model_inputs(operation, approved_cache: ModelArtifactStore, staging_ro
 
 # -- worker: cache and HF verification -----------------------------------------------------------
 
-def _artifact_location(cache_root: Path, ref: ModelArtifactRef) -> Path:
-    return Path(cache_root).absolute() / ref.artifact_id / ref.inventory_sha256
-
-
 def verify_cached_artifact(cache_root: Path, ref: ModelArtifactRef) -> ModelDescriptor:
-    """Verify ``<cache_root>/<artifact_id>/<inventory_sha256>/{files/,descriptor.json,inventory.json}``.
+    """Verify ``<cache_root>/<artifact_id>/<inventory_sha256>`` without lineage (fixed argv entry for 7.4).
 
-    Same identity, inventory and payload checks as ``ModelArtifactStore``, but no lineage: a remote cache
-    holds only the roles an operation binds, not every ancestor.
+    A remote cache holds only the roles an operation binds, not every ancestor.
     """
-    ref = ModelArtifactRef.model_validate(ref)
-    location = _artifact_location(cache_root, ref)
-    try:
-        _check_ancestors(location)
-        if {item.name for item in location.iterdir()} != {"files", "descriptor.json", "inventory.json"}:
-            raise ValueError("unexpected model artifact metadata files")
-        descriptor_raw = _read_json(location / "descriptor.json")
-        inventory_raw = _read_json(location / "inventory.json")
-        descriptor = ModelDescriptor.model_validate(descriptor_raw)
-        if digest(canonical(descriptor_raw)) != ref.artifact_id:
-            raise ValueError("model descriptor hash mismatch")
-        if not isinstance(inventory_raw, list):
-            raise ValueError("invalid model artifact inventory")
-        inventory = tuple(_FileEntry.model_validate(entry) for entry in inventory_raw)
-        if digest(_inventory_bytes(inventory)) != ref.inventory_sha256:
-            raise ValueError("model inventory hash mismatch")
-        if _inventory(location / "files") != inventory:
-            raise ValueError("model inventory files/hash mismatch")
-        _validate_payload(location / "files", descriptor, inventory)
-        return descriptor
-    except OSError as exc:
-        raise ValueError("model artifact is missing or inaccessible") from exc
+    return ArtifactVerifier(cache_root, lineage=False).verify(ref)
 
 
 def hf_root_location(root: HFRootRef, hf_home: Path) -> Path:
@@ -411,30 +343,33 @@ def resolve_hf_root(root: HFRootRef, hf_home: Path) -> Path:
     Same GPU-host download behaviour as v1 LLaMA-Factory loading, but into ``local_dir`` (real files)
     rather than the symlinked hub cache. The config hash and tokenizer fingerprint must equal the root.
     """
+    return _resolve_hf_snapshot(root, hf_home)[0]
+
+
+def _resolve_hf_snapshot(root: HFRootRef, hf_home: Path) -> tuple[Path, dict]:
     root = HFRootRef.model_validate(root)
     home = Path(hf_home).absolute()
-    _check_ancestors(home)
+    check_link_free(home)
     target = hf_root_location(root, home)
-    _check_ancestors(target)
+    check_link_free(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     from huggingface_hub import snapshot_download
     returned = snapshot_download(root.repo_id, revision=root.revision, local_dir=str(target),
                                  allow_patterns=list(HF_ALLOW_PATTERNS))
-    _check_ancestors(target)
+    check_link_free(target)
     if Path(returned).resolve() != target.resolve():
         raise ValueError("HF snapshot was not written to the approved local directory")
     try:
-        _files(target)   # the whole tree is link-free, including .cache/huggingface/ metadata
-        with _open_regular(target / "config.json") as stream:
-            config_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+        # The whole tree must be link-free (including .cache/huggingface/ metadata) and loadable unambiguously.
+        config = check_full_model_directory(target)
+        config_sha256 = local_config_sha256(target)
     except OSError as exc:
         raise ValueError("HF snapshot is incomplete or inaccessible") from exc
     if config_sha256 != root.config_sha256:
         raise ValueError("model config snapshot fingerprint mismatch")
     if local_tokenizer_fingerprint(target) != root.tokenizer_fingerprint:
         raise ValueError("tokenizer snapshot fingerprint mismatch")
-    check_full_model_directory(target)
-    return target
+    return target, config
 
 
 # -- worker: verified paths ----------------------------------------------------------------------
@@ -454,8 +389,13 @@ class VerifiedModelPath:
 
 @dataclass(frozen=True)
 class VerifiedModelPaths:
+    """Verified local paths only; the approved cache roots come from the worker configuration."""
     models: tuple[VerifiedModelPath, ...]
-    roots: tuple[Path, ...]              # approved cache roots (model cache, HF_HOME)
+
+    def __post_init__(self):
+        roles = [(item.role, item.index) for item in self.models]
+        if len(set(roles)) != len(roles):
+            raise ValueError("duplicate verified model role")
 
     def path(self, role: ModelRole, index: int = 0) -> Path:
         for item in self.models:
@@ -476,39 +416,37 @@ def verify_model_paths(resolved: ResolvedModelInputs, operation, *, model_cache:
     operation = _operation(operation)
     if (resolved.operation_kind, resolved.operation_sha256) != (operation.kind, operation_sha256(operation)):
         raise ValueError("staged model inputs belong to another operation")
-    cache = Path(model_cache).absolute()
-    _check_ancestors(cache)
-    describe = _cached(lambda ref: verify_cached_artifact(cache, ref))
-    if _derive(operation, describe) != resolved:
+    verifier = ArtifactVerifier(model_cache, lineage=False)   # each cache entry hashed once in this call
+    if _derive(operation, verifier) != resolved:
         raise ValueError("staged model inputs differ from the operation's verified roles")
     home = Path(hf_home).absolute() if hf_home is not None else None
-    snapshots, entries = {}, []
+    snapshots, configs, entries = {}, {}, []
     for staged in resolved.models:
         if staged.artifact is not None:
-            path, descriptor = _artifact_location(cache, staged.artifact) / "files", describe(staged.artifact)
+            path, descriptor = verifier.path(staged.artifact), verifier.verify(staged.artifact)
             if staged.storage_kind == "full_model":
-                check_full_model_directory(path)
+                configs[path] = check_full_model_directory(path)
         else:
             if home is None:
                 raise ValueError("HF root inputs require an approved HF_HOME cache")
             key = staged.hf_root.model_dump_json()
             if key not in snapshots:
-                snapshots[key] = resolve_hf_root(staged.hf_root, home)
+                snapshots[key], config = _resolve_hf_snapshot(staged.hf_root, home)
+                configs[snapshots[key]] = config
             path, descriptor = snapshots[key], None
         entries.append(VerifiedModelPath(role=staged.role, index=staged.index, path=path, staged=staged,
                                          descriptor=descriptor))
-    verified = VerifiedModelPaths(models=tuple(entries), roots=(cache, *((home,) if home is not None else ())))
+    verified = VerifiedModelPaths(models=tuple(entries))
     if isinstance(operation, TrainOperation):
-        if operation.config.training_method == "qlora":
-            config = _read_json(verified.path("policy_base") / "config.json")
-            if not isinstance(config, dict) or "quantization_config" in config:
-                raise ValueError("QLoRA requires an unquantized full effective base")
+        if operation.config.training_method == "qlora" and "quantization_config" in configs[
+                verified.path("policy_base")]:
+            raise ValueError("QLoRA requires an unquantized full effective base")
 
         def evidence_for(base):
             if inspect_targets is None:
                 return None
-            return _verified_evidence(inspect_targets(verified.path("policy_base"), base), base, describe)
-        _continuation(operation, describe, evidence_for)
+            return _verified_evidence(inspect_targets(verified.path("policy_base"), base), base, verifier)
+        _continuation(operation, verifier, evidence_for)
     return verified
 
 
@@ -545,7 +483,7 @@ def _approved_path(path: Path, roots: tuple[Path, ...]) -> Path:
     if not path.is_absolute() or ".." in path.parts or not any(
             path != root and path.is_relative_to(root) for root in roots):
         raise ValueError(OUTSIDE)
-    _check_ancestors(path)
+    check_link_free(path)
     if not path.is_dir():
         raise ValueError("bound model path is not a directory")
     return path
@@ -555,14 +493,21 @@ def _inconsistent(key: str):
     return ValueError(f"bound training plan is inconsistent with verified model roles: {key}")
 
 
-def bind_training_plan(template: Mapping, verified_bindings: VerifiedModelPaths) -> BoundTrainingPlan:
-    """Replace only allowlisted role sentinels with verified local paths; refuse anything else."""
+def bind_training_plan(template: Mapping, verified_bindings: VerifiedModelPaths, *,
+                       approved_roots: Sequence[Path]) -> BoundTrainingPlan:
+    """Replace only allowlisted role sentinels with verified local paths; refuse anything else.
+
+    ``approved_roots`` are the model cache and HF_HOME from the worker's own configuration, never taken
+    from the verified paths, so a forged path cannot carry its own root.
+    """
     if not isinstance(verified_bindings, VerifiedModelPaths):
         raise TypeError("binding requires VerifiedModelPaths from verify_model_paths")
     if not isinstance(template, Mapping):
         raise TypeError("training template must be a mapping")
+    roots = tuple(Path(root).absolute() for root in approved_roots)
+    if not roots:
+        raise ValueError("binding requires the worker's approved model cache roots")
     template = json.loads(canonical(dict(template)))   # detached, JSON-normalized copy
-    roots = tuple(Path(root).absolute() for root in verified_bindings.roots)
     verified = {(item.role, item.index): item for item in verified_bindings.models}
     slots = set(ROLE_SLOTS.values())
     for key, value in _walk(template):
@@ -597,15 +542,18 @@ def bind_training_plan(template: Mapping, verified_bindings: VerifiedModelPaths)
         raise _inconsistent("ref_model_quantization_bit")
     if "resume_from_checkpoint" in plan:
         raise ValueError("a bound plan starts a fresh optimizer; resume_from_checkpoint is not allowed")
+    for key in sorted(PATH_KEYS & set(plan) - slots):
+        if RELATIVE_PATHS.get(key) != plan[key]:
+            raise ValueError(f"training plan contains an unapproved path: {key}")
+    if any(plan.get(key) != value for key, value in RELATIVE_PATHS.items()):
+        raise ValueError("training plan contains an unapproved path: dataset_dir/output_dir")
     for key, value in _walk(plan):
-        if key in slots and key in plan:
+        if key in slots:
             continue
         if isinstance(value, str) and value.startswith(ROLE_PREFIX):
             raise ValueError(f"unbound or misplaced model role placeholder: {key}")
         if isinstance(value, str) and _PATH_LIKE.match(value) and RELATIVE_PATHS.get(key) != value:
             raise ValueError(f"training plan contains an unapproved path: {key}")
-    if any(plan.get(key) != value for key, value in RELATIVE_PATHS.items()):
-        raise ValueError("training plan contains an unapproved path: dataset_dir/output_dir")
     binding = {
         "schema_version": 1,
         "models": [{"role": item.role, "index": item.index, "path": item.path.as_posix(),
@@ -620,12 +568,15 @@ def bind_training_plan(template: Mapping, verified_bindings: VerifiedModelPaths)
 
 
 def write_bound_plan(directory: Path, bound: BoundTrainingPlan) -> None:
-    """Write train.bound.yaml, model-binding.json and binding-evidence.json with deterministic bytes."""
+    """Write train.bound.yaml, model-binding.json and binding-evidence.json with deterministic bytes.
+
+    The evidence also records the SHA256 of the exact ``train.bound.yaml`` bytes that the engine executes.
+    """
     bound = BoundTrainingPlan.model_validate(bound.model_dump(mode="json"))
     directory = Path(directory)
+    plan_bytes = yaml.safe_dump(bound.plan, sort_keys=True).encode("utf-8")
     evidence = {"template_sha256": bound.template_sha256, "bound_sha256": bound.bound_sha256,
-                "binding_sha256": bound.binding_sha256}
-    for name, data in (("train.bound.yaml", yaml.safe_dump(bound.plan, sort_keys=True).encode("utf-8")),
-                       ("model-binding.json", canonical(bound.binding)),
+                "binding_sha256": bound.binding_sha256, "train_bound_yaml_sha256": hashlib.sha256(plan_bytes).hexdigest()}
+    for name, data in (("train.bound.yaml", plan_bytes), ("model-binding.json", canonical(bound.binding)),
                        ("binding-evidence.json", canonical(evidence))):
         _write_atomic(directory / name, data)

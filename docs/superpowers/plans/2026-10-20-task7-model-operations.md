@@ -45,7 +45,7 @@ since been deleted.
 | F15 | The primary GPU lock pins `torch==2.7.1`, `peft==0.18.1`, `transformers==5.6.0`, `safetensors==0.8.0`, `tokenizers==0.22.2`, `accelerate==1.11.0`, `huggingface-hub==1.33.0`, `numpy==2.5.4`. The PPO lock pins PEFT 0.15.2 and Transformers 4.52.4. The main `.venv` has no torch/peft/transformers/safetensors, and `uv.lock` has no torch. | `grep` on the locks; `find_spec` in `.venv`. |
 | F16 | The PROGRESS line "Separate CPU dependency/export preparation" is the ad hoc, **unlocked** venv `.factory/model-ops-cpu-env` (created 2026-10-18). torch was installed from `https://download.pytorch.org/whl/cpu/torch-2.7.1%2Bcpu-cp312-cp312-win_amd64.whl`, plus peft 0.18.1, transformers 5.6.0, safetensors 0.8.0, tokenizers 0.22.2 and **accelerate 1.15.0** (≠ the GPU lock's 1.11.0). No `.in`/`.lock` was committed. | `pyvenv.cfg`, `direct_url.json`, site-packages listing. |
 | F17 | Lock convention: both GPU locks are made with `uv pip compile pyproject.toml containers/<name>.in … --generate-hashes --no-header` (docs/OPERATIONS.md:108), so they have no comment header. A dry resolution of the proposed CPU `.in` (§4) with `--python-platform x86_64-pc-windows-msvc --torch-backend cpu` **succeeded** (56 packages, `torch==2.7.1+cpu` with 19 hashes) into `%TEMP%`. Nothing was installed. `uv pip compile` and `uv pip sync` both accept `--torch-backend` in uv 0.11.23. | Command output. |
-| F18 | Golden digest of legacy `translate()` at HEAD `1c5d2d3`: the 6 stages × 5 methods matrix (§3.2 test 1) = `f5d2c0e523c28909988eeebeb33de2db8df7722b5d76a0e61c58359243461499`. `configs/ai/paper_extraction.yaml` = `1630e49b5cda266ac5ced12ee3a92a10f85aad14ac62c33c60f56925b9b57144` and `integration_smoke.yaml` = `0aa75a3927a7336973574f43bd66a5b139de7f07fc781335330b436ff9c91498`. | Main env computation. |
+| F18 | Golden digest of legacy `translate()` at HEAD `1c5d2d3`: the 6 stages × 5 methods matrix (§3.2 test 1) = `f5d2c0e523c28909988eeebeb33de2db8df7722b5d76a0e61c58359243461499`. `configs/ai/paper_extraction.yaml` = `1630e49b5cda266ac5ced12ee3a92a10f85aad14ac62c33c60f56925b9b57144` and `integration_smoke.yaml` = `0aa75a3927a7336973574f43bd66a5b139de7f07fc781335330b436ff9c91498`. **Superseded in 7.2:** the construction behind `f5d2c0e5…1499` was not recorded and could not be reproduced. The pinned golden is `d488f35a7950c46fe5bba5925fa532d920cad05235938ee24261d32e85343473`, computed at HEAD `42064b7` from the unmodified `translate` over the explicit matrix in `tests/test_model_inputs.py::legacy_matrix` (`AIConfig` base, `model_copy` per stage × method, PPO `StageOptions(reward_model="/workspace/rm", reward_model_sha256="0"*64)`, OFT `FinetuningOptions(oft_rank=8, oft_block_size=0)`, digest of `canonical({"<stage>/<method>": plan})`). The two example-config digests reproduce exactly. | Main env computation. |
 
 ---
 
@@ -461,7 +461,8 @@ and appends `: <fields>`.
 
 1. `test_translate_legacy_output_is_byte_identical`: the 30-row matrix (`pt…kto` × `lora…oft`; PPO with
    `/workspace/rm`; OFT with `oft_rank=8, oft_block_size=0`; base `Qwen/Qwen2.5-0.5B-Instruct`, revisions
-   `a*40`) has digest **f5d2c0e5…1499**. The example configs keep their F18 digests, and
+   `a*40`) has digest **f5d2c0e5…1499** (superseded: the test pins `d488f35a…3473` for its explicit
+   `legacy_matrix`; see F18). The example configs keep their F18 digests, and
    `translate(c) == translate(c, None)`.
 2. `test_v1_manifest_training_config_hash_unchanged`: `resolve(paper_extraction)["training_config_sha256"] == "1630e49b…7144"`.
 3. `test_logical_template_holds_only_role_placeholders`: no `base_model` repo id, no `model_revision`, no
@@ -1058,7 +1059,8 @@ uv pip list --python .venv/Scripts/python.exe | Select-String -Pattern '^(torch|
    base/tokenizer/target/dimension mismatches, rank > 256, variants and non-finite values. The merge is FP32
    `cat` with normalized weights, and the output dtype is F32 only. Checks: delta, reload logits, non-target
    identity, finite scan. The CPU receipt has every check passed, with no skip and no download.
-10. **Unchanged legacy.** The golden `translate` matrix digest is `f5d2c0e5…1499`. The v1 manifest
+10. **Unchanged legacy.** The golden `translate` matrix digest is `f5d2c0e5…1499`, superseded by `d488f35a…3473`
+    for the explicit `legacy_matrix` construction (see F18). The v1 manifest
     `training_config_sha256` is unchanged, as are v1 `worker.main`, `SSHExecutor.run` and the desktop
     `check()` default dict. Both GPU locks are byte-identical, and the main `.venv` has no torch.
 11. **Boundaries.** No MLflow calls, scheduling or `record_outputs` in Task 7. `LocalSelect` stays local.

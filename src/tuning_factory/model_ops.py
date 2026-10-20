@@ -55,9 +55,9 @@ __all__ = [
     "MaterializeReceipt", "MergePlan", "MergeReceipt", "StagedLoad", "TolerancePolicy",
     "adapter_metadata_from_config", "check_continuation", "check_continuation_targets",
     "check_full_model_directory", "continuation_mismatches", "expected_continuation_adapter",
-    "inspect_target_modules", "local_tokenizer_fingerprint", "materialize_model", "merge_adapters",
-    "scan_finite_safetensors", "validate_materialize_input", "validate_merge_inputs", "verify_inspected_targets",
-    "write_adapter_config",
+    "inspect_target_modules", "local_config_sha256", "local_tokenizer_fingerprint", "materialize_model",
+    "merge_adapters", "scan_finite_safetensors", "validate_materialize_input", "validate_merge_inputs",
+    "verify_inspected_targets", "write_adapter_config",
 ]
 
 POLICY_F32_V1 = "model-ops-f32-v1"
@@ -193,6 +193,12 @@ def _check_adapter_local(model: LocalModel) -> ModelDescriptor:
             != (descriptor.config_sha256, descriptor.tokenizer_fingerprint)):
         raise ValueError("local model identity differs from its verified descriptor")
     return descriptor
+
+
+def local_config_sha256(directory: Path) -> str:
+    """SHA256 of a local model's config.json, read as a regular non-link file."""
+    with _open_regular(Path(directory).absolute() / "config.json") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def local_tokenizer_fingerprint(directory: Path) -> str:

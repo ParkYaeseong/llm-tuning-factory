@@ -972,3 +972,10 @@ def test_cpu_lock_pins_primary_runtime_versions_with_hashes():
     assert dict(MODEL_OPS_PINS) == {name: gpu[name] for name in ("torch", "peft", "transformers", "safetensors")}
     with pytest.raises(TypeError):
         MODEL_OPS_PINS["torch"] = "0"
+
+
+def test_source_files_have_lf_line_endings_for_a_checkout_independent_source_hash():
+    # manifest.source_hash() hashes raw bytes, so a CRLF checkout would silently change source_sha256.
+    carriage = [path.relative_to(ROOT).as_posix() for path in sorted((ROOT / "src").rglob("*.py"))
+                if b"\r" in path.read_bytes()]
+    assert carriage == []

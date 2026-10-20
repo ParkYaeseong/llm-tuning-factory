@@ -87,13 +87,15 @@ def tensors_of(shapes, file):
     return [TensorMetadata(file=file, name=name, shape=shape, dtype="F32") for name, shape in shapes.items()]
 
 
+VALUE_HEAD = {"v_head.summary.weight": (1, 2), "v_head.summary.bias": (1,)}
+
+
 def full_model(tmp_path, marker, *, modules=MODULES, config=CONFIG, tokenizer=TOKENIZER, quantization_bit=None,
-               value_head=None, base=None, parents=(), synthetic=False):
-    """A full-model snapshot; value_head names the file that holds the v_head tensor."""
+               value_head=None, head=VALUE_HEAD, base=None, parents=(), synthetic=False):
+    """A full-model snapshot; value_head names the file that holds the v_head tensors."""
     directory = tmp_path / "src" / marker
     write_snapshot(directory, config=config, tokenizer=tokenizer)
     shapes = {f"{module}.weight": (2, 2) for module in modules}
-    head = {"v_head.summary.weight": (1, 2)}
     if value_head == "model.safetensors":
         shapes.update(head)
     write_safetensors(directory / "model.safetensors", shapes)
@@ -127,9 +129,8 @@ def peft_adapter(tmp_path, marker, *, rank=2, alpha=4, base=None, parents=(), me
     write_safetensors(directory / "adapter_model.safetensors", shapes)
     tensors = tensors_of(shapes, "adapter_model.safetensors")
     if value_head:
-        head = {"v_head.summary.weight": (1, 2)}
-        write_safetensors(directory / "value_head.safetensors", head)
-        tensors += tensors_of(head, "value_head.safetensors")
+        write_safetensors(directory / "value_head.safetensors", VALUE_HEAD)
+        tensors += tensors_of(VALUE_HEAD, "value_head.safetensors")
     metadata = adapter_metadata_from_config(exported, method=method, quantization_bit=quantization_bit,
                                             loraplus_lr_ratio=loraplus_lr_ratio)
     descriptor = ModelDescriptor(
@@ -207,13 +208,17 @@ def stage(tmp_path, store, operation, **kwargs):
     return runner().stage_model_inputs(operation, store, tmp_path / "attempt", **kwargs)
 
 
+def roots_for(store, hf_home=None):
+    return (store.root, *((Path(hf_home),) if hf_home is not None else ()))
+
+
 def bind(tmp_path, store, operation, *, hf_home=None, inspect=None, **kwargs):
     module = runner()
     resolved = stage(tmp_path, store, operation, **kwargs)
     verified = module.verify_model_paths(resolved, operation, model_cache=store.root, hf_home=hf_home,
                                          inspect_targets=inspect)
     template = LlamaFactoryBackend.translate(operation.config, operation.model_input)
-    return module.bind_training_plan(template, verified), verified
+    return module.bind_training_plan(template, verified, approved_roots=roots_for(store, hf_home)), verified
 
 
 def sentinel(role):
@@ -350,6 +355,21 @@ def test_prepare_writes_the_logical_template_for_graph_configs(tmp_path):
     written = yaml.safe_load((tmp_path / "train.yaml").read_text(encoding="utf-8"))
     assert written == LlamaFactoryBackend.translate(config, model_input)
     assert type(LlamaFactoryBackend().validate_config(graph_config(stage="ppo"))) is GraphTrainingConfig
+    legacy = tmp_path / "legacy"
+    with pytest.raises(ValueError, match="graph training requires a typed model_input"):
+        LlamaFactoryBackend().prepare(config, legacy, b'[{"instruction":"x","output":"y"}]')
+    assert not (legacy / "train.yaml").exists()
+
+
+@pytest.mark.parametrize("method,model_input,message", [
+    ("full", lambda: policy(ROOT, ModelArtifactRef(artifact_id="1" * 64, inventory_sha256="2" * 64)),
+     "adapter continuation requires LoRA/QLoRA"),
+    ("freeze", lambda: policy(ROOT), "initialization differs from requested training method"),
+    ("lora", lambda: full_weights(ROOT), "initialization differs from requested training method"),
+])
+def test_translate_refuses_initialization_that_differs_from_method(method, model_input, message):
+    with pytest.raises(ValueError, match=message):
+        LlamaFactoryBackend.translate(graph_config(method=method), model_input())
 
 
 # -- 4-8. staging, verification and tokenizers ---------------------------------------------------
@@ -634,10 +654,12 @@ def test_continuation_resumes_parent_adapter_with_fresh_optimizer(tmp_path, stor
     assert bound.plan["output_dir"] == "./output"
     assert not list(Path(cache_path(store, adapter_ref)).glob("optimizer*"))
     template = LlamaFactoryBackend.translate(operation.config, operation.model_input)
+    roots = roots_for(store)
     with pytest.raises(ValueError, match="resume_from_checkpoint"):
-        module.bind_training_plan({**template, "resume_from_checkpoint": "./output/checkpoint-1"}, verified)
+        module.bind_training_plan({**template, "resume_from_checkpoint": "./output/checkpoint-1"}, verified,
+                                  approved_roots=roots)
     with pytest.raises(ValueError, match="create_new_adapter"):
-        module.bind_training_plan({**template, "create_new_adapter": True}, verified)
+        module.bind_training_plan({**template, "create_new_adapter": True}, verified, approved_roots=roots)
 
 
 def test_worker_continuation_requires_inspected_targets(tmp_path, store):
@@ -775,6 +797,10 @@ def test_ppo_reward_mismatch_is_refused(tmp_path, store, sft):
     inline_ref, _ = frozen(store, full_model(tmp_path, "inline-head", value_head="model.safetensors"))
     with pytest.raises(ValueError, match="value_head.safetensors"):
         stage(tmp_path, store, train_operation(policy(sft_ref, reward=ModelLoadRef(base=inline_ref)), stage="ppo"))
+    weight_only, _ = frozen(store, full_model(tmp_path, "weight-only-head", value_head="value_head.safetensors",
+                                              head={"v_head.summary.weight": (1, 2)}))
+    with pytest.raises(ValueError, match="v_head.summary.weight and v_head.summary.bias"):
+        stage(tmp_path, store, train_operation(policy(sft_ref, reward=ModelLoadRef(base=weight_only)), stage="ppo"))
     reward = ModelLoadRef(base=inline_ref)
     with pytest.raises(ValueError, match="PPO requires a typed reward_model binding; other stages cannot bind reward"):
         train_operation(policy(sft_ref, reward=reward), stage="sft")
@@ -804,11 +830,14 @@ def test_ppo_continuation_is_refused(tmp_path, store, sft):
 
 # -- 22-25. binding safety, determinism, QLoRA base, resolved drift ------------------------------
 
-def manual_paths(module, path, *roots, role="policy_base"):
+def manual_entry(module, path, role="policy_base"):
     staged = module.StagedModel(role=role, source="hf_root", hf_root=ROOT, storage_kind="full_model",
                                 config_sha256=ROOT.config_sha256, tokenizer_fingerprint=ROOT.tokenizer_fingerprint)
-    return module.VerifiedModelPaths(models=(module.VerifiedModelPath(role=role, index=0, path=path, staged=staged,
-                                                                      descriptor=None),), roots=roots)
+    return module.VerifiedModelPath(role=role, index=0, path=path, staged=staged, descriptor=None)
+
+
+def manual_paths(module, path, role="policy_base"):
+    return module.VerifiedModelPaths(models=(manual_entry(module, path, role),))
 
 
 def test_bind_refuses_paths_outside_approved_cache_and_misplaced_slots(tmp_path):
@@ -818,30 +847,64 @@ def test_bind_refuses_paths_outside_approved_cache_and_misplaced_slots(tmp_path)
     inside = cache / "model"
     inside.mkdir(parents=True)
     template = LlamaFactoryBackend.translate(graph_config(), policy(ROOT))
-    assert module.bind_training_plan(template, manual_paths(module, inside, cache)).plan[
+    roots = (cache,)
+    assert module.bind_training_plan(template, manual_paths(module, inside), approved_roots=roots).plan[
         "model_name_or_path"] == inside.as_posix()
     outside = tmp_path / "elsewhere"
     outside.mkdir()
     for path in (cache / ".." / "elsewhere", outside):
         with pytest.raises(ValueError, match="bound model path is outside the approved model caches"):
-            module.bind_training_plan(template, manual_paths(module, path, cache))
+            module.bind_training_plan(template, manual_paths(module, path), approved_roots=roots)
     directory_link(cache / "linked", outside)
     with pytest.raises(ValueError, match="link|reparse"):
-        module.bind_training_plan(template, manual_paths(module, cache / "linked", cache))
-    paths = manual_paths(module, inside, cache)
+        module.bind_training_plan(template, manual_paths(module, cache / "linked"), approved_roots=roots)
+    paths = manual_paths(module, inside)
     with pytest.raises(ValueError, match="unbound or misplaced model role placeholder: output_dir"):
-        module.bind_training_plan({**template, "output_dir": sentinel("policy_base")}, paths)
+        module.bind_training_plan({**template, "output_dir": sentinel("policy_base")}, paths, approved_roots=roots)
     with pytest.raises(ValueError, match="unbound or misplaced model role placeholder: ref_model"):
-        module.bind_training_plan({**template, "ref_model": sentinel("reference_base")}, paths)
+        module.bind_training_plan({**template, "ref_model": sentinel("reference_base")}, paths, approved_roots=roots)
     with pytest.raises(ValueError, match="unbound or misplaced model role placeholder: adapter_name_or_path"):
-        module.bind_training_plan({**template, "adapter_name_or_path": sentinel("policy_base")}, paths)
+        module.bind_training_plan({**template, "adapter_name_or_path": sentinel("policy_base")}, paths,
+                                  approved_roots=roots)
     with pytest.raises(ValueError, match="graph training binds only typed model roles"):
-        module.bind_training_plan({**template, "model_name_or_path": "Qwen/Qwen2.5-0.5B-Instruct"}, paths)
+        module.bind_training_plan({**template, "model_name_or_path": "Qwen/Qwen2.5-0.5B-Instruct"}, paths,
+                                  approved_roots=roots)
     with pytest.raises(ValueError, match="unapproved path: dataset_dir"):
-        module.bind_training_plan({**template, "dataset_dir": "/workspace/other"}, paths)
-    reference_paths = manual_paths(module, inside, cache, role="reference_base")
+        module.bind_training_plan({**template, "dataset_dir": "/workspace/other"}, paths, approved_roots=roots)
+    reference_paths = manual_paths(module, inside, role="reference_base")
     with pytest.raises(ValueError, match="unbound or misplaced model role placeholder"):
-        module.bind_training_plan(template, reference_paths)
+        module.bind_training_plan(template, reference_paths, approved_roots=roots)
+
+
+def test_bind_uses_configured_roots_and_refuses_duplicate_roles(tmp_path, store, sft):
+    module = runner()
+    sft_ref, _ = sft
+    operation = train_operation(policy(sft_ref))
+    _, verified = bind(tmp_path, store, operation)
+    assert not hasattr(verified, "roots")   # roots come from the worker configuration, never with the paths
+    template = LlamaFactoryBackend.translate(operation.config, operation.model_input)
+    elsewhere = tmp_path / "configured-cache"
+    elsewhere.mkdir()
+    with pytest.raises(ValueError, match="bound model path is outside the approved model caches"):
+        module.bind_training_plan(template, verified, approved_roots=(elsewhere,))
+    with pytest.raises(TypeError):
+        module.bind_training_plan(template, verified)
+    entry = verified.models[0]
+    with pytest.raises(ValueError, match="duplicate verified model role"):
+        module.VerifiedModelPaths(models=(entry, entry))
+
+
+@pytest.mark.parametrize("key,value", [
+    ("tokenized_path", "cache/tok"), ("cache_dir", "hf"), ("deepspeed", "ds.json"), ("logging_dir", "logs"),
+    ("output_dir", "./other"), ("dataset_dir", "data"), ("media_dir", "images"), ("adapter_folder", "adapters"),
+])
+def test_known_path_keys_hold_only_approved_values(tmp_path, key, value):
+    module = runner()
+    cache = tmp_path / "cache"
+    (cache / "model").mkdir(parents=True)
+    template = {**LlamaFactoryBackend.translate(graph_config(), policy(ROOT)), key: value}
+    with pytest.raises(ValueError, match=f"training plan contains an unapproved path: {key}"):
+        module.bind_training_plan(template, manual_paths(module, cache / "model"), approved_roots=(cache,))
 
 
 def test_bound_plan_evidence_is_deterministic(tmp_path, store, sft):
@@ -850,7 +913,7 @@ def test_bound_plan_evidence_is_deterministic(tmp_path, store, sft):
     operation = train_operation(policy(sft_ref, reference=True), stage="dpo")
     first, verified = bind(tmp_path, store, operation)
     template = LlamaFactoryBackend.translate(operation.config, operation.model_input)
-    second = module.bind_training_plan(template, verified)
+    second = module.bind_training_plan(template, verified, approved_roots=roots_for(store))
     assert first == second
     assert first.template_sha256 == digest(canonical(template))
     assert first.bound_sha256 == digest(canonical(first.plan))
@@ -866,7 +929,7 @@ def test_bound_plan_evidence_is_deterministic(tmp_path, store, sft):
     assert yaml.safe_load(written[0]["train.bound.yaml"]) == first.plan
     assert json.loads(written[0]["binding-evidence.json"]) == {
         "template_sha256": first.template_sha256, "bound_sha256": first.bound_sha256,
-        "binding_sha256": first.binding_sha256}
+        "binding_sha256": first.binding_sha256, "train_bound_yaml_sha256": sha(written[0]["train.bound.yaml"])}
     assert json.loads(written[0]["model-binding.json"]) == first.binding
     assert b"\r\n" not in written[0]["train.bound.yaml"]
 
@@ -971,3 +1034,39 @@ def test_staged_model_requires_one_identity_matching_its_role():
     with pytest.raises(ValidationError):
         module.StagedModel(role="policy_base", source="artifact", artifact=ref, storage_kind="full_model", index=1,
                            **common)
+
+
+def test_staging_and_worker_hash_each_artifact_once(tmp_path, store, sft, monkeypatch):
+    from collections import Counter
+
+    from tuning_factory import model_artifacts
+    module = runner()
+    sft_ref, _ = sft
+    adapter_ref, adapter = frozen(store, peft_adapter(tmp_path, "dpo-parent", base=sft_ref, parents=(sft_ref,)))
+    # The policy, its frozen reference and the adapter lineage all name the same full-model base.
+    operation = train_operation(policy(sft_ref, adapter_ref, reference=True), stage="dpo")
+    original, scans = model_artifacts._inventory, []
+
+    def counting(directory):
+        scans.append(Path(directory).absolute())
+        return original(directory)
+
+    monkeypatch.setattr(model_artifacts, "_inventory", counting)
+    resolved = stage(tmp_path, store, operation, target_evidence=(evidence(sft_ref),),
+                     producers=(producer(adapter_ref, adapter, stage="dpo"),))
+    expected = {Path(cache_path(store, sft_ref)), Path(cache_path(store, adapter_ref))}
+    assert Counter(scans) == Counter(expected)
+    scans.clear()
+    module.verify_model_paths(resolved, operation, model_cache=store.root, hf_home=None, inspect_targets=inspector)
+    assert Counter(scans) == Counter(expected)
+
+
+def test_operation_runner_uses_only_public_artifact_verification():
+    import ast
+
+    module = runner()
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    private = [alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+               and (node.module or "").endswith("model_artifacts") for alias in node.names if alias.name.startswith("_")]
+    assert private == []
+    assert not hasattr(module, "_check_load")

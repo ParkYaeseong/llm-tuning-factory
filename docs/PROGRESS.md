@@ -348,19 +348,61 @@ Actual verification:
 - `uv run pytest -q` gave **906 passed, 1 skipped**. Ruff is clean, `check_secrets.py` reports 0 findings, both GPU locks
   are unchanged, and the main `.venv` has no torch/peft/transformers/safetensors/huggingface_hub.
 - The CPU acceptance re-run (`-I`) exited 0 with all 25 checks passed and unchanged max errors (merge delta 7.78e-9,
-  materialize delta 9.17e-9, parent→child 6.42e-9, logits 3.35e-8/2.98e-8). Receipt SHA256
-  `6a62e78871a8c852c3671495f1a3866e399f9c5dbaa4f875a712a57ac39d447a`, source_sha256
-  `632d468b5bb05e15d038c0ece196716e8a3d48349e46c4316b26f4940f63cc37`, and lock_sha256 unchanged.
+  materialize delta 9.17e-9, parent→child 6.42e-9, logits 3.35e-8/2.98e-8). On the reviewer's clean LF tree at
+  `7f74762` the receipt SHA256 was `2eba5b1049435928447855af5b0960b35eb7189ee9045973d9302c15e4163d4e` and the
+  source_sha256 `b26e7b2b4bc0a0cb9e3111c8520aa140af83a9dd4556deb757f5610eaaf3d3a2`, with lock_sha256 unchanged. The
+  values first recorded here (`6a62e788…`/`632d468b…`) came from a working tree with CRLF files and are void. The
+  review fixes below supersede both.
+
+7.2 review fixes (commits `fix: refuse PPO continuation at planning and compile` and
+`fix: refuse PPO continuation at planning and verify each artifact once`):
+- PPO continuation is refused at planning and compile too, reusing `training.PPO_CONTINUATION`:
+  - `validate_graph`/`plan_graph` refuse a PPO child of a LoRA/QLoRA parent (`parent_transition`), the same handoff
+    through a selection (`_static_routes`), and an explicit `continue_adapter` ModelInput with a PPO recipe
+    (`train_contract`).
+  - `compile_node` refuses PPO `continue_adapter`, for plans pinned before the rule.
+- One verifier per call:
+  - `model_artifacts` gains `verify_artifact_directory` (one entry, no lineage) and `ArtifactVerifier` (one
+    completed-cache shared by `verify`, `path`, `validate_input` and lineage; `lineage=False` for the worker cache).
+    `ModelArtifactStore.verifier()` exposes it, and the store's public reads delegate to it.
+  - operation_runner's near-copies (`verify_cached_artifact` body, `_check_load`) and all private `model_artifacts`
+    imports are gone; `verify_cached_artifact` is a one-line wrapper.
+  - A DPO continuation on an artifact base (policy, frozen reference and adapter lineage all naming the base) now hashes
+    each distinct artifact exactly once at staging and once on the worker (test counts `_inventory` calls).
+- Binding and paths:
+  - `VerifiedModelPaths` refuses duplicate (role, index) and no longer carries roots.
+  - `bind_training_plan(..., approved_roots=)` takes the cache roots from the worker configuration (7.3 passes them).
+  - Known LLaMA-Factory/TrainingArguments path keys (`tokenized_path`, `cache_dir`, `deepspeed`, `logging_dir`,
+    `media_dir`, `adapter_folder`, …) may hold only the approved values. The prefix heuristic remains as a catch-all
+    for unknown keys.
+  - `binding-evidence.json` adds `train_bound_yaml_sha256` of the exact executed bytes.
+- Training rules:
+  - `check_model_input_contract` refuses an initialization that differs from the method, so `translate(full,
+    continue_adapter)` no longer emits an adapter slot.
+  - `prepare(GraphTrainingConfig)` without `model_input` refuses instead of writing a legacy plan.
+  - A PPO reward needs both `v_head.summary.weight` and `v_head.summary.bias` in `value_head.safetensors`.
+- Guards and docs: a test fails if any `src/**/*.py` contains CR bytes, so `source_sha256` cannot depend on the
+  checkout. Sub-plan F18 and Review Focus 10 now point at `d488f35a…3473` and its explicit construction.
+
+Verification after the review fixes:
+- RED first for each fix: 5 planner/compile tests, then 30 model-input tests (`approved_roots`, path keys, hash count,
+  value-head bias, translate/prepare defence). The CR guard failed on a probe CRLF file.
+- `uv run pytest -q` gave **927 passed, 1 skipped**. Ruff is clean, `check_secrets.py` reports 0 findings, and
+  `git ls-files --eol | awk '$2 ~ /w\/crlf/'` prints nothing.
+- The CPU acceptance (`-I`) exited 0 with all 25 checks passed and the same max errors. Receipt SHA256
+  `905e7494ff88ad65e543d2d7909f92b32644789051bca76c7ab5e56171897a27` (byte-identical on a second run), source_sha256
+  `66d599bb1c57e14a2d6fe0cd33f02f5c93cd891f84cff5f9604b807ef9564b62`, and lock_sha256
+  `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437` unchanged.
 
 Still open for Task 7 GPU work:
 - Hardware and numerics: merge/materialize tolerances at real model sizes on CUDA (TF32 off); memory (FP32 loads;
   about 3 base loads per merge); a BF16 storage policy (none yet; F32 doubles size).
-- Worker v2 (7.3): wire `verify_model_paths` → `bind_training_plan` → `write_bound_plan`, with
-  `model_ops.inspect_target_modules` as `inspect_targets`.
+- Worker v2 (7.3): wire `verify_model_paths` → `bind_training_plan(approved_roots=<configured cache, HF_HOME>)` →
+  `write_bound_plan`, with `model_ops.inspect_target_modules` as `inspect_targets`.
 - SSH cache and single launch (7.4): remote cache entries must stay link-free (uploaded directories moved with
   `mv -T`, never symlinked). HF_HOME and the model cache on the GPU host must not sit under a symlink or junction, and
   HF roots are resolved on the worker, never uploaded.
-- Attempt runner (7.5, including F11), and Task 8's planning-time refusal of PPO continuation.
+- Attempt runner (7.5, including F11).
 - Real LF training on a bound YAML, real DPO/KTO references and PPO remain unverified.
 
 ---
