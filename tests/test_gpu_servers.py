@@ -1,5 +1,6 @@
 """Software-only direct SSH contracts; every remote response is a local fixture."""
 import json
+import re
 from datetime import datetime, timezone
 
 import pytest
@@ -1475,9 +1476,12 @@ def test_doctor_rejects_pod_id_combined_with_a_server_profile(tmp_path, monkeypa
     path = tmp_path / "server.json"
     path.write_text(settings().model_dump_json())
     result = CliRunner().invoke(app, ["--state-dir", str(tmp_path / "state"), "doctor", "--pod-id", "pod1",
-                                      "--server-profile", str(path)])
+                                      "--server-profile", str(path)],
+                                env={"NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "200"})
     assert result.exit_code == 2, result.output
-    assert "pod-id" in result.output
+    # Rich may colour, box and wrap usage errors depending on the terminal; compare plain words only.
+    plain = re.sub(r"\s+", " ", re.sub(r"[│╭╮╰╯─]", " ", re.sub(r"\[[0-9;]*m", "", result.output)))
+    assert "pod-id" in plain
 
 
 def test_claim_refuses_an_inspection_as_server_facts(tmp_path):
