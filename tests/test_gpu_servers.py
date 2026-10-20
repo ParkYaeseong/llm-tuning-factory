@@ -1480,7 +1480,7 @@ def test_doctor_rejects_pod_id_combined_with_a_server_profile(tmp_path, monkeypa
                                 env={"NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "200"})
     assert result.exit_code == 2, result.output
     # Rich may colour, box and wrap usage errors depending on the terminal; compare plain words only.
-    plain = re.sub(r"\s+", " ", re.sub(r"[│╭╮╰╯─]", " ", re.sub(r"\[[0-9;]*m", "", result.output)))
+    plain = re.sub(r"\s+", " ", re.sub(r"[\u2500-\u257f]", " ", re.sub(r"\x1b\[[0-9;]*m", "", result.output)))
     assert "pod-id" in plain
 
 
