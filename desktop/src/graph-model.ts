@@ -24,7 +24,7 @@ export interface SelectionJson { metric: string; direction: "max" | "min"; thres
 export interface GraphJson { nodes: NodeJson[]; depends_on?: { node_id: string; depends_on: string }[]; max_concurrent?: number;
   max_total_cost_usd?: number; retry_policy?: { max_attempts: number; backoff_seconds: number } }
 
-export const MAX_NODES = 64, MAX_EDGES = 256;
+export const MAX_NODES = 64, MAX_EDGES = 256;          // graph_schema: edges = dependencies ∪ input references
 export const EVALUATOR_VERSION = "1";
 // Pinned by tests/test_desktop_ui_contract.py (= evaluation.metric_schema): the object literal below, up to " as const;",
 // must stay valid JSON (quoted keys, no trailing comma, no comments inside).
@@ -37,6 +37,9 @@ export type EvaluatorKind = keyof typeof EVALUATOR_METRICS;
 export interface DraftContext {
   recipes: Map<Sha256, RecipeSummary>; bindings: DatasetBinding[]; roots: ModelRoot[];
   benchmarks: Map<Sha256, BenchmarkRevision>; defaultProfiles: string[];
+  /** IDs a new card must not take although the draft lacks them: the saved revision's cards (their check results and
+   * planning inputs are keyed by ID). */
+  reservedIds?: readonly string[];
 }
 export type InputPort = "model_input" | "model" | "evaluations" | "models" | "reward_binding";
 export interface InputOption { value: NodeOutputRef; label: string; allowed: boolean; reason?: string }
@@ -58,7 +61,7 @@ export const REASONS = {
   oftRecipe: "그래프에서는 OFT 학습을 쓸 수 없습니다",
   materialize: "학습 방법이 바뀌는 연결은 먼저 ‘전체 모델 확정’ 단계가 필요합니다",
   ppoRoute: "PPO 학습과 다른 학습 단계는 결과를 서로 넘길 수 없습니다",
-  ppoContinuation: "PPO는 어댑터를 이어서 학습할 수 없습니다. 먼저 ‘전체 모델 확정’ 단계를 넣으세요",
+  ppoContinuation: "PPO는 이전 단계의 어댑터를 이어서 학습할 수 없습니다",
   ppoReward: "PPO 학습에는 보상 모델 연결이 필요합니다",
   rewardNotPpo: "보상 모델은 PPO 학습에서만 연결할 수 있습니다",
   mergeLimit: "병합은 최대 4개 모델까지입니다",
@@ -87,6 +90,7 @@ export const REASONS = {
   settingsCost: "최대 총비용은 0보다 커야 합니다",
   settingsAttempts: "재시도 횟수는 1–5 사이의 정수여야 합니다",
   settingsBackoff: "재시도 간격은 0–3600초 사이의 정수여야 합니다",
+  edgeLimit: "그래프 연결은 최대 256개입니다",
 } as const;
 export const NOTES = {
   text: "텍스트 정답 일치 지표 · 의미적 품질 점수가 아닙니다",
@@ -140,19 +144,30 @@ export function readGraph(value: Record<string, unknown>): GraphJson {
   return graph as GraphJson;
 }
 
-const DEFAULT_SETTINGS = JSON.stringify(emptyGraph());
+/** Key-order independent JSON (the backend stores the graph with sorted keys; project-store compares the same way). */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (isObject(value)) return `{${Object.keys(value).sort().filter(key => value[key] !== undefined)
+    .map(key => JSON.stringify(key) + ":" + canonical(value[key])).join(",")}}`;
+  return JSON.stringify(value) ?? "null";
+}
+/** Whether two drafts serialize to the same stored graph, whatever their key order. */
+export const sameGraph = (a: GraphJson, b: GraphJson) => canonical(graphToJson(a)) === canonical(graphToJson(b));
+
+const DEFAULT_SETTINGS = canonical(emptyGraph());
 /** The JSON the project stores: an empty graph with default settings is `{}`; undefined values are dropped. */
 export function graphToJson(graph: GraphJson): Record<string, unknown> {
   const json = JSON.parse(JSON.stringify(graph)) as Obj;   // drops undefined values
   if (!json.nodes?.length && !Object.keys(json).some(key => !["nodes", "max_concurrent", "max_total_cost_usd", "retry_policy"].includes(key))
-      && JSON.stringify({ nodes: [], max_concurrent: json.max_concurrent, max_total_cost_usd: json.max_total_cost_usd, retry_policy: json.retry_policy }) === DEFAULT_SETTINGS)
+      && canonical({ nodes: [], max_concurrent: json.max_concurrent, max_total_cost_usd: json.max_total_cost_usd, retry_policy: json.retry_policy }) === DEFAULT_SETTINGS)
     return {};
   return json;
 }
 
-export function nextId(graph: GraphJson, kind: NodeKind): string {
+/** The next free `<prefix>-<n>`: after every number the draft or `reserved` (the saved revision's IDs) uses. */
+export function nextId(graph: GraphJson, kind: NodeKind, reserved: Iterable<string> = []): string {
   const prefix = ID_PREFIX[kind];
-  const taken = new Set(graph.nodes.map(node => String(node.id)));
+  const taken = new Set([...graph.nodes.map(node => String(node.id)), ...reserved]);
   let number = 1 + Math.max(0, ...[...taken].map(id => new RegExp(`^${prefix}-(\\d+)$`).exec(id)).filter(Boolean).map(match => Number(match![1])));
   while (taken.has(`${prefix}-${number}`)) number++;
   return `${prefix}-${number}`;
@@ -176,7 +191,7 @@ const benchmarkKind = (node: NodeJson | undefined, ctx: DraftContext) =>
 
 /** A new card with the context's defaults: the first recipe, root, train binding and benchmark; the default profiles. */
 function freshNode(graph: GraphJson, kind: NodeKind, ctx: DraftContext): NodeJson {
-  const id = nextId(graph, kind);
+  const id = nextId(graph, kind, ctx.reservedIds);
   const node: Obj = { id, kind, label: defaultLabel(kind, id) };
   if (kind === "train") {
     const recipe = firstOf(ctx.recipes);
@@ -254,7 +269,7 @@ export function addParallel(graph: GraphJson, siblingId: string, ctx: DraftConte
   const kind = kindOf(sibling);
   if (!sibling) throw new Error(REASONS.missingNode);
   if (!kind) throw new Error(REASONS.unknownKind);
-  const id = nextId(graph, kind);
+  const id = nextId(graph, kind, ctx.reservedIds);
   const node: Obj = { id, kind, label: defaultLabel(kind, id) };
   for (const field of SIBLING_FIELDS[kind]) if ((sibling as Obj)[field] !== undefined) node[field] = clone((sibling as Obj)[field]);
   return { graph: withNode(graph, node as NodeJson), id };
@@ -277,7 +292,10 @@ export function removeNode(graph: GraphJson, id: string): GraphJson {
       if (!node.models.length) { delete node.models; delete node.weights; }
     }
   }
-  if (Array.isArray(next.depends_on)) next.depends_on = next.depends_on.filter(edge => edge.node_id !== id && edge.depends_on !== id);
+  if (Array.isArray(next.depends_on)) {
+    next.depends_on = next.depends_on.filter(edge => edge.node_id !== id && edge.depends_on !== id);
+    if (!next.depends_on.length) delete next.depends_on;     // no empty list left behind
+  }
   return next;
 }
 
@@ -303,6 +321,14 @@ export function connect(graph: GraphJson, nodeId: string, port: InputPort, value
 }
 
 // -- graph relations --
+/** The graph's connections as graph_schema.graph_edges counts them: explicit dependencies and input references, each
+ * (from, to) pair once. */
+export function graphEdgeCount(graph: GraphJson): number {
+  const edges = new Set<string>();
+  for (const node of graph.nodes) for (const { ref } of refsOf(node)) edges.add(JSON.stringify([ref.node_id, String(node.id)]));
+  for (const edge of graph.depends_on ?? []) if (isObject(edge)) edges.add(JSON.stringify([String(edge.depends_on), String(edge.node_id)]));
+  return edges.size;
+}
 function childrenMap(graph: GraphJson) {
   const children = new Map<string, Set<string>>();
   const add = (from: string, to: string) => { if (!children.has(from)) children.set(from, new Set()); children.get(from)!.add(to); };
@@ -408,10 +434,10 @@ export function equalWeights(count: 2 | 3 | 4): number[] {
 /** A weight as the percent text the form shows (0.3333 → "33.33"). */
 export function percentText(weight: unknown): string {
   if (typeof weight !== "number" || !Number.isFinite(weight)) return "";
-  const units = scaled(weight, 12);
+  const units = scaled(weight, 40);                        // the scale weightsValid uses: tiny weights round-trip
   if (units === null) return String(weight * 100);
-  const text = (units * 100n).toString().padStart(13, "0");
-  const whole = text.slice(0, -12).replace(/^0+(?=\d)/, ""), fraction = text.slice(-12).replace(/0+$/, "");
+  const text = (units * 100n).toString().padStart(41, "0");
+  const whole = text.slice(0, -40).replace(/^0+(?=\d)/, ""), fraction = text.slice(-40).replace(/0+$/, "");
   return fraction ? `${whole}.${fraction}` : whole;
 }
 /** A percent text as an exact decimal weight (null when it is not a decimal number). */
@@ -461,6 +487,7 @@ export function localIssues(graph: GraphJson, ctx: DraftContext): WorkflowIssue[
   const issues: WorkflowIssue[] = [];
   const at = (index: number, field?: string) => `/graph/nodes/${index}${field ? `/${field}` : ""}`;
   if (graph.nodes.length > MAX_NODES) issues.push(local("local_limit", REASONS.limit, "/graph/nodes"));
+  if (graphEdgeCount(graph) > MAX_EDGES || (graph.depends_on?.length ?? 0) > MAX_EDGES) issues.push(local("local_edge_limit", REASONS.edgeLimit, "/graph"));
   if (graph.max_concurrent !== undefined && !isInteger(graph.max_concurrent, 1, 64)) issues.push(local("local_settings", REASONS.settingsConcurrent, "/graph/max_concurrent"));
   if (graph.max_total_cost_usd !== undefined && !(typeof graph.max_total_cost_usd === "number" && graph.max_total_cost_usd > 0))
     issues.push(local("local_settings", REASONS.settingsCost, "/graph/max_total_cost_usd"));
@@ -633,22 +660,22 @@ export function waitingOnSharedProfile(graph: GraphJson, allowed?: Map<string, s
 
 /** The four starting shapes of an empty graph (design §4). Reasons they may hold show on their cards. */
 export function starter(shape: StarterShape, ctx: DraftContext): GraphJson {
-  const append = (graph: GraphJson, node: NodeJson) => withNode(graph, node);
-  let graph = addNode(emptyGraph(), "train", ctx).graph;
+  const first = addNode(emptyGraph(), "train", ctx);
+  let graph = first.graph;
+  // Each card connects to the IDs the shape actually got (reserved IDs move them on).
+  const child = (fromId: string, kind: NodeKind) => { const node = serialChild(graph, fromId, kind, ctx); graph = withNode(graph, node); return node.id; };
   if (shape === "single") return graph;
-  if (shape === "serial") return append(graph, serialChild(graph, "train-1", "train", ctx));
-  graph = addParallel(graph, "train-1", ctx).graph;
-  graph = append(graph, serialChild(graph, "train-1", "evaluate", ctx));
-  graph = append(graph, serialChild(graph, "train-2", "evaluate", ctx));
-  const evaluations = [outputRef("eval-1", "evaluation"), outputRef("eval-2", "evaluation")];
+  if (shape === "serial") { child(first.id, "train"); return graph; }
+  const sibling = addParallel(graph, first.id, ctx);
+  graph = sibling.graph;
+  const evaluations = [outputRef(child(first.id, "evaluate"), "evaluation"), outputRef(child(sibling.id, "evaluate"), "evaluation")];
   if (shape === "parallel_merge") {
-    graph = append(graph, serialChild(graph, "train-1", "merge", ctx));
-    graph = connect(graph, "merge-1", "models", [outputRef("train-1"), outputRef("train-2")]);
-    graph = append(graph, serialChild(graph, "merge-1", "evaluate", ctx));
-    evaluations.push(outputRef("eval-3", "evaluation"));
+    const merge = child(first.id, "merge");
+    graph = connect(graph, merge, "models", [outputRef(first.id), outputRef(sibling.id)]);
+    evaluations.push(outputRef(child(merge, "evaluate"), "evaluation"));
   }
-  graph = append(graph, serialChild(graph, "eval-1", "select", ctx));
-  return connect(graph, "select-1", "evaluations", evaluations);
+  const select = child(evaluations[0].node_id, "select");
+  return connect(graph, select, "evaluations", evaluations);
 }
 
 /** The HF root a card loads directly, else the first one upstream (for the module-structure link). */

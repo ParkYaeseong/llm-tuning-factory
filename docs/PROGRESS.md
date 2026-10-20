@@ -4874,6 +4874,45 @@ Not verified or still open:
 - Real WebView2 (dialog sizing, radio and number-input keyboard behaviour), a real sidecar with real 9.2/9.3/9.8
   answers, a real controller after a submit: Task 11. No network, GPU, provider, MLflow or institution data was used.
 
+## Task 10.5 review fixes: canonical graph comparison, clean reused card IDs, 2026-10-21
+
+Commit `fix: compare graph drafts canonically and keep reused card ids clean`, after 10.6 in the same worktree. It
+follows the independent 10.5 review ("Ready with fixes": I1 required; M1, M2, M4, M8 recommended, plus nits).
+Changed: `desktop/src/graph-model.ts`, `desktop/src/views/graph-editor.{ts,css}`, `desktop/src/components/model-roots.ts`,
+`desktop/tests/{graph-model,graph-editor,graph-plan}.spec.ts` (new tests appended; existing test bodies unchanged, only
+`graph-model.spec.ts`'s import list and the 10.6 plan fake's `sortKeys` option grew) and this file.
+
+- I1: the graph editor's no-op guard compares canonically (`sameGraph`, sorted keys as `project-store` does), the
+  threshold is updated in place, and `graphToJson`'s defaults check is canonical. A graph the backend returned with
+  sorted keys therefore saves as `{}` when emptied, and an edit to the same values neither dirties the draft nor
+  drops a held plan.
+- M1: `nextId` skips reserved IDs. The editor reserves the saved revision's card IDs and the IDs with planning inputs,
+  so a new card never inherits a removed card's check results or time limit. Starting shapes connect to the IDs they
+  actually get.
+- M2: `graphEdgeCount` counts connections as `graph_schema.graph_edges` does. Above 256 a `local_edge_limit` issue
+  appears; at 256, unchosen evaluation and merge choices are disabled with "그래프 연결은 최대 256개입니다", and the
+  toolbar says so.
+- M4: removing the last card focuses the first starting shape. After a snapshot or module check the focus goes to the
+  root's next action, else to the root (`tabindex="-1"`), only from `body` and on the same page.
+- M7 and M8: `percentText` uses the 40-digit scale, so tiny weights round-trip. Tests cover a near-miss that a 1e-9
+  float tolerance would accept, and `removeNode` filtering `depends_on`.
+- Nits:
+  - an emptied `depends_on` is omitted;
+  - the "not available" state is read again on each entry;
+  - the threshold input waits for a selection metric ("선택 지표를 고른 뒤 입력할 수 있습니다");
+  - M5: the PPO continuation reason no longer suggests an unfollowable step.
+- M6: no change. 10.6 derives "primary" for every non-train step and "ppo" only for PPO train steps, as the local
+  PPO route reason assumes. M3 (reward-binding route reasons) is left open.
+
+Actual verification:
+- RED first:
+  - `graph-model.spec.ts` failed to load (`does not provide an export named 'graphEdgeCount'`);
+  - the 5 page tests failed on their assertions: the removed ID reused (`train-2` present), the 257th evaluation
+    enabled, focus not on the first starting shape, the threshold enabled without a metric, and the plan dropped by
+    the "0.50" threshold.
+- `npx playwright test` **224 passed** (202 + 13 from 10.6 + 9 new); `npm run build` passes;
+  `tests/test_desktop_ui_contract.py` passes.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

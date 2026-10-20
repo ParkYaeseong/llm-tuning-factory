@@ -45,7 +45,7 @@ export function modelRootsPanel(state: RootsState, busy: boolean): string {
       !entry.snapshot_ready ? `<button type="button" data-action="wf:graph:root-snapshot:${index}" aria-label="${name} 설정·토크나이저 받기"${disabled(busy || state.unavailable)}>설정·토크나이저 받기</button>` : "",
       entry.snapshot_ready && !entry.targets_ready ? `<button type="button" data-action="wf:graph:root-targets:${index}" aria-label="${name} 모듈 구조 확인"${disabled(busy || state.unavailable)}>모듈 구조 확인</button>` : "",
     ].join("");
-    return `<li class="root-item" data-root="${escapeHtml(rootKey(entry.root))}"><div><b>${name}</b> <span class="mono">${short(entry.root.revision)}</span>
+    return `<li class="root-item" data-root="${escapeHtml(rootKey(entry.root))}" tabindex="-1"><div><b>${name}</b> <span class="mono">${short(entry.root.revision)}</span>
       <small>${escapeHtml(entry.profile?.architecture ?? "")} · 템플릿 ${escapeHtml(entry.profile?.template ?? "")}</small></div>
       <div class="root-states">${entry.snapshot_ready ? statusPill("good", "설정·토크나이저 받음") : statusPill("warn", "설정·토크나이저 없음")}
       ${entry.targets_ready ? statusPill("good", "모듈 구조 확인됨") : statusPill("neutral", "모듈 구조 확인 전")}</div>
@@ -140,6 +140,8 @@ export async function snapshotRoot(ctx: ViewContext, repoId: string, revision: s
       <p>이 버전의 설정(config)과 토크나이저 파일만 이 PC에 받습니다. 학습 그래프의 기반 모델과 평가 기준의 토크나이저로 씁니다.</p><p>${SNAPSHOT_NOTE}</p>`,
     actions: [{ id: "back", label: "돌아가기" }, { id: "fetch", label: "받기", primary: true }] });
   if (answer?.action !== "fetch") return;
+  const back = focusRootLater(ctx, repoId, revision);
+  let done = false;
   await ctx.task("설정·토크나이저 받는 중", async () => {
     rootsState.error = null;
     const result = await planning.rootSnapshot(repoId, revision);
@@ -150,7 +152,20 @@ export async function snapshotRoot(ctx: ViewContext, repoId: string, revision: s
     await loadRoots();
     rootsState.inspected = null; rootsState.pinned = null; rootsState.results = null; rootsState.model = "";
     ctx.notify(`${repoId}의 설정·토크나이저를 받았습니다. 가중치는 받지 않았습니다.`);
+    done = true;
   });
+  if (done) back();
+}
+
+/** After a check the button that started it is gone: the focus goes to the root's next action, else to the root
+ * itself, only when the render left it on `body` and the user is still on the same page. */
+function focusRootLater(ctx: ViewContext, repoId: string, revision: string): () => void {
+  const page = ctx.page, arg = ctx.arg;
+  return () => {
+    if (ctx.page !== page || ctx.arg !== arg || (document.activeElement && document.activeElement !== document.body)) return;
+    const item = document.querySelector<HTMLElement>(`#model-roots [data-root="${CSS.escape(rootKey({ repo_id: repoId, revision }))}"]`);
+    (item?.querySelector<HTMLButtonElement>("button:not(:disabled)") ?? item)?.focus();
+  };
 }
 
 /** "모듈 구조 확인": its own notice dialog; then `model_root_targets` (header-only) and a fresh root list. */
@@ -160,6 +175,8 @@ export async function inspectTargets(ctx: ViewContext, root: HFRootRef): Promise
       <p>${TARGETS_NOTE}</p><p>확인한 모듈 구조는 이 PC에 기록되어 LoRA 대상 모듈(lora_target: all)과 Full·Freeze 학습의 계획·모의 실행에 쓰입니다.</p>`,
     actions: [{ id: "back", label: "돌아가기" }, { id: "inspect", label: "확인", primary: true }] });
   if (answer?.action !== "inspect") return;
+  const back = focusRootLater(ctx, root.repo_id, root.revision);
+  let done = false;
   await ctx.task("모듈 구조 확인 중", async () => {
     rootsState.error = null;
     const result = await planning.rootTargets(root.repo_id, root.revision);
@@ -169,5 +186,7 @@ export async function inspectTargets(ctx: ViewContext, root: HFRootRef): Promise
     }
     await loadRoots();
     ctx.notify(`${root.repo_id}의 모듈 구조를 확인했습니다. 가중치는 받지 않았습니다.`);
+    done = true;
   });
+  if (done) back();
 }

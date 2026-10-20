@@ -1,9 +1,9 @@
 // The graph editor's pure draft model (10.5, D6, D7): serial/parallel cards, starting shapes, layout and preview,
 // connection reasons, metric choices and the strict serialized shape. Node tests (no page).
 import { test, expect } from "@playwright/test";
-import { addNode, addParallel, addSerial, connect, emptyGraph, equalWeights, EVALUATOR_METRICS, graphToJson, inputOptions,
-  layout, localIssues, MAX_NODES, metricChoices, nextId, previewSvg, readGraph, serialKinds, starter, waitingOnSharedProfile,
-  type DraftContext, type GraphJson, type NodeJson } from "../src/graph-model.ts";
+import { addNode, addParallel, addSerial, connect, emptyGraph, equalWeights, EVALUATOR_METRICS, graphEdgeCount, graphToJson, inputOptions,
+  layout, localIssues, MAX_NODES, metricChoices, nextId, percentText, previewSvg, readGraph, REASONS, removeNode, sameGraph, serialKinds, starter,
+  waitingOnSharedProfile, weightFromPercent, weightsValid, type DraftContext, type GraphJson, type NodeJson } from "../src/graph-model.ts";
 import type { BenchmarkRevision, ModelRoot, RecipeSummary } from "../src/workflow-types.ts";
 
 const HOSTILE = "<img src=x onerror=alert(1)>";
@@ -274,4 +274,59 @@ test("drafts serialize to the strict graph shape", () => {
   expect(equalWeights(3)).toEqual([0.34, 0.33, 0.33]);
   expect(equalWeights(4)).toEqual([0.25, 0.25, 0.25, 0.25]);
   for (const count of [2, 3, 4] as const) expect(equalWeights(count).reduce((sum, weight) => sum + units(weight), 0n)).toBe(10n ** 12n);
+});
+
+// -- 10.5 review fixes (I1, M1, M2, M7, M8) --
+test("a graph read back with the backend's sorted keys compares and serializes canonically", () => {
+  // projects._json_object stores the graph with sorted keys; emptied, it still saves as {}.
+  const sorted = { max_concurrent: 1, max_total_cost_usd: 100, nodes: [], retry_policy: { backoff_seconds: 0, max_attempts: 1 } };
+  expect(graphToJson(readGraph(structuredClone(sorted)))).toEqual({});
+  expect(graphToJson(readGraph({ ...sorted, max_concurrent: 2 }))).toEqual({ ...sorted, max_concurrent: 2 });
+  expect(sameGraph(readGraph(structuredClone(sorted)), emptyGraph())).toBe(true);
+  expect(sameGraph(readGraph({ ...sorted, max_concurrent: 2 }), emptyGraph())).toBe(false);
+});
+
+test("new card IDs skip the IDs the saved revision still has", () => {
+  const graph: GraphJson = { ...emptyGraph(), nodes: [train("train-1", LORA.revision_sha256)] };
+  expect(nextId(graph, "train")).toBe("train-2");
+  expect(nextId(graph, "train", ["train-2", "train-5", "eval-9"])).toBe("train-6");
+  const reserved = { ...ctx, reservedIds: ["train-2"] };
+  expect(addParallel(graph, "train-1", reserved).id).toBe("train-3");
+  expect(addNode(graph, "train", reserved).id).toBe("train-3");
+  expect(addSerial(graph, "train-1", "evaluate", { ...ctx, reservedIds: ["eval-1"] }).id).toBe("eval-2");
+  // A starting shape after every saved card was removed still connects its own cards.
+  const shape = starter("parallel_merge", { ...ctx, reservedIds: ["train-1", "eval-1", "select-1"] });
+  expect(kinds(shape)).toEqual(["train-2:train", "train-3:train", "eval-2:evaluate", "eval-3:evaluate", "merge-1:merge", "eval-4:evaluate", "select-2:select"]);
+  expect(node(shape, "merge-1").models).toEqual([ref("train-2"), ref("train-3")]);
+  expect(node(shape, "eval-2").model).toEqual(ref("train-2"));
+  expect(node(shape, "select-2").evaluations).toEqual([ref("eval-2", "evaluation"), ref("eval-3", "evaluation"), ref("eval-4", "evaluation")]);
+});
+
+test("more than 256 connections is a local issue", () => {
+  const evals = Array.from({ length: 16 }, (_, index) => ({ id: `eval-${index + 1}`, kind: "evaluate", label: `평가 ${index + 1}`, model: ref("train-1"),
+    benchmark_revision: TEXT.revision_sha256, executor_profile_ids: ["pod-a"] }) as NodeJson);
+  const selects = Array.from({ length: 15 }, (_, index) => ({ id: `select-${index + 1}`, kind: "select", label: `선택 ${index + 1}`,
+    evaluations: evals.map(item => ref(item.id, "evaluation")) }) as NodeJson);
+  const graph: GraphJson = { ...emptyGraph(), nodes: [train("train-1", LORA.revision_sha256), ...evals, ...selects] };
+  expect(graphEdgeCount(graph)).toBe(256);
+  expect(localIssues(graph, ctx).filter(item => item.code === "local_edge_limit")).toEqual([]);
+  graph.depends_on = [{ node_id: "select-1", depends_on: "train-1" }];
+  expect(graphEdgeCount(graph)).toBe(257);
+  expect(localIssues(graph, ctx)).toContainEqual({ code: "local_edge_limit", message: REASONS.edgeLimit, path: "/graph" });
+});
+
+test("merge weights are exact decimals and a removed card leaves no dependency", () => {
+  expect(weightsValid([0.1, 0.2, 0.7], 3)).toBe(true);
+  expect(weightsValid([0.3333333333, 0.3333333333, 0.3333333334], 3)).toBe(true);
+  expect(weightsValid([0.3333333333, 0.3333333333, 0.3333333333], 3)).toBe(false);   // a 1e-9 tolerance would accept it
+  expect(weightsValid([0.5, 0.5000000001], 2)).toBe(false);
+  // Tiny weights round-trip through the percent text.
+  expect(percentText(1e-13)).toBe("0.00000000001");
+  expect(weightFromPercent(percentText(1e-13))).toBe(1e-13);
+  expect(percentText(0.3333)).toBe("33.33");
+  const chain: GraphJson = { ...emptyGraph(), nodes: [train("train-1", LORA.revision_sha256), train("train-2", LORA.revision_sha256),
+    train("train-3", LORA.revision_sha256)], depends_on: [{ node_id: "train-2", depends_on: "train-1" }, { node_id: "train-3", depends_on: "train-2" }] };
+  expect(removeNode(chain, "train-1").depends_on).toEqual([{ node_id: "train-3", depends_on: "train-2" }]);
+  expect(removeNode(chain, "train-2").depends_on).toBeUndefined();   // no empty list left behind
+  expect("depends_on" in graphToJson(removeNode(chain, "train-2"))).toBe(false);
 });

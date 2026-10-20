@@ -546,3 +546,72 @@ test("saving the graph is not submitted twice", async ({ page }) => {
   // No binding or default profile exists yet: those fields stay absent (the first root and recipe are filled in).
   expect(graph).toEqual(graphOf([{ id: "train-1", kind: "train", label: "학습 1", recipe_revision: recipe.data.revision_sha256, model_input: fromRoot }]));
 });
+
+// -- 10.5 review fixes (M1, M2, M4, nits) --
+test("a new card never takes the ID of a removed saved card or its check results", async ({ page }) => {
+  const validation = invalid([issue("recipe_missing", "이 단계의 레시피 버전을 찾을 수 없습니다.", "/graph/nodes/1/recipe_revision", { node_id: "train-2" })]);
+  await openWorkbench(page, options({ workflow: { graph_validate: validation } }));
+  await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"]), trainNode("train-2", revisions["lora-sft"])]) });
+  await openGraph(page);
+  await save(page);
+  await expect(card(page, "train-2")).toContainText("이 단계의 레시피 버전을 찾을 수 없습니다.");
+  await cardButton(page, "train-2").click();
+  await page.locator("#graph-toolbar").getByRole("button", { name: "단계 삭제", exact: true }).click();
+  await cardButton(page, "train-1").click();
+  await page.getByRole("button", { name: "나란히 추가", exact: true }).click();
+  await expect(cards(page)).toHaveCount(2);
+  await expect(card(page, "train-2")).toHaveCount(0);
+  await expect(card(page, "train-3")).not.toContainText("레시피 버전을 찾을 수 없습니다");
+});
+
+test("evaluation choices stop at 256 connections", async ({ page }) => {
+  await openWorkbench(page, options());
+  const evals = () => Array.from({ length: 16 }, (_, index) => evalNode(`eval-${index + 1}`, "train-1",
+    { label: `평가 ${index + 1}`, benchmark_revision: TEXT_BENCHMARK.revision_sha256 }));
+  const select = (index: number, count: number) => ({ id: `select-${index}`, kind: "select", label: `선택 ${index}`,
+    evaluations: Array.from({ length: count }, (_, item) => ref(`eval-${item + 1}`, "evaluation")) });
+  // 16 evaluation inputs + 14 × 16 + 15 selections + 1 dependency = 256 connections.
+  await seed(page, { recipes: [LORA], graph: revisions => ({ ...graphOf([trainNode("train-1", revisions["lora-sft"]), ...evals(),
+    ...Array.from({ length: 14 }, (_, index) => select(index + 1, 16)), select(15, 15)]), depends_on: [{ node_id: "select-1", depends_on: "train-1" }] }) });
+  await openGraph(page);
+  await cardButton(page, "select-15").click();
+  const unchosen = nodeForm(page).locator('[data-node-evaluation="eval-16"]');
+  await expect(unchosen).toBeDisabled();
+  await expect(nodeForm(page).locator('label:has([data-node-evaluation="eval-16"])')).toContainText("그래프 연결은 최대 256개입니다");
+  await expect(nodeForm(page).locator('[data-node-evaluation="eval-15"]')).toBeEnabled();
+  await expect(page.locator("#graph-toolbar")).toContainText("그래프 연결은 최대 256개입니다");
+});
+
+test("focus stays on the page after the last card goes and after a model check", async ({ page }) => {
+  await openWorkbench(page, options({ workflow: {
+    model_roots_list: [ok({ roots: [{ ...ROOT_ENTRY, snapshot_ready: false }] }), ok({ roots: [ROOT_ENTRY] }), ok({ roots: [{ ...ROOT_ENTRY, targets_ready: true }] })],
+    model_root_snapshot: ok({ root: ROOT, profile: ROOT_ENTRY.profile, files: ["config.json"] }),
+    model_root_targets: ok({ root: ROOT, shards: ["model.safetensors"], module_count: 1, targets: ["q_proj"], evidence_sha256: H("e") }) } }));
+  await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"])]) });
+  await openGraph(page);
+  await cardButton(page, "train-1").click();
+  await page.locator("#graph-toolbar").getByRole("button", { name: "단계 삭제", exact: true }).click();
+  await expect(page.locator(".graph-starters button").first()).toBeFocused();
+  // After a snapshot the root's next step has the focus; after its module check, the root itself.
+  await roots(page).getByRole("button", { name: `${ROOT.repo_id} 설정·토크나이저 받기` }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "받기", exact: true }).press("Enter");
+  await idle(page);
+  await expect(roots(page).getByRole("button", { name: `${ROOT.repo_id} 모듈 구조 확인` })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await page.getByRole("dialog").getByRole("button", { name: "확인", exact: true }).press("Enter");
+  await idle(page);
+  await expect(roots(page).locator(`[data-root="${ROOT.repo_id}@${ROOT.revision}"]`)).toBeFocused();
+});
+
+test("a threshold waits for the selection metric", async ({ page }) => {
+  await openWorkbench(page, options());
+  await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"]),
+    evalNode("eval-1", "train-1", { benchmark_revision: TEXT_BENCHMARK.revision_sha256 }),
+    { id: "select-1", kind: "select", label: "선택", evaluations: [ref("eval-1", "evaluation")], selection: { direction: "max", thresholds: [] } }]) });
+  await openGraph(page);
+  await cardButton(page, "select-1").click();
+  await expect(nodeForm(page).getByLabel("기준값 (선택)")).toBeDisabled();
+  await expect(nodeForm(page)).toContainText("선택 지표를 고른 뒤 입력할 수 있습니다");
+  await nodeForm(page).getByLabel("선택 지표").selectOption("exact_match");
+  await expect(nodeForm(page).getByLabel("기준값 (선택)")).toBeEnabled();
+});

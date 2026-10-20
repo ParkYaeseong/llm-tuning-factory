@@ -12,9 +12,9 @@ import { captureRootsForm, findRoot, inspectModel, inspectTargets, loadRoots, mo
   searchModels, snapshotRoot } from "../components/model-roots";
 import { applyPlanningInputs, bindPlanPanel, capturePlanPanel, planAction, planFeedback, planPanelBody, planPanelHtml,
   readPlanningInputs, type PlanEnv, type PlanView } from "../components/plan-panel";
-import { addNode, addParallel, addSerial, connect, findNode, graphToJson, initializationFor, inputOptions, isRef, KIND_LABELS,
-  labelOf, layout, localIssues, MAX_NODES, metricChoices, NOTES, outputRef, percentText, previewSvg, readGraph, REASONS,
-  removeNode, rootInput, sameRoot, selectionEvaluators, serialKinds, starter, upstreamRoot, waitingOnSharedProfile,
+import { addNode, addParallel, addSerial, connect, findNode, graphEdgeCount, graphToJson, initializationFor, inputOptions, isRef,
+  KIND_LABELS, labelOf, layout, localIssues, MAX_EDGES, MAX_NODES, metricChoices, NOTES, outputRef, percentText, previewSvg, readGraph,
+  REASONS, removeNode, rootInput, sameGraph, sameRoot, selectionEvaluators, serialKinds, starter, upstreamRoot, waitingOnSharedProfile,
   weightFromPercent, weightsValid, type DraftContext, type GraphJson, type InputPort, type NodeJson, type NodeKind,
   type StarterShape } from "../graph-model";
 import { issueList, issuesAt, localize, nodeIssues } from "../issues";
@@ -100,7 +100,9 @@ function draftContext(draft: ProjectDraft): DraftContext {
   for (const [revision, recipe] of pinnedRecipes) if (recipe && !recipes.has(revision)) recipes.set(revision, recipe);
   return { recipes, bindings: draft.spec.datasets, roots: rootsState.roots,
     benchmarks: new Map((benchmarkList ?? []).map(item => [item.revision_sha256, item])),
-    defaultProfiles: draft.spec.default_executor_profile_id ? [draft.spec.default_executor_profile_id] : [] };
+    defaultProfiles: draft.spec.default_executor_profile_id ? [draft.spec.default_executor_profile_id] : [],
+    // A new card never takes a saved card's ID (its check results) or one with planning inputs (its time limit).
+    reservedIds: [...new Set([...savedIds(draft), ...Object.keys(draft.planning.nodeResources)])] };
 }
 const graphOf = (draft: ProjectDraft) => readGraph(draft.spec.graph);
 const savedIds = (draft: ProjectDraft) => readGraph(draft.saved?.project.graph ?? {}).nodes.map(node => String(node.id));
@@ -113,8 +115,10 @@ function selectedIn(projectId: string, graph: GraphJson): string | null {
 function editGraph(ctx: ViewContext, projectId: string, change: (graph: GraphJson) => GraphJson) {
   const draft = ctx.store.draft(projectId);
   if (!draft) return;
-  const next = graphToJson(change(readGraph(draft.spec.graph)));
-  if (JSON.stringify(next) === JSON.stringify(graphToJson(readGraph(draft.spec.graph)))) return;
+  const changed = change(readGraph(draft.spec.graph));
+  // Canonically: the backend returns the graph with sorted keys, and an edit may rebuild an object in another order.
+  if (sameGraph(changed, readGraph(draft.spec.graph))) return;
+  const next = graphToJson(changed);
   ctx.store.edit(projectId, spec => { spec.graph = next; });
 }
 /** Applies a change to one card of the draft. */
@@ -246,8 +250,9 @@ function toolbarHtml(ctx: ViewContext, view: Shown): string {
   const menu = addMenu && selected && !full ? `<div id="graph-add-kinds" class="graph-kinds" role="group" aria-label="추가할 단계 종류">
       ${serialKinds(graph, selected, dctx).map(choice => `<span class="graph-kind"><button type="button" data-action="wf:graph:add:${choice.kind}"${off(!choice.allowed)}>${escapeHtml(choice.label)}</button>${choice.reason ? `<small>${escapeHtml(choice.reason)}</small>` : ""}</span>`).join("")}
       <button type="button" class="quiet" data-action="wf:graph:add-menu-close">닫기</button></div>` : "";
-  const note = full ? `<p class="graph-limit">${REASONS.limit} · 단계를 삭제한 뒤 추가하세요.</p>`
-    : !selected ? '<p class="muted">카드를 고르면 그 카드 다음 단계나 나란히 놓을 카드를 추가할 수 있습니다.</p>' : "";
+  const note = (full ? `<p class="graph-limit">${REASONS.limit} · 단계를 삭제한 뒤 추가하세요.</p>`
+    : !selected ? '<p class="muted">카드를 고르면 그 카드 다음 단계나 나란히 놓을 카드를 추가할 수 있습니다.</p>' : "")
+    + (graphEdgeCount(graph) >= MAX_EDGES ? `<p class="graph-limit">${REASONS.edgeLimit} · 연결을 지운 뒤 추가하세요.</p>` : "");
   return `<div class="graph-toolbar"><button type="button" data-action="wf:graph:add-menu" aria-expanded="${Boolean(menu)}" aria-controls="graph-add-kinds"${off(!selected || full)}>다음 단계 추가</button>
     <button type="button" data-action="wf:graph:add-parallel"${off(!selected || full)}>나란히 추가</button>
     <button type="button" data-action="wf:graph:add-root"${off(full)}>새 학습 단계</button>
@@ -395,10 +400,12 @@ function evaluateFields(view: Shown, node: Obj, at: (field: string) => WorkflowI
 function selectFields(view: Shown, node: Obj, at: (field: string) => WorkflowIssue[]): string {
   const chosen = new Set((Array.isArray(node.evaluations) ? node.evaluations : []).filter(isRef).map((ref: Obj) => ref.node_id));
   const options = inputOptions(view.graph, node.id, "evaluations", view.dctx).filter(option => findNode(view.graph, option.value.node_id)?.kind === "evaluate");
+  const edgesFull = graphEdgeCount(view.graph) >= MAX_EDGES;     // another evaluation would add a connection
   const boxes = options.map((option, index) => {
     const id = option.value.node_id;
-    const off = !option.allowed && !chosen.has(id);
-    return `<label class="check"><input type="checkbox" id="node-evaluation-${index}" data-focus-key="evaluation:${escapeHtml(id)}" data-node-evaluation="${escapeHtml(id)}"${chosen.has(id) ? " checked" : ""}${off ? " disabled" : ""}>${escapeHtml(labelOf(findNode(view.graph, id)))}${option.reason ? ` <small>${escapeHtml(option.reason)}</small>` : ""}</label>`;
+    const reason = option.reason ?? (edgesFull && !chosen.has(id) ? REASONS.edgeLimit : undefined);
+    const off = Boolean(reason) && !chosen.has(id);
+    return `<label class="check"><input type="checkbox" id="node-evaluation-${index}" data-focus-key="evaluation:${escapeHtml(id)}" data-node-evaluation="${escapeHtml(id)}"${chosen.has(id) ? " checked" : ""}${off ? " disabled" : ""}>${escapeHtml(labelOf(findNode(view.graph, id)))}${reason ? ` <small>${escapeHtml(reason)}</small>` : ""}</label>`;
   }).join("");
   const selection: Obj = isObject(node.selection) ? node.selection : {};
   const kinds = selectionEvaluators(view.graph, node as NodeJson, view.dctx);
@@ -414,9 +421,10 @@ function selectFields(view: Shown, node: Obj, at: (field: string) => WorkflowIss
     kinds === null ? '<small class="muted">평가 기준 정보를 불러오지 못해 지표를 확인할 수 없습니다.</small>' : ""].join("");
   const thresholds: Obj[] = Array.isArray(selection.thresholds) ? selection.thresholds : [];
   const editable = thresholds.length === 0 || (thresholds.length === 1 && thresholds[0]?.metric === metric && thresholds[0]?.direction === (selection.direction ?? "max"));
+  // A threshold belongs to the selection metric: without one it cannot be kept, so it waits for the metric.
   const threshold = editable
-    ? numberHtml("node-threshold", "기준값 (선택)", "threshold", thresholds[0]?.value, 'step="any"', at("selection/thresholds"),
-      `<small class="muted">${(selection.direction ?? "max") === "min" ? "이 값보다 높은 후보는 제외합니다." : "이 값보다 낮은 후보는 제외합니다."}</small>`)
+    ? numberHtml("node-threshold", "기준값 (선택)", "threshold", thresholds[0]?.value, metric ? 'step="any"' : 'step="any" disabled', at("selection/thresholds"),
+      `<small class="muted">${!metric ? "선택 지표를 고른 뒤 입력할 수 있습니다." : (selection.direction ?? "max") === "min" ? "이 값보다 높은 후보는 제외합니다." : "이 값보다 낮은 후보는 제외합니다."}</small>`)
     : `<p class="muted">저장된 기준 ${thresholds.length}개는 그대로 둡니다.</p>`;
   return `<fieldset class="graph-choices"${at("evaluations").length ? ' aria-invalid="true"' : ""}><legend>비교할 평가</legend>${boxes || '<p class="muted">평가 단계를 먼저 추가하세요.</p>'}${issueList(at("evaluations"))}</fieldset>
     ${selectHtml("node-metric", "선택 지표", "selection.metric", metricOptions, metric, at("selection/metric"), metricHelp)}
@@ -443,10 +451,12 @@ function mergeFields(view: Shown, node: Obj, at: (field: string) => WorkflowIssu
   const chosen = models.map(item => isRef(item) ? item.node_id : null);
   const options = inputOptions(view.graph, node.id, "models", view.dctx).filter(option => option.value.node_id !== node.id
     && findNode(view.graph, option.value.node_id)?.kind !== "evaluate");
+  const edgesFull = graphEdgeCount(view.graph) >= MAX_EDGES;     // another model would add a connection
   const rows = options.map((option, index) => {
     const id = option.value.node_id;
     const position = chosen.indexOf(id);
     const label = labelOf(findNode(view.graph, id));
+    if (option.allowed && edgesFull && position < 0) option = { ...option, allowed: false, reason: REASONS.edgeLimit };
     const off = !option.allowed && position < 0;
     return `<div class="graph-merge-row"><label class="check"><input type="checkbox" id="node-merge-${index}" data-focus-key="merge:${escapeHtml(id)}" data-node-merge="${escapeHtml(id)}"${position >= 0 ? " checked" : ""}${off ? " disabled" : ""}>${escapeHtml(label)}</label>
       ${position >= 0 ? `<label class="graph-weight"><span>가중치 (%)</span><input id="node-weight-${index}" type="text" inputmode="decimal" data-node-weight="${escapeHtml(id)}" aria-label="${escapeHtml(label)} 가중치 (%)" value="${escapeHtml(percentText(weights[position]))}"></label>` : ""}
@@ -600,8 +610,10 @@ function onNodeInput(ctx: ViewContext, event: Event) {
       if (node.kind !== "select") return;
       const selection: Obj = isObject(node.selection) ? node.selection : (node.selection = {});
       if (field === "threshold") {
-        selection.thresholds = value === undefined || !Number.isFinite(value) || !selection.metric ? []
-          : [{ metric: selection.metric, direction: selection.direction ?? "max", value }];
+        const kept = Array.isArray(selection.thresholds) && selection.thresholds.length === 1 && isObject(selection.thresholds[0]) ? selection.thresholds[0] : null;
+        if (value === undefined || !Number.isFinite(value) || !selection.metric) selection.thresholds = [];
+        else if (kept) Object.assign(kept, { metric: selection.metric, direction: selection.direction ?? "max", value });   // in place: its key order stays
+        else selection.thresholds = [{ metric: selection.metric, direction: selection.direction ?? "max", value }];
       } else {
         const key = field.replace(/^selection\./, "");
         if (value === undefined || !Number.isFinite(value)) delete selection[key]; else selection[key] = value;
@@ -730,7 +742,8 @@ function removeCard(ctx: ViewContext) {
   addMenu = false;
   toolbarNote = `‘${label}’ 단계와 이 단계로 들어오던 연결을 지웠습니다. 저장하기 전에는 저장된 그래프가 바뀌지 않습니다.`;
   ctx.render();
-  if (next) restoreFocus(document, `card:${next}`); else restoreFocus(document, "wf:graph:add-root");
+  // The last card gone: the empty graph has no toolbar, only its starting shapes.
+  if (next) restoreFocus(document, `card:${next}`); else document.querySelector<HTMLButtonElement>(".graph-starters button")?.focus();
 }
 
 function useCurrentRecipe(ctx: ViewContext) {
@@ -786,6 +799,7 @@ async function enterGraph(ctx: ViewContext) {
   const projectId = ctx.arg;
   if (!projectId) return;
   loadIssues.delete(projectId);
+  unavailable = false;                                     // this project's own reads decide again
   await ctx.task("학습 그래프 불러오는 중", async () => {
     // The stored planning inputs first (read-only, 9.8), then the project and its lists as before (10.6).
     await queue.run(() => readPlanningInputs(projectId));

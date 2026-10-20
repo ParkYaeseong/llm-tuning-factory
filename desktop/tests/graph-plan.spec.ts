@@ -92,10 +92,12 @@ const dataOf = async (page: Page, action: string) => (await calls(page, { action
  * another window would. graph_plan answers come from `plans` in order (the last repeats); an `ok` takes the
  * request's project, revision and mode. Every call reaches the shared mock first, so it is recorded.
  */
-async function installPlanFake(page: Page, options: { stored?: object | null; plans?: object[] } = {}) {
-  await page.evaluate(({ initial, plans }) => {
+async function installPlanFake(page: Page, options: { stored?: object | null; plans?: object[]; sortKeys?: boolean } = {}) {
+  await page.evaluate(({ initial, plans, sortKeys }) => {
     const w = window as any;
     const original = w.__TAURI_INTERNALS__.invoke;
+    const sorted = (value: any): any => Array.isArray(value) ? value.map(sorted) : value && typeof value === "object"
+      ? Object.fromEntries(Object.keys(value).sort().map(key => [key, sorted(value[key])])) : value;
     const projects: Record<string, any> = {};
     const records: Record<string, any> = {};
     let position = 0;
@@ -106,6 +108,8 @@ async function installPlanFake(page: Page, options: { stored?: object | null; pl
       const answer = await original(command, args);
       if (command !== "workflow_action") return answer;
       const { action, data } = args;
+      // `sortKeys`: projects come back as the backend stores them (projects._json_object: sorted keys).
+      if (sortKeys && ["project_create", "project_save", "project_get"].includes(action) && answer?.status === "ok") answer.data.project = sorted(answer.data.project);
       if ((action === "project_create" || action === "project_save") && answer?.status === "ok") projects[answer.data.project.project_id] = answer.data;
       if (action === "planning_inputs_get" || action === "planning_inputs_save") {
         const project = projects[data.project_id];
@@ -133,7 +137,7 @@ async function installPlanFake(page: Page, options: { stored?: object | null; pl
       }
       return answer;
     };
-  }, { initial: options.stored ?? null, plans: options.plans ?? [] });
+  }, { initial: options.stored ?? null, plans: options.plans ?? [], sortKeys: options.sortKeys ?? false });
 }
 
 /** Saves recipes and one project with bindings and a graph through the definitions fake (as another window would). */
@@ -663,4 +667,34 @@ test("a refused submit shows the backend reasons and keeps the plan", async ({ p
   await expect(heading(page)).toHaveText("그래프 실행");
   const sent = await dataOf(page, "graph_submit");
   expect(sent.map(request => request.request_id)).toEqual([sent[0].request_id, sent[0].request_id]);
+});
+
+// -- 10.5 review fix I1: a no-op edit never reaches the store, also when the backend returns sorted keys --
+test("edits that leave the saved graph as it is keep the plan, with the backend's sorted keys", async ({ page }) => {
+  const selection = { metric: "exact_match", direction: "max", thresholds: [{ metric: "exact_match", direction: "max", value: 0.5 }],
+    allow_partial: false, min_success: 2, merge_regression_tolerance: 0 };
+  const benchmark = { revision_sha256: H("7"), spec: { dataset: DATASETS[2].dataset, evaluator_kind: "text", evaluator_version: "1",
+    ordered_sample_ids: ["row:0", "row:1"], max_new_tokens: 64, cutoff_len: 512, seed: 1, generation_mode: "greedy", precision: "bf16",
+    quantization_bit: null, tokenizer_fingerprint: ROOT.tokenizer_fingerprint, template: "qwen", semantic_model_kind: "causal_lm" } };
+  await openWorkbench(page, options({ workflow: { benchmarks_list: ok({ benchmarks: [benchmark] }) } }));
+  await installPlanFake(page, { sortKeys: true, plans: [ONE_STEP] });
+  await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label: "기준 학습" }),
+    evalNode("eval-1", "train-1", { label: "평가", benchmark_revision: benchmark.revision_sha256 }),
+    { id: "select-1", kind: "select", label: "선택", evaluations: [ref("eval-1", "evaluation")], selection }]) });
+  await openGraph(page);
+  await plan(page);
+  await expect(approveButton(page)).toBeEnabled();
+  await cardButton(page, "select-1").click();
+  // The same threshold typed differently, the same cost and the same label.
+  await nodeForm(page).getByLabel("기준값 (선택)").fill("0.50");
+  await page.locator("#graph-cost").fill("100");
+  await nodeForm(page).getByLabel("단계 이름").fill("선택");
+  await expect(page.locator("#graph-head")).not.toContainText("저장 안 된 변경");
+  await expect(approveButton(page)).toBeEnabled();
+  await expect(dropped(page)).toHaveCount(0);
+  // A real change still drops it.
+  await nodeForm(page).getByLabel("기준값 (선택)").fill("0.6");
+  await expect(dropped(page)).toContainText("프로젝트 초안이 바뀌었습니다");
+  await nodeForm(page).getByLabel("기준값 (선택)").fill("0.5");
+  await expect(page.locator("#graph-head")).not.toContainText("저장 안 된 변경");
 });
