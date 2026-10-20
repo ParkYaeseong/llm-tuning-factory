@@ -3089,6 +3089,247 @@ Not verified or still open:
 - No GUI screen calls `model_root_targets` yet (Task 10). No network, GPU, SSH, model download, MLflow, provider
   call or institution data was used.
 
+## Task 9.4 controller entry: stdin start, single auth scope, lifecycle, 2026-10-21
+
+Commit `feat: run the graph controller as a stdin-configured background sidecar`, written on `b0d2c90` in the worktree
+`D:\llm-tuning-factory-wt94` and rebased onto `bf9a13b` (the 9.2 follow-ups, 9.7, the 8.5 re-review Minors, 9.3, the
+Task 10 plan and the 9.7 review fixes landed meanwhile; only this file conflicted). It follows
+[Task 9 plan](superpowers/plans/2026-10-20-task9-secure-desktop-broker.md) §4 "9.4" with D2–D5, D7, D14 and D19,
+checked against the landed 8.5 controller and the 9.5 broker (`broker.rs`, the 9.5 review fixes). Changed: new
+`src/tuning_factory/controller_entry.py`, new `tests/test_controller_entry.py`, `scripts/desktop_entry.py` (argv
+routing only) and this file. `desktop_workflows.py` is untouched: its table already maps `controller_status` and
+`controller_stop` to `controller_entry`, which registers them with `workflow_action`.
+
+What it does:
+- `desktop_entry.py`:
+  - No argv: the legacy one-request sidecar `desktop.main`, byte for byte. A test compares the bytes with the pre-9.4
+    entry.
+  - Exactly `--controller`: `controller_entry.main`.
+  - Anything else (`--bogus`, `--controller x`, `--Controller`, `controller`, `--controller=`): `unsupported sidecar
+    arguments` on stderr and exit 2. Stdin is never read.
+- The start message:
+  - `read_start` takes exactly one UTF-8 JSON line of at most 1 MiB, newline included (the broker's limit).
+  - The line is parsed into a strict `ControllerStart`:
+    - `schema` is the only spelling accepted;
+    - `state_root` must be absolute and local: no UNC or device prefix, no `..`, no control character;
+    - `owner_id` follows `OWNER_ID`;
+    - at most 32 profiles, with IDs unique under `casefold().rstrip(".")`;
+    - profile fields follow `NativeProfile`'s allowlist, and credential names are refused there;
+    - the only secret is `RUNPOD_API_KEY`;
+    - tracking string fields are at most 2048 characters;
+    - `StartSettings` takes strict floats and Task 8's `ControllerSettings` constraints.
+  - Duplicate JSON keys, NaN and an unterminated line are refused.
+  - Every refusal is `ValueError("invalid controller start message")`, with no cause and no context. `main` prints
+    `{"ok": false, "code": "invalid_start", "error": ...}` and exits 2.
+  - `repr` and `str` show only the owner and the profile IDs.
+  - The Rust `CONTROLLER_MESSAGE_SAMPLE` validates: `test_rust_controller_message_matches_python` now runs instead of
+    skipping.
+- One auth scope (D7):
+  - `apply_tracking_scope` first pops the 18 credential variables of the plan.
+  - It then sets the scope once, before any thread starts, filtered exactly as `filter_mlflow_auth` filters (`none`
+    drops all four MLflow auth values even if they were sent).
+  - It enforces `require_secure_tracking`, `require_secure_artifacts`, `require_complete_oidc` and the D11 public
+    view.
+  - A refusal gives a fixed text and leaves no credential variable set.
+  - RunPod keys exist only in `ProfileSecrets`. S3 and HF credentials never reach the controller.
+- Profiles: `provider_profiles` builds RunPod profiles offline with 9.2's `public_profile`; each needs its own key.
+  SSH profiles are built from the stored observation of the same revision. A skipped profile gets a fixed reason:
+  `invalid_fields`, `credential_missing`, `observation_missing`, `observation_revision_differs` or
+  `observation_invalid`. Since the 9.2 follow-ups, `public_profile` refuses a relative key path, so such a profile is
+  skipped as `invalid_fields` (tested), as planning refuses it.
+- `build_controller` wires the controller as Task 8 §7 says:
+  - `GraphStore` and `SettingsExecutorProvider`, wrapped in `BoundedProvider` (below);
+  - `DispatchRouter(OperationAttemptRunner, SimulatedOperationDispatcher(roots=DirectoryRootSnapshots(
+    root_snapshots_dir(state))), store=)`;
+  - `controller_tracker(uri)`, only when the URI is not blank;
+  - `ControllerSettings` from `StartSettings`;
+  - no `simulated_provider`: the controller builds one per simulation run.
+  - The `GraphController` constructor installs `GraphController.redact` as `JobStore.error_filter`; a test asserts it.
+  - `attempt_runner` (it imports paramiko) is imported only inside `build_controller`, so the polling sidecar never
+    loads paramiko or MLflow (tested).
+- `serve`, in this order:
+  - A settings refusal exits 4 before any owner lease.
+  - The owner lease: a duplicate prints `{"ok": false, "code": "owner_held"}`, exits 3 and writes no file.
+  - `current.json` is written, then the ready line `{"ok": true, "owner_id", "pid"}`; stdout then goes to the null
+    device.
+  - Two daemon watchers start: EOF on the stdin lifeline, and the poll of `stop-request.json` every tick.
+  - `run_forever` drains and releases the owner lease. There is no kill-now.
+  - At the end, `current.json` gets `stopped_at` and `code` (`stopped`, or `owner_lost`), and a `stop-request.json`
+    naming this owner is removed.
+  - Exit codes: 0 for a drained stop, 1 for a lost (fenced) owner lease or an unexpected error (its type name goes
+    into `current.json`), 2, 3 and 4 as the broker maps them.
+- The stdin lifeline. This was found by the RED subprocess test and is pinned by
+  `test_the_lifeline_is_moved_off_standard_input`:
+  - On Windows, a thread blocked in a synchronous read of the broker's pipe hangs every child process that inherits
+    the pipe as its standard input. The manifest's `git rev-parse` hung, so no node was ever prepared, and the test
+    failed for that reason.
+  - A daemon thread holding `sys.stdin`'s buffered-reader lock at shutdown is a fatal error (exit `0xC0000005`/fatal
+    "could not acquire lock for <stdin>").
+  - The fix: after the start line, `main` moves the pipe to its own non-inheritable descriptor and puts the null
+    device on standard input. `os.dup2` also updates the Windows standard handle, which was checked. The watcher
+    reads that descriptor with `os.read`.
+  - The PyInstaller build reads `commit.txt` instead of running git, but any child process would have hung.
+- Status files (D19) under `state/controller/` hold only IDs, revisions, hashes, timestamps, fixed codes and texts.
+  - `current.json` while running: `{ok, owner_id, pid, started_at, profiles: {id: revision} (every profile the start
+    named), skipped_profiles: {id: reason}, tracking: {view_sha256, auth_mode, effective_auth_mode},
+    tracking_settings_sha256}`.
+  - A refusal or failure before the owner lease writes `{ok: false, code: "settings_refused"|"controller_failed",
+    error|error_type, owner_id, at}`, but only when no live controller owns the directory.
+  - `stop-request.json` is `{owner_id, requested_at}`.
+- `controller_status`:
+  - Returns `{controller, current, broker, stop_requested, restart_required: {profiles, tracking}, runs: {active}}`.
+  - `controller` is exactly `graph_status(...)["controller"]`; test 13 checks parity at every step.
+  - It is read through a read-only SQLite connection: a poll never creates, migrates or write-locks `jobs.db`, never
+    reads every run, and creates nothing in a fresh state directory.
+  - `runs.active` counts RUNNING and PAUSED graph runs.
+  - `restart_required` is filled only while the state is `running` and `current.json` is the same owner's.
+- `controller_stop`: `{"requested": true, "owner_id"}` for a running controller; otherwise
+  `{"requested": false, "reason": "not_running"}`, and nothing is written.
+
+`restart_required` (the choice to review):
+- `profiles`: the sorted IDs whose native revision (the request's public fields, through `profile_revision`) differs
+  from the revision snapshotted in `current.json`. That covers added, changed and deleted profiles. A rotated key
+  needs no restart, because the revision never includes it.
+- `tracking` is computed from public fields only. A poll carries no `*_saved` flag and no vault data.
+  - `current.json` records a hash of the public tracking view, not the settings in clear (D19). The view is the URI,
+    the artifact location, the operator, `auth_mode`, and the OIDC token URL and client ID when the mode uses OIDC
+    (`""` or `oidc`).
+  - It also records the saved `auth_mode` and the auth mode the process actually applied (`current_auth_mode()` after
+    the scope).
+  - `true` when the request's view hash differs.
+  - Also `true` when an explicit `auth_mode` (`oidc`, `token`, `none`) differs from the applied mode, for example a
+    token saved after the start.
+  - The legacy empty `auth_mode` skips that second check. Its applied mode depends on saved credentials that a poll
+    cannot see, so it never reports a permanent false restart; a change of its URI, artifact location, operator or
+    OIDC values is still reported.
+  - `null` when `current.json` has no recorded view.
+  - Known consequences:
+    - Re-saving or rotating a credential without changing a public field is invisible to polling. Task 10 should say
+      "restart the controller after saving credentials".
+    - An explicit mode whose credential was never saved (for example `token` with no token) reports `true` until the
+      credential is saved and the controller restarted.
+    - An unreadable settings or profiles file arrives as `{}`/`[]` (9.5) and reads as changed.
+
+Task 8 review notes:
+1. The process is owned. `serve` runs one `GraphController` per process, and nothing else in the sidecar uses MLflow.
+   The CLI (9.6) must keep that true when it calls `serve`.
+2. Auth scope: as above.
+3. Redaction:
+   - `JobStore.error_filter = GraphController.redact` (installed by the constructor, asserted here).
+   - `BoundedProvider` also redacts the provider's own keys from `resolve`/`recover` exception texts, re-raised
+     without a cause; a fixed `ValueError` refusal passes unchanged.
+   - Still not covered: remote log uploads (`train.log`, `worker.log` uploaded as lineage); exception text escaping a
+     dispatcher, which reaches wait reasons through 8.5's `_display` (MLflow secrets and bearer patterns only, not
+     RunPod keys; RunPod errors are fixed texts).
+4. Timeouts:
+   - Implemented in `build_controller`: `BoundedProvider` opens each `resolve`/`recover` context on a helper thread
+     and raises `TimeoutError` after `DESTINATION_TIMEOUT_SECONDS = 300`. The controller then backs off as for any
+     unavailable destination.
+   - A destination that opens late is closed on that thread at once.
+   - Not covered: work inside an open connection (reconcile, result download, runtime probes) relies on the
+     connection layer's own limits (paramiko 20 s connect, banner and auth; 20 s exec; httpx 30 s). A hang there still
+     stalls the tick while the heartbeat keeps `running`. A tick watchdog is a known limitation for Task 11.
+5. Reconcile still runs inline on the tick thread (8.5), unchanged and documented in the module docstring.
+6. Stopping: a `controller_stop` request and EOF both drain; there is no kill-now.
+7. Status files: D19, as above.
+
+Actual verification (main venv with `PYTHONPATH` on the worktree `src`; `--basetemp` under `%TEMP%`):
+- RED first. All 45 tests of the new module failed for the intended reasons:
+  - the module was missing (`controller_entry (Task 9.4) is missing`);
+  - `--controller` with a broken start exited 0 through the legacy path instead of 2;
+  - the import test could not import `controller_entry`.
+- The contract parity test skipped as designed.
+- During GREEN, the subprocess tests went RED twice for real defects, both fixed above: the Windows stdin
+  deadlock (the run never prepared its node), and the fatal shutdown error after a stop request.
+- Mutations, each restored and checked by SHA256. All 11 were killed by at least one test:
+  - EOF never stops;
+  - no env pop;
+  - the lifeline left on stdin;
+  - a refusal overwriting a live controller's status;
+  - `restart_required` for a stale owner;
+  - no effective-mode check;
+  - a duplicate writing `current.json`;
+  - the stop request ignored;
+  - no destination time limit;
+  - pydantic's default `repr`;
+  - the default `str`.
+  - One weaker variant first survived (`__str__ = object.__repr__` leaks nothing). The test now also forbids
+    settings, URIs and paths in `repr` and `str`.
+- GREEN:
+  - `tests/test_controller_entry.py`: **47 passed**. The plan's 15 tests; test 1 is parametrized over 26 cases. Four
+    tests were added: valid starts, the lifeline, the CLI's `TrackingScope.from_environment`, and the bounded,
+    redacted destination.
+  - With `tests/test_native_contract.py`: **54 passed**, and the parity test runs instead of skipping.
+  - `test_controller_entry`, `test_native_contract`, `test_desktop_projects`, `test_graph_controller`, the six
+    `test_desktop*` modules, `test_executor_profiles`, `test_simulated_dispatch` and `test_workflow_planning`:
+    **383 passed**.
+  - Full suite: **1507 passed, 1 skipped**. The baseline was 1459 passed, 2 skipped; the one skip left is the real-GPU
+    test.
+- Ruff is clean. `scripts/check_secrets.py` reports 0 findings. `git diff --exit-code containers/ pyproject.toml
+  uv.lock desktop/` is clean. Every changed file is LF only.
+- CPU acceptance:
+  - Command: `model-ops-cpu-venv ... -I scripts/verify_model_ops_cpu.py --receipt .factory/model-ops-cpu-receipt.json`.
+  - Result: exit 0, **29/29**, passed.
+  - Receipt SHA256 `272cf4e858e53c169b01b74773a311484a58258cee3c64f45f3a54d67ad408b0`.
+  - `source_sha256 3ddc44d777f259214867cacfd743772640e662bb1005aac3139fa9ce6516b967`, equal to `source_hash()` of the
+    tree.
+  - `lock_sha256 5883aae6…1437`.
+- After the rebase onto `c2f1bbb`, and again on `9f2927d` (the Task 10 plan only; `src`, `tests` and `scripts` are
+  byte-identical, and both runs gave the numbers below):
+  - Upstream's `check_key_paths` (now inside `public_profile`) refused the tests' relative SSH key path `test-key`.
+    The test profiles now use absolute paths, and test 12 also pins a relative RunPod key path as `invalid_fields`.
+  - Upstream's `DISPATCHER_STORE_DIFFERS` check passes: `build_controller` gives every dispatcher the controller's
+    own `GraphStore`.
+  - `test_controller_entry`, `test_native_contract`, `test_desktop_projects` and `test_workflow_runs`: **120 passed**,
+    with no skip.
+  - Full suite: **1634 passed, 1 skipped**, which is 9.3's 1586 plus the 47 new tests plus the parity test that no
+    longer skips. The one skip is the real-GPU test.
+  - Ruff, `check_secrets.py` (0 findings with the change staged), the diff check and the LF check are clean.
+  - CPU acceptance: exit 0, **29/29**.
+    - Receipt SHA256 `f7f7f459f21ca86def8cbff725efcd44fcc81e8ae11e86b9215911e6e1904975`.
+    - `source_sha256 d62d1ecd1e932b30b06eb6d3d5a0e275134aaa3d3f4ea0b427f71948299173c8`, equal to `source_hash()` of
+      the committed `src`.
+    - `lock_sha256 5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`.
+- On the final tree `bf9a13b` (the 9.7 review fixes; desktop/ changed there, not here):
+  - The same four test modules: **120 passed**.
+  - Full suite: **1648 passed, 1 skipped**, which is 9.7's 1600 plus the 47 new tests plus the parity test.
+  - Ruff, `check_secrets.py` (0 findings), the LF check and `git diff --exit-code origin/... -- desktop/ containers/
+    pyproject.toml uv.lock` (no change by this commit) are clean.
+  - CPU acceptance: exit 0, **29/29**.
+    - Receipt SHA256 `5d8cd5c317c113927d69dd80e4258cad1d6e6ea911ba261d799bbccc323a8fc8`.
+    - `source_sha256 989c97fbb79185f51bc075ca825bde6a0ca18b8a87f9d1b84fb631bccac89d7f`, equal to `source_hash()` of
+      the committed `src`.
+    - `lock_sha256 5883aae6…1437`.
+    - It supersedes 9.7's review-fix receipt `caeb6130…cce6`.
+
+Not verified (Task 11):
+- The real Rust broker spawning the sidecar. Only the Python stand-in (`broker_standin.py`, written at runtime) was
+  run.
+- The PyInstaller onefile child: its bootloader and child process, and EOF through it. The venv `python.exe` used here
+  is also a launcher with a child, so the ready line's `pid` is the controller's own.
+- Windows job objects and `CREATE_BREAKAWAY_FROM_JOB` with the real app.
+- Credential Manager read from the background broker.
+- A real MLflow server, real RunPod and real SSH from the controller process.
+- Still open: the 8.5 re-review's note 4 (a PENDING model version that MLflow later marks `FAILED_REGISTRATION` still
+  shows `registered`). Checking it needs an MLflow read in the tracking outbox (8.x files), not in the entry; 9.4
+  leaves it to a later task.
+
+Deviations:
+- `populate_by_name` is not set. The wire name `schema` is the only accepted spelling (`schema_` is refused), and the
+  Python constructor uses `schema=`.
+- Skip reasons `credential_missing` and `observation_invalid` were added. `current.json` `profiles` lists every
+  profile the start named, usable or skipped, so that `restart_required` can compare them.
+- `current.json` keeps the tracking view as a hash (D19), not as clear public settings.
+- `controller_status` reads `jobs.db` read-only instead of building a `GraphStore` and calling `graph_status`. Parity
+  of the controller block is tested.
+- A refusal or failure before the owner lease writes `current.json` only when no live controller owns the directory.
+  The plan said it always writes, which could replace a running controller's status.
+- A fenced (lost) owner lease exits 1 with `code: "owner_lost"`, not 0, so the broker records `controller_failed`.
+- New: the stdin lifeline is moved off standard input, and `BoundedProvider` adds time limits and redaction.
+- Tests: the plan's 15 plus 4 more (above). Subprocesses run with a `sitecustomize` socket guard in the child, and a
+  Python broker stand-in and GUI proxy written at runtime. Every process is detached and killed in teardown, and every
+  wait is at most 30 s.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
