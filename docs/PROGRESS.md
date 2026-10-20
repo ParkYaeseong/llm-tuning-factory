@@ -4145,6 +4145,75 @@ keeps its own rule. It compares the rebuilt profile with the stored one (`observ
 `pin_observation`. On the home-directory probe the rebuild raises, so the controller skips the profile
 (`invalid_fields`) as planning refuses it, but the two are not one function.
 
+## Task 10.4 executor profiles and the controller bar, 2026-10-21
+
+Commit `feat: manage executor profiles and the background controller from the workbench`, written in the main tree on
+`128f995` (9.8) and fast-forwarded onto `42fbb0d` (the 9.6 and 9.8 review fixes, which change no desktop file). It
+implements [Task 10 plan](superpowers/plans/2026-10-21-task10-workflow-workbench-ui.md) §4 "10.4" with D9, D10, D14 and
+the root decisions (9.8's `executor_profile_inventory` and `observations_list`). Changed: new
+`desktop/src/views/executor-profiles.{ts,css}`, `desktop/src/components/controller-bar.ts`,
+`desktop/tests/executor-profiles.spec.ts`; `desktop/src/api.ts` (two wrappers, see deviations) and this file. No
+Python, Rust, package or lock file changed.
+
+What changed:
+- 실행 프로필 (settings, order 20; `data-tour="executor-profiles"` once). Entering reads `executor_profiles_get`,
+  `observations_list` and `controller_status` only. The list shows allowlisted public fields, the key flag or GPU
+  count, and the last check (age, GPU × count, price, cost source, `fresh_for_real_plan`).
+- Save and delete use the native commands (provider and ID fixed once saved; delete behind a dialog); the list is
+  read again, `store.markProfilesChanged()` runs, `affected_runs` shows "이 변경 후 다시 계획해야 하는 실행: …";
+  refusals are shown verbatim and the form keeps its public values. The RunPod key is a password field read once at
+  save time, sent only when typed, never rendered, stored or logged, and empty after every save.
+- SSH GPUs are checkboxes from `executor_profile_inventory`; "자원 확인" runs `executor_profile_inspect` (session
+  result for 10.6, "1시간 이내"). Both run only after a read-only notice dialog.
+- `#controller-bar`: 정지 / 동작 중 · 마지막 신호 N초 전 / 연결 끊김 / 정지 요청됨 / not installed (start and stop
+  disabled); `broker` only while none runs; one restart banner with the D5 procedure for changed profiles, MLflow
+  changes and a key saved for a `credential_missing` profile; a missing MLflow credential is not called a restart;
+  `tracking: null` shows nothing. Start is click-only (`already_running`, the redirected-AppData text); stop shows the
+  drain dialog. Polling per D10 (5 s, one call at a time, backoff incl. `status_busy` with the last status kept, never
+  while busy, hidden or left; `not_available` stops it; patches only on change).
+
+Deviations:
+- `desktop/src/api.ts` gained `observationsList()`, `profileInventory(profile_id)` and their two result interfaces
+  (`ObservationSummary`, `ProfileInventory`), declared there because `workflow-types.ts` stays unchanged. Additive
+  only; nothing else in the file changed.
+- Test 1 expects three entry calls (the plan lists two): `observations_list` is read-only and is how the root decision
+  shows the last check. Test 3 picks GPUs from the inventory instead of typing UUID lines, so `ProfileDraft` has
+  `gpus: string[]` instead of `gpuLines`. No selection is sent as `""` (the native store's value before a selection);
+  an unchanged selection keeps its saved text, so a no-op save keeps the profile revision.
+- A typed RunPod key is not kept after a refused save: it lives only in its input until the save reads it, and the
+  task's re-render clears it (test 5 asserts the empty input), so it never enters module state (10.1 implementation
+  note).
+- Twelve tests, not ten: test 11 (`status_busy` backoff), test 12 (restart, credential, skipped-profile and broker
+  notes). Test 5 also refuses a delete after a save that named runs to plan again.
+- `controllerBarHtml(state, busy, host = "profiles")` and `attachControllerBar(ctx, {host, queue, profiles})` take
+  the host view, because the bar's buttons route through `wf:<host>:controller-start|stop` (`controllerAction` for
+  10.7). `ControllerBarState` adds optional `busyRead`, `profiles` and `settings`. The bar's rules live in
+  `executor-profiles.css` (the only CSS file of 10.4); the eager view bundle loads them on every page.
+- Playwright ran through a scratch config under `%TEMP%` with this tree's own Vite on port 1444
+  (`reuseExistingServer: false`), so no other agent's server on 1420 could be reused.
+
+Actual verification:
+- RED first: all 12 new tests failed on the missing `실행 프로필` sidebar entry (`nav:profiles` not found).
+- 21 mutations of the new code (key only when typed, reload after save, GPU selection, fixed provider, both notice
+  dialogs, the busy submit guard, both `affected` resets, backoff and the kept status on `status_busy`, the
+  `ROOT_UNUSABLE` text, the stop dialog, the credential-missing and skipped-key rules, broker hidden while running,
+  start disabled when unavailable, `tracking: null`): 20 failed a test. The survivor is equivalent: removing the
+  detach on leave still makes no call, because the poller's `active()` also checks the page.
+- From `desktop/`: `npx playwright test` (scratch config) **124 passed** (112 existing, unchanged, plus 12 new; the
+  new spec also passed three times in a row); `npm run build` passes.
+- From the root: `uv run pytest -q` **1707 passed, 1 skipped** on `128f995` and **1713 passed, 1 skipped** on `42fbb0d`;
+  `uv run ruff check src tests` passes; `scripts/check_secrets.py` reports 0 findings with the change staged;
+  `git diff --exit-code src/ desktop/src-tauri/ containers/ pyproject.toml uv.lock desktop/package.json
+  desktop/package-lock.json` is clean; every changed file is CR-free.
+
+Not verified or still open:
+- Real WebView2 (dialogs, focus, timers, the native file picker for key paths), a real sidecar and controller, real
+  Credential Manager: Task 11. No network, GPU, SSH, RunPod, MLflow, model download or institution data was used.
+- The end-to-end effect of `markProfilesChanged()` on a held plan is 10.6's test 4(b). The runs page (10.7) mounts
+  the same bar.
+- A RunPod key rotated without any other change, and MLflow credentials re-saved without a public change, need a
+  controller restart that polling cannot report; the bar and the key field say so.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

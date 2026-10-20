@@ -68,6 +68,21 @@ export const planning = {
   plan: (request: PlanRequest) => workflow<PlanSummary>("graph_plan", request),
   planGet: (plan_sha256: Sha256) => workflow<PlanSummary>("graph_plan_get", { plan_sha256 }),
 };
+// 9.8 read-only actions used by the executor profiles screen (10.4). Their shapes are declared here because
+// workflow-types.ts stays as it is for that sub-task (workflow_planning.observations_list / executor_profile_inventory).
+export interface ObservationSummary {
+  profile_id: string; revision: Sha256; observed_at: string; age_seconds: number; provider: "existing_runpod" | "ssh_server";
+  name: string; resource_id: string; gpu_type: string; gpu_count: number; total_hourly_cost_usd: number; cost_source: string;
+  selected_gpu_uuids: string[]; profile_current: boolean | null; fresh_for_real_plan: boolean;
+}
+export interface ProfileInventory {
+  profile_id: string; revision: Sha256; observed_at: string; server_id: Sha256; resource_id: string;
+  inventory: { uuid: string; name: string; memory_mib: number }[]; selected_gpu_uuids: string[];
+}
+/** Each profile's last stored observation; a record that does not verify is `{profile_id, error}`. DB/file only. */
+export const observationsList = () => workflow<{ observations: (ObservationSummary | { profile_id: string; error: string })[] }>("observations_list");
+/** The GPU listing of a saved SSH profile (contacts the server read-only; stores nothing). */
+export const profileInventory = (profile_id: string) => workflow<ProfileInventory>("executor_profile_inventory", { profile_id });
 export const runs = {
   submit: (r: { plan_sha256: Sha256; request_id: string; approve_execution: boolean; approve_data_transfer: boolean }) => workflow<SubmitResult>("graph_submit", r),
   list: () => workflow<RunList>("graph_runs_list"),
