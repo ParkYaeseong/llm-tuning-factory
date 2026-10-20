@@ -693,6 +693,41 @@ Verification after the follow-up:
   `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437` unchanged. This supersedes every earlier Task 7
   receipt, including 7.5's `811d4177…b673` (source `478e2a41…e5d2` of `7120193`).
 
+7.4 short-name follow-up (commit `fix: refuse 8.3 short-name aliases on download`):
+- On NTFS volumes that generate 8.3 names (this machine's C:, including `%TEMP%`, `%LOCALAPPDATA%` and `%APPDATA%`,
+  where the desktop app keeps its state), an existing `remote-attempt.json` can also be opened as `REMOTE~1.JSO`. Such
+  a name passed every earlier check: no reserved character, no casefold match, and it resolves inside the root. The
+  review reproduced a forged `remote-attempt.json` (and still a COMPLETED result) and a replaced protected
+  `data/dataset.json`.
+- `download` now refuses any target that already exists locally (`os.path.lexists`) whose canonical relative path
+  (`resolve()` returns the long name and real case) differs from the remote name. That one check covers 8.3, case
+  and trailing-dot/space aliases of any existing file or directory. As a second guard, any remote name containing
+  `~<digit>` is refused; engine output never contains one. Device names now also cover `COM0`/`LPT0`, `COM¹`–`COM³`,
+  `LPT¹`–`LPT³`, `CONIN$` and `CONOUT$`.
+- Tests:
+  - The real short names, from `GetShortPathNameW`, of a local `remote-attempt.json` and of a protected
+    `data/dataset.json` are refused, with the local bytes unchanged. Each runs with both guards and with the
+    canonical-name check alone (the `~<digit>` guard disabled). They skip off Windows or where no 8.3 name exists;
+    here they ran.
+  - Plain unit cases cover `~<digit>` names and the new device names everywhere.
+  - The `Data/dataset.json` parent-alias case is now refused at the existing `data` directory.
+- Verification. RED first: 11 tests failed. The two real short-name cases reproduced the overwrite (no refusal).
+  - The sub-plan set gave **239 passed**.
+  - In a clean detached worktree of `14c1ba4` plus only this change (the next commit, `2075a26`, adds only a plan
+    document), `uv run pytest -q` gave **1101 passed,
+    1 skipped**. That was the second full run there. The first had a single failure in
+    `test_operation_runner.py::test_outputs_rebuild_is_idempotent_after_crash[after_result]` that never reproduced:
+    that test file passed 36/36 twice with this change and twice without it, and the exact parametrization passed
+    8/8.
+  - The shared tree, which also held the 7.5 fix agent's uncommitted edits and tests, gave **1120 passed,
+    1 skipped**.
+  - Ruff is clean, `check_secrets.py` reports 0 findings, and the eol check prints nothing.
+- CPU acceptance (`-I`, script and sources from the clean worktree): exit 0 twice with byte-identical receipts and all
+  **29** checks passed. Max errors and inventories are unchanged. Receipt SHA256
+  `97fa2c89076ae8687b31e1229dc3b7fa6f5d45c1c3feef96fdf4bcd5bafcdf3b`, source_sha256
+  `0ae3419b0bb6a96cba139ce413b43eba266c6977e2f67ede1d963eba5dc9b67a` (the tree with this commit), lock_sha256
+  `5883aae6…1437` unchanged. This supersedes `a9bece24…e45d`.
+
 Still open for Task 7 GPU work:
 - Hardware and numerics: merge/materialize tolerances at real model sizes on CUDA (TF32 off); memory (FP32 loads;
   about 3 base loads per merge); a BF16 storage policy (none yet; F32 doubles size).
@@ -833,8 +868,8 @@ Task 7 is complete in software: 7.1–7.5 and their review fixes. Verified on th
 - A control-plane runner that freezes outputs with exact lineage, computes evaluation receipts under
   `BenchmarkSpec.fingerprint()` (F11 fixed) and rebuilds idempotently after a crash.
 - Final receipt `811d4177…b673` (29/29 checks, source `478e2a41…e5d2` of commit 7120193). After the 7.4 follow-up
-  (Windows name aliases and uploaded-input protection on download), the current receipt is `a9bece24…e45d` (29/29 checks,
-  source `247003f6…6c7f`).
+  (Windows name aliases and uploaded-input protection on download) it was `a9bece24…e45d` (source `247003f6…6c7f`).
+  After the 8.3 short-name follow-up, the current receipt is `97fa2c89…df3b` (29/29 checks, source `0ae3419b…b67a`).
 
 Not verified (needs explicit GPU/host authorization):
 - Any real GPU or host.

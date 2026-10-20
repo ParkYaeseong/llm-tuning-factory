@@ -1452,7 +1452,7 @@ class RemoteTree:
     ({"/remote": [("command.json.", FILE, b"forged")]}, "unsafe remote artifact name"),          # trailing dot
     ({"/remote": [("Command.json", FILE, b"forged")]}, "aliases an uploaded control-plane input"),
     ({"/remote": [("Data", DIRECTORY, None)], "/remote/Data": [("dataset.json", FILE, b"forged")]},
-     "aliases an uploaded control-plane input"),
+     "aliases an (existing local file|uploaded control-plane input)"),
     ({"/remote": [("command.json", DIRECTORY, None)], "/remote/command.json": []},
      "aliases an uploaded control-plane input"),
     ({"/remote": [("output", DIRECTORY, None), ("OUTPUT", DIRECTORY, None)], "/remote/output": [],
@@ -1460,6 +1460,15 @@ class RemoteTree:
     ({"/remote": [("trainer_log.jsonl", FILE, b"{}"), ("TRAINER_LOG.JSONL", FILE, b"{}")]}, "collide"),
     ({"/remote": [("NUL.json", FILE, b"x")]}, "unsafe remote artifact name"),
     ({"/remote": [("a?b", FILE, b"x")]}, "unsafe remote artifact name"),
+    # 8.3 short-name shapes (refused everywhere; engine output never contains them) and more device names.
+    ({"/remote": [("REMOTE~1.JSO", FILE, b"forged")]}, "Windows short name"),
+    ({"/remote": [("data", DIRECTORY, None)], "/remote/data": [("DATASE~1.JSO", FILE, b"forged")]},
+     "Windows short name"),
+    ({"/remote": [("PROGRE~12", DIRECTORY, None)], "/remote/PROGRE~12": []}, "Windows short name"),
+    ({"/remote": [("COM0", FILE, b"x")]}, "unsafe remote artifact name"),
+    ({"/remote": [("lpt¹.txt", FILE, b"x")]}, "unsafe remote artifact name"),
+    ({"/remote": [("CONIN$", FILE, b"x")]}, "unsafe remote artifact name"),
+    ({"/remote": [("conout$.log", FILE, b"x")]}, "unsafe remote artifact name"),
 ])
 def test_download_refuses_windows_name_aliases(tmp_path, tree, message):
     local = tmp_path / "launch"
@@ -1474,6 +1483,47 @@ def test_download_refuses_windows_name_aliases(tmp_path, tree, message):
         executor.download(remote, "/remote", local, {}, skip={"remote-attempt.json"},
                           protected={name: digest(originals[name]) for name in ("command.json", "data/dataset.json")})
     assert remote.gets == []   # every name of a directory is checked before anything in it is written
+    assert {path.relative_to(local).as_posix(): path.read_bytes() for path in local.rglob("*") if path.is_file()} == (
+        originals)
+
+
+def windows_short_name(path):
+    """The real 8.3 name NTFS generated for an existing file, or skip where none exists."""
+    import os
+    if os.name != "nt":
+        pytest.skip("8.3 short names exist only on Windows")
+    import ctypes
+    buffer = ctypes.create_unicode_buffer(32768)
+    if not ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer)):
+        pytest.skip("GetShortPathNameW failed")
+    short = Path(buffer.value).name
+    if short.casefold() == Path(path).name.casefold():
+        pytest.skip("this volume does not generate 8.3 short names")
+    return short
+
+
+@pytest.mark.parametrize("guard", ["both", "canonical_name_only"])
+@pytest.mark.parametrize("target", ["remote-attempt.json", "data/dataset.json"])
+def test_download_refuses_real_short_name_aliases_of_local_files(tmp_path, monkeypatch, guard, target):
+    from tuning_factory import execution
+    local = tmp_path / "launch"
+    (local / "data").mkdir(parents=True)
+    originals = {"remote-attempt.json": b'{"record":"local"}', "data/dataset.json": b'[{"local":true}]'}
+    for name, data in originals.items():
+        (local / name).write_bytes(data)
+    short = windows_short_name(local / target)
+    if guard == "canonical_name_only":   # prove the existing-target check alone catches the alias
+        monkeypatch.setattr(execution, "_SHORT_NAME", re.compile(r"(?!)"))
+    if "/" in target:
+        tree = {"/remote": [("data", DIRECTORY, None)], "/remote/data": [(short, FILE, b"forged")]}
+    else:
+        tree = {"/remote": [(short, FILE, b"forged")]}
+    remote = RemoteTree(tree)
+    executor = SSHExecutor("test-host", 22, "root", "unused", client=FakeSSH(tmp_path / "remote"))
+    with pytest.raises(ValueError, match="Windows short name|aliases an existing local file"):
+        executor.download(remote, "/remote", local, {}, skip={"remote-attempt.json"},
+                          protected={"data/dataset.json": digest(originals["data/dataset.json"])})
+    assert remote.gets == []
     assert {path.relative_to(local).as_posix(): path.read_bytes() for path in local.rglob("*") if path.is_file()} == (
         originals)
 

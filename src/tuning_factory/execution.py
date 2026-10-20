@@ -45,7 +45,10 @@ REQUIRED_UPLOADS = (COMMAND, "manifest.json", "model-inputs.json")
 # Names Windows cannot hold as written: reserved characters and control codes (``:`` also selects a drive or
 # an alternate data stream), device names, and a trailing dot or space (Win32 strips both, aliasing the name).
 _WINDOWS_UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]|[. ]$')
-_DEVICE_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", re.IGNORECASE)
+_DEVICE_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[0-9¹²³]|LPT[0-9¹²³])"
+                          r"(?:\..*)?", re.IGNORECASE)
+# The shape of an NTFS 8.3 short name (``REMOTE~1.JSO``), which can open an existing long-named file.
+_SHORT_NAME = re.compile(r"~[0-9]")
 
 
 def _refuse_v2_directory(directory: Path, action: str = "launch", entry: str = "run_operation") -> None:
@@ -289,7 +292,9 @@ class SSHExecutor(ExecutionBackend):
         (NTFS would alias them). At the top level ``cancel`` and ``skip`` (control-plane records) are never
         taken from the host. ``protected`` (relative path -> SHA256 of what the control plane uploaded) is
         never replaced; the caller checks the host's inventory against it first. A name equal to a skipped
-        or protected name only under ``casefold`` is refused.
+        or protected name only under ``casefold`` is refused. A name with an 8.3 short-name shape (``~<digit>``)
+        is refused, and so is any name whose existing local target resolves to a different canonical name
+        (NTFS short names, case or trailing dot/space aliases of an existing file or directory).
         """
         root = root or local
         local.mkdir(parents=True, exist_ok=True)
@@ -299,23 +304,32 @@ class SSHExecutor(ExecutionBackend):
             raise ValueError("remote artifact names collide on a case-insensitive filesystem")
         skipped = {name.casefold(): name for name in ("cancel", *skip)} if local == root else {}
         guarded = {path.casefold(): path for path in (protected or {})}
+        canonical_root = Path(root).resolve()
         entries = []
         for entry in listing:
             name = entry.filename
             if name in {"", ".", ".."} or _WINDOWS_UNSAFE.search(name) or _DEVICE_NAME.fullmatch(name):
                 raise ValueError("unsafe remote artifact name")
+            if _SHORT_NAME.search(name):
+                raise ValueError("remote artifact name has the shape of a Windows short name (8.3) and could alias a "
+                                 "local file")
             if name.casefold() in skipped:
                 if skipped[name.casefold()] != name:
                     raise ValueError("remote artifact name aliases a control-plane record")
                 continue  # Mutable control signal or a control-plane record, never a model artifact.
             target = local / name
-            if not target.resolve().is_relative_to(Path(root).resolve()):
+            canonical = target.resolve()
+            if not canonical.is_relative_to(canonical_root):
                 raise ValueError("unsafe remote artifact name")
             relative = target.relative_to(root).as_posix()
             if relative.casefold() in guarded:
                 if guarded[relative.casefold()] != relative or not stat.S_ISREG(entry.st_mode):
                     raise ValueError("remote artifact name aliases an uploaded control-plane input")
                 continue  # An uploaded input is never replaced by host bytes.
+            # An existing target resolves to its canonical long name and case, so a short (8.3), case or
+            # trailing-dot/space alias of any existing local file or directory differs here.
+            if os.path.lexists(target) and canonical.relative_to(canonical_root).as_posix() != relative:
+                raise ValueError("remote artifact name aliases an existing local file")
             if stat.S_ISLNK(entry.st_mode):
                 raise ValueError("remote symlink artifact rejected")
             entries.append((entry, target))
