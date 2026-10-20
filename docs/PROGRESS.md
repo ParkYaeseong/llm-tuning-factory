@@ -2202,6 +2202,115 @@ Not verified or still open:
   detected.
 - No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
 
+## Task 9.5 native executor profiles, workflow channel and headless broker, 2026-10-20
+
+Commit `feat: expose secure desktop workflow automation and controller lifecycle`, written on `3d119c6` (9.1, not yet
+pushed) in the worktree `codex/task-9.5`. It implements [Task 9 plan](superpowers/plans/2026-10-20-task9-secure-desktop-broker.md)
+§4 "9.5" with D1, D2, D5, D6, D8, D19 and D20, and the coordinator's 9.1-review notes M4 (key-marker scope) and M9
+(profile-ID identity). Only Rust (`profiles.rs`, `broker.rs`, `main.rs`) and the new `tests/test_native_contract.py`
+changed: no `src/tuning_factory`, TypeScript, crate, `Cargo.lock`, `pyproject.toml` or `uv.lock` change.
+
+What changed:
+- `profiles.rs` (new): the `Vault` trait (`KeyringVault` for Credential Manager, same service and error texts as the
+  settings commands) and the executor-profile store `<app_root>/executor-profiles.json`
+  (`{"schema_version": 1, "profiles": {id: {public fields}}}`, at most 32). Fields are allowlisted per provider
+  (the `RUNPOD_PROFILE_FIELDS`/`SERVER_PROFILE_FIELDS` of 9.1), values are strings of ≤2048 bytes, the provider is
+  fixed once saved, and a name (≤200 characters) is required. Pasted private keys and `.ppk` paths are refused
+  (`main.rs` rules), and so is key content in any profile field. GPU selections must be unique, ports 1–65535, and
+  costs plain non-negative decimals. Each RunPod profile has its own vault entry
+  `executor-profile/<id>/RUNPOD_API_KEY`. An empty key input keeps the saved key. SSH profiles hold no key.
+  `copy_legacy_credential` copies the legacy key only on request. Deleting a profile removes only its own entry.
+  Save and delete validate first, then ask the sidecar `executor_profile_edit_check` (9.3), and fail closed.
+- `broker.rs` (new): `is_controller_mode` (exactly `[exe, "--controller"]`), `sidecar_binary` (the `factory_action`
+  rule), `sidecar_command` and `broker_command` (args exactly `--controller`, no environment change, stdout/stderr
+  null; `CREATE_NO_WINDOW`, and for the broker also `CREATE_NEW_PROCESS_GROUP` and `CREATE_BREAKAWAY_FROM_JOB`, with
+  one retry without breakaway on OS error 5), the strict `factory-broker/1` parser, `owner_id`, `controller_message`,
+  `should_start`, `serve_broker` and `run_broker` (exit 10 bad start line, 11 settings/profiles/vault unreadable or
+  start line over 1 MiB, 12 sidecar not started, else the sidecar's code; D19 `state/controller/broker.json`
+  `{at, code, error}` with fixed codes and Korean texts only before the sidecar starts).
+- `main.rs`: `main()` enters broker mode before `tauri::Builder`; `run_sidecar` is the spawn code of
+  `factory_action` moved unchanged (same argv, flags, stdio, error texts and request keys); `read_settings` now
+  reads the vault through `Vault` with the same texts; the pasted-key, `.ppk` and GPU-selection rules became named
+  helpers used by `merge_public_settings` unchanged. New commands `workflow_action` (closed 32-name allowlist,
+  disjoint from the legacy 34), `executor_profiles_get`, `executor_profile_save`, `executor_profile_delete`,
+  `controller_start`, `controller_status`, `controller_stop`. `forget_credentials` also deletes every profile's key.
+
+Stdin schemas as implemented (for 9.4):
+- GUI → broker, one line, no secret: `{"schema": "factory-broker/1", "app_root": "<absolute app data dir>"}`. Exactly
+  these two keys; the root is absolute, ≤4000 bytes, without control characters, a `..` component or a UNC/device
+  prefix (`\\`, `//`, mixed); the line is ≤64 KiB. The GUI then closes the pipe.
+- Broker → sidecar `factory-bridge --controller`, one UTF-8 JSON line ≤1 MiB, then the pipe stays open until the
+  sidecar exits: `{"schema": "factory-controller/1", "state_root": "<app_root>\\state", "owner_id":
+  "desktop.<pid>.<unix nanos>", "tracking": {...}, "profiles": [{"profile_id", "fields": {public fields},
+  "secrets": {} | {"RUNPOD_API_KEY": "..."}}]}`. No `settings` key (StartSettings defaults apply). `tracking` holds
+  only string values of `MLFLOW_TRACKING_URI`, `FACTORY_MLFLOW_ARTIFACT_LOCATION`, `FACTORY_OPERATOR`, `auth_mode`
+  and the credentials `filter_mlflow_auth` keeps for that mode (`none`: none; `token`: `MLFLOW_TRACKING_TOKEN`;
+  `oidc`/empty: `MLFLOW_OIDC_TOKEN_URL`, `MLFLOW_OIDC_CLIENT_ID`, `MLFLOW_OIDC_CLIENT_SECRET`). Absent settings are
+  omitted, not sent empty. `profiles` is sorted by ID; SSH profiles always carry `"secrets": {}`. The broker reads
+  from the vault only the MLflow secret its auth mode keeps and each RunPod profile's own entry, never S3, HF or the
+  legacy RunPod key. `broker.rs` pins one exact line (`CONTROLLER_MESSAGE_SAMPLE`); the contract test validates it.
+- Workflow requests (GUI → one-request sidecar): `{"channel": "workflow", "root": "<app_root>\\state", "settings":
+  <public strings of the 28 settings fields without key content, plus <secret>_saved: true>, "profiles": [public
+  views], "secrets": {}, "action", "data": {object}}`. `secrets` is `{"RUNPOD_API_KEY"}` only for
+  `executor_profile_inspect` on exactly a stored RunPod profile ID, and `{"HF_TOKEN"}` only for `model_root_snapshot`.
+
+Deviations and choices to review:
+- 9.5's tests: the plan's 15 Rust tests plus 11 more (pinned contract sample, broker pipe lifetime and exit codes,
+  least-privilege vault reads, breakaway fallback, `should_start`, edit check, legacy-key copy, store bounds and
+  corruption, ID collisions, settings through the vault, the legacy sidecar's empty argv/env). Python: the plan's 3
+  contract tests became 5. `test_rust_controller_message_follows_the_plan_schema` pins the plan's values and the
+  sample now. `test_rust_controller_message_matches_python` skips until `controller_entry` (9.4) exists; it then
+  validates the sample with `ControllerStart`. `test_profile_names_with_key_words_are_not_pasted_keys` covers M4.
+- Fail closed. A profile save or delete is refused unless `executor_profile_edit_check` answers `ok` with an
+  `affected_runs` array. Until 9.3 lands, that action answers `not_available`, so profile edits are refused.
+  `controller_start` spawns only for `controller.state` `absent` or `stale`. It returns `already_running` for
+  `running` and an error for anything else (until 9.4 lands: `not_available`).
+- M9: profile IDs are one identity under `profile_id_key` (ASCII lowercase plus trailing dots stripped, equal to
+  9.1's `casefold().rstrip(".")`). A new colliding ID is refused. Deleting another spelling of a stored ID is
+  refused, because Credential Manager would resolve it to that profile's entry. The scoped key is given only for the
+  exact stored ID. A hand-edited file with colliding IDs serves only the first in ID order. Profile IDs also refuse
+  DOS device names and any `estimate-` prefix, case-insensitively.
+- M4: Rust refuses key markers in every profile field (stricter). The workflow settings view drops any public value
+  with key content instead of sending it, so a legacy stored pasted key cannot break the channel. Non-string or
+  unknown keys in `settings.json` are dropped from that view too.
+- `executor-profiles.json` writes keep only what is served (invalid or colliding hand-edited entries are dropped on
+  the next save). A corrupt file or more than 32 served profiles is an error (`실행 프로필 파일이 손상되었습니다.`).
+- A successful sidecar start removes a stale `broker.json`.
+- `forget_credentials` now takes the `AppHandle`, which Tauri injects, so the TypeScript call is unchanged. It
+  deletes the seven legacy entries before it resolves the app folder, as before.
+- `executor_profile_delete` returns `{"profile_id", "affected_runs"}` (§5 left it untyped).
+
+Actual verification (worktree `D:\llm-tuning-factory-wt95`; cargo with `CARGO_TARGET_DIR` on the main tree's cache;
+main venv with `PYTHONPATH` on the worktree `src`, where `tuning_factory.__file__` resolved):
+- RED first. The Python contract tests failed 3 of 3 on the missing Rust constants and files (the parity test
+  skipped). With `todo!()` stubs, 26 new Rust tests failed and the 12 existing ones passed.
+- GREEN: `cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` → **38 passed**
+  (12 + 26). `cargo check --release` (production build) has no warning.
+- Mutations (one at a time, sources restored and checked by SHA256): stdin closed before the wait, no auth-mode
+  filter, the legacy RunPod key as the scoped secret, the scoped key by normalized ID, an added sidecar env var,
+  the edit check failing open, no ID-collision check, key content kept in workflow settings, the broker reading
+  every secret, delete by another spelling, extra argv accepted. Each failed at least one test.
+- `tests/test_native_contract.py` with `tests/test_desktop_projects.py` → **37 passed, 1 skipped** (the 9.4 parity
+  test). Full suite on `3d119c6` → **1320 passed, 2 skipped** (1316 + 4; the skips are the opt-in real-GPU test
+  and the 9.4 parity test). The known `test_jobs.py::test_recovery_does_not_release_unknown_remote_execution` flake
+  failed once in the baseline run (1315 passed, 1 failed, 1 skipped) and did not occur in the final run.
+- Ruff (`src tests`) is clean. `check_secrets.py` → 0 findings over 785 file versions (this change staged).
+  `git diff --exit-code desktop/src-tauri/Cargo.toml desktop/src-tauri/Cargo.lock containers/ pyproject.toml uv.lock
+  desktop/src/` is clean. Every changed file is CR-free.
+- From `desktop/` (a copy of the main tree's `node_modules`): `npx playwright test` → **81 passed**; `npm run build`
+  passes.
+- No CPU acceptance run: `src/tuning_factory` is unchanged; only `tests/test_native_contract.py` was added.
+
+Not verified or still open:
+- Everything native was tested with an in-memory vault and fake sidecars. Not exercised: the real Credential
+  Manager from a background (broker) process, a real detached broker spawn and breakaway from a Windows job object,
+  the PyInstaller onefile child keeping the stdin lifeline, and the broker's EOF stop end to end. All are Task 11
+  installed-app acceptance.
+- The 9.3 `executor_profile_edit_check` and 9.4 `controller_status`/`controller_stop`/`--controller` contracts are
+  coded against the plan. Rust tests cover them with fake answers; the Python parity test runs once 9.4 lands.
+  Rebasing onto the 9.1 review fixes (M4, M9) and 8.5 must re-run the contract test.
+- No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

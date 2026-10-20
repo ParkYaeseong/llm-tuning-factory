@@ -1,7 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod broker;
+mod profiles;
+
+use profiles::{KeyringVault, Vault};
 use serde_json::{json, Map, Value};
-use std::{fs, io::Write, path::PathBuf, process::{Command, Stdio}, sync::Mutex};
+use std::{fs, io::Write, path::{Path, PathBuf}, process::{Command, Stdio}, sync::Mutex};
 use tauri::Manager;
 
 const SECRETS: [&str; 7] = ["RUNPOD_API_KEY", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLOW_TRACKING_TOKEN",
@@ -18,6 +22,21 @@ const FIELDS: [&str; 28] = [
 // OIDC values first, then the issued token: token mode withholds the first three, "none" all four.
 const MLFLOW_CREDENTIALS: [&str; 4] = ["MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "MLFLOW_OIDC_CLIENT_SECRET",
     "MLFLOW_TRACKING_TOKEN"];
+// The least-privilege workflow channel (Task 9 plan D8): exactly desktop_workflows.WORKFLOW_ACTIONS.
+const WORKFLOW_ACTIONS: [&str; 32] = [
+    "projects_list", "project_create", "project_get", "project_save", "project_import_legacy",
+    "recipes_list", "recipe_get", "recipe_save", "recipe_clone",
+    "dataset_import_source", "dataset_import_preview", "dataset_import_register",
+    "dataset_split_preview", "dataset_split_commit",
+    "executor_profile_inspect", "model_root_snapshot", "model_roots_list", "benchmark_save", "benchmarks_list",
+    "graph_validate", "graph_plan", "graph_plan_get",
+    "graph_submit", "graph_runs_list", "graph_run_get", "graph_pause", "graph_resume", "graph_cancel",
+    "tracking_rearm", "executor_profile_edit_check",
+    "controller_status", "controller_stop",
+];
+// The only workflow actions that receive a credential: that profile's RunPod key, and the legacy HF token.
+const PROFILE_SCOPED_ACTIONS: [&str; 1] = ["executor_profile_inspect"];
+const HF_SCOPED_ACTIONS: [&str; 1] = ["model_root_snapshot"];
 struct SaveLock(Mutex<()>);
 
 fn app_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -27,30 +46,36 @@ fn app_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 fn entry(name: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new("kr.kbiofoundry.tuningfactory", name).map_err(|_| "Windows 자격 증명 저장소 오류".into())
+    keyring::Entry::new(profiles::SERVICE, name).map_err(|_| "Windows 자격 증명 저장소 오류".into())
 }
 
-fn read_settings(root: &PathBuf, secrets: bool) -> Result<Value, String> {
+/// `settings.json` as an object without any credential name (legacy or hand-edited plaintext is never returned).
+fn read_settings_file(root: &Path) -> Result<Value, String> {
     let path = root.join("settings.json");
     let mut value = if path.exists() {
         serde_json::from_slice::<Value>(&fs::read(path).map_err(|_| "설정을 읽을 수 없습니다.")?)
             .map_err(|_| "설정 파일이 손상되었습니다.")?
     } else { json!({}) };
     if !value.is_object() { return Err("설정 파일이 손상되었습니다.".into()); }
-    // Never return legacy or hand-edited plaintext credentials from the public settings file.
     for name in SECRETS { value.as_object_mut().unwrap().remove(name); }
+    Ok(value)
+}
+
+/// The public view with `<name>_saved` flags, or with the saved credentials (`secrets`, MLflow filtered by auth mode).
+fn read_settings_from(root: &Path, vault: &dyn Vault, secrets: bool) -> Result<Value, String> {
+    let mut value = read_settings_file(root)?;
     for name in SECRETS {
-        match entry(name)?.get_password() {
-            Ok(secret) => {
-                value[format!("{name}_saved")] = json!(true);
-                if secrets { value[name] = json!(secret); }
-            },
-            Err(keyring::Error::NoEntry) => {},
-            Err(_) => return Err("Windows 자격 증명에 접근할 수 없습니다.".into()),
+        if let Some(secret) = vault.get(name)? {
+            value[format!("{name}_saved")] = json!(true);
+            if secrets { value[name] = json!(secret); }
         }
     }
     filter_mlflow_auth(value.as_object_mut().unwrap(), secrets);
     Ok(value)
+}
+
+fn read_settings(root: &Path, secrets: bool) -> Result<Value, String> {
+    read_settings_from(root, &KeyringVault, secrets)
 }
 
 /// Only the chosen MLflow method's values reach the sidecar (`secrets`). The public view used by the form
@@ -71,11 +96,29 @@ fn settings_get(app: tauri::AppHandle) -> Result<Value, String> {
 }
 
 const KEY_FILE_FIELDS: [&str; 2] = ["ssh_key_file", "server_ssh_key_file"];
+// Pasted OpenSSH/PEM or PuTTY key content (= desktop_workflows.KEY_MARKERS).
+const KEY_MARKERS: [&str; 3] = ["PRIVATE KEY", "PuTTY-User-Key-File-", "Private-Lines:"];
+const PASTED_KEY_REFUSED: &str = "SSH 개인키 파일에는 키 내용이 아니라 키 파일 경로를 입력하세요.";
+const PPK_REFUSED: &str = "PuTTY .ppk 키는 지원하지 않습니다. OpenSSH 형식(암호 없는 키)으로 변환한 키 파일을 선택하세요.";
+
+fn key_content(text: &str) -> bool { KEY_MARKERS.iter().any(|marker| text.contains(marker)) }
 
 /// Pasted OpenSSH/PEM or PuTTY (.ppk) key content in a key-file path field.
 fn pasted_key(name: &str, value: &Value) -> bool {
-    KEY_FILE_FIELDS.contains(&name) && value.as_str().is_some_and(|text|
-        ["PRIVATE KEY", "PuTTY-User-Key-File-", "Private-Lines:"].iter().any(|marker| text.contains(marker)))
+    KEY_FILE_FIELDS.contains(&name) && value.as_str().is_some_and(key_content)
+}
+
+/// A PuTTY .ppk path in a key-file field. Windows drops trailing dots and spaces from file names, so "key.ppk."
+/// names the same .ppk file.
+fn ppk_path(name: &str, value: &Value) -> bool {
+    KEY_FILE_FIELDS.contains(&name) && value.as_str().is_some_and(|path|
+        path.trim_end_matches(|c: char| c == '.' || c.is_whitespace()).to_ascii_lowercase().ends_with(".ppk"))
+}
+
+/// Empty, or a JSON array of at most 8 strings.
+fn valid_gpu_selection(selection: &str) -> bool {
+    selection.is_empty() || matches!(serde_json::from_str::<Value>(selection),
+        Ok(Value::Array(items)) if items.len() <= 8 && items.iter().all(Value::is_string))
 }
 
 fn merge_public_settings(existing: Value, input: &Map<String, Value>) -> Result<Map<String, Value>, String> {
@@ -89,14 +132,11 @@ fn merge_public_settings(existing: Value, input: &Map<String, Value>) -> Result<
     // settings.json is plaintext: refuse submitted key content where only a path belongs. A value stored
     // before this check is dropped below instead of blocking unrelated saves (S3, HF, the other provider).
     if input.iter().any(|(name, value)| pasted_key(name, value)) {
-        return Err("SSH 개인키 파일에는 키 내용이 아니라 키 파일 경로를 입력하세요.".into());
+        return Err(PASTED_KEY_REFUSED.into());
     }
     // The sidecar's SSH client reads OpenSSH keys without a passphrase or agent, never PuTTY files.
-    if input.iter().any(|(name, value)| KEY_FILE_FIELDS.contains(&name.as_str())
-        // Windows drops trailing dots and spaces from file names, so "key.ppk." names the same .ppk file.
-        && value.as_str().is_some_and(|path| path.trim_end_matches(|c: char| c == '.' || c.is_whitespace())
-            .to_ascii_lowercase().ends_with(".ppk"))) {
-        return Err("PuTTY .ppk 키는 지원하지 않습니다. OpenSSH 형식(암호 없는 키)으로 변환한 키 파일을 선택하세요.".into());
+    if input.iter().any(|(name, value)| ppk_path(name, value)) {
+        return Err(PPK_REFUSED.into());
     }
     let previous = existing.as_object().ok_or("설정 파일이 손상되었습니다.")?;
     let mut public: Map<String, Value> = previous.iter()
@@ -113,10 +153,7 @@ fn merge_public_settings(existing: Value, input: &Map<String, Value>) -> Result<
     if !["", "oidc", "token", "none"].contains(&text("auth_mode")) {
         return Err("MLflow 인증 방식은 기관 인증·발급 토큰·인증 없음 중 하나여야 합니다.".into());
     }
-    let selection = text("server_selected_gpu_uuids");
-    let valid_selection = selection.is_empty() || matches!(serde_json::from_str::<Value>(selection),
-        Ok(Value::Array(items)) if items.len() <= 8 && items.iter().all(Value::is_string));
-    if !valid_selection {
+    if !valid_gpu_selection(text("server_selected_gpu_uuids")) {
         return Err("선택한 GPU 목록은 GPU UUID 문자열 최대 8개의 JSON 배열이어야 합니다.".into());
     }
     if let Some(endpoint) = public.get("S3_ENDPOINT_URL").and_then(Value::as_str) {
@@ -161,14 +198,14 @@ fn settings_save(app: tauri::AppHandle, values: Value, lock: tauri::State<SaveLo
 }
 
 #[tauri::command]
-fn forget_credentials() -> Result<(), String> {
-    for name in SECRETS {
-        match entry(name)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => {},
-            Err(_) => return Err("인증값 삭제 실패".into()),
-        }
-    }
-    Ok(())
+fn forget_credentials(app: tauri::AppHandle) -> Result<(), String> {
+    forget_all_credentials(|| app_root(&app), &KeyringVault)
+}
+
+/// The seven connection credentials first (as before), then every executor profile's own entry.
+fn forget_all_credentials(root: impl FnOnce() -> Result<PathBuf, String>, vault: &dyn Vault) -> Result<(), String> {
+    for name in SECRETS { vault.delete(name)?; }
+    profiles::forget_profile_secrets(&root()?, vault)
 }
 
 #[tauri::command]
@@ -195,35 +232,164 @@ async fn factory_action(app: tauri::AppHandle, action: String, data: Value) -> R
     let root = app_root(&app)?;
     let settings = read_settings(&root, true)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let binary = if cfg!(debug_assertions) {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries/factory-bridge-x86_64-pc-windows-msvc.exe")
-        } else {
-            std::env::current_exe().map_err(|_| "앱 경로 오류")?.parent().ok_or("앱 경로 오류")?.join("factory-bridge.exe")
-        };
-        let mut command = Command::new(binary);
-        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-        #[cfg(windows)] {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000); // CREATE_NO_WINDOW; credentials are only sent through stdin.
-        }
-        let mut child = command.spawn().map_err(|_| "학습 엔진을 실행할 수 없습니다. 설치 파일을 확인해 주세요.")?;
-        let request = json!({"root": root.join("state"), "settings": settings, "action": action, "data": data});
-        {
-            let mut stdin = child.stdin.take().ok_or("엔진 입력 연결 오류")?;
-            writeln!(stdin, "{}", request).map_err(|_| "엔진 요청 전송 실패")?;
-        }
-        let output = child.wait_with_output().map_err(|_| "엔진 응답 오류")?;
-        let response: Value = serde_json::from_slice(&output.stdout)
-            .map_err(|_| "엔진 응답을 해석할 수 없습니다.")?;
-        if response["ok"] == true { Ok(response["result"].clone()) }
-        else { Err(response["error"].as_str().unwrap_or("실행 오류").to_owned()) }
+        run_sidecar(&json!({"root": root.join("state"), "settings": settings, "action": action, "data": data}))
     }).await.map_err(|_| "엔진 작업 오류")?
 }
 
+/// The one-request sidecar: no argument, no added environment; credentials are only sent through stdin.
+fn request_command(binary: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(windows)] {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW; credentials are only sent through stdin.
+    }
+    command
+}
+
+/// One request to a fresh sidecar (extracted from `factory_action` unchanged): one JSON line in, then
+/// `{"ok": true, "result"}` → `Ok(result)` or `{"ok": false, "error"}` → `Err(error)`.
+fn run_sidecar(request: &Value) -> Result<Value, String> {
+    let mut child = request_command(&broker::sidecar_binary()?).spawn()
+        .map_err(|_| "학습 엔진을 실행할 수 없습니다. 설치 파일을 확인해 주세요.")?;
+    {
+        let mut stdin = child.stdin.take().ok_or("엔진 입력 연결 오류")?;
+        writeln!(stdin, "{}", request).map_err(|_| "엔진 요청 전송 실패")?;
+    }
+    let output = child.wait_with_output().map_err(|_| "엔진 응답 오류")?;
+    let response: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "엔진 응답을 해석할 수 없습니다.")?;
+    if response["ok"] == true { Ok(response["result"].clone()) }
+    else { Err(response["error"].as_str().unwrap_or("실행 오류").to_owned()) }
+}
+
+fn workflow_allowed(action: &str) -> bool { WORKFLOW_ACTIONS.contains(&action) }
+
+/// The settings view the workflow channel accepts: saved public strings without key content, and `*_saved` flags.
+fn workflow_settings(public: &Value) -> Map<String, Value> {
+    let saved: Vec<String> = SECRETS.iter().map(|name| format!("{name}_saved")).collect();
+    public.as_object().into_iter().flatten()
+        .filter(|(name, value)| (FIELDS.contains(&name.as_str()) && !SECRETS.contains(&name.as_str())
+                && value.as_str().is_some_and(|text| !key_content(text)))
+            || (saved.contains(name) && **value == json!(true)))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+/// D8: only `executor_profile_inspect` (that stored RunPod profile's own key) and `model_root_snapshot` (the legacy
+/// HF token) receive a credential.
+fn scoped_secrets(root: &Path, vault: &dyn Vault, action: &str, data: &Value) -> Result<Map<String, Value>, String> {
+    let mut secrets = Map::new();
+    if PROFILE_SCOPED_ACTIONS.contains(&action) {
+        if let Some(id) = data.get("profile_id").and_then(Value::as_str) {
+            if let Some(key) = profiles::profile_secret(root, vault, id)? { secrets.insert("RUNPOD_API_KEY".into(), json!(key)); }
+        }
+    } else if HF_SCOPED_ACTIONS.contains(&action) {
+        if let Some(token) = vault.get("HF_TOKEN")? { secrets.insert("HF_TOKEN".into(), json!(token)); }
+    }
+    Ok(secrets)
+}
+
+fn workflow_request(root: &Path, public_settings: Value, public_profiles: Value, secrets: Map<String, Value>,
+                    action: &str, data: Value) -> Value {
+    json!({"channel": "workflow", "root": root.join("state"), "settings": public_settings,
+           "profiles": public_profiles, "secrets": secrets, "action": action, "data": data})
+}
+
+fn build_workflow_request(root: &Path, vault: &dyn Vault, action: &str, data: Value) -> Result<Value, String> {
+    if !workflow_allowed(action) { return Err("허용하지 않은 작업".into()); }
+    if !data.is_object() { return Err("잘못된 작업 요청".into()); }
+    let settings = workflow_settings(&read_settings_from(root, vault, false)?);
+    let mut listed = profiles::read_profiles(root, vault, false)?;
+    let secrets = scoped_secrets(root, vault, action, &data)?;
+    Ok(workflow_request(root, Value::Object(settings), listed["profiles"].take(), secrets, action, data))
+}
+
+fn workflow_call(root: &Path, vault: &dyn Vault, action: &str, data: Value) -> Result<Value, String> {
+    run_sidecar(&build_workflow_request(root, vault, action, data)?)
+}
+
+#[tauri::command]
+async fn workflow_action(app: tauri::AppHandle, action: String, data: Value) -> Result<Value, String> {
+    if !workflow_allowed(&action) { return Err("허용하지 않은 작업".into()); }
+    let root = app_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || workflow_call(&root, &KeyringVault, &action, data))
+        .await.map_err(|_| "엔진 작업 오류")?
+}
+
+#[tauri::command]
+fn executor_profiles_get(app: tauri::AppHandle) -> Result<Value, String> {
+    profiles::read_profiles(&app_root(&app)?, &KeyringVault, false)
+}
+
+fn edit_check(root: &Path, id: &str) -> Result<Value, String> {
+    workflow_call(root, &KeyringVault, profiles::EDIT_CHECK_ACTION, json!({"profile_id": id}))
+}
+
+#[tauri::command]
+async fn executor_profile_save(app: tauri::AppHandle, profile_id: String, values: Value,
+                               copy_legacy_credential: Option<bool>) -> Result<Value, String> {
+    let root = app_root(&app)?;
+    let input = values.as_object().cloned().ok_or("잘못된 실행 프로필")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let lock = app.state::<SaveLock>();
+        profiles::save_profile_checked(&root, &KeyringVault, &profile_id, &input, copy_legacy_credential == Some(true),
+            &mut |id| edit_check(&root, id), &lock.0)
+    }).await.map_err(|_| "엔진 작업 오류")?
+}
+
+#[tauri::command]
+async fn executor_profile_delete(app: tauri::AppHandle, profile_id: String) -> Result<Value, String> {
+    let root = app_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let lock = app.state::<SaveLock>();
+        profiles::delete_profile_checked(&root, &KeyringVault, &profile_id, &mut |id| edit_check(&root, id), &lock.0)
+    }).await.map_err(|_| "엔진 작업 오류")?
+}
+
+/// Starts the headless broker (this executable, exactly `--controller`) and hands it the one non-secret start line.
+/// The window never waits for it: the broker and its controller outlive the GUI (D1, D3).
+fn start_broker(root: &Path) -> Result<(), String> {
+    let line = broker::broker_start_line(root)?;
+    let exe = std::env::current_exe().map_err(|_| "앱 경로 오류")?;
+    let mut child = broker::spawn_breakaway_or_fallback(|breakaway| broker::broker_command(&exe, breakaway).spawn())
+        .map_err(|_| "백그라운드 컨트롤러를 시작할 수 없습니다.")?;
+    let mut stdin = child.stdin.take().ok_or("백그라운드 컨트롤러 입력 연결 오류")?;
+    stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush())
+        .map_err(|_| "백그라운드 컨트롤러 시작 요청 전송 실패")?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn controller_start(app: tauri::AppHandle) -> Result<Value, String> {
+    let root = app_root(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = workflow_call(&root, &KeyringVault, "controller_status", json!({}))?;
+        if !broker::should_start(&status)? { return Ok(json!({"started": false, "reason": "already_running"})); }
+        start_broker(&root)?;
+        Ok(json!({"started": true}))
+    }).await.map_err(|_| "엔진 작업 오류")?
+}
+
+#[tauri::command]
+async fn controller_status(app: tauri::AppHandle) -> Result<Value, String> {
+    workflow_action(app, "controller_status".into(), json!({})).await
+}
+
+#[tauri::command]
+async fn controller_stop(app: tauri::AppHandle) -> Result<Value, String> {
+    workflow_action(app, "controller_stop".into(), json!({})).await
+}
+
 fn main() {
+    // Headless broker (D1): exactly [exe, "--controller"], decided before any window or WebView exists.
+    let args: Vec<String> = std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()).collect();
+    if broker::is_controller_mode(&args) { std::process::exit(broker::run_broker(&KeyringVault)); }
     tauri::Builder::default()
         .manage(SaveLock(Mutex::new(())))
-        .invoke_handler(tauri::generate_handler![settings_get, settings_save, forget_credentials, pick_file, factory_action])
+        .invoke_handler(tauri::generate_handler![settings_get, settings_save, forget_credentials, pick_file, factory_action,
+            workflow_action, executor_profiles_get, executor_profile_save, executor_profile_delete, controller_start,
+            controller_status, controller_stop])
         .run(tauri::generate_context!())
         .expect("Windows application startup failed");
 }
@@ -417,5 +583,135 @@ mod tests {
             assert!(allowed(action), "{action} must be allowed");
         }
         for action in ["shell", "server_start", "server_stop", "ssh", "runtime_release_all"] { assert!(!allowed(action)); }
+    }
+    // Copied from allowed(): the legacy channel keeps exactly these 34 names.
+    const LEGACY_ACTIONS: [&str; 34] = ["catalog", "save_profile", "dataset", "plan", "submit", "execute", "jobs", "logs",
+        "cancel", "recover", "reconcile", "resume", "connection", "pod", "runtime_check", "runtime_prepare", "live_logs",
+        "history", "compare", "model_revision", "dataset_preview", "job_progress", "capabilities", "s3_list", "s3_head",
+        "s3_import", "model_search", "model_inspect", "model_import", "server_inspect", "server_facts",
+        "runtime_reservations", "runtime_release", "tutorial_sample"];
+    #[test]
+    fn workflow_actions_are_a_closed_list_disjoint_from_legacy_actions() {
+        let unique: std::collections::BTreeSet<&str> = WORKFLOW_ACTIONS.into_iter().collect();
+        assert_eq!(unique.len(), 32);
+        for action in WORKFLOW_ACTIONS {
+            assert!(workflow_allowed(action), "{action}");
+            assert!(!allowed(action), "the legacy channel accepts the workflow action {action}");
+        }
+        for action in LEGACY_ACTIONS {
+            assert!(allowed(action), "the legacy action {action} is no longer allowed");
+            assert!(!workflow_allowed(action), "the workflow channel accepts the legacy action {action}");
+        }
+        for action in ["", "shell", "controller_start", "executor_profile_save", "factory_action", "PROJECTS_LIST",
+            "projects_list ", "graph_plan\n"] {
+            assert!(!workflow_allowed(action) && !allowed(action), "{action:?}");
+        }
+        assert!(PROFILE_SCOPED_ACTIONS.iter().chain(HF_SCOPED_ACTIONS.iter()).all(|action| WORKFLOW_ACTIONS.contains(action)));
+    }
+    fn keys_named(value: &Value, names: &[&str]) -> Vec<String> {
+        match value {
+            Value::Object(map) => map.iter().flat_map(|(key, item)| {
+                let mut found = keys_named(item, names);
+                if names.contains(&key.as_str()) { found.push(key.clone()); }
+                found
+            }).collect(),
+            Value::Array(items) => items.iter().flat_map(|item| keys_named(item, names)).collect(),
+            _ => Vec::new(),
+        }
+    }
+    #[test]
+    fn workflow_requests_carry_public_settings_and_scoped_secrets_only() {
+        use profiles::testing::{fake_key_header, synthetic, MemoryVault, TempRoot};
+        let app = TempRoot::new("workflow-request");
+        fs::write(app.path().join("settings.json"), json!({"MLFLOW_TRACKING_URI": "https://mlflow.invalid",
+            "auth_mode": "token", "pod_id": "legacy-pod", "S3_REGION": "kr", "unknown": "x", "FACTORY_OPERATOR": 12,
+            "ssh_key_file": fake_key_header("OPENSSH "), "RUNPOD_API_KEY": "legacy-plaintext-value"}).to_string()).unwrap();
+        let mut secrets: Vec<String> = SECRETS.iter().map(|name| synthetic(&name.to_ascii_lowercase())).collect();
+        let entries: Vec<(&str, &str)> = SECRETS.iter().copied().zip(secrets.iter().map(String::as_str)).collect();
+        let vault = MemoryVault::with(&entries);
+        let (key_a, key_b) = (synthetic("profile-a"), synthetic("profile-b"));
+        let runpod = |name: &str, key: &str| json!({"provider": "existing_runpod", "name": name, "pod_id": "pod",
+            "RUNPOD_API_KEY": key}).as_object().unwrap().clone();
+        profiles::save_profile(app.path(), &vault, "gpu-a", &runpod("A", &key_a), None).unwrap();
+        profiles::save_profile(app.path(), &vault, "gpu-b", &runpod("B", &key_b), None).unwrap();
+        profiles::save_profile(app.path(), &vault, "lab", json!({"provider": "ssh_server", "name": "Lab"}).as_object().unwrap(), None).unwrap();
+        secrets.extend([key_a.clone(), key_b.clone(), "legacy-plaintext-value".into()]);
+        let scoped = |action: &str| PROFILE_SCOPED_ACTIONS.contains(&action) || HF_SCOPED_ACTIONS.contains(&action);
+        for action in WORKFLOW_ACTIONS.into_iter().filter(|action| !scoped(action)) {
+            let request = build_workflow_request(app.path(), &vault, action, json!({"profile_id": "gpu-a"})).unwrap();
+            let text = request.to_string();
+            for secret in &secrets { assert!(!text.contains(secret.as_str()), "{action} carried a credential"); }
+            assert!(keys_named(&request, &SECRETS).is_empty(), "{action}: {:?}", keys_named(&request, &SECRETS));
+            assert!(!text.contains("PRIVATE KEY"), "{action} carried stored key content");
+            let keys: std::collections::BTreeSet<&str> = request.as_object().unwrap().keys().map(String::as_str).collect();
+            assert_eq!(keys, ["action", "channel", "data", "profiles", "root", "secrets", "settings"].into_iter().collect());
+            assert_eq!(request["channel"], "workflow");
+            assert_eq!(request["root"], json!(app.path().join("state")));
+            assert_eq!(request["action"], action);
+            assert_eq!(request["data"], json!({"profile_id": "gpu-a"}));
+            assert_eq!(request["secrets"], json!({}));
+            let settings = request["settings"].as_object().unwrap();
+            for name in SECRETS { assert_eq!(settings.get(&format!("{name}_saved")), Some(&json!(true)), "{name}"); }
+            for name in ["MLFLOW_TRACKING_URI", "auth_mode", "pod_id", "S3_REGION"] { assert!(settings.contains_key(name), "{name}"); }
+            for name in ["unknown", "FACTORY_OPERATOR", "ssh_key_file"] { assert!(!settings.contains_key(name), "{name} was sent"); }
+            assert!(settings.values().all(|value| value.is_string() || value == &json!(true)));
+            let profiles = request["profiles"].as_array().unwrap();
+            assert_eq!(profiles.len(), 3);
+            assert!(profiles.iter().all(|profile| profile.get("secrets").is_none()));
+            assert_eq!(profiles[0]["RUNPOD_API_KEY_saved"], true);
+        }
+        // The profile-scoped action carries exactly that profile's key, once.
+        let request = build_workflow_request(app.path(), &vault, "executor_profile_inspect", json!({"profile_id": "gpu-b"})).unwrap();
+        assert_eq!(request["secrets"], json!({"RUNPOD_API_KEY": key_b}));
+        let text = request.to_string();
+        assert_eq!(text.matches(key_b.as_str()).count(), 1);
+        for secret in secrets.iter().filter(|secret| **secret != key_b) { assert!(!text.contains(secret.as_str())); }
+        // An SSH, unknown or invalid profile ID, or another spelling of a stored ID, gets no key.
+        for data in [json!({"profile_id": "lab"}), json!({"profile_id": "missing"}), json!({"profile_id": "../gpu-a"}),
+            json!({"profile_id": "GPU-A"}), json!({"profile_id": "gpu-a."}), json!({"profile_id": 3}), json!({})] {
+            let request = build_workflow_request(app.path(), &vault, "executor_profile_inspect", data.clone()).unwrap();
+            assert_eq!(request["secrets"], json!({}), "{data}");
+        }
+        // The HF action gets only the legacy HF token.
+        let hf = synthetic("hf_token");
+        let request = build_workflow_request(app.path(), &vault, "model_root_snapshot", json!({"repo_id": "org/model"})).unwrap();
+        assert_eq!(request["secrets"], json!({"HF_TOKEN": hf}));
+        for secret in secrets.iter().filter(|secret| **secret != hf) { assert!(!request.to_string().contains(secret.as_str())); }
+        // Only a JSON object is a workflow request body.
+        for data in [json!([1]), json!("x"), json!(null)] {
+            assert!(build_workflow_request(app.path(), &vault, "projects_list", data).is_err());
+        }
+    }
+    #[test]
+    fn settings_read_through_the_vault_keep_the_legacy_rules() {
+        use profiles::testing::{synthetic, FailingVault, MemoryVault, TempRoot};
+        let app = TempRoot::new("settings-vault");
+        fs::write(app.path().join("settings.json"), json!({"auth_mode": "none", "MLFLOW_TRACKING_URI": "http://127.0.0.1:5000",
+            "MLFLOW_OIDC_TOKEN_URL": "https://sso.invalid/token", "HF_TOKEN": "plaintext-in-file"}).to_string()).unwrap();
+        let values: Vec<String> = SECRETS.iter().map(|name| synthetic(name)).collect();
+        let entries: Vec<(&str, &str)> = SECRETS.iter().copied().zip(values.iter().map(String::as_str)).collect();
+        let vault = MemoryVault::with(&entries);
+        let public = read_settings_from(app.path(), &vault, false).unwrap();
+        for value in &values { assert!(!public.to_string().contains(value.as_str())); }
+        assert!(!public.to_string().contains("plaintext-in-file"));
+        for name in SECRETS { assert_eq!(public[format!("{name}_saved")], true); }
+        assert_eq!(public["MLFLOW_OIDC_TOKEN_URL"], "https://sso.invalid/token", "the public view keeps every MLflow field");
+        // The sidecar view of auth_mode "none" holds no MLflow credential; the other credentials are unchanged.
+        let sidecar = read_settings_from(app.path(), &vault, true).unwrap();
+        for name in MLFLOW_CREDENTIALS { assert!(sidecar.get(name).is_none(), "none kept {name}"); }
+        assert_eq!(sidecar["S3_SECRET_ACCESS_KEY"], synthetic("S3_SECRET_ACCESS_KEY"));
+        assert_eq!(sidecar["RUNPOD_API_KEY"], synthetic("RUNPOD_API_KEY"));
+        let empty = TempRoot::new("settings-empty");
+        assert_eq!(read_settings_from(empty.path(), &MemoryVault::default(), true).unwrap(), json!({}));
+        fs::write(empty.path().join("settings.json"), "[]").unwrap();
+        assert!(read_settings_from(empty.path(), &MemoryVault::default(), false).is_err());
+        assert!(read_settings_from(app.path(), &FailingVault, false).is_err());
+    }
+    #[test]
+    fn the_one_request_sidecar_keeps_no_arguments_and_no_environment() {
+        let command = request_command(Path::new("C:\\Program Files\\LLM Tuning Factory\\factory-bridge.exe"));
+        assert_eq!(command.get_args().count(), 0, "the legacy sidecar mode has no argv");
+        assert_eq!(command.get_envs().count(), 0, "credentials are only sent through stdin");
+        assert!(command.get_current_dir().is_none());
     }
 }
