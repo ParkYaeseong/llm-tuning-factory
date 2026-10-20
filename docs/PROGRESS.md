@@ -3330,6 +3330,90 @@ Deviations:
   Python broker stand-in and GUI proxy written at runtime. Every process is detached and killed in teardown, and every
   wait is at most 30 s.
 
+## Task 10.1 workbench foundations: typed bridge, project drafts, view shell, 2026-10-21
+
+Commit `feat: add the typed workflow bridge, project drafts and workbench navigation shell`. It was written in the
+main tree on `9f2927d` and fast-forwarded under the uncommitted work onto `1a9ae29` (9.7 native follow-up `bf9a13b`
+and 9.4 `1a9ae29`; no file overlap). It implements
+[Task 10 plan](superpowers/plans/2026-10-21-task10-workflow-workbench-ui.md) §4 "10.1" with D1–D4, D10, D12, D15 and
+D19. The Task 9.8 replacements of D11 and D20 are not part of 10.1. Changed: new `desktop/src/{workflow-types,api,
+issues,poller,project-store,nav-model,view-types,view-registry}.ts`, new `desktop/tests/{workflow-mock.ts,
+workflow-core.spec.ts,navigation.spec.ts}`, modified `desktop/src/{main,workbench}.ts`, `desktop/src/style.css` and
+this file. No Python, Rust, package or lock file changed.
+
+What changed:
+- Typed bridge. `workflow-types.ts` lists the 33 workflow actions and the request and result shapes, checked against
+  `desktop_workflows.py`, `workflow_planning.py`, `workflow_runs.py`, `hf_targets.py`, `controller_entry.py`,
+  `graph_status`, `profiles.rs` and `broker.rs`. `api.ts` is the only new `invoke` caller. Every workflow answer is
+  validated as a `WorkflowResult` (`BridgeError` "엔진 응답 형식이 올바르지 않습니다." otherwise); a native `Err`
+  string becomes a `BridgeError` with that text.
+- `issues.ts` routes issues by pointer, card (`node_id` or `/graph/nodes/<i>`), import row and plan section. It
+  shows Korean texts: Korean (Task 9) messages as received, English Task 1–8 texts by message pattern, else by code,
+  with the original under "원문 보기"; unknown codes show the message as received. `issueList` escapes and stops at
+  50 ("외 N건").
+- `poller.ts` (D10: no overlap, `max(base, 2 × duration)`, doubling backoff to 60 s, inactive skip) and
+  `createQueue`. `project-store.ts`: drafts with the saved revision, dirty state by content, CAS saves whose
+  conflicts keep the draft, "overwrite" (get the latest, save against it), reload, planning inputs per project for
+  the session, a held plan with its basis (project revision, pinned recipe revisions, profile and settings
+  generations), one request ID per plan hash, and `bindingIdFor`.
+- Shell (`main.ts`): the sidebar groups 워크스페이스, 단일 학습 and 설정 from `navModel`; `nav:<page>[:<arg>]`
+  with the views' `leave` and `enter`; `wf:<view>:<verb>[:<arg>]` actions; `captureDrafts` calls every view's
+  `capture`; `patch(regionId, html)` keeps the focused control and what was typed in it; overview and datasets slot
+  panels; "새 프로젝트" as the overview's primary only when a projects view exists; a child page shows its parent in
+  the breadcrumb and sidebar; Ctrl+K lists the sidebar pages. D19 headings: "예제 시작점 · 선택", "실험 설정",
+  "목적에 맞는 …".
+- D15 (F8 fixed). `refresh()` keeps single jobs only: `isGraphJob` is a `graph_run_id` or no v1 `manifest.config`.
+  The overview and 실행 관리 say "그래프 실행 단계 N개는 ‘그래프 실행’에서 확인하세요." (with a link once a runs view
+  exists); counts and the jobs marker use single jobs only. The legacy `jobs` response is unchanged. Before, any graph
+  job made `render()` throw and the boot notice never cleared.
+- `store.markSettingsChanged()` runs after every successful `saveSettings` (the connection form and the GPU
+  selection save) and after "저장된 인증값 삭제".
+- `workbench.ts`: `openDialog` (refuses a second dialog, focuses its heading, checks gate actions, the first activation
+  disables every action, Esc resolves null, focus returns to the opener), `focusKey`/`restoreFocus`, `statusPill`,
+  `isGraphJob` and four nav icons. `style.css`: group labels, `.status-pill`, `.issue-list`, `.wf-banner`,
+  `.wf-columns`, `.wf-dialog`, `.graph-jobs-note`, and a scrollable sidebar.
+- `tests/workflow-mock.ts` is the shared mock (owned by 10.1). Unscripted answers model a sidecar where no workflow
+  module answers: workflow actions and controller status/stop answer `not_available`; profile save/delete and
+  `controller_start` reject with the native fail-closed texts. Options: `workflow`, `native` (`{reject}`),
+  `definitions` (a stateful 9.1 fake with CAS and request-ID semantics), `holds` and `clock`.
+
+Deviations:
+- Ten tests, not nine. Test 10 (`navigation.spec.ts`) drives routing, slots, `patch` focus, the busy state, dialogs
+  and the render guard through the view contract, with a stand-in `/src/view-registry.ts` served by `page.route` (no
+  app hook). It was written after the shell code, except its render-guard part. It fails under each of five mutations
+  (focus restore, rebinding a patched region, the dialog nesting guard, the dialog check gate, the bind guard).
+- Added a render guard. A view's `render`, slot panel or `bind` that throws shows "이 영역을 표시하지 못했습니다.
+  …" (escaped) and leaves the legacy page working. It was RED first.
+- `NATIVE_PENDING` is empty: `bf9a13b` added `model_root_targets` to `main.rs`. Test 1 failed on the new base as
+  designed until it was emptied.
+- `ControllerStatus.broker.at` is a number (broker.rs writes epoch seconds), not a string as in the plan's interface.
+  `ControllerStatus` and the `controller_stop` result match the landed `controller_entry.py`.
+- `ctx.legacy` accepts only `catalog`, `model_search` and `model_inspect`. `parseWorkflowResult` also requires the
+  `data` key and checks each issue's field types. `planSection` maps `/project_id` and `/project_revision` to
+  `project` and keys `graph` issues by `node_id`. `markSettingsChanged` also runs after forgetting credentials.
+  `createProjectStore` takes an optional request-ID generator. Extra result types: `LegacyImport`,
+  `ImportRegistered`, `SplitCommitted`, `RootSnapshot`, `RootTargets`, `GraphValidation`, `ControllerStopResult`,
+  `RunList`, `RunSteered`, `TrackingRearmed`.
+
+Actual verification:
+- RED on `9f2927d` before any `src` edit: `workflow-core.spec.ts` failed to load (`Cannot find module
+  …/src/workflow-types.ts`); test 8 failed on the missing "단일 학습" group; test 9 failed on the boot notice that
+  never cleared, with `TypeError: Cannot read properties of undefined (reading 'ai_id')` at `main.ts:281`.
+- From `desktop/` on `1a9ae29`: `npx playwright test` **91 passed** (the 81 existing tests unchanged, plus 10 new;
+  the baseline at `9f2927d` was 81 passed); `npm run build` passes.
+- From the root: `uv run pytest -q` **1648 passed, 1 skipped** (unchanged from 9.4's
+  receipt on this tree; the skip is the real-GPU test); `uv run ruff check src tests` passes;
+  `scripts/check_secrets.py` reports 0 findings with the change staged; `git diff --exit-code src/ desktop/src-tauri/
+  containers/ pyproject.toml uv.lock desktop/package.json desktop/package-lock.json` is clean; every changed file is
+  CR-free.
+
+Not verified or still open:
+- Real WebView2 (`<dialog>`, focus return, the `import.meta.glob` bundle once views exist): Task 11. No workflow
+  view exists yet; the shell plumbing is covered only through the stand-in registry.
+- Planning inputs stay in memory for the session; their backend store is Task 9.8.
+- Legacy `recover` still fails stale graph jobs too (Q-K; Task 9.8 adds the test).
+- No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

@@ -16,6 +16,10 @@ const paths: Record<string, string> = {
   chevron: '<path d="m9 5 7 7-7 7"/>',
   folder: '<path d="M3 6V4h6l2 3h10v13H3z"/>',
   tutorial: '<circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2.2 4.8-4.8 2.2 2.2-4.8z"/>',
+  projects: '<path d="M3 7V5h7l2 2h9v12H3z"/><path d="M8 13h8M8 16h5"/>',
+  recipes: '<path d="M6 3h12v18H6z"/><path d="M9 8h6M9 12h6M9 16h3"/>',
+  runs: '<circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M8.5 6H12v12H8.5M12 12h3.5"/>',
+  profiles: '<rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/>',
 };
 export function icon(name: string, size = 16) {
   return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.file}</svg>`;
@@ -46,4 +50,80 @@ export function progressView(progress: Obj | null) {
   return `<div class="progress-summary"><div><small>진행 단계</small><b>${number(progress.current_step)} <span>/ ${number(progress.total_steps)}</span></b></div><div><small>최근 train loss</small><b>${number(progress.loss)}</b></div><div><small>경과 시간</small><b>${escapeHtml(progress.elapsed_time || "—")}</b></div><div><small>남은 시간 · 엔진 추정</small><b>${escapeHtml(progress.remaining_time || "—")}</b></div></div>
   ${progress.percent !== null && progress.percent !== undefined ? `<progress max="100" value="${Number(progress.percent)}" aria-label="학습 진행률"></progress>` : ""}
   ${chart}<div class="chart-caption">LLaMA-Factory 원본 학습 로그 · 최대 200개 지점 · 업무 품질 점수가 아닙니다</div>`;
+}
+
+/** Graph-owned jobs (D15): a `graph_run_id`, or a manifest without the v1 `config`. Legacy lists never show them. */
+export const isGraphJob = (job: Obj) => Boolean(job?.graph_run_id) || !job?.manifest?.config;
+
+/** What identifies a focusable control across re-renders: `data-focus-key`, else `data-action`, else `id`. */
+export function focusKey(element: Element | null): string | null {
+  if (!(element instanceof HTMLElement)) return null;
+  return element.dataset.focusKey ?? element.dataset.action ?? (element.id || null);
+}
+
+/** Focuses the element under `root` that `focusKey` named before a re-render (no scrolling). */
+export function restoreFocus(root: ParentNode, key: string | null): void {
+  if (!key) return;
+  const quoted = CSS.escape(key);
+  const target = root.querySelector<HTMLElement>(`[data-focus-key="${quoted}"]`)
+    ?? root.querySelector<HTMLElement>(`[data-action="${quoted}"]`) ?? root.querySelector<HTMLElement>(`#${quoted}`);
+  target?.focus({ preventScroll: true });
+}
+
+/** A state pill (not a `.badge`): semantic colour for real states only. */
+export function statusPill(kind: "neutral" | "good" | "warn" | "bad", text: string): string {
+  return `<span class="status-pill ${kind}">${escapeHtml(text)}</span>`;
+}
+
+export interface DialogSpec {
+  title: string; bodyHtml: string;                               // caller escapes dynamic parts
+  checks?: { id: string; label: string }[];
+  actions: { id: string; label: string; primary?: boolean; requires?: string[] }[];
+}
+let dialogs = 0;
+
+/**
+ * A modal `<dialog>` appended to `body`. Resolves null (and opens nothing) when a dialog is already open, and on Esc.
+ * The heading takes focus; an action that requires checks stays disabled until they are all checked; the first
+ * activation disables every action; on close, focus returns to the control that was focused before opening.
+ */
+export function openDialog(spec: DialogSpec): Promise<{ action: string; checked: string[] } | null> {
+  if (document.querySelector("dialog[open]")) return Promise.resolve(null);
+  const opener = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
+  const openerKey = focusKey(opener);
+  const titleId = `wf-dialog-title-${++dialogs}`;
+  const dialog = document.createElement("dialog");
+  dialog.className = "wf-dialog";
+  dialog.setAttribute("aria-labelledby", titleId);
+  dialog.innerHTML = `<h2 id="${titleId}" tabindex="-1">${escapeHtml(spec.title)}</h2><div class="wf-dialog-body">${spec.bodyHtml}</div>
+    ${(spec.checks ?? []).map(check => `<label class="check"><input type="checkbox" data-dialog-check="${escapeHtml(check.id)}">${escapeHtml(check.label)}</label>`).join("")}
+    <div class="actions">${spec.actions.map(item => `<button type="button" class="${item.primary ? "primary" : ""}" data-dialog-action="${escapeHtml(item.id)}">${escapeHtml(item.label)}</button>`).join("")}</div>`;
+  document.body.append(dialog);
+  const checks = [...dialog.querySelectorAll<HTMLInputElement>("[data-dialog-check]")];
+  const buttons = [...dialog.querySelectorAll<HTMLButtonElement>("[data-dialog-action]")];
+  const checked = () => checks.filter(input => input.checked).map(input => input.dataset.dialogCheck!);
+  const update = () => buttons.forEach((button, index) => {
+    const requires = spec.actions[index].requires ?? [];
+    button.disabled = !requires.every(id => checked().includes(id));
+  });
+  update();
+  dialog.showModal();
+  dialog.querySelector<HTMLElement>(`#${titleId}`)!.focus();
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (result: { action: string; checked: string[] } | null) => {
+      if (settled) return;
+      settled = true;
+      buttons.forEach(button => button.disabled = true);
+      dialog.close(); dialog.remove();
+      if (opener?.isConnected) opener.focus({ preventScroll: true });
+      else restoreFocus(document, openerKey);
+      resolve(result);
+    };
+    checks.forEach(input => input.addEventListener("change", update));
+    buttons.forEach((button, index) => button.addEventListener("click", () => {
+      if (!button.disabled) finish({ action: spec.actions[index].id, checked: checked() });
+    }));
+    dialog.addEventListener("cancel", event => { event.preventDefault(); finish(null); });
+  });
 }

@@ -1,6 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { version } from "../package.json";
-import { button, filterRuns, formatDate, icon, progressView } from "./workbench";
+import { button, filterRuns, focusKey, formatDate, icon, isGraphJob, progressView, restoreFocus } from "./workbench";
+import { planning as planningApi, projects as projectApi } from "./api";
+import { NAV_GROUPS, navModel, type NavItem } from "./nav-model";
+import { createProjectStore } from "./project-store";
+import { viewById, views as workflowViews } from "./view-registry";
+import type { Catalog, View, ViewContext } from "./view-types";
 import { createTutorial, rememberTutorial, tutorialSeen } from "./tutorial";
 import { TUTORIAL_DATASET } from "./tutorial-steps";
 import { connectionResult, destinationChange, GPU_POLICY_MESSAGE, inventoryTable, isServer, jobDestination, jobDestinationIssue,
@@ -12,8 +17,8 @@ import "./style.css";
 type Obj = Record<string, any>;
 const root = document.querySelector<HTMLDivElement>("#app")!;
 const state: Obj = {
-  page: "overview", settings: {}, catalog: { templates: [], profiles: [], datasets: [] },
-  config: null, jobs: [], plan: null, logs: "", experiments: [], runs: [], nextToken: null,
+  page: "overview", arg: null, settings: {}, catalog: { templates: [], profiles: [], datasets: [] },
+  config: null, jobs: [], graphJobs: 0, plan: null, logs: "", experiments: [], runs: [], nextToken: null,
   selected: [], experiment: "16", busy: "", notice: "", error: "", active: "", comparison: null,
   preview: null, datasetDraft: {}, historyQuery: "", historyStatus: "", progress: null,
   jobCapabilities: null, modelMetadata: null, connectionReport: null, runtimeReport: null, settingsDraft: null, s3SettingsDraft: null,
@@ -24,6 +29,30 @@ const state: Obj = {
 const pages: Record<string, string> = {
   overview: "작업 공간", connections: "연결 설정", datasets: "데이터", training: "학습 설정",
   jobs: "실행 관리", history: "기록 비교",
+};
+// Project drafts of the workflow views (D4); a successful connection save invalidates held plans (D8).
+const store = createProjectStore({
+  get: (projectId, revision) => projectApi.get(projectId, revision),
+  save: (spec, expected) => projectApi.save(spec, expected),
+  validate: (projectId, revision) => planningApi.validate(projectId, revision),
+});
+// The only legacy actions a workflow view may call (read-only catalog and HF metadata, D3, D13).
+const VIEW_LEGACY_ACTIONS = new Set(["catalog", "model_search", "model_inspect"]);
+const ctx: ViewContext = {
+  get page() { return state.page; }, get arg() { return state.arg; }, get settings() { return state.settings; },
+  get catalog() { return state.catalog as Catalog; }, get busy() { return Boolean(state.busy); }, store,
+  hasPage: id => Object.hasOwn(pages, id) || viewById(id) !== undefined,
+  navigate: (page, arg) => action(arg === undefined ? `nav:${page}` : `nav:${page}:${arg}`),
+  render: () => render(),
+  patch: (regionId, html) => patch(regionId, html),
+  task: (label, work) => task(label, work),
+  notify(message) { state.notice = message; if (!state.busy) render(); },
+  fail(message) { state.error = message; if (!state.busy) render(); },
+  async legacy<T>(name: string, data: object = {}) {
+    if (!VIEW_LEGACY_ACTIONS.has(name)) throw new Error("허용하지 않은 작업");
+    return await api(name, data as Obj) as T;
+  },
+  reloadCatalog: () => catalog(),
 };
 const defaults: Obj = {
   MLFLOW_TRACKING_URI: "https://mlflow.kbiofoundry.kr",
@@ -40,7 +69,7 @@ const descriptions: Obj = {
   overview: "최근 실행과 다음 작업을 한곳에서 확인하세요.",
   connections: "학습에 사용할 GPU와 공용 기록 저장소를 연결합니다.",
   datasets: "데이터를 먼저 살펴보고, 검증한 버전을 학습에 사용하세요.",
-  training: "업무에 맞는 데이터, 모델, 학습 조건을 설정합니다.",
+  training: "목적에 맞는 데이터, 모델, 학습 조건을 설정합니다.",
   jobs: "실행 상태부터 실제 학습 지표, 체크포인트까지 확인합니다.",
   history: "같은 기준으로 실험을 살펴보고 다음 학습을 결정하세요.",
 };
@@ -83,6 +112,7 @@ function captureDrafts() {
     export_allowed: (data.elements.namedItem("export_allowed") as HTMLInputElement).checked };
   const checkpoint = document.querySelector<HTMLInputElement>("#checkpoint");
   if (checkpoint) state.checkpoint = checkpoint.value;
+  for (const view of workflowViews) view.capture?.(ctx);
 }
 function commandSearch() {
   if (document.querySelector("dialog[open]")) return;
@@ -93,8 +123,9 @@ function commandSearch() {
   const input = dialog.querySelector("input")!;
   const options = dialog.querySelector(".command-options")!;
   const update = () => {
-    options.innerHTML = [...Object.entries(pages), ["tutorial", "튜토리얼"] as [string, string]].filter(([, name]) => name.includes(input.value.trim())).map(([id, name]) =>
-      `<button data-command="${id}">${icon(id)}<span>${name}</span>${icon("arrow", 13)}</button>`).join("");
+    // The sidebar pages only (D1), in sidebar order.
+    options.innerHTML = navModel(workflowViews).filter(item => item.label.includes(input.value.trim())).map(item =>
+      `<button data-command="${esc(item.id)}">${icon(item.icon)}<span>${esc(item.label)}</span>${icon("arrow", 13)}</button>`).join("");
     options.querySelectorAll<HTMLButtonElement>("[data-command]").forEach(el => el.addEventListener("click", () => {
       const id = el.dataset.command!; dialog.close(); dialog.remove(); void action(id === "tutorial" ? "tutorial" : "nav:" + id);
     }));
@@ -277,10 +308,10 @@ function overview() {
     { page: "training", label: "첫 학습 준비", text: "업무와 모델을 선택하고 계획을 확인하세요.", done: state.jobs.length > 0 },
   ];
   return `${tutorialCard()}<div class="summary-strip"><div><span class="status-dot blue"></span>진행 중 <b>${running}</b></div><div>완료한 실행 <b>${complete}</b></div><div>데이터 버전 <b>${state.catalog.datasets.length}</b></div><div>저장한 설정 <b>${state.catalog.profiles.length}</b></div></div>
-  <div class="workspace-columns"><div><section class="panel"><div class="panel-heading"><h3>최근 실행 <span class="count">${state.jobs.length}</span></h3>${button("전체 보기 " + icon("arrow", 13), "nav:jobs", "quiet")}</div>
+  <div class="workspace-columns"><div>${slotPanels("overviewPanel")}<section class="panel"><div class="panel-heading"><h3>최근 실행 <span class="count">${state.jobs.length}</span></h3>${button("전체 보기 " + icon("arrow", 13), "nav:jobs", "quiet")}</div>
   ${state.jobs.length ? `<div class="table-scroll"><table><thead><tr><th>실험</th><th>상태</th><th>데이터</th><th>업데이트</th></tr></thead><tbody>${state.jobs.slice(0, 7).map((j: Obj) => `<tr><td><button class="row-link" data-action="job:${esc(j.id)}">${esc(j.manifest.config.ai_id)}</button><small class="mono">${esc(j.manifest.config.base_model.split("/").at(-1))}</small></td><td>${badge(j.status)}</td><td>${esc(j.manifest.config.dataset_id)}<small>v${esc(j.manifest.config.dataset_version)}</small></td><td>${formatDate(j.updated)}</td></tr>`).join("")}</tbody></table></div>` :
-  `<div class="empty-workspace"><div class="empty-symbol">${icon("training", 28)}</div><h3>첫 번째 실험을 시작해 보세요</h3><p>데이터와 모델을 고르면 실행 전에<br>설정과 예상 비용을 확인할 수 있습니다.</p>${button(icon("plus") + " 새 학습 설정", "nav:training", "primary")}<small>계획 확인만으로 GPU가 실행되지는 않습니다.</small></div>`}</section>
-  <section class="panel task-library"><div class="panel-heading"><h3>업무별 시작점</h3><span class="subtle">설정을 불러와 자유롭게 수정하세요</span></div>
+  `<div class="empty-workspace"><div class="empty-symbol">${icon("training", 28)}</div><h3>첫 번째 실험을 시작해 보세요</h3><p>데이터와 모델을 고르면 실행 전에<br>설정과 예상 비용을 확인할 수 있습니다.</p>${button(icon("plus") + " 새 학습 설정", "nav:training", "primary")}<small>계획 확인만으로 GPU가 실행되지는 않습니다.</small></div>`}${graphJobsNote()}</section>
+  <section class="panel task-library"><div class="panel-heading"><h3>예제 시작점 · 선택</h3><span class="subtle">설정을 불러와 자유롭게 수정하세요</span></div>
   ${state.catalog.templates.map((t: Obj, i: number) => `<button class="template-row" data-action="template:${i}"><span class="template-icon">${icon(i === 0 ? "file" : i === 1 ? "folder" : "overview", 19)}</span><span><b>${esc(taskNames[t.name] || t.name)}</b><small>${esc(t.config.workflow_id)}</small></span><span class="model-tag">LoRA</span>${icon("chevron", 14)}</button>`).join("")}</section></div>
   <div class="workspace-rail"><section class="panel" data-tour="overview-setup"><div class="panel-heading"><h3>시작하기</h3><span class="count">${steps.filter(s => s.done).length} / 3</span></div><div class="setup-list">${steps.map(s => `<button data-action="nav:${s.page}" class="setup-row"><span class="setup-check ${s.done ? "done" : ""}">${s.done ? icon("check", 12) : ""}</span><span><b>${s.label}</b><small>${s.text}</small></span>${icon("chevron", 12)}</button>`).join("")}</div></section>
   <section class="panel"><div class="panel-heading"><h3>연결 정보</h3>${button("설정", "nav:connections", "quiet")}</div><dl class="connection-list"><div><dt>${icon("connections")} ${server ? "GPU 서버" : "RunPod"}</dt><dd>${server ? (saved.server_ssh_host ? esc(serverAddress(saved, false)) : "미설정") : saved.pod_id ? esc(saved.pod_id) : "미설정"}</dd></div><div><dt>${icon("history")} MLflow</dt><dd>${state.settings.MLFLOW_TRACKING_URI ? "주소 저장됨" : "미설정"}</dd></div></dl><p class="panel-note">저장 상태입니다. 실제 연결은 연결 설정에서 검사하세요.</p></section>
@@ -360,6 +391,7 @@ function datasets() {
   <label class="check"><input name="synthetic" type="checkbox" ${state.datasetDraft.synthetic ? "checked" : ""}> 더미·합성 데이터입니다</label>
   <label class="check"><input name="export_allowed" type="checkbox" ${state.datasetDraft.export_allowed ? "checked" : ""}> 이 데이터를 선택한 GPU로 전송해도 됩니다</label>
   <p class="muted">여기서는 PC에만 등록합니다. 실제 전송은 학습 실행 시 별도로 확인합니다.</p><div class="actions">${button("샘플 미리보기", "dataset-preview")}<button class="primary" type="submit" data-tour="dataset-submit">검사하고 등록</button></div></form></section>
+  ${slotPanels("datasetsPanel")}
   ${s3Datasets()}
   ${state.preview ? `<section class="card"><div class="section-title"><h3>데이터 미리보기</h3><span class="badge">${esc(state.preview.format)} · ${num(state.preview.rows)}건</span></div>
   <p class="${state.preview.duplicate_rows ? "warning-text" : "muted"}">중복 레코드 ${num(state.preview.duplicate_rows)}건 · 앞 3건 미리보기 · 긴 내용은 일부만 표시합니다.</p><div class="sample-list">${state.preview.samples.map((sample: Obj, i: number) => `<article><small>SAMPLE ${String(i + 1).padStart(2, "0")}</small><pre>${esc(JSON.stringify(sample, null, 2))}</pre></article>`).join("")}</div></section>` : ""}
@@ -370,7 +402,7 @@ function training() {
   normalizeConfig();
   const c = state.config;
   const datasetOptions: [string, string][] = [["", "선택해 주세요"], ...state.catalog.datasets.map((d: Obj) => [d.dataset_id + ":" + d.version, d.dataset_id + " · v" + d.version])];
-  return `${modelHubView()}<form id="training-form"><section class="card"><div class="section-title"><h3>업무 AI 설정</h3>${button("설정 저장", "save-profile")}</div><div class="grid">
+  return `${modelHubView()}<form id="training-form"><section class="card"><div class="section-title"><h3>실험 설정</h3>${button("설정 저장", "save-profile")}</div><div class="grid">
   ${select("예제·저장한 설정 불러오기", "template", "", [["", "현재 설정"], ...state.catalog.templates.map((t: Obj, i: number) => ["t:" + i, t.name]), ...state.catalog.profiles.map((p: Obj, i: number) => ["p:" + i, "저장됨 · " + p.ai_id])])}
   ${configField("업무 AI ID", "ai_id")}${configField("업무 흐름 ID", "workflow_id")}
   ${select("학습 데이터", "train_dataset", c.dataset_id + ":" + c.dataset_version, datasetOptions).replace('<label class="field">', '<label class="field" data-tour="train-dataset">')}
@@ -421,7 +453,7 @@ function jobs() {
   const active = state.jobs.find((j: Obj) => j.id === state.active);
   const resumeSupported = state.jobCapabilities && state.jobCapabilities.resume_supported !== false;
   return `<section class="card" data-tour="jobs-list"><div class="section-title"><h3>이 PC의 작업</h3><div class="actions">${button("새로고침", "refresh")}${button("연결 끊긴 작업 확인", "recover")}</div></div>
-  <p class="muted">학습은 원격에서 계속됩니다. PC를 다시 열면 이전 작업을 선택해 결과 회수를 시도하세요. GPU가 사용 중이면 종료하지 마세요.</p>
+  <p class="muted">학습은 원격에서 계속됩니다. PC를 다시 열면 이전 작업을 선택해 결과 회수를 시도하세요. GPU가 사용 중이면 종료하지 마세요.</p>${graphJobsNote()}
   ${state.jobs.length ? `<table><thead><tr><th>업무 AI / 작업</th><th>상태</th><th>시도</th><th>종류</th><th>실행 위치</th><th></th></tr></thead><tbody>${state.jobs.map((j: Obj) => `<tr><td><b>${esc(j.manifest.config.ai_id)}</b><small class="mono">${esc(j.id)}</small></td><td>${badge(j.status)}</td><td>${j.attempts}</td><td>${j.manifest.simulation ? "모의" : "실제"}</td><td>${esc(jobDestination(j))}</td><td>${button("선택", "job:" + j.id)}</td></tr>`).join("")}</tbody></table>` : '<div class="empty">실행 계획을 확인한 뒤 학습을 시작해 보세요.</div>'}</section>
   ${active ? `<section class="card"><div class="section-title"><h3>${esc(active.manifest.config.ai_id)} ${badge(active.status)}</h3><div class="actions">${button("저장된 진행 지표", "progress-local")}${button("원격 진행 지표", "progress-remote")}</div></div>${progressView(state.progress)}${active.error ? `<p class="error">${esc(active.error)}</p>` : ""}
   <div class="actions">${button("학습 로그", "logs")}${button("원격 실시간 로그", "live_logs")}${button("평가 결과", "evaluation")}${button("재연결 · 결과 회수", "reconcile")}${button("대기 작업 실행", "execute")}${button("취소 요청", "cancel", "danger")}</div>
@@ -476,23 +508,97 @@ function render() {
     return;
   }
   renderDeferred = false;
-  const views: Obj = { overview, connections, datasets, training, jobs, history };
+  const legacyViews: Obj = { overview, connections, datasets, training, jobs, history };
+  const view = viewById(state.page);
+  const title = view ? view.title : pages[state.page];
+  const parent = view?.parent ? viewById(view.parent)?.title ?? pages[view.parent] : null;
+  const primary = state.page !== "overview" ? "" : viewById("projects")
+    ? button(icon("plus") + " 새 프로젝트", "nav:projects", "primary") : button(icon("plus") + " 새 학습", "nav:training", "primary");
   root.innerHTML = `<aside><div class="brand"><span class="brand-mark"><svg width="22" height="24" viewBox="0 0 22 24" fill="none"><path d="M3 5h16M3 12h11M3 19h6" stroke="currentColor" stroke-width="3.2" stroke-linecap="square"/><circle cx="18" cy="19" r="2" fill="currentColor"/></svg></span><div>Tuning Factory<small>개인 워크스페이스</small></div>${icon("chevron", 12)}</div>
-  <button class="command-trigger" data-action="search">${icon("search")}<span>바로 가기</span><kbd>Ctrl K</kbd></button><div class="nav-label">워크스페이스</div><nav>${Object.entries(pages).filter(([id]) => id !== "connections").map(([id, name]) => `<button aria-label="${name}" data-action="nav:${id}" class="${state.page === id ? "selected" : ""}">${icon(id)}<span>${name}</span>${id === "jobs" && state.jobs.filter((j: Obj) => j.status === "RUNNING").length ? '<i class="activity-marker"></i>' : ""}</button>`).join("")}</nav>
-  <div class="nav-label settings-label">설정</div><nav><button aria-label="연결 설정" data-action="nav:connections" class="${state.page === "connections" ? "selected" : ""}">${icon("connections")}<span>연결 설정</span></button><button aria-label="튜토리얼" data-action="tutorial">${icon("tutorial")}<span>튜토리얼</span></button></nav>
+  <button class="command-trigger" data-action="search">${icon("search")}<span>바로 가기</span><kbd>Ctrl K</kbd></button>${sidebarNav(view?.parent ?? state.page)}
   <div class="sidebar-foot"><span class="avatar">${esc((state.settings.FACTORY_OPERATOR || "U").slice(0, 1).toUpperCase())}</span><div><b>${esc(state.settings.FACTORY_OPERATOR || "사용자 미설정")}</b><small>Windows · 내부 검토 ${esc(version)}</small></div></div></aside>
-  <main><div class="appbar"><span class="breadcrumb">내 워크스페이스 <span>/</span> <b>${esc(pages[state.page])}</b></span><span class="local-context">${icon("folder", 13)} 내 PC에서 작업 관리</span></div><div class="content"><header class="page-heading"><div><h1>${esc(pages[state.page])}</h1><p>${esc(descriptions[state.page])}</p></div>${state.page === "overview" ? button(icon("plus") + " 새 학습", "nav:training", "primary") : ""}</header>
+  <main><div class="appbar"><span class="breadcrumb">내 워크스페이스 <span>/</span> ${parent ? `${esc(parent)} <span>/</span> ` : ""}<b>${esc(title)}</b></span><span class="local-context">${icon("folder", 13)} 내 PC에서 작업 관리</span></div><div class="content"><header class="page-heading"><div><h1>${esc(title)}</h1><p>${esc(view ? view.description : descriptions[state.page])}</p></div>${primary}</header>
   <div aria-live="polite">${state.busy ? `<div class="notice busy"><span class="spinner"></span>${esc(state.busy)}<small>다른 화면에서도 작업 상태를 확인할 수 있습니다.</small></div>` : ""}${state.notice ? `<div class="notice">${esc(state.notice)}</div>` : ""}${state.error ? `<div class="notice error" role="alert">${esc(state.error)}</div>` : ""}</div>
-  ${views[state.page]()}</div></main>`;
+  ${view ? guarded(() => view.render(ctx)) : legacyViews[state.page]()}</div></main>`;
   bind();
+  for (const shown of shownViews(view)) {
+    try { shown.bind?.(ctx); } catch (error) { console.error(error); }
+  }
   tutorial.afterRender();
 }
-async function refresh() { state.jobs = await api("jobs"); }
+/** A workflow view that throws never takes the shell or the legacy pages down with it (as graph jobs did, F8). */
+function guarded(work: () => string) {
+  try { return work(); }
+  catch (error) {
+    console.error(error);
+    return `<div class="wf-banner bad">이 영역을 표시하지 못했습니다. ${esc(String(error))}</div>`;
+  }
+}
+/** The sidebar of D1: three groups from the nav model; a child page (such as one project) highlights its parent. */
+function sidebarNav(highlighted: string) {
+  const running = state.jobs.some((j: Obj) => j.status === "RUNNING");
+  const item = ({ id, label, icon: name }: NavItem) => id === "tutorial"
+    ? `<button aria-label="${esc(label)}" data-action="tutorial">${icon(name)}<span>${esc(label)}</span></button>`
+    : `<button aria-label="${esc(label)}" data-action="nav:${esc(id)}" class="${highlighted === id ? "selected" : ""}">${icon(name)}<span>${esc(label)}</span>${id === "jobs" && running ? '<i class="activity-marker"></i>' : ""}</button>`;
+  const items = navModel(workflowViews);
+  return NAV_GROUPS.map(group => `<div class="nav-label${group.id === "workspace" ? "" : ` group-label ${group.id}-label`}" id="nav-group-${group.id}">${group.label}</div>`
+    + `<nav aria-labelledby="nav-group-${group.id}">${items.filter(entry => entry.group === group.id).map(item).join("")}</nav>`).join("");
+}
+const byNavOrder = (a: View, b: View) => (a.nav?.order ?? 1000) - (b.nav?.order ?? 1000) || a.id.localeCompare(b.id);
+/** Workflow panels on the overview (first in the left column) and on the datasets page (after the legacy form). */
+function slotPanels(slot: "overviewPanel" | "datasetsPanel") {
+  return [...workflowViews].sort(byNavOrder).map(view => view[slot] ? guarded(() => view[slot]!(ctx)) : "").join("");
+}
+/** The current view and every view whose slot panel this page shows: each binds its own elements after a render. */
+function shownViews(current: View | undefined) {
+  const shown = current ? [current] : [];
+  for (const view of workflowViews)
+    if ((state.page === "overview" && view.overviewPanel) || (state.page === "datasets" && view.datasetsPanel))
+      if (!shown.includes(view)) shown.push(view);
+  return shown;
+}
+/** D15: legacy lists show single jobs only; graph steps are counted and pointed to the graph runs page. */
+function graphJobsNote() {
+  if (!state.graphJobs) return "";
+  const link = viewById("runs") ? " " + button("그래프 실행 열기", "nav:runs", "quiet") : "";
+  return `<p class="graph-jobs-note">그래프 실행 단계 ${state.graphJobs}개는 ‘그래프 실행’에서 확인하세요.${link}</p>`;
+}
+/** Replaces one region of the current page (a poll result) without a full render: its actions are bound again and the
+ * focused control, with what was typed in it, survives. A pending press defers it like a render. */
+function patch(regionId: string, html: string) {
+  if (pressed || renderDeferred) { render(); return; }
+  const region = document.getElementById(regionId);
+  if (!region || !root.contains(region)) return;
+  const active = document.activeElement;
+  const inside = active instanceof HTMLElement && region.contains(active);
+  const key = inside ? focusKey(active) : null;
+  const typed = inside && (active instanceof HTMLTextAreaElement || (active instanceof HTMLInputElement
+    && !["checkbox", "radio", "file", "button", "submit", "reset"].includes(active.type)))
+    ? { value: active.value, start: active.selectionStart, end: active.selectionEnd } : null;
+  region.innerHTML = html;
+  bindActions(region);
+  if (key) {
+    restoreFocus(region, key);
+    const next = document.activeElement;
+    if (typed && region.contains(next) && (next instanceof HTMLTextAreaElement || next instanceof HTMLInputElement)) {
+      next.value = typed.value;
+      try { next.setSelectionRange(typed.start, typed.end); } catch { /* inputs without a text selection */ }
+    }
+  }
+  tutorial.afterRender();
+}
+async function refresh() {
+  const all = await api("jobs");
+  const list: Obj[] = Array.isArray(all) ? all : [];
+  state.jobs = list.filter(job => !isGraphJob(job));
+  state.graphJobs = list.length - state.jobs.length;
+}
 let catalogLoaded = false;
 async function catalog() { state.catalog = await api("catalog"); catalogLoaded = true; }
 async function saveSettings(values: Obj) {
   const before = state.settings;
   state.settings = await invoke("settings_save", { values });
+  store.markSettingsChanged();
   const change = destinationChange(before, state.settings);
   if (change === "none") return change;
   // A plan or runtime report made for the previous destination or GPU selection must not be reused.
@@ -526,6 +632,11 @@ async function execute(job: Obj) {
     render();
   }).catch(async error => { state.error = String(error); await refresh(); render(); });
 }
+/** Every action button under `scope` runs its action; while busy, all but navigation (and every submit) are disabled. */
+function bindActions(scope: ParentNode) {
+  if (state.busy) scope.querySelectorAll<HTMLButtonElement>("button[data-action]:not([data-action^='nav:']), button[type='submit']").forEach(el => el.disabled = true);
+  scope.querySelectorAll<HTMLElement>("[data-action]").forEach(el => el.addEventListener("click", () => void action(el.dataset.action!)));
+}
 function bind() {
   document.querySelector<HTMLFormElement>("#hub-form")?.addEventListener("submit", e => { e.preventDefault(); void action("hub-search"); });
   document.querySelector<HTMLInputElement>('#hub-form [data-key="model"]')?.addEventListener("input", () => {
@@ -535,13 +646,10 @@ function bind() {
     e.preventDefault(); const values = settingsFromForm(e.currentTarget as HTMLFormElement);
     void task("HF 인증값 저장 중", async () => { state.settings = await invoke("settings_save", {values}); state.hfDraft = null; state.notice = "HF 인증값을 보안 저장했습니다."; });
   });
-  if (state.busy) {
-    document.querySelectorAll<HTMLButtonElement>("button[data-action]:not([data-action^='nav:']), button[type='submit']").forEach(el => el.disabled = true);
-    // A task's final re-render would drop typing, so connection inputs stay locked until it finishes.
-    document.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(":is(#settings-form, #s3-settings-form, #hf-settings-form) "
-      + ":is(input, select, textarea), [data-gpu]").forEach(el => el.disabled = true);
-  }
-  document.querySelectorAll<HTMLButtonElement>("[data-action]").forEach(el => el.addEventListener("click", () => void action(el.dataset.action!)));
+  bindActions(document);
+  // A task's final re-render would drop typing, so connection inputs stay locked until it finishes.
+  if (state.busy) document.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(":is(#settings-form, #s3-settings-form, #hf-settings-form) "
+    + ":is(input, select, textarea), [data-gpu]").forEach(el => el.disabled = true);
   document.querySelector<HTMLFormElement>("#settings-form")?.addEventListener("submit", e => {
     e.preventDefault(); const values = settingsFromForm(e.currentTarget as HTMLFormElement);
     void task("연결 정보 저장 중", async () => { await saveSettings(values); state.settingsDraft = null; state.connectionReport = null; state.notice = "연결 정보를 저장했습니다."; });
@@ -670,7 +778,29 @@ async function action(name: string) {
     captureConfig(); captureDrafts(); await tutorial.start(); return;
   }
   if (name === "tutorial-dismiss") { rememberTutorial("dismissed"); render(); return; }
-  if (name.startsWith("nav:")) { captureConfig(); captureDrafts(); state.page = name.split(":")[1]; render(); if (state.page === "training" && !state.capabilities && !state.capabilityPending) { await checkCapabilities(); render(); } return; }
+  if (name.startsWith("wf:")) {
+    const [, viewId, verb, ...rest] = name.split(":");
+    const target = viewById(viewId);
+    if (!target?.action || !verb) return;
+    captureConfig(); captureDrafts();
+    try { await target.action(ctx, verb, rest.length ? rest.join(":") : null); }
+    catch (error) { state.error = String(error); render(); }
+    return;
+  }
+  if (name.startsWith("nav:")) {
+    const [, page, ...rest] = name.split(":");
+    if (!Object.hasOwn(pages, page) && !viewById(page)) return;
+    captureConfig(); captureDrafts();
+    viewById(state.page)?.leave?.(ctx);
+    state.page = page; state.arg = rest.length ? rest.join(":") : null;
+    render();
+    const entered = viewById(page);
+    if (entered?.enter) {
+      try { await entered.enter(ctx); } catch (error) { state.error = String(error); render(); }
+    }
+    if (state.page === "training" && !state.capabilities && !state.capabilityPending) { await checkCapabilities(); render(); }
+    return;
+  }
   if (name.startsWith("template:")) {
     state.config = structuredClone(state.catalog.templates[Number(name.split(":")[1])].config);
     normalizeConfig(); state.plan = null; state.capabilities = null; state.page = "training"; render(); await checkCapabilities(); render(); return;
@@ -755,7 +885,7 @@ async function action(name: string) {
     }
     else if (name === "forget") {
       if (await approve("저장된 인증값 삭제", "Windows 자격 증명 저장소에 저장한 이 앱의 RunPod·MLflow·S3·Hugging Face 인증값을 삭제합니다. 진행 중인 작업에는 적용되지 않습니다.")) {
-        await invoke("forget_credentials"); state.settings = await invoke("settings_get"); state.settingsDraft = null; state.s3SettingsDraft = null; state.hfDraft = null; state.connectionReport = null; state.notice = "저장된 인증값을 삭제했습니다.";
+        await invoke("forget_credentials"); state.settings = await invoke("settings_get"); store.markSettingsChanged(); state.settingsDraft = null; state.s3SettingsDraft = null; state.hfDraft = null; state.connectionReport = null; state.notice = "저장된 인증값을 삭제했습니다.";
       }
     }
     else if (name === "runtime_check" || name === "runtime_prepare") { state.runtimeReport = await api(name, { approved: name === "runtime_prepare", training_stage: state.config?.training_stage || "sft" }); state.notice = `선택한 ${isServer(state.settings) ? "GPU 서버" : "Pod"}에서 앱과 일치하는 학습 환경과 CUDA를 확인했습니다.`; }
