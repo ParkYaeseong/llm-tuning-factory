@@ -23,7 +23,7 @@ const FIELDS: [&str; 28] = [
 const MLFLOW_CREDENTIALS: [&str; 4] = ["MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "MLFLOW_OIDC_CLIENT_SECRET",
     "MLFLOW_TRACKING_TOKEN"];
 // The least-privilege workflow channel (Task 9 plan D8): exactly desktop_workflows.WORKFLOW_ACTIONS.
-const WORKFLOW_ACTIONS: [&str; 32] = [
+const WORKFLOW_ACTIONS: [&str; 33] = [
     "projects_list", "project_create", "project_get", "project_save", "project_import_legacy",
     "recipes_list", "recipe_get", "recipe_save", "recipe_clone",
     "dataset_import_source", "dataset_import_preview", "dataset_import_register",
@@ -33,10 +33,12 @@ const WORKFLOW_ACTIONS: [&str; 32] = [
     "graph_submit", "graph_runs_list", "graph_run_get", "graph_pause", "graph_resume", "graph_cancel",
     "tracking_rearm", "executor_profile_edit_check",
     "controller_status", "controller_stop",
+    "model_root_targets",
 ];
-// The only workflow actions that receive a credential: that profile's RunPod key, and the legacy HF token.
+// The only workflow actions that receive a credential: that profile's RunPod key, and the legacy HF token (the
+// config/tokenizer snapshot and 9.7's header-only target read).
 const PROFILE_SCOPED_ACTIONS: [&str; 1] = ["executor_profile_inspect"];
-const HF_SCOPED_ACTIONS: [&str; 1] = ["model_root_snapshot"];
+const HF_SCOPED_ACTIONS: [&str; 2] = ["model_root_snapshot", "model_root_targets"];
 // Controller lifecycle requests never touch Credential Manager and survive unreadable settings or profile files, so a
 // broken vault or file can never block stopping (or polling) the background controller.
 const VAULT_FREE_ACTIONS: [&str; 2] = ["controller_status", "controller_stop"];
@@ -292,8 +294,8 @@ fn workflow_settings(public: &Value) -> Map<String, Value> {
         .collect()
 }
 
-/// D8: only `executor_profile_inspect` (that stored RunPod profile's own key) and `model_root_snapshot` (the legacy
-/// HF token) receive a credential.
+/// D8: only `executor_profile_inspect` (that stored RunPod profile's own key), `model_root_snapshot` and
+/// `model_root_targets` (the legacy HF token) receive a credential.
 fn scoped_secrets(root: &Path, vault: &dyn Vault, action: &str, data: &Value) -> Result<Map<String, Value>, String> {
     let mut secrets = Map::new();
     if PROFILE_SCOPED_ACTIONS.contains(&action) {
@@ -618,7 +620,7 @@ mod tests {
     #[test]
     fn workflow_actions_are_a_closed_list_disjoint_from_legacy_actions() {
         let unique: std::collections::BTreeSet<&str> = WORKFLOW_ACTIONS.into_iter().collect();
-        assert_eq!(unique.len(), 32);
+        assert_eq!(unique.len(), 33);
         for action in WORKFLOW_ACTIONS {
             assert!(workflow_allowed(action), "{action}");
             assert!(!allowed(action), "the legacy channel accepts the workflow action {action}");
@@ -701,11 +703,23 @@ mod tests {
             let request = build_workflow_request(app.path(), &vault, "executor_profile_inspect", data.clone()).unwrap();
             assert_eq!(request["secrets"], json!({}), "{data}");
         }
-        // The HF action gets only the legacy HF token.
+        // The HF actions (the snapshot and 9.7's header-only target read) get only the legacy HF token.
         let hf = synthetic("hf_token");
-        let request = build_workflow_request(app.path(), &vault, "model_root_snapshot", json!({"repo_id": "org/model"})).unwrap();
-        assert_eq!(request["secrets"], json!({"HF_TOKEN": hf}));
-        for secret in secrets.iter().filter(|secret| **secret != hf) { assert!(!request.to_string().contains(secret.as_str())); }
+        for action in ["model_root_snapshot", "model_root_targets"] {
+            let request = build_workflow_request(app.path(), &vault, action, json!({"repo_id": "org/model"})).unwrap();
+            assert_eq!(request["secrets"], json!({"HF_TOKEN": hf}), "{action}");
+            let text = request.to_string();
+            for secret in secrets.iter().filter(|secret| **secret != hf) { assert!(!text.contains(secret.as_str()), "{action}"); }
+        }
+        // Without a saved HF token they get no secret at all.
+        let values: Vec<String> = SECRETS.iter().map(|name| synthetic(&name.to_ascii_lowercase())).collect();
+        let without_hf: Vec<(&str, &str)> = SECRETS.iter().copied().zip(values.iter().map(String::as_str))
+            .filter(|(name, _)| *name != "HF_TOKEN").collect();
+        let no_token = MemoryVault::with(&without_hf);
+        for action in ["model_root_snapshot", "model_root_targets"] {
+            let request = build_workflow_request(app.path(), &no_token, action, json!({"repo_id": "org/model"})).unwrap();
+            assert_eq!(request["secrets"], json!({}), "{action}");
+        }
         // Only a JSON object is a workflow request body.
         for data in [json!([1]), json!("x"), json!(null)] {
             assert!(build_workflow_request(app.path(), &vault, "projects_list", data).is_err());

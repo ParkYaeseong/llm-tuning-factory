@@ -488,7 +488,7 @@ def dispatch_action(context: WorkflowContext, action: str, data: Mapping) -> Wor
         raise TypeError("workflow handlers must return a WorkflowResult")
     secrets = tuple(value for value in context.secrets.values() if len(value) >= 8)
     if secrets:
-        # Defence in depth for the two scoped actions: no secret value leaves in a result.
+        # Defence in depth for the scoped actions (SECRET_SCOPES): no secret value leaves in a result.
         result = WorkflowResult.model_validate(_scrub(result.model_dump(mode="json"), secrets))
     return result
 

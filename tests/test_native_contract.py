@@ -77,17 +77,11 @@ def legacy_actions() -> tuple[str, ...]:
     return tuple(re.findall(r'"([a-z0-9_]+)"', allowed[:allowed.index("\n}\n")]))
 
 
-# Python actions the native allowlist does not offer yet: Task 9.7 adds the HF-root target inspector to the Python
-# table while desktop/ stays frozen, so the GUI cannot call it until main.rs lists it (with HF_SCOPED_ACTIONS).
-PYTHON_ONLY = ("model_root_targets",)
-
-
 def test_rust_workflow_allowlist_matches_python():
     main = source("main.rs")
     actions = str_array(main, "WORKFLOW_ACTIONS")
-    assert set(PYTHON_ONLY) <= set(wf.WORKFLOW_ACTIONS) and not set(PYTHON_ONLY) & set(actions)
-    assert actions == tuple(name for name in wf.WORKFLOW_ACTIONS if name not in PYTHON_ONLY)
-    assert len(set(actions)) == 32
+    assert actions == wf.WORKFLOW_ACTIONS
+    assert len(set(actions)) == 33
     assert not set(actions) & set(legacy_actions())
     profile_scoped = str_array(main, "PROFILE_SCOPED_ACTIONS")
     hf_scoped = str_array(main, "HF_SCOPED_ACTIONS")
@@ -95,8 +89,8 @@ def test_rust_workflow_allowlist_matches_python():
     assert profile_secrets == ("RUNPOD_API_KEY",)
     native_scopes = {**{name: frozenset(profile_secrets) for name in profile_scoped},
                      **{name: frozenset({"HF_TOKEN"}) for name in hf_scoped}}
-    assert native_scopes == {name: scope for name, scope in wf.SECRET_SCOPES.items() if name not in PYTHON_ONLY}
-    assert all(wf.SECRET_SCOPES[name] == frozenset({"HF_TOKEN"}) for name in PYTHON_ONLY)
+    assert native_scopes == dict(wf.SECRET_SCOPES)
+    assert hf_scoped == ("model_root_snapshot", "model_root_targets")      # 9.7: header reads get the HF token too
     # The controller lifecycle actions built without Credential Manager or readable files (9.5 review m1).
     lifecycle = str_array(main, "VAULT_FREE_ACTIONS")
     assert set(lifecycle) == {"controller_status", "controller_stop"}

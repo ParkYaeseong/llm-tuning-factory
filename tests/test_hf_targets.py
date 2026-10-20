@@ -47,8 +47,7 @@ def layer(index):
 
 
 FIRST = {"model.embed_tokens.weight": (VOCAB, HIDDEN), **layer(0)}
-SECOND = {**layer(1), "model.norm.weight": (HIDDEN,), "lm_head.weight": (VOCAB, HIDDEN),
-          "v_head.summary.weight": (1, HIDDEN)}
+SECOND = {**layer(1), "model.norm.weight": (HIDDEN,), "lm_head.weight": (VOCAB, HIDDEN)}
 # Written by hand (not computed by the rule under test): the 2D *.weight tensors outside embeddings, norms and
 # heads, as {module: (out, in)}.
 EXPECTED = {f"model.layers.{index}.{name}": shape for index in (0, 1) for name, shape in LINEAR.items()}
@@ -137,8 +136,9 @@ class FakeShards:
         if name is None:
             return httpx.Response(404)
         if self.redirect and request.url.host == "huggingface.co" and name.endswith(".safetensors"):
+            # No Content-Length and an endless body: a redirect is followed without reading its body at all.
             return httpx.Response(302, headers={"Location": f"{self.redirect}/{name}?signature=1"},
-                                  content=b"Found")
+                                  content=self.endless(MIB))
         data = self.files.get(name)
         if data is None:
             return httpx.Response(404)
@@ -455,7 +455,8 @@ def test_header_parsing_matches_the_local_safetensors_rules(tmp_path, monkeypatc
 # -- what is refused, not guessed -------------------------------------------------------------------
 
 @pytest.mark.parametrize("case", ["moe_profile", "multimodal_profile", "fused_experts_3d", "expert_weight_3d",
-                                  "per_expert_2d", "conv_kernel", "int8_weight", "gptq_qweight"])
+                                  "per_expert_2d", "conv_kernel", "int8_weight", "gptq_qweight", "prefix_less",
+                                  "classifier_score", "value_head", "empty_targets", "zero_dimension"])
 def test_architectures_without_plain_linear_weights_are_refused_not_guessed(tmp_path, monkeypatch, case):
     ht = targets()
     state = tmp_path / "state"
@@ -467,10 +468,22 @@ def test_architectures_without_plain_linear_weights_are_refused_not_guessed(tmp_
              "expert_weight_3d": {"model.layers.1.mlp.experts.down_proj.weight": (4, INTER, HIDDEN)},
              "per_expert_2d": {"model.layers.1.mlp.experts.0.gate_proj.weight": (INTER, HIDDEN)},
              "conv_kernel": {"model.layers.1.linear_attn.conv1d.weight": (INTER, 1, 4)},
-             "gptq_qweight": {"model.layers.1.self_attn.q_proj.qweight": (1, HIDDEN)}}.get(case, {})
+             "gptq_qweight": {"model.layers.1.self_attn.q_proj.qweight": (1, HIDDEN)},
+             # A sequence classifier's head and a value head are not modules of AutoModelForCausalLM.
+             "classifier_score": {"score.weight": (2, HIDDEN)},
+             "value_head": {"v_head.summary.weight": (1, HIDDEN)}}.get(case, {})
     dtypes = {"int8_weight": {"model.layers.0.self_attn.q_proj.weight": "I8"},
               "gptq_qweight": {"model.layers.1.self_attn.q_proj.qweight": "I32"}}.get(case)
-    server = FakeShards(checkpoint(second={**SECOND, **extra}, dtypes=dtypes)).install(monkeypatch)
+    first, second = FIRST, {**SECOND, **extra}
+    if case == "prefix_less":     # saved from the bare XModel (embedding models): the runtime adds ``model.``
+        first = {name.removeprefix("model."): shape for name, shape in FIRST.items()}
+        second = {name.removeprefix("model."): shape for name, shape in SECOND.items() if name != "lm_head.weight"}
+    elif case == "empty_targets":  # valid safetensors, but no 2D target weight at all
+        first = {"model.embed_tokens.weight": (VOCAB, HIDDEN)}
+        second = {"model.norm.weight": (HIDDEN,), "lm_head.weight": (VOCAB, HIDDEN)}
+    elif case == "zero_dimension":
+        first = {**FIRST, "model.layers.0.self_attn.q_proj.weight": (0, HIDDEN)}
+    server = FakeShards(checkpoint(first, second, dtypes=dtypes)).install(monkeypatch)
     result = inspect(state)
     issue = desk.only_issue(result, "invalid", "architecture_unsupported", "/repo_id")
     assert issue["message"] == ht.ARCHITECTURE_UNSUPPORTED
@@ -591,24 +604,68 @@ def test_authorization_is_dropped_on_cross_host_redirects(tmp_path, monkeypatch)
     assert [item.headers.get("range") for item in cdn] == [
         *ranges(server.files[SHARDS[0]]), *ranges(server.files[SHARDS[1]])]
     assert dimensions(evidence_of(state, root)) == EXPECTED
+    # The redirects declared no Content-Length and streamed endless bodies: not one byte of them was read.
+    assert server.pulled == 0
 
 
-@pytest.mark.parametrize("case, code", [("plain_http", "insecure_redirect"), ("large_redirect", "size_limit")])
+@pytest.mark.parametrize("case, code", [("plain_http", "insecure_redirect"), ("redirect_loop", "targets_failed")])
 def test_unsafe_redirects_are_refused(tmp_path, monkeypatch, case, code):
-    targets()
+    ht = targets()
     state = tmp_path / "state"
     wpt.snapshot_root(state, monkeypatch)
 
-    def large(server, request, name, data, wanted):
-        if name.endswith(".safetensors"):     # a redirect whose body httpx would read in full before following
-            return httpx.Response(302, headers={"Location": f"{CDN}/{name}"}, content=bytes(MIB))
-        return None
+    def loop(server, request, name, data, wanted):
+        return httpx.Response(302, headers={"Location": str(request.url)}, content=server.endless(MIB))
 
-    options = {"redirect": "http://cdn-lfs.hf.example"} if case == "plain_http" else {"hook": large}
+    options = {"redirect": "http://cdn-lfs.hf.example"} if case == "plain_http" else {"hook": loop}
     server = FakeShards(**options).install(monkeypatch)
-    desk.only_issue(inspect(state, secrets={"HF_TOKEN": HF_SECRET}), "invalid", code, "/repo_id")
+    issue = desk.only_issue(inspect(state, secrets={"HF_TOKEN": HF_SECRET}), "invalid", code, "/repo_id")
     assert all(item.url.scheme == "https" for item in server.requests)   # never sent over plain HTTP
     assert not any(item.url.host == urlsplit(CDN).hostname for item in server.requests)
+    assert server.pulled == 0 and stored(state) == []
+    if case == "redirect_loop":
+        assert issue["message"] == ht.TOO_MANY_REDIRECTS
+        assert len(server.requests) == ht.MAX_REDIRECTS + 1            # the first request and five redirects
+
+
+def test_a_declared_oversized_index_is_refused_before_reading(tmp_path, monkeypatch):
+    ht = targets()
+    state = tmp_path / "state"
+    wpt.snapshot_root(state, monkeypatch)
+
+    def declared(server, request, name, data, wanted):
+        if name == INDEX:
+            return httpx.Response(200, content=server.endless(MIB),
+                                  headers={"Content-Length": str(ht.MAX_INDEX_BYTES + 1)})
+        return None
+
+    server = FakeShards(hook=declared).install(monkeypatch)
+    desk.only_issue(inspect(state), "invalid", "size_limit", "/repo_id")
+    assert server.pulled == 0 and server.calls == [(INDEX, None)] and stored(state) == []
+
+
+@pytest.mark.parametrize("where, code", [("header", "header_invalid"), ("index", "index_invalid")])
+def test_deeply_nested_json_is_refused_not_raised(tmp_path, monkeypatch, where, code):
+    """200,000 ``[`` make ``json.loads`` raise RecursionError: an invalid header or index, over HTTP and locally."""
+    targets()
+    from tuning_factory.model_artifacts import read_json, tensor_header
+    state = tmp_path / "state"
+    wpt.snapshot_root(state, monkeypatch)
+    nested = b"[" * 200_000
+    local = tmp_path / "local"
+    local.mkdir()
+    if where == "header":
+        files = {SINGLE: raw_file(nested, 0)}
+        (local / SINGLE).write_bytes(files[SINGLE])
+        with pytest.raises(ValueError, match="invalid artifact JSON metadata"):
+            tensor_header(local / SINGLE, SINGLE)
+    else:
+        files = {**checkpoint(), INDEX: nested}
+        (local / INDEX).write_bytes(nested)
+        with pytest.raises(ValueError, match="invalid artifact JSON metadata"):
+            read_json(local / INDEX)
+    FakeShards(files).install(monkeypatch)
+    desk.only_issue(inspect(state), "invalid", code, "/repo_id")
     assert stored(state) == []
 
 

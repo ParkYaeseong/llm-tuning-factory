@@ -7,14 +7,17 @@ pinned revision it reads ``model.safetensors.index.json`` (or, when that is abse
 ``model.safetensors``). Then, for each shard, it makes exactly two HTTP range requests: ``bytes=0-7`` (the
 little-endian u64 header length, at most 16 MiB) and the header JSON. A range must be answered ``206`` with the
 matching ``Content-Range``; a ``200`` (the whole file) is closed unread, so weights are never streamed. Every
-response is capped, and so is their total. Redirects must stay on HTTPS and their bodies are bounded; httpx drops
-the Authorization header when a redirect leaves the origin (the CDN).
+response is capped, and so is their total. Redirects are followed here, never by httpx: each redirect body is
+discarded unread (declared or not), every hop must be HTTPS, and httpx's ``next_request`` drops the Authorization
+header when a redirect leaves the origin (the CDN) and keeps ``Range``.
 
 The evidence follows exactly the full-model artifact rule of ``target_inspection.verify_inspected_targets``: the
 2D ``*.weight`` tensors that ``_not_a_target`` keeps, with ``(out, in)`` dimensions. The headers are validated by
 ``model_artifacts.header_tensors``, the rule set local safetensors files use. Architectures whose linear modules
-are not plain 2D weights are refused, never guessed: only reviewed dense text architectures are inspected, and any
-tensor of three or more dimensions, any expert tensor and any quantized storage refuses the root. The evidence is
+are not plain 2D weights are refused, never guessed: only reviewed dense text architectures are inspected, every
+tensor must sit under the causal LM's own names (``model.`` or ``lm_head.``, the ``base_model_prefix`` of all of
+them), and any tensor of three or more dimensions, any expert tensor, any quantized storage, a zero dimension or no
+target weight at all refuses the root. The evidence is
 stored immutably beside the root index (``workflow_planning.save_root_targets``); ``graph_plan`` passes it as
 ``ExecutionChoices.base_targets``, which lifts D15 for that root.
 
@@ -62,8 +65,7 @@ INDEX_FILE = "model.safetensors.index.json"
 SINGLE_FILE = "model.safetensors"
 MAX_HEADER_BYTES = 16 * 1024 * 1024
 MAX_INDEX_BYTES = 16 * 1024 * 1024
-MAX_REDIRECT_BYTES = 64 * 1024
-MAX_TARGET_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_TARGET_TOTAL_BYTES = 64 * 1024 * 1024      # every body byte read; redirect bodies are never read
 MAX_SHARDS = 256
 MAX_REDIRECTS = 5
 # Reviewed dense text architectures: every linear layer is an nn.Linear stored as one 2D (out, in) weight under its
@@ -73,6 +75,9 @@ MAX_REDIRECTS = 5
 HEADER_TARGET_ARCHITECTURES = frozenset({"qwen2", "qwen3", "llama", "mistral", "gemma2", "gemma3_text", "phi3"})
 FLOAT_DTYPES = frozenset({"F16", "BF16", "F32", "F64"})
 QUANTIZED_SUFFIXES = (".qweight", ".weight_packed")       # packed storage beside or instead of ``.weight``
+# The names a causal LM's checkpoint uses at runtime: transformers 5.6 adds ``model.`` to a bare ``XModel`` save
+# (embedding models) at load, and a classifier's ``score`` or a value head is not a module of AutoModelForCausalLM.
+CAUSAL_LM_PREFIXES = ("model.", "lm_head.")
 _CONTENT_RANGE = re.compile(r"bytes ([0-9]{1,20})-([0-9]{1,20})/([0-9]{1,20})")
 FILE_REQUEST_FAILED = "Hugging Face file request failed (HTTP {status}); check model access"   # 9.2's text
 
@@ -84,6 +89,7 @@ HEADER_INVALID = "모델 파일의 safetensors 헤더가 올바르지 않거나 
 INDEX_INVALID = "모델의 safetensors 색인(model.safetensors.index.json)이 올바르지 않거나 안전하지 않습니다."
 WEIGHTS_FORMAT_UNSUPPORTED = "이 모델 버전에는 safetensors 가중치(model.safetensors 또는 model.safetensors.index.json)가 없습니다."
 TARGETS_TOO_LARGE = "모델 파일 서버의 응답이 크기 제한(헤더·색인 각 16 MiB, 합계 64 MiB)을 넘어 읽기를 멈췄습니다."
+TOO_MANY_REDIRECTS = "모델 파일 서버가 연결을 너무 여러 번 넘겨 읽기를 멈췄습니다."
 ENCODED_RESPONSE = "모델 파일 서버가 압축된 응답을 보내 읽지 않았습니다."
 TARGETS_CHANGED = ("이 고정 모델 버전에 이미 저장된 모듈 구조 정보와 읽은 헤더가 다릅니다. "
                    "고정 버전은 바뀌지 않아야 하므로 저장하지 않았습니다.")
@@ -95,23 +101,30 @@ class RootTargets(RootSnapshot):
 
 # -- HTTP: one client, bounded reads, exact ranges ----------------------------------------------
 
-def _bounded_redirect(response: httpx.Response) -> None:
-    """httpx reads a redirect's body in full before following it: only a declared, small body is allowed."""
-    if response.has_redirect_location:
-        declared = response.headers.get("content-length", "").strip()
-        if not declared.isdigit() or int(declared) > MAX_REDIRECT_BYTES:
-            raise _Refused("size_limit", TARGETS_TOO_LARGE)
-
-
 def _client(token: str | None, *, transport: httpx.BaseTransport | None = None) -> httpx.Client:
     """The Hugging Face client; an Authorization header only when ``HF_TOKEN`` was scoped to this request.
 
-    httpx drops the header on a redirect to another origin. Responses are never content-decoded (``identity``)."""
+    Redirects are followed by ``_open``, never by httpx (which reads a redirect body in full first). Every hop passes
+    the HTTPS hook before it is sent. Responses are never content-decoded (``identity``)."""
     headers = {"Accept-Encoding": "identity"}
     if token:
         headers["Authorization"] = "Bearer " + token
-    return httpx.Client(timeout=20, follow_redirects=True, max_redirects=MAX_REDIRECTS, headers=headers,
-                        transport=transport, event_hooks={"request": [https_only], "response": [_bounded_redirect]})
+    return httpx.Client(timeout=20, follow_redirects=False, headers=headers, transport=transport,
+                        event_hooks={"request": [https_only]})
+
+
+def _open(client: httpx.Client, url: str, headers: dict[str, str] | None = None) -> httpx.Response:
+    """A streamed GET that follows at most ``MAX_REDIRECTS`` redirects. Each redirect is closed with its body unread;
+    the next hop is httpx's ``next_request``, which drops Authorization across origins and keeps ``Range``. The
+    caller closes the returned response."""
+    request = client.build_request("GET", url, headers=headers)
+    for _ in range(MAX_REDIRECTS + 1):
+        response = client.send(request, stream=True, follow_redirects=False)
+        if response.next_request is None:
+            return response
+        request = response.next_request
+        response.close()
+    raise _Refused("targets_failed", TOO_MANY_REDIRECTS)
 
 
 def _failed(status: int) -> _Refused:
@@ -137,13 +150,20 @@ def _read(response: httpx.Response, limit: int, refused: _Refused) -> bytes:
 def _index(client: httpx.Client, url: str, budget: int) -> bytes | None:
     """The shard index of the pinned revision, or None when the revision has none (HTTP 404)."""
     too_large = _Refused("size_limit", TARGETS_TOO_LARGE)
-    with client.stream("GET", url) as response:
+    response = _open(client, url)
+    try:
         if response.status_code == 404:
             return None
         if response.status_code != 200:
             raise _failed(response.status_code)
         _identity(response, _Refused("targets_failed", ENCODED_RESPONSE))
-        return _read(response, min(MAX_INDEX_BYTES, budget), too_large)
+        limit = min(MAX_INDEX_BYTES, budget)
+        declared = response.headers.get("content-length", "").strip()
+        if declared.isdigit() and int(declared) > limit:     # refused before reading; undeclared sizes stream capped
+            raise too_large
+        return _read(response, limit, too_large)
+    finally:
+        response.close()
 
 
 def _range(client: httpx.Client, url: str, start: int, length: int, budget: int,
@@ -154,7 +174,8 @@ def _range(client: httpx.Client, url: str, start: int, length: int, budget: int,
         raise _Refused("size_limit", TARGETS_TOO_LARGE)
     end = start + length - 1
     refused = _Refused("range_unsupported", RANGE_UNSUPPORTED)
-    with client.stream("GET", url, headers={"Range": f"bytes={start}-{end}"}) as response:
+    response = _open(client, url, {"Range": f"bytes={start}-{end}"})
+    try:
         if response.status_code == 200:
             raise refused
         if response.status_code == 404 and missing is not None:
@@ -169,6 +190,8 @@ def _range(client: httpx.Client, url: str, start: int, length: int, budget: int,
         if len(body) != length:
             raise refused
         return body, int(match[3])
+    finally:
+        response.close()
 
 
 def _shard_tensors(client: httpx.Client, url: str, shard: str, budget: int,
@@ -241,12 +264,15 @@ def target_evidence(root: HFRootRef, tensors) -> ModelTargetEvidence:
     unsupported = _Refused("architecture_unsupported", ARCHITECTURE_UNSUPPORTED)
     modules = []
     for tensor in tensors:
-        if len(tensor.shape) >= 3 or "experts" in tensor.name.split(".") or tensor.name.endswith(QUANTIZED_SUFFIXES):
+        if (not tensor.name.startswith(CAUSAL_LM_PREFIXES) or len(tensor.shape) >= 3
+                or "experts" in tensor.name.split(".") or tensor.name.endswith(QUANTIZED_SUFFIXES)):
             raise unsupported
         if tensor.name.endswith(".weight") and len(tensor.shape) == 2 and not _not_a_target(tensor.name):
-            if tensor.dtype not in FLOAT_DTYPES:
+            if tensor.dtype not in FLOAT_DTYPES or 0 in tensor.shape:
                 raise unsupported
             modules.append((tensor.name[:-len(".weight")], tensor.shape))
+    if not modules:                  # a valid checkpoint without one target weight: nothing to adapt
+        raise unsupported
     try:
         return ModelTargetEvidence(base=root, modules=tuple(
             TargetModuleEvidence(name=name, input_dimension=shape[1], output_dimension=shape[0])

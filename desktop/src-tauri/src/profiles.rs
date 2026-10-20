@@ -158,8 +158,12 @@ fn validate_fields(fields: &Map<String, Value>) -> Result<(), String> {
         && port.parse::<u32>().is_ok_and(|number| (1..=65535).contains(&number));
     if !port.is_empty() && !valid_port { return Err(PORT.into()); }
     // The D11 transport hash resolves the key path, so a relative one would depend on each process's working
-    // directory (planning sidecar versus controller). Profiles only; the legacy connection settings are unchanged.
-    if crate::KEY_FILE_FIELDS.iter().any(|name| !text(name).is_empty() && !Path::new(text(name)).is_absolute()) {
+    // directory (planning sidecar versus controller). UNC and device paths (`\\server\share`, `\\?\`, `\\.\`,
+    // any two leading separators) are network or device access (D12). Profiles only; the legacy connection settings
+    // are unchanged.
+    let local_absolute = |path: &str| Path::new(path).is_absolute()
+        && !(path.len() >= 2 && path.as_bytes()[..2].iter().all(|byte| matches!(byte, b'\\' | b'/')));
+    if crate::KEY_FILE_FIELDS.iter().any(|name| !text(name).is_empty() && !local_absolute(text(name))) {
         return Err(KEY_PATH_RELATIVE.into());
     }
     Ok(())
@@ -750,8 +754,10 @@ mod tests {
         // The D11 transport hash resolves the key path: a relative path would resolve against different working
         // directories in the planning sidecar and in the controller, and every real run would be refused for good.
         for (fields, name) in [(runpod("p", "pod"), "ssh_key_file"), (server("lab"), "server_ssh_key_file")] {
+            // UNC and device paths are absolute but network or device access (Task 9 D12, 9.7 review Minor 7).
             for path in ["id_ed25519", ".ssh\\id_ed25519", "..\\keys\\id", "./id", "\\keys\\id_ed25519", "C:keys\\id",
-                " C:\\keys\\id_ed25519"] {
+                " C:\\keys\\id_ed25519", "\\\\server\\share\\id", "//server/share/id", "\\/server/share/id",
+                "\\\\?\\C:\\keys\\id", "\\\\.\\pipe\\id", "\\\\?\\UNC\\server\\share\\id"] {
                 let mut input = fields.clone();
                 input.insert(name.into(), json!(path));
                 let error = merge_profile(None, &input).expect_err("a relative key path was accepted");

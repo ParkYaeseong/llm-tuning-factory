@@ -2769,8 +2769,8 @@ the controller now does. They implement
 before Task 10) and the review of 9.2 (ready to merge; Minor items only).
 
 9.2 review follow-ups (first commit, `workflow_planning.py` and its tests only):
-- Minor 1, tests for behaviour that mutations showed untested. Each new test fails against the mutation it
-  targets (8 mutations, all killed):
+- Minor 1, tests for behaviour that mutations showed untested: six new tests (9 cases; the repository test has
+  4 parameters) pin 8 mutations, each killed by the test that targets it (the D15 test kills 3):
   - The D15 walker: continuation through a selection of HF-root adapters, and from a merge output, is blocked
     without evidence; training after materialize is not.
   - A negative observation age is `observation_stale`; `repository_unsupported`; the `root_snapshot_conflict`
@@ -2844,8 +2844,8 @@ Actual verification (worktree `D:\llm-tuning-factory-wt97`, main venv with `PYTH
   module (`pytest.fail`, not collection), the table pin on the missing name, and the native contract on the
   undeclared Python-only action. Added later, test-first: `shifted_range`, `ambiguous_root` and a reversed index
   order (each killing a surviving mutation), and the three Minor 3 envelope cases (red without the wider catch).
-- 9.2 follow-ups RED: the 13 behaviour cases failed on unpatched code, and the 9 pin cases each failed against
-  their mutation. GREEN: `test_workflow_planning` gave **78 passed**, and the full suite on that commit gave
+- 9.2 follow-ups RED: the 13 behaviour cases failed on unpatched code, and the 9 pin cases (6 tests) failed
+  against the 8 mutations they target. GREEN: `test_workflow_planning` gave **78 passed**, and the full suite on that commit gave
   **1464 passed, 2 skipped** (1442 + 22).
 - Mutations of `hf_targets.py` through a harness under `%TEMP%` (each restored): **33 of 33 killed**. They covered
   reading a 200 body, the Content-Range equality and exact length, the identity check, each refusal rule, the
@@ -2994,6 +2994,100 @@ Not verified or still open:
   `registered`) is not addressed: re-checking a version needs an MLflow read, and 9.3's actions are DB-only. It
   stays open for the controller side (9.4) or a later task.
 - No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
+
+## Task 9.7 review fixes: native exposure and hardened header reads, 2026-10-21
+
+Commit `fix: expose HF target inspection natively and harden header reads`, written in `D:\llm-tuning-factory-wt95`
+(branch `codex/task-9.7-fix`) on `02436c8`, then rebased onto the 8.5 re-review fixes (`960c99e`, no conflict)
+and onto 9.3 (`c2f1bbb`; only this file conflicted, every entry kept), then onto the Task 10 plan (`9f2927d`, docs
+only). The independent review of 9.7 (`02436c8`) and of the 9.2 follow-ups (`8931b1f`) was "Ready with fixes":
+nothing Critical or Important, and every reported number reproduced.
+
+Required before Task 10:
+- **Native exposure (9.7 deviation 1 resolved).** `main.rs`: `WORKFLOW_ACTIONS` is `[&str; 33]` with
+  `model_root_targets` last (the Python order), and `HF_SCOPED_ACTIONS` is `["model_root_snapshot",
+  "model_root_targets"]`. The comments are updated.
+  - Rust tests: the closed list has 33 unique names. Both HF actions carry exactly `{"HF_TOKEN": hf}` and no other
+    secret, and `{}` when no HF token is saved.
+  - `test_native_contract` no longer has `PYTHON_ONLY`: `actions == wf.WORKFLOW_ACTIONS`, 33 names, and
+    `native_scopes == dict(wf.SECRET_SCOPES)`.
+  - The stale comment in `desktop_workflows.dispatch_action` and the plan's D8, §5 and §7 now say 33 names and
+    three scoped actions.
+- **Minor 1: `RecursionError` escaped the envelope.** `model_artifacts._json` turns it into
+  `ValueError("invalid artifact JSON metadata")`, for local files too. 200,000 `[` give `header_invalid` or
+  `index_invalid` over HTTP, and `tensor_header` and `read_json` raise that `ValueError` locally.
+- **Minor 2: header names must be runtime names.** `target_evidence` refuses (`architecture_unsupported`) any
+  tensor outside `model.` or `lm_head.` (`CAUSAL_LM_PREFIXES`, the `base_model_prefix` of all seven allowed
+  architectures). This covers prefix-less checkpoints saved from a bare `XModel`, a classifier's top-level
+  `score.weight` and a value head.
+
+Recommended, also done:
+- **Redirects** (Minor 3 and the real-HF risk).
+  - `_open` follows at most 5 redirects itself. Each redirect is closed with its body unread, so a missing
+    `Content-Length` is no longer refused and redirect bodies cost nothing against the 64 MiB total.
+  - The next hop is httpx's public `next_request`: it drops Authorization across origins and keeps `Range`.
+  - Every hop still passes the HTTPS hook before it is sent. More redirects give `targets_failed`
+    (`TOO_MANY_REDIRECTS`).
+  - `_bounded_redirect` and `MAX_REDIRECT_BYTES` are gone.
+- **Minor 4:** `_index` refuses a declared `Content-Length` above the cap before reading; undeclared sizes still
+  stream capped.
+- **Minor 5:** a checkpoint without one target weight, or a target with a zero dimension, is
+  `architecture_unsupported`, not `header_invalid`.
+- **Minor 6:** `test_snapshot_errors_stay_in_the_issue_envelope` has a `KeyError` case. The count wording in the 9.7
+  entry above now says: 9 pin cases in 6 tests against 8 mutations.
+- **Minor 7: key-path gaps.**
+  - `check_key_paths` applies `desktop_workflows.local_file` (after `~`), so UNC and device paths (`\\server\share`,
+    `//server/share`, `\\?\`, `\\.\`) are refused.
+  - A `~` without a resolvable home is `KEY_PATH_RELATIVE` (`ValueError`) instead of an escaping `RuntimeError`.
+  - `profiles.rs` also refuses any key path that starts with two separators (UNC, `\\?\`, `\\?\UNC\`, `\\.\`), and
+    still refuses `~`. Python keeps accepting `~`, which the native side never sends.
+
+Deviations:
+- Rust coverage was added to the two existing tests the review named and to `profile_key_paths_must_be_absolute`,
+  not as new test functions, so `cargo test` still reports 48.
+- Python's key-path rule is `local_file`'s, so it also refuses DOS device names and a `:` after the drive. The Rust
+  rule refuses the double-separator prefix only (Windows file dialogs never produce the other forms).
+
+Actual verification (main venv with `PYTHONPATH` on the wt95 `src`; `tuning_factory.__file__` resolved into wt95;
+`CARGO_TARGET_DIR` on the main tree's target):
+- RED, before any source edit:
+  - Python: **17 failed**, each for its intended reason: the native contract (Rust still had 32 names), five
+    architecture cases, the endless-body redirect, both redirect refusals, the declared index size, both nested-JSON
+    cases (`RecursionError` escaped), four UNC/device key paths and the unresolvable home.
+  - The new `KeyError` snapshot case passed, because the catch already existed. It failed against the mutation that
+    removes `KeyError` from that catch.
+  - `cargo test`: **45 passed, 3 failed**: the closed list (32), the HF secret scope (`model_root_targets` not
+    allowed) and the UNC/device key paths.
+- GREEN:
+  - `cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release`: **48 passed**.
+    `git diff --exit-code desktop/src-tauri/Cargo.toml desktop/src-tauri/Cargo.lock` is clean.
+  - `test_hf_targets` (80), `test_workflow_planning`, `test_native_contract`, `test_model_artifacts` and
+    `test_desktop_projects`: **295 passed, 1 skipped**.
+  - Full suite: **1567 passed, 2 skipped** (1553 + 14). The known `test_jobs` flake did not occur.
+  - From `desktop/`: `npx playwright test` **81 passed**, and `npm run build` passes.
+  - Rebased onto `960c99e`: the same Python set **295 passed, 1 skipped**, the full suite **1571 passed,
+    2 skipped** (8.5's 1557 + 14), `cargo test` **48 passed**, Playwright **81 passed** and `npm run build` passes.
+  - Rebased onto `c2f1bbb` (the final tree): the same set plus `test_workflow_runs` **324 passed, 1 skipped**, the
+    full suite **1600 passed, 2 skipped** (9.3's 1586 + 14), `cargo test` **48 passed**, Playwright **81 passed**
+    and `npm run build` passes. On `9f2927d` (docs only, the final tree) the full suite again gave **1600 passed,
+    2 skipped**; `source_hash()` is unchanged, so the receipt below stands. The known `test_jobs` flake did not
+    occur in any run.
+  - Ruff is clean. `check_secrets.py` reports 0 findings with the change staged. Every changed file is CR-free.
+- CPU acceptance (`-I`, wt95's script and source) exited 0 and all **29** checks passed on each tree (on `02436c8`:
+  receipt `f8cc5d7a…6075`; on `960c99e`: `d0d077a1…a184`). On `c2f1bbb` (the same `src` as the final tree): receipt
+  SHA256 `caeb61307f2db610132722bf475ce2348018ff88a3c32776855b28c1f405cce6`
+  (`D:\llm-tuning-factory-wt95\.factory\model-ops-cpu-receipt.json`), source_sha256
+  `71c10d2190cd14371a411796a9b80ec83f2e0224d4b406fb7c0350781935e338` (equal to `source_hash()` of a `git archive`
+  export of the commit), lock_sha256 `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`. Max errors
+  are unchanged (merge delta 7.78e-9, materialize delta 9.17e-9, parent→child 6.42e-9, logits 3.35e-8/2.98e-8).
+  `model_downloaded`, `gpu_used`, `institution_data_used` and `production_promotable` are false. It supersedes 9.3's
+  `00d0043b…7f93`.
+
+Not verified or still open:
+- Real Hugging Face redirects, ranges and gated access are still exercised only with MockTransport. Closing an
+  unread redirect drops its connection, which is harmless but not measured.
+- No GUI screen calls `model_root_targets` yet (Task 10). No network, GPU, SSH, model download, MLflow, provider
+  call or institution data was used.
 
 ---
 

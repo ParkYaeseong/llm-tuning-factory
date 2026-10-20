@@ -1282,18 +1282,67 @@ def test_relative_key_paths_are_refused_before_hashing(tmp_path, monkeypatch, ke
                                                              for item in planned["issues"]], planned
 
 
+class KeyErrorHub(FakeHub):
+    """A config fetch that fails with a KeyError (``config=None`` below)."""
+
+    def respond(self, request):
+        if unquote(request.url.path).endswith("/config.json"):
+            raise KeyError("model_type")
+        return super().respond(request)
+
+
 @pytest.mark.parametrize("config, error", [
     (canonical({"model_type": "qwen2", "max_position_embeddings": "big"}), "TypeError"),
-    (canonical([{"model_type": "qwen2"}]), "AttributeError")])
+    (canonical([{"model_type": "qwen2"}]), "AttributeError"),
+    (None, "KeyError")])
 def test_snapshot_errors_stay_in_the_issue_envelope(tmp_path, monkeypatch, config, error):
     """Minor 3: unexpected metadata shapes are issues with the type name, never an escaping exception."""
     wp = planning()
     state = tmp_path / "state"
-    FakeHub(files={"config.json": config, **TOKENIZER}).install(monkeypatch)
+    if config is None:
+        KeyErrorHub().install(monkeypatch)
+    else:
+        FakeHub(files={"config.json": config, **TOKENIZER}).install(monkeypatch)
     result = run(state, "model_root_snapshot", {"repo_id": REPO, "revision": COMMIT, "download_approved": True},
                  secrets={"HF_TOKEN": HF_SECRET})
     assert desk.only_issue(result, "invalid", "snapshot_failed", "/repo_id")["message"] == error
     assert files(wp.root_snapshots_dir(state)) == [] and HF_SECRET not in json.dumps(result)
+
+
+@pytest.mark.parametrize("key", ["\\\\server\\share\\pod-key", "//server/share/pod-key",
+                                 "\\\\?\\C:\\keys\\pod-key", "\\\\.\\pipe\\pod-key"])
+def test_network_and_device_key_paths_are_refused(tmp_path, monkeypatch, key):
+    """9.7 review Minor 7: UNC and device key paths are network or device access (D12), refused like relative ones."""
+    wp = planning()
+    state = tmp_path / "state"
+    runpod = runpod_profile(tmp_path, ssh_key_file=key)
+    with pytest.raises(ValueError) as refused:
+        wp.check_key_paths(runpod["fields"])
+    assert str(refused.value) == wp.KEY_PATH_RELATIVE
+    inspected, fake = inspect(state, monkeypatch, runpod)
+    issue = desk.only_issue(inspected, "invalid", "executor_profile_invalid", "/profile_id")
+    assert issue["message"] == wp.KEY_PATH_RELATIVE and fake.calls == []
+    with pytest.raises(ValueError):
+        wp.check_key_paths(server_profile(server_ssh_key_file=key)["fields"])
+
+
+def test_an_unexpandable_home_in_a_key_path_is_an_issue(tmp_path, monkeypatch):
+    """9.7 review Minor 7: ``~`` without a resolvable home raised RuntimeError out of ``executor_profile_inspect``."""
+    import pathlib
+    wp = planning()
+    state = tmp_path / "state"
+    runpod = runpod_profile(tmp_path, ssh_key_file="~/.ssh/pod-key")
+
+    def no_home(self):
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(pathlib.Path, "expanduser", no_home)
+    with pytest.raises(ValueError) as refused:
+        wp.public_profile("pod-a", runpod["fields"])
+    assert str(refused.value) == wp.KEY_PATH_RELATIVE
+    inspected, fake = inspect(state, monkeypatch, runpod)
+    issue = desk.only_issue(inspected, "invalid", "executor_profile_invalid", "/profile_id")
+    assert issue["message"] == wp.KEY_PATH_RELATIVE and fake.calls == []
 
 
 @pytest.mark.parametrize("change", [{"semantic_model_kind": "reward_model"}, {"generation_mode": "sample"},

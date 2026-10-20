@@ -48,6 +48,7 @@ from .desktop_workflows import (
     invalid,
     issue,
     issues_from_validation,
+    local_file,
     ok,
     refusal,
     workflow_action,
@@ -162,7 +163,8 @@ ROOT_SNAPSHOT_CONFLICT = "이 모델 버전의 스냅샷 폴더가 이미 있지
 PLAN_UNKNOWN = "저장된 실행 계획을 찾을 수 없습니다. 다시 계획하세요."
 PLAN_STORED_DIFFERS = "같은 해시로 저장된 실행 계획 파일이 손상되었거나 바뀌었습니다."
 TRACKING_STORED_DIFFERS = "저장된 MLflow 공개 설정 파일이 손상되었거나 바뀌었습니다."
-KEY_PATH_RELATIVE = "SSH 키 파일은 이 PC의 절대 경로로 지정하세요. 상대 경로는 실행 위치에 따라 다른 파일을 가리킵니다."
+KEY_PATH_RELATIVE = ("SSH 키 파일은 이 PC의 로컬 절대 경로로 지정하세요. 상대 경로는 실행 위치에 따라 다른 파일을 가리키고, "
+                     "네트워크(UNC)·장치 경로는 쓸 수 없습니다.")
 REMOTE_COMMAND_FAILED = "서버 확인 명령이 실패했습니다. 서버에 직접 접속해 GPU와 python3 상태를 확인하세요."
 INSECURE_REDIRECT = "모델 파일 서버가 HTTPS가 아닌 주소로 연결을 넘겨 받지 않았습니다."
 
@@ -231,12 +233,18 @@ def profile_revision(profile_id: str, fields: Mapping[str, str]) -> str:
 
 
 def check_key_paths(fields: Mapping[str, str]) -> None:
-    """Key paths must be absolute (after ``~``): the D11 transport hashes hash the resolved path, so a relative one
-    would resolve against the working directory and the controller would refuse the pinned transport for good."""
+    """Key paths must be local absolute paths (after ``~``): the D11 transport hashes hash the resolved path, so a
+    relative one would resolve against the working directory and the controller would refuse the pinned transport
+    for good. UNC and device paths are refused as ``desktop_workflows.local_file`` refuses them (D12), and a ``~``
+    without a resolvable home is refused too, rather than raising RuntimeError."""
     for name in KEY_FILE_FIELDS:
         value = fields.get(name)
-        if isinstance(value, str) and value.strip() and not Path(value).expanduser().is_absolute():
-            raise ValueError(KEY_PATH_RELATIVE)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            local_file(str(Path(value).expanduser()) if value.startswith("~") else value)
+        except (ValueError, RuntimeError):
+            raise ValueError(KEY_PATH_RELATIVE) from None
 
 
 def public_profile(profile_id: str, fields: Mapping[str, str],

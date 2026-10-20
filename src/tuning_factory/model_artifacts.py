@@ -292,7 +292,7 @@ def _json(data):
     try:
         return json.loads(data, object_pairs_hook=_unique_object,
                           parse_constant=lambda value: (_ for _ in ()).throw(ValueError("nonfinite metadata")))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:   # deep nesting recurses in the decoder
         raise ValueError("invalid artifact JSON metadata") from exc
 
 
