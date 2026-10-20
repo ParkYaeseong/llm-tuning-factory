@@ -1,0 +1,37 @@
+/* Data import and split (10.3): the numbered steps from a local file to registered and split versions. */
+.import-fieldset{border:0;margin:0;padding:0;min-width:0}
+.import-field{display:flex;flex-direction:column;gap:6px;min-width:0}
+.import-field .issue-list{margin:4px 0 0}
+.import-path-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px 16px;align-items:start}
+.import-path-row .actions{margin:24px 0 0;flex-wrap:nowrap}
+.import-source-facts,.import-facts{margin:14px 0 0;font-size:11px;color:#5f6775;overflow-wrap:anywhere}
+.import-facts{margin:0 0 14px}
+.import-columns{gap:18px 24px}
+.import-columns .field>span small{font-size:10px;font-weight:450;color:#969daa;margin-left:4px}
+.import-columns .field>span small.import-required{color:#a25f54}
+.import-labels{margin-top:18px}
+.import-table{margin-top:22px}
+.import-table-title{margin:0 0 8px;font-size:11px;font-weight:550;color:#555d6b}
+.import-samples td{max-width:280px;overflow-wrap:anywhere;white-space:pre-wrap;vertical-align:top;padding:10px 12px}
+.import-samples th{padding:10px 12px}
+.import-samples td.import-row{color:#9aa2ae;font-variant-numeric:tabular-nums;white-space:nowrap;width:1%}
+.import-status{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:0 0 14px;font-size:11px;color:#5f6775}
+.import-stale{color:#8f6420}
+.import-issues li{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 8px}
+.import-issues details{flex-basis:100%}
+.import-issue-where{min-width:34px;font-weight:600;font-variant-numeric:tabular-nums}
+#import-register-actions{align-items:center}
+.import-triple{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px 24px}
+.import-split-grid{margin-top:18px}
+.import-split-state{margin-top:18px;padding-top:16px;border-top:1px solid #eff1f4}
+.import-split-state .actions{margin-top:12px;align-items:center}
+.import-counts{margin:0 0 6px;font-size:12px;font-weight:550;color:#343a45;font-variant-numeric:tabular-nums}
+.import-outputs{margin:0;padding:0 0 0 18px;font-size:11px;line-height:1.8;color:#5f6775;overflow-wrap:anywhere}
+.import-result{margin:18px 0 0;font-size:12px;color:#3f7a55;overflow-wrap:anywhere}
+.import-result p{margin:0 0 4px;color:inherit}
+.import-result:focus,.import-staged:focus{outline:none}
+.import-result:focus-visible,.import-staged:focus-visible{outline:2px solid #7d8ddd;outline-offset:3px}
+.import-staged{margin-top:18px}
+.import-staged>p{margin:0 0 8px;font-size:12px;color:#4b5361}
+.import-project b{font-weight:600}
+@media(max-width:1000px){.import-triple,.import-path-row{grid-template-columns:minmax(0,1fr)}.import-path-row .actions{margin:0}}

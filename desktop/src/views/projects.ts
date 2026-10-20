@@ -230,7 +230,7 @@ function bindings(ctx: ViewContext, spec: ProjectSpec, issues: WorkflowIssue[]) 
     ${issueList(issues)}
     <fieldset class="project-fieldset binding-add"${ctx.busy ? " disabled" : ""}><div class="grid">${datasetOptions(ctx)}
     ${select("데이터 역할", "binding_role", bindingDraft.role, ROLES).replace("<select ", '<select id="binding-role" ')}</div>
-    <div class="actions">${button("데이터 연결 추가", "wf:project:bind")}</div></fieldset>
+    <div class="actions">${button("데이터 연결 추가", "wf:project:bind")}${ctx.hasPage("data-import") && ctx.arg ? button("CSV·JSON 가져오기", `nav:data-import:${ctx.arg}`, "quiet") : ""}</div></fieldset>
     <p class="binding-note${bindingNote?.kind === "error" ? " error-text" : ""}" role="status" aria-live="polite">${bindingNote ? escapeHtml(bindingNote.text) : ""}</p></section>`;
 }
 

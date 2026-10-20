@@ -229,11 +229,24 @@ fn legacy_request(root: &Path, settings: Value, action: &str, data: Value) -> Va
     json!({"root": root.join("state"), "settings": settings, "action": action, "data": data})
 }
 
+// The legacy registration accepts JSON/JSONL; the mapped import (Task 10 D18) also accepts CSV.
+const DATASET_EXTENSIONS: &[&str] = &["json", "jsonl"];
+const IMPORT_EXTENSIONS: &[&str] = &["csv", "json", "jsonl"];
+
+/// The file dialog filter of a picker kind; every other kind (the SSH key file) is unfiltered.
+fn picker_filter(kind: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match kind {
+        "dataset" => Some(("학습 데이터", DATASET_EXTENSIONS)),
+        "import" => Some(("가져올 데이터", IMPORT_EXTENSIONS)),
+        _ => None,
+    }
+}
+
 #[tauri::command]
 async fn pick_file(kind: String) -> Result<Option<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut dialog = rfd::FileDialog::new();
-        if kind == "dataset" { dialog = dialog.add_filter("학습 데이터", &["json", "jsonl"]); }
+        if let Some((name, extensions)) = picker_filter(&kind) { dialog = dialog.add_filter(name, extensions); }
         dialog.pick_file().map(|p| p.to_string_lossy().into_owned())
     }).await.map_err(|_| "파일 선택 오류".into())
 }
@@ -613,6 +626,17 @@ mod tests {
             assert!(allowed(action), "{action} must be allowed");
         }
         for action in ["shell", "server_start", "server_stop", "ssh", "runtime_release_all"] { assert!(!allowed(action)); }
+    }
+    #[test]
+    fn import_picker_accepts_csv_json_and_jsonl() {
+        assert_eq!(picker_filter("import"), Some(("가져올 데이터", &["csv", "json", "jsonl"][..])));
+        // The legacy registration picker and the unfiltered key picker are unchanged.
+        assert_eq!(picker_filter("dataset"), Some(("학습 데이터", &["json", "jsonl"][..])));
+        for kind in ["key", "", "Import", "csv"] { assert_eq!(picker_filter(kind), None, "{kind:?}"); }
+        let source = include_str!("main.rs");
+        let command = &source[source.find("async fn pick_file(").unwrap()..];
+        let command = &command[..command.find("\n}\n").unwrap()];
+        assert!(command.contains("picker_filter(&kind)") && !command.contains("add_filter(\""), "{command}");
     }
     // Copied from allowed(): the legacy channel keeps exactly these 34 names.
     const LEGACY_ACTIONS: [&str; 34] = ["catalog", "save_profile", "dataset", "plan", "submit", "execute", "jobs", "logs",

@@ -4270,6 +4270,121 @@ Not verified or still open:
 - Real WebView2 timing (overlapping tasks, IME composition, touch): Task 11. Full renders during an IME composition
   (not patches) are not deferred.
 
+## Task 10.3 data import and split, 2026-10-21
+
+Commit `feat: map CSV and JSON columns and split datasets in the Windows workbench`, written in
+`D:\llm-tuning-factory-wt95` (branch `codex/task-10.3`) on `128f995` (9.8). It was rebased onto `4b4c194` (the
+9.6 review fixes, the 9.8 follow-ups and 10.4) and then onto `0a19c37` (the 10.2 review fixes). Only this file
+conflicted each time; every entry is kept, this one last. It implements the
+[Task 10 plan](superpowers/plans/2026-10-21-task10-workflow-workbench-ui.md) §4 "10.3" with D1–D5, D16 and D18.
+Changed: new `desktop/src/views/data-import.{ts,css}` and `desktop/tests/data-import.spec.ts`; modified
+`desktop/src-tauri/src/main.rs` (`pick_file` and one test), `desktop/src/views/projects.ts` (one link, see
+deviations) and this file. No Python, package, lock or Cargo file changed.
+
+What changed:
+- The `data-import` page (child of 데이터; `nav:data-import[:<projectId>]`) runs seven numbered steps; entering it calls
+  nothing.
+  - 1 원본 파일 (`data-tour="data-import"`, once): "파일 찾기" (`pick_file` kind `import`) or a typed path, then
+    "가져오기" → `dataset_import_source`. Refusals (`local_file_only`, `file_unreadable`, `size_limit`) show at the
+    path. The same click runs the column-discovery preview (`fields: {}`).
+  - 2 형식: format guessed from the extension; encoding (CP949 offered for CSV only and dropped on a switch to
+    JSON/JSONL); CSV delimiter; data kind.
+  - 3 열 연결: one select per canonical field of the kind (`CANONICAL_FIELDS`, required marked), filled from
+    `source_fields`; same-named columns are mapped on discovery; KTO true/false label sets (a one-sided set is
+    refused before any call); the first five source rows, escaped.
+  - 4 미리보기: a status line (passed, `문제 N건`, or "형식이/열 연결이 바뀌어 다시 미리보아야 합니다"); issues up to
+    50 ("외 N건") labelled "N행" (1-based, header excluded), "헤더" or "파일", in Korean with "원문 보기" (the codec
+    error shows the CP949 hint); the five canonical samples, escaped. A discovery preview lists only file-level issues.
+  - 5 등록: enabled only for a current preview with status `ok` and no issue; sends the previewed mapping and
+    `preview_sha256` with `synthetic`/`export_allowed` as booleans (default false). `version_exists` and
+    `practice_reserved` show under their field (the backend's Korean text for the second); `preview_changed` asks
+    for a new preview. Success shows `ID · vN · SHA256 8자` and reloads the catalog.
+  - 6 분할 (선택, after registration): whole percentages summing to 100 (`basisPoints`, else "합계가 100%가 되어야
+    합니다." with no call), seed 42, an optional group column from the registered import's source columns, output
+    IDs `<id>-train/-validation/-test` and version 1; a 0% role gets no output. `dataset_split_preview` shows
+    "학습 n · 검증 n · 시험 n"; "분할 등록" → `dataset_split_commit {plan_sha256}` for a current preview only, then
+    the catalog reloads.
+  - 7 프로젝트에 연결 (project context only): `store.open` (the latest saved revision; a dirty draft is kept), then
+    `store.edit` adds the split outputs by role, else the registered version as 학습, with `bindingIdFor` IDs; a
+    version already bound is not added again. The page lists "저장 전 연결: …"; saving stays on the project page
+    (no `project_save`).
+- Edits to the mapping, labels and split inputs patch only the derived regions (status line, register button, split
+  state), so typing, focus and Tab order are kept; format and kind changes re-render and keep the select focused.
+  Every step is a task (controls disabled while busy) and also refuses a programmatic submit while busy.
+- The shell rules of the 10.2 review fixes: `capture` skips controls locked while busy (a disabled fieldset), so
+  leaving the page during a step cannot undo its result. A step's result takes the focus only while the user is still
+  on the same page and project. No step navigates from inside its task.
+- The 데이터 page shows a slot card "열 연결해 가져오기 · CSV·JSON·JSONL" after the legacy registration card; the legacy
+  form, its anchors and button names are unchanged. The card holds one navigation button and no form control, and it
+  runs no task beside the legacy forms (which are never locked). Every import step runs on the `data-import` page.
+- Native (D18): `pick_file` uses a pure `picker_filter(kind)`: `import` → `csv`, `json`, `jsonl` ("가져올 데이터");
+  `dataset` → `json`, `jsonl` (unchanged); every other kind, including `key`, is unfiltered (unchanged).
+
+Deviations:
+- `views/projects.ts` (10.2's file) gained one button, "CSV·JSON 가져오기" → `nav:data-import:<projectId>`, in the
+  data-binding card, shown only when the `data-import` view exists. D1 says the page is reached "from a project" and
+  test 7 stages data for "the project that opened the import", but no sub-task owned that link. Without it the
+  project step cannot be reached in the UI.
+- Test 7 opens the import from that link instead of an arbitrary `nav:data-import:<id>`. The project was created by
+  a direct bridge call (another window), so the project page reads it; "프로젝트에 연결" then calls `project_get`
+  again through `store.open`, as the plan's test expects.
+- Thirteen Playwright tests plus the Rust test, not nine plus one. The extra four are:
+  - test 7b, a registered version without a split is staged as 학습;
+  - a KTO label test;
+  - a pure test of `CANONICAL_FIELDS`, `mappingFrom` and `basisPoints`, imported in the page;
+  - a test that leaving the page during a step keeps that step's result.
+
+  Test 9 also checks that typing in `#dataset-form` and `#s3-form` survives a round trip through the slot card. The
+  KTO and pure tests, and that test 9 check, were written after the code: they are characterization checks, not RED
+  first. Targeted mutants (below) fail the KTO and pure tests.
+- `ImportDraft` derives staleness from the previewed mapping (`previewSent`) instead of a `previewStale` flag, and
+  carries the source fields, issues and registration state. Exports `emptyDraft`, `emptySplit` and `guessFormat` are
+  extra. The split output version is editable ("분할 버전", default 1). Splitting a version registered earlier
+  elsewhere is not offered: the split source is the version registered on this page.
+
+Actual verification:
+- RED first: before any `src` change, all eleven first-written Playwright tests failed. Ten failed on the missing
+  slot button, page or project link; the pure test failed on the missing module. The Rust test failed to compile
+  (`cannot find function picker_filter`).
+- Mutants of `data-import.ts` and the project link, each run against the spec. Every one failed a test except two
+  equivalent mutants. Removing both layers of the busy guard together fails test 8. Sending `mappingFrom(draft)`
+  instead of the previewed mapping is equivalent, because registration requires them to be equal. The mutants were:
+  stale mapping, stale format, discovery rows, the busy guard, the percentage sum, booleans, the reload before
+  staging, the picker kind, cell escaping, CP949 for JSON, the zero-role output, duplicate staging, version focus,
+  split staleness, the row label, the catalog reload, the project link, the one-sided KTO set, typing without derived
+  refresh, dropped labels, and full re-render on edits.
+- After the rebase onto `0a19c37`, the leaving-the-page test failed first: the navigation's capture read the locked
+  split form back (`qa-train` instead of the new registration's `qa2-train`). Skipping locked controls fixed it.
+- Python, run from the root with the main venv and `PYTHONPATH` set to wt95's `src`:
+  - On `128f995`: **1706 passed, 1 skipped, 1 failed**. The failure was
+    `test_graph_controller.py::test_ambiguous_launch_waits_for_the_operator[False-desktop]`: a `PermissionError`
+    (WinError 5) renaming a file in its pytest temp directory while Playwright ran beside it. That file alone then gave
+    **65 passed**, so 1707 passed.
+  - On `4b4c194`: **1713 passed, 1 skipped**.
+  - On the final tree (`0a19c37` plus this commit, which changes no Python): **1715 passed, 1 skipped**, run alone.
+  - `tests/test_native_contract.py`: **7 passed** on each tree.
+- `cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` (target dir of the main
+  tree): **49 passed** (48 + 1) on each tree. `git diff --exit-code desktop/src-tauri/Cargo.toml
+  desktop/src-tauri/Cargo.lock` is clean.
+- Playwright from `desktop/`, against wt95's own Vite on port 1430. A scratch config under `%TEMP%` was used because
+  the stock config would reuse the main tree's 1420.
+  - `npx playwright test`: **124 passed** on `128f995` (112 + 12), **136 passed** on `4b4c194` (124 + 10.4's 12) and
+    **151 passed** on the final tree (the 10.2 review fixes' 138 + 13).
+  - The new spec passed three times in a row on the final tree.
+  - `npm run build` passes on each tree.
+- Ruff (`src tests`) passes. `check_secrets.py` reports 0 findings with the change staged. `git diff --exit-code`
+  against the base is clean for `src/`, `containers/`, `pyproject.toml`, `uv.lock`, `desktop/package.json` and
+  `desktop/package-lock.json`.
+- Every changed file is LF only.
+
+Not verified or still open:
+- Real WebView2 and the real Windows file dialog filter (`rfd`), a real sidecar import of a CP949 CSV, and focus
+  behaviour of native selects: Task 11. The 10.8 tutorial step for `data-import` is not added here.
+- The page keeps one import draft for the session. Opening the import from another project shows the same draft, and
+  "프로젝트에 연결" stages into the project named in the page argument and shown in the banner. Every pre-rebase
+  mutant was run on `128f995`; only the leaving-the-page test was added after the rebase.
+- No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
