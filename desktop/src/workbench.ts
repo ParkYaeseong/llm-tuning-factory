@@ -24,6 +24,14 @@ const paths: Record<string, string> = {
 export function icon(name: string, size = 16) {
   return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.file}</svg>`;
 }
+/** A labelled input. `label` and `help` are fixed markup (not escaped); the value is escaped. */
+export function field(label: string, key: string, value: unknown = "", type = "text", help = "") {
+  return `<label class="field"><span>${label}</span><input aria-label="${escapeHtml(label)}" data-key="${key}" type="${type}" value="${escapeHtml(value)}" ${type === "password" ? 'autocomplete="new-password"' : ""}>${help ? `<small>${help}</small>` : ""}</label>`;
+}
+/** A labelled select. `label` is fixed markup; option IDs and titles are escaped. */
+export function select(label: string, key: string, value: string, options: [string, string][]) {
+  return `<label class="field"><span>${label}</span><select aria-label="${escapeHtml(label)}" data-key="${key}">${options.map(([id, title]) => `<option value="${escapeHtml(id)}" ${id === String(value ?? "") ? "selected" : ""}>${escapeHtml(title)}</option>`).join("")}</select></label>`;
+}
 export const button = (label: string, action: string, cls = "", disabled = false) =>
   `<button type="button" class="${cls}" data-action="${escapeHtml(action)}"${disabled ? " disabled" : ""}>${label}</button>`;
 export function formatDate(seconds: unknown) {

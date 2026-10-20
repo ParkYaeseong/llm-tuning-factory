@@ -3414,6 +3414,70 @@ Not verified or still open:
 - Legacy `recover` still fails stale graph jobs too (Q-K; Task 9.8 adds the test).
 - No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
 
+## Task 10.2 projects and recipes, 2026-10-21
+
+Commit `feat: create projects and reusable recipes from the Windows workbench`, written in the main tree on `6c4b877`.
+It implements [Task 10 plan](superpowers/plans/2026-10-21-task10-workflow-workbench-ui.md) §4 "10.2" with D1, D3–D5
+and D17. Changed: new `desktop/src/views/{projects,recipes}.{ts,css}`, `desktop/src/components/recipe-fields.ts`,
+`desktop/tests/{projects,recipes}.spec.ts`; modified `desktop/src/main.ts` (the recipe-field functions only),
+`desktop/src/workbench.ts` (`field`/`select` moved in), `desktop/tests/navigation.spec.ts` (two assertions, see
+deviations) and this file. No Python, Rust, package or lock file changed.
+
+What changed:
+- Projects. The overview's first panel "빈 프로젝트 만들기" (`data-tour="project-start"`, once) creates a project
+  from a free name (required) with optional purpose and task type. The `request_id` is reused on a retry until those
+  values change. The 프로젝트 page lists projects (`projects_list` on entering), offers the same form and "기존 학습
+  설정 가져오기" (`project_import_legacy` per saved legacy profile; warnings and the created recipe's revision are
+  shown on the project page, by hash). The project page edits name, purpose, task type and the default executor
+  profile (from `executor_profiles_get`, optional). Data bindings choose registered catalog versions, take their ID
+  from `bindingIdFor`, refuse a version that is already bound and mark `tutorial_sample` "연습 데이터 · 실제 실행
+  불가"; removal is refused while a graph card uses the binding. Saving is explicit ("저장", also Enter); a
+  `revision_conflict` keeps the draft and offers "최신 버전 불러오기" and "내 변경으로 덮어쓰기", each behind a
+  confirm dialog (D5). Nothing runs at boot; a project just created or imported is not re-read on opening.
+- Recipes. The 레시피 page lists recipes and offers 새 레시피, 열기, 복제 (`recipe_clone` with the shown revision and
+  "… 복사본") and "예제에서 만들기". `recipeFromTemplate` copies stage, method, quantization, hyperparameters,
+  fine-tuning options, stage options without the reward binding and evaluation defaults without the dataset; never
+  the AI or workflow ID, data, base model, revisions, template or resources. Saving uses CAS (`expected_revision`
+  null for a new recipe); a replaced revision calls `store.markRecipeChanged`. Issues show under their field (with
+  `aria-invalid`) or in the form summary, in Korean with "원문 보기"; a conflict keeps the draft with the D5 choices.
+  Drafts stay in memory per recipe.
+- D17. `components/recipe-fields.ts` holds `stageSelect`, `methodSelect`, `trainingOptions`, `readFields` and
+  `inputKindFor`, parameterized by `data-config`/`data-recipe` and a value getter; recipe mode omits the three PPO
+  reward fields. The training page calls it through `configSource`; `field`/`select` live in `workbench.ts`.
+
+Deviations:
+- `tests/navigation.spec.ts` test 8 (a 10.1 test) was edited with root's approval: the sidebar labels are checked as
+  D1-ordered (each present label at its D1 position) instead of the exact seven legacy labels, and the overview's
+  primary is "새 프로젝트" → `nav:projects`. Both old assertions encoded "no workflow view exists"; the rest of the
+  test is unchanged.
+- Fifteen tests, not fourteen: test 15 checks that a retried `project_create` reuses its `request_id` and a changed
+  name gets a new one (the plan's implementation note).
+- `RecipeFieldContext` has an optional `decorate(path, html)` hook (recipe mode puts issues under fields); the training
+  form never sets it. `captureConfig` in `main.ts` was left as it is; `readFields` repeats its rules for recipes.
+- 9.8's `recipe_get` by `revision_sha256` is not used: pinned revisions are shown by hash (the import note).
+
+Actual verification:
+- The characterization test (`recipes.spec.ts` test 1: the ordered `[data-config]` controls, flags and labels for
+  sft/lora, dpo/freeze with SimPO, kto/qlora and ppo/oft) was written first and passed on `6c4b877` before any `src`
+  edit. Tests 2–14 then failed on the missing overview panel and sidebar entries (13 failed, 1 passed).
+- The training page's `#app .content` HTML was captured for six stage/method combinations before the extraction and
+  compared after it (and again with the views present): byte-identical. Changing one field's flag in
+  `recipe-fields.ts` makes test 1 fail.
+- Eleven mutations of the new views (request-ID reuse, the busy submit guard, focus after save, the re-read skip, the
+  duplicate-binding refusal, recipe CAS, recipe-mode reward fields, template dataset stripping, issue routing,
+  conflict draft keeping, overwrite against the latest revision) each made its test fail.
+- From `desktop/`: `npx playwright test` **106 passed** (91 existing, of which `navigation.spec.ts` test 8 has the two
+  edited assertions, plus 15 new); `npm run build` passes.
+- From the root: `uv run pytest -q` **1648 passed, 1 skipped** (no Python change; same as `6c4b877`); `uv run ruff
+  check src tests` passes; `scripts/check_secrets.py` reports 0 findings with the change staged; `git diff
+  --exit-code src/ desktop/src-tauri/ containers/ pyproject.toml uv.lock desktop/package.json
+  desktop/package-lock.json` is clean; every changed file is CR-free.
+
+Not verified or still open:
+- Real WebView2 (dialogs, focus, the views in the `import.meta.glob` bundle) and a real sidecar: Task 11.
+- Deleting projects or recipes has no action; graph editing (10.5) and data import (10.3) are separate sub-tasks.
+- No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

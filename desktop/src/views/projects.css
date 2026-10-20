@@ -1,0 +1,28 @@
+/* Projects (10.2): the overview's blank-project panel, the project list and one project's page. */
+.project-fieldset{border:0;margin:0;padding:0;min-width:0}
+.project-wide{grid-column:1/-1}
+.project-field{display:flex;flex-direction:column;gap:8px;min-width:0}
+.project-field>small{font-size:10px;line-height:1.65}
+.project-field .issue-list,.project-wide .issue-list{margin:0}
+.project-create .actions{margin-top:16px}
+.project-create textarea,.project-form textarea{resize:vertical;min-height:72px;line-height:1.6}
+.project-create textarea:focus-visible,.project-form textarea:focus-visible{outline:2px solid #7d8ddd;outline-offset:3px}
+.project-create textarea:hover,.project-form textarea:hover{border-color:#cbd0db}
+.project-start-body{padding:4px 18px 18px}
+.project-start-body>.muted{margin:10px 0 16px}
+.project-start .grid{gap:16px 20px}
+.projects-page{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(300px,1fr);gap:20px;align-items:start}
+.projects-page td small{display:block;color:#8a919d;font-size:10px;margin-top:3px;overflow-wrap:anywhere}
+.projects-side{min-width:0}
+.legacy-import td small{display:block;color:#8a919d;font-size:10px;margin-top:3px}
+.binding-table td small{display:block;color:#986b2c;font-size:10px;margin-top:3px}
+.binding-add{margin-top:18px}
+.binding-add .actions{margin-top:14px}
+.binding-note{min-height:18px;margin:12px 0 0;font-size:11px;color:#5f6775}
+.import-note p{margin:4px 0 6px}
+.import-note .issue-list{color:#7c5a1f;margin:6px 0 0}
+.project-banner small{display:block;font-size:10px;color:inherit;opacity:.8}
+.project-summary{margin:0 0 6px}
+.project-actions{align-items:center;margin:4px 0 24px}
+.project-actions .muted{margin-left:4px}
+@media(max-width:1150px){.projects-page{grid-template-columns:minmax(0,1fr)}}

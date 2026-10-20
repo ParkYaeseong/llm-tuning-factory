@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { version } from "../package.json";
-import { button, filterRuns, focusKey, formatDate, icon, isGraphJob, progressView, restoreFocus } from "./workbench";
+import { button, field, filterRuns, focusKey, formatDate, icon, isGraphJob, progressView, restoreFocus, select } from "./workbench";
+import { methodSelect, sourceField, sourceSelect, stageSelect, trainingOptions, type FieldSource, type RecipeFieldContext } from "./components/recipe-fields";
 import { planning as planningApi, projects as projectApi } from "./api";
 import { NAV_GROUPS, navModel, type NavItem } from "./nav-model";
 import { createProjectStore } from "./project-store";
@@ -74,12 +75,6 @@ const descriptions: Obj = {
   history: "같은 기준으로 실험을 살펴보고 다음 학습을 결정하세요.",
 };
 const taskNames: Obj = { paper_extraction: "논문 정보 추출", labnote_generation: "실험노트 생성", workflow_classification: "업무 분류" };
-function field(label: string, key: string, value: unknown = "", type = "text", help = "") {
-  return `<label class="field"><span>${label}</span><input aria-label="${esc(label)}" data-key="${key}" type="${type}" value="${esc(value)}" ${type === "password" ? 'autocomplete="new-password"' : ""}>${help ? `<small>${help}</small>` : ""}</label>`;
-}
-function select(label: string, key: string, value: string, options: [string, string][]) {
-  return `<label class="field"><span>${label}</span><select aria-label="${esc(label)}" data-key="${key}">${options.map(([id, title]) => `<option value="${esc(id)}" ${id === String(value ?? "") ? "selected" : ""}>${esc(title)}</option>`).join("")}</select></label>`;
-}
 async function api(action: string, data: Obj = {}) {
   return invoke<any>("factory_action", { action, data });
 }
@@ -147,33 +142,16 @@ function captureConfig() {
     target[parts.at(-1)!] = el instanceof HTMLInputElement && el.type === "checkbox" ? el.checked : el.value === "" && el.dataset.optional ? null : el.dataset.number ? Number(el.value) : el.value;
   });
 }
-function configField(label: string, path: string, type = "text", help = "") {
-  let v = state.config; for (const p of path.split(".")) v = v?.[p];
-  return field(label, path, v, type, help).replace('data-key=', 'data-config=')
-    .replace("<input ", `<input ${type === "number" ? 'data-number="true" step="any" ' : ""}`);
-}
-function configSelect(label: string, path: string, options: [string, string][]) {
-  let v = state.config; for (const p of path.split(".")) v = v?.[p];
-  return select(label, path, v, options).replace("data-key=", "data-config=");
-}
+// The training form's fields come from the shared recipe fields (D17), reading the single-job config.
+const configSource: FieldSource = { attr: "data-config", value(path) { let v = state.config; for (const p of path.split(".")) v = v?.[p]; return v; } };
+const trainingFields = (): RecipeFieldContext => ({ ...configSource, stages: state.catalog.training_stages || [], capabilities: state.capabilities, recipeMode: false });
+const configField = (label: string, path: string, type = "text", help = "") => sourceField(configSource, label, path, type, help);
+const configSelect = (label: string, path: string, options: [string, string][]) => sourceSelect(configSource, label, path, options);
 function modelMetadataView() {
   const metadata = state.modelMetadata;
   const c = state.config;
   if (!metadata || metadata.model !== c.base_model || metadata.model_revision !== c.model_revision || metadata.tokenizer_revision !== c.tokenizer_revision) return "";
   return `<div class="model-metadata compatibility"><h3>고정 버전 메타데이터 · ${metadata.metadata_verified ? "확인됨" : "확인 필요"}</h3><p>아키텍처 ${esc(metadata.architecture || "확인 필요")} · 레이어 ${num(metadata.hidden_layers)} · 권장 정밀도 ${esc(metadata.recommended_precision || "확인 필요")}</p>${typeof metadata.max_length === "number" ? `<p>모델 최대 길이 ${num(metadata.max_length)} 토큰 · 현재 설정을 자동으로 변경하지 않습니다.</p>` : ""}<small>설정은 직접 조정하고 호환성 검사 결과를 확인하세요.</small></div>`;
-}
-function methodSelect() {
-  const methods = [["lora", "LoRA"], ["qlora", "QLoRA · 양자화 LoRA"], ["full", "Full · 전체 갱신"], ["freeze", "Freeze · 일부 레이어"], ["oft", "OFT"]];
-  const supported = state.capabilities?.methods;
-  return `<label class="field"><span>학습 방법</span><select aria-label="학습 방법" data-config="training_method">${methods.map(([id, name]) => `<option value="${id}" ${state.config.training_method === id ? "selected" : ""} ${supported && !supported.includes(id) ? "disabled" : ""}>${name}${supported && !supported.includes(id) ? " · 현재 단계 미지원" : ""}</option>`).join("")}</select></label>`;
-}
-function configCheck(label: string, path: string) {
-  let v = state.config; for (const p of path.split(".")) v = v?.[p];
-  return `<label class="check"><input type="checkbox" data-config="${path}" ${v ? "checked" : ""}>${label}</label>`;
-}
-function stageSelect() {
-  const supported = state.capabilities?.supported_stages;
-  return `<label class="field"><span>학습 단계</span><select aria-label="학습 단계" data-config="training_stage">${(state.catalog.training_stages || []).map((stage: Obj) => `<option value="${esc(stage.id)}" ${state.config.training_stage === stage.id ? "selected" : ""} ${supported && !supported.includes(stage.id) ? "disabled" : ""}>${esc(stage.label)}${supported && !supported.includes(stage.id) ? " · 이 모델 미지원" : ""}</option>`).join("")}</select></label>`;
 }
 function modelHubView() {
   const d = state.hubDraft, inspected = state.hubInspection;
@@ -181,9 +159,6 @@ function modelHubView() {
   <form id="hub-form"><div class="grid">${field("HF 모델 검색", "query", d.query)}${select("검색 정렬", "sort", d.sort, [["downloads", "다운로드 순"], ["lastModified", "최신 업데이트 순"]])}${field("직접 입력할 모델 ID", "model", d.model, "text", "예: Qwen/Qwen3.5-0.8B")}</div><div class="actions">${button("모델 검색", "hub-search")}${button("입력한 ID 확인", "hub-inspect")}</div></form>
   ${state.hubModels.length ? `<div class="table-scroll"><table><thead><tr><th>모델</th><th>종류</th><th>다운로드</th><th>추가</th></tr></thead><tbody>${state.hubModels.map((model: Obj, index: number) => `<tr><td>${esc(model.id)}<small>${esc(model.last_modified || "")}</small></td><td>${esc(model.pipeline_tag || "확인 필요")}</td><td>${num(model.downloads)}</td><td>${button("확인", "hub-inspect:" + index)}</td></tr>`).join("")}</tbody></table></div>` : ""}
   ${inspected ? `<div class="compatibility ${inspected.supported ? "" : "error"}"><h3>모델 확인 · ${esc(inspected.repo_id)}</h3><p>구조 ${esc(inspected.architecture || "확인 불가")} · 템플릿 ${esc(inspected.template || "확인 필요")}</p><small class="mono">${esc(inspected.revision)}</small><p>${inspected.supported ? "현재 엔진에서 설정 가능한 구조입니다. 실제 GPU 검증은 별도이며 텍스트 데이터만 지원합니다." : esc((inspected.reasons || []).join(" · "))}</p><button type="button" data-action="hub-import" class="primary" ${inspected.supported ? "" : "disabled"}>이 모델 추가·선택</button></div>` : ""}</section>`;
-}
-function optionalConfigField(label: string, path: string, type = "text", help = "") {
-  return configField(label, path, type, help).replace("<input ", '<input data-optional="true" ');
 }
 function normalizeConfig() {
   if (!state.config) return;
@@ -259,29 +234,6 @@ function s3Datasets() {
   <label class="check"><input name="synthetic" type="checkbox" ${d.synthetic ? "checked" : ""}> 가져올 파일은 더미·합성 데이터입니다</label>
   <label class="check"><input name="export_allowed" type="checkbox" ${d.export_allowed ? "checked" : ""}> 등록한 사본을 선택한 GPU로 전송할 수 있습니다</label>
   <div class="actions"><button type="button" data-action="s3-import" class="primary" ${!object ? "disabled" : ""}>S3에서 PC로 가져오기</button></div><p class="muted">가져오기 동의와 RunPod 학습 전송 동의는 별도입니다. 여기서는 GPU를 사용하지 않습니다.</p></form></section>`;
-}
-function trainingOptions() {
-  const c = state.config;
-  const stage = c.training_stage;
-  const method = c.training_method;
-  const options = c.stage_options;
-  let fields = "";
-  if (["dpo", "kto"].includes(stage)) {
-    if (stage === "dpo") fields += configSelect("선호 학습 loss", "stage_options.pref_loss", [["sigmoid", "DPO · sigmoid"], ["hinge", "Hinge"], ["ipo", "IPO"], ["kto_pair", "KTO pair"], ["orpo", "ORPO"], ["simpo", "SimPO"]]);
-    fields += configField("선호 학습 beta", "stage_options.pref_beta", "number");
-    if (stage === "dpo") fields += configField("SFT 보조 loss 비중", "stage_options.pref_ftx", "number") + configField("DPO label smoothing", "stage_options.dpo_label_smoothing", "number") + configField("BCO 가중치", "stage_options.pref_bco_weight", "number");
-    if (stage === "dpo" && options.pref_loss === "simpo") fields += configField("SimPO gamma", "stage_options.simpo_gamma", "number");
-    if (stage === "kto") fields += configField("Chosen 가중치", "stage_options.kto_chosen_weight", "number") + configField("Rejected 가중치", "stage_options.kto_rejected_weight", "number");
-  }
-  if (stage === "ppo") fields += optionalConfigField("보상 모델 원격 경로", "stage_options.reward_model", "text", "GPU에 관리자가 미리 준비한 보상 모델의 절대 경로입니다.") + configSelect("보상 모델 종류", "stage_options.reward_model_type", [["lora", "LoRA 어댑터"], ["full", "전체 모델"]]) + optionalConfigField("보상 모델 SHA256", "stage_options.reward_model_sha256", "text", "관리자가 제공한 파일 목록 {상대경로: SHA256}의 정규 JSON SHA256을 입력하세요.") + configField("PPO buffer size", "stage_options.ppo_buffer_size", "number") + configField("PPO epoch", "stage_options.ppo_epochs", "number") + configField("PPO KL target", "stage_options.ppo_target", "number");
-  let methods = "";
-  if (["lora", "qlora"].includes(method)) {
-    methods += configField("LoRA rank", "hyperparameters.lora_rank", "number") + configSelect("LoRA 대상", "hyperparameters.lora_target", [["all", "전체"], ["q_proj,v_proj", "q_proj · v_proj"]]) + optionalConfigField("LoRA alpha · 비우면 자동", "finetuning_options.lora_alpha", "number") + configField("LoRA dropout", "finetuning_options.lora_dropout", "number") + optionalConfigField("LoRA+ 학습률 비율 · 선택", "finetuning_options.loraplus_lr_ratio", "number") + configField("LoRA+ embedding 학습률", "finetuning_options.loraplus_lr_embedding", "number") + configField("PiSSA 초기화 반복 수", "finetuning_options.pissa_iter", "number");
-    if (method === "qlora") methods += configSelect("양자화 비트", "quantization_bit", (state.capabilities?.quantization_bits || [4, 8]).map((bit: number) => [String(bit), `${bit}-bit · bitsandbytes`])).replace('<select ', '<select data-number="true" ');
-  }
-  if (method === "freeze") methods += configField("학습할 레이어 수", "finetuning_options.freeze_trainable_layers", "number") + configSelect("학습할 모듈", "finetuning_options.freeze_trainable_modules", [["all", "전체"], ["self_attn", "Attention"], ["mlp", "MLP"], ["self_attn,mlp", "Attention + MLP"]]) + configSelect("추가 학습 모듈 · 선택", "finetuning_options.freeze_extra_modules", [["", "추가 없음"], ["embed_tokens", "Embedding"], ["lm_head", "LM head"], ["norm", "Normalization"], ["embed_tokens,lm_head", "Embedding + LM head"]]).replace("<select ", '<select data-optional="true" ');
-  if (method === "oft") methods += configField("OFT rank", "finetuning_options.oft_rank", "number") + configField("OFT block size", "finetuning_options.oft_block_size", "number") + configSelect("OFT 대상", "finetuning_options.oft_target", [["all", "전체"], ["q_proj,v_proj", "q_proj · v_proj"]]) + configField("OFT module dropout", "finetuning_options.module_dropout", "number");
-  return `${fields ? `<section class="card"><h3>학습 단계별 설정</h3><div class="grid">${fields}</div>${stage === "ppo" ? configCheck("PPO score normalization", "stage_options.ppo_score_norm") + configCheck("PPO reward whitening", "stage_options.ppo_whiten_rewards") : ""}</section>` : ""}${methods ? `<section class="card"><h3>파라미터 갱신 설정</h3><div class="grid">${methods}</div>${["lora", "qlora"].includes(method) ? configCheck("rsLoRA 사용", "finetuning_options.use_rslora") + configCheck("DoRA 사용", "finetuning_options.use_dora") + configCheck("PiSSA 초기화", "finetuning_options.pissa_init") + configCheck("PiSSA 변환 저장", "finetuning_options.pissa_convert") : ""}</section>` : ""}`;
 }
 async function approve(title: string, body: string): Promise<boolean> {
   const dialog = document.createElement("dialog");
@@ -410,8 +362,8 @@ function training() {
   ${configSelect("평가 방식", "evaluation_profile.kind", [["pipeline", "학습 완료 확인"], ["json", "JSON 형식"], ["classification", "분류"], ["extraction", "정보 추출"], ["kbf_extraction", "KBF 추출"], ["reward", "보상 점수 · RM"]])}
   </div></section><section class="card"><h3>모델과 학습</h3><div class="grid">
   ${configSelect("기반 모델", "base_model", (state.catalog.models || []).map((model: Obj) => [model.id, model.id + (model.gpu_verified ? " · GPU 검증 이력" : "")]))}
-  ${stageSelect()}
-  ${methodSelect()}
+  ${stageSelect(trainingFields())}
+  ${methodSelect(trainingFields())}
   ${configField("학습 횟수 (epoch)", "hyperparameters.num_train_epochs", "number")}
   ${configField("학습률", "hyperparameters.learning_rate", "number")}
   ${configField("배치 크기", "hyperparameters.per_device_train_batch_size", "number")}
@@ -428,7 +380,7 @@ function training() {
   ${configField("체크포인트 보관 수", "hyperparameters.save_total_limit", "number")}
   ${configField("검증 최대 건수", "evaluation_profile.max_samples", "number")}
   ${configField("답변 최대 토큰", "evaluation_profile.max_new_tokens", "number")}
-  </div></details></section>${trainingOptions()}<section class="card"><h3>GPU와 실행 한도</h3><div class="grid">
+  </div></details></section>${trainingOptions(trainingFields())}<section class="card"><h3>GPU와 실행 한도</h3><div class="grid">
   ${configField("GPU 종류 · 연결 설정에서 가져오기", "resource_profile.gpu_type")}
   ${configField("GPU 수", "resource_profile.gpu_count", "number")}
   ${configField("GPU 한 개당 시간 요금 (USD)", "resource_profile.hourly_cost_usd", "number")}

@@ -11,13 +11,16 @@ test("legacy navigation, labels and anchors stay while no workflow call runs at 
     await expect(sidebar.getByRole("button", { name, exact: true })).toHaveCount(1);
   // D1: the single-job pages get their own group; the group labels are plain text, not buttons or headings.
   await expect(sidebar.locator(".nav-label")).toHaveText(["워크스페이스", "단일 학습", "설정"]);
-  expect(await sidebar.locator("nav button").evaluateAll(buttons => buttons.map(button => button.getAttribute("aria-label"))))
-    .toEqual(["작업 공간", "데이터", "기록 비교", "학습 설정", "실행 관리", "연결 설정", "튜토리얼"]);
+  // Every sidebar item sits at its D1 position; workflow views (프로젝트, 레시피, later 그래프 실행, 실행 프로필) slot in.
+  const D1 = ["작업 공간", "프로젝트", "데이터", "레시피", "그래프 실행", "기록 비교", "학습 설정", "실행 관리", "연결 설정", "실행 프로필", "튜토리얼"];
+  const labels = await sidebar.locator("nav button").evaluateAll(buttons => buttons.map(button => button.getAttribute("aria-label")!));
+  expect(labels).toEqual(D1.filter(label => labels.includes(label)));
+  expect(labels).toEqual(expect.arrayContaining(["작업 공간", "프로젝트", "데이터", "레시피", "기록 비교", "학습 설정", "실행 관리", "연결 설정", "튜토리얼"]));
   await expect(page.locator(".sidebar-foot small")).toHaveCount(1);
   await expect(page.locator(".sidebar-foot b")).toHaveText(HOSTILE);
-  // D19 wording on the fixed headings; the header keeps "새 학습" while no project view exists.
+  // D19 wording on the fixed headings; with the projects view the header's primary action starts a project (D1).
   await expect(page.getByRole("heading", { name: "예제 시작점 · 선택", exact: true })).toBeVisible();
-  await expect(page.locator(".page-heading").getByRole("button", { name: "새 학습" })).toHaveCount(1);
+  await expect(page.locator(".page-heading").getByRole("button", { name: "새 프로젝트" })).toHaveAttribute("data-action", "nav:projects");
   await expect(page.locator('#app [data-tour="overview-setup"]')).toHaveCount(1);
   for (const [nav, anchors] of [["datasets", ["dataset-form", "dataset-submit"]], ["training", ["train-dataset", "training-plan"]],
     ["jobs", ["jobs-list"]], ["history", []], ["connections", ["connection-provider", "connection-fields", "connection-runtime"]]] as const) {
