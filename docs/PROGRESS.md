@@ -946,8 +946,9 @@ CPU and with fakes:
   (Windows name aliases and uploaded-input protection on download) it was `a9bece24…e45d` (source `247003f6…6c7f`).
   After the 8.3 short-name follow-up it was `97fa2c89…df3b` (source `0ae3419b…b67a`). After the 7.5 review fixes
   it was `042bf8fe…9c0b` (source `6b57e120…9b5f`). After Task 8.1 it was `5cc24562…63be` (source
-  `0d405733…373a`). After Task 8.2, the current receipt is `26a68aee…a117` (29/29 checks, source `58adcdc8…ec17`;
-  see "Task 8.2 readiness, outcomes, failure propagation and safe release").
+  `0d405733…373a`). After Task 8.2 it was `26a68aee…a117` (source `58adcdc8…ec17`). After Task 8.3, the current
+  receipt is `1ddbabdc…6ceb` (29/29 checks, source `eed26807…fc54`; see "Task 8.3 tracking outbox and MLflow
+  repair").
 
 Not verified (needs explicit GPU/host authorization):
 - Any real GPU or host.
@@ -1257,7 +1258,9 @@ Fixes from the independent review of `ac2209c` (8.1):
   opens, and the run can still be paused and canceled. Test:
   `test_migration_reserves_an_unpriceable_attempt_without_failing_the_store` (two cases).
 - M4: a FAILED attempt with `launch_started=0` that still holds its lock can only come from a stale `JobStore.recover`
-  of an attempt that the launch gate refused, since it has no heartbeat before `begin_launch`. `failure_kind` reports
+  of an attempt whose `begin_launch` never committed: one the launch gate refused (it has no heartbeat before
+  `begin_launch`), a crash before `begin_launch` followed by a global recover, or a recover racing the runner's
+  pre-launch checks. All of them provably never ran (corrected in 8.3 after the 8.2 review, M-6). `failure_kind` reports
   `refused_before_launch`, as the plan's order says. `classify_attempt` makes it uncounted, voids its reservation,
   releases the lock and makes the node retryable at once: `begin_launch` never committed, and cannot commit now
   that the job is FAILED.
@@ -1347,7 +1350,9 @@ Not verified or still open:
   - Stale unstarted PROVISIONING attempts: `takeover_attempt` + `return_unlaunched`. Started ones:
     `release_uncontacted`.
   - Use `prepare_ready(lease, node_ids=…)` only. The `None` path records errors on unready nodes.
-  - A select whose winner artifact fails verification stays PROVISIONING with its `local:` lock.
+  - ~~A select whose winner artifact fails verification stays PROVISIONING with its `local:` lock.~~ Superseded
+    by 8.3 (8.2 review I-3): returning it would loop uncounted, so `complete_local_selection` now settles the
+    refusal itself (counted, terminal `refused_before_launch`; a cancel still wins first).
     `complete_local_selection` raises before its transaction; the controller must fail or return it.
   - Install `LedgerBindingResolver` on the trusted path.
 - M3 (review note for 8.5): owner fencing still applies only when a run lease is replaced. 8.5 should `LEFT JOIN
@@ -1357,11 +1362,249 @@ Not verified or still open:
   refuses a claim. An unpriced backfilled attempt already names itself (`UNPRICED_ATTEMPT`).
 - The simulated dispatcher (8.4) must write `remote-attempt.json`, or an equivalent record, before it acts. Otherwise
   `release_uncontacted` treats a simulated attempt as uncontacted.
-- The compiler accepts only one selection parent with failed evaluations per node. Two selection parents with
-  failures would refuse at compile (`unrequested failed evaluation parent`) and fail the node.
+- ~~The compiler accepts only one selection parent with failed evaluations per node. Two selection parents with
+  failures would refuse at compile (`unrequested failed evaluation parent`) and fail the node.~~ Corrected by the
+  8.2 review (I-1): this understated it. A node with two or more selection parents failed if **any one** of them had
+  a failed evaluation, because every parent was recompiled with the merged list. Fixed in 8.3.
 - A stale-recovered unlaunched attempt that a deterministic runner check would also refuse is retried once,
   uncounted. Its next refusal is counted and terminal, so retries stay bounded.
 - Multi-process contention is untested.
+
+## Task 8.3 tracking outbox and MLflow repair, 2026-10-20
+
+Commit `feat: repair MLflow tracking through an idempotent outbox`, on `dfac977`. It implements plan §4 "8.3" and §6
+(decisions D1–D14 as accepted; D5, D6, D7, D10 and D11 here) and folds in the fixes from the independent review of
+`dfac977` (8.2), listed separately below.
+
+What changed:
+- New `tracking_outbox.py`:
+  - `TrackingEvent` (kinds `graph_run`, `node_run`, `attempt_run`, `attempt_evidence`, `model_registration`,
+    `graph_summary`). `event_id = sha256(canonical({kind, key}))`. Keys must match
+    `[A-Za-z0-9][A-Za-z0-9_.:-]{0,249}`, so no quote can reach an MLflow filter string.
+  - Additive table `tracking_events` plus the index `tracking_events_due`, exactly as in §6, created by the
+    `GraphStore` migration. The pre-8.3 `tracking_outbox` table stays the per-attempt gate.
+  - `enqueue_event(db, event, now)`: one row per key. Reusing a key with anything else different raises
+    `tracking idempotency key reused with different payload`. A missing parent raises `tracking parent event is
+    missing`.
+  - `TrackingOutbox(store, *, clock, policy, claim_ttl_seconds=600)`:
+    - `claim_pending(owner_lease)`: fenced by the owner lease and a claim token. A child is claimable only once
+      its parent is ACKNOWLEDGED; a graph summary waits until no other event of its run is PENDING.
+    - `record_intent`, `record_receipt`, `retry` and `defer`. Each refuses a token another owner has replaced
+      (`stale tracking claim`).
+    - `rearm` (FAILED/UNCERTAIN → PENDING, tries=0, intent kept), `backfill(owner_lease)` and
+      `status(run_id)`.
+  - `TrackingPublisher(outbox, store, tracker, *, local_sink)`, `LocalEvidenceSink(state_root)` and `redact`.
+- Enqueue points, each inside the ledger transaction it describes (graph_store.py):
+
+  | Method | Events |
+  |---|---|
+  | `submit` | `graph:{run}` |
+  | `claim_ready` | `node:{run}:{node}` |
+  | `record_outputs` | `attempt:{a}`, `evidence:{a}` and, for a real eligible train/merge/materialize model, `register:{artifact}:{inventory}:{a}` |
+  | `complete_local_selection` | `attempt:{a}` and `evidence:{a}` (a selection registers nothing) |
+  | `classify_attempt` | `attempt:{a}` and `evidence:{a}`, with the disposition and the redacted ledger error |
+  | `finalize_run` | `graph-summary:{run}:{final}`, once |
+
+  Each point enqueues its ancestors idempotently, with identical payloads, so a run submitted before 8.3 gains its
+  graph and node events on its next claim or record.
+- The gate (D5): acknowledging an `attempt_evidence` event sets `tracking_outbox.acknowledged=1` in the same
+  transaction. `readiness`, `ledger()`, `compile_node` and `producer_evidence` are unchanged. Model registration
+  never gates anything.
+- Payloads hold identities, hashes and state-relative evidence paths only. They record the SHA256 of each file
+  present at enqueue time:
+  - `jobs/<job>/manifest.json`;
+  - `command.json`, `model-inputs.json`, `binding-evidence.json`, `remote-result.json`, `remote-artifacts.json`,
+    `train.log` and `worker.log` of the attempt's own launch;
+  - `launches/<launch_id>.result.json`;
+  - the content addresses of `descriptor.json`/`inventory.json`;
+  - the hash of the `node_outputs` row.
+
+  At send time every byte is re-read and re-hashed. A mismatch, a symlink or a path outside the state directory
+  fails the event permanently with `local evidence changed after enqueue`, before any client call for that event.
+  `remote-attempt.json`, dataset files and benchmark bytes are never uploaded.
+- MLflow mapping (one tracker per shared auth scope):
+  - One graph run, carrying `lineage/plan.json`, `lineage/approval.json` and, at the end, `summary.json`.
+  - Node runs under it, attempt runs under their node (`mlflow.parentRunId`).
+  - The attempt evidence uploads under `lineage/`: the files above, plus `node-outputs.json`, `evaluation.json` (the
+    `EvaluationRecord`), `selection.json` and `error.txt`.
+  - Finite evaluation metrics at step 0, with the attempt's `created` time as timestamp, so a retry repeats
+    identical points.
+  - Identical params on every retry. The attempt run is then terminated FINISHED/FAILED/KILLED.
+  - Tags: the §6 `factory.*` set and `mlflow.parentRunId`. `factory.operator` comes from `FACTORY_OPERATOR`, as in
+    v1.
+  - Registration uploads the verified `files/` to `model/` and creates a version of
+    `factory-{project_id}-{node_id}` (source `runs:/<attempt run>/model`). Its tags are the registration key, the
+    artifact, inventory, producer job/attempt, manifest and plan hashes, `base_model`, `model_revision`,
+    `quality_qualified=false` and `approval=pending`.
+  - The summary terminates the node runs and the graph run with the final statuses.
+- Adoption after a lost receipt:
+  - Every create (`create_run`, `create_model_version`) records a durable intent first.
+  - With an intent present, the next try searches first. Runs are found by `tags.\`factory.tracking_key\``, and
+    versions by `name` + `run_id` over every page, with the key tag checked client-side.
+  - Duplicates are adopted earliest-first or lowest-first and listed in the receipt; nothing is ever deleted.
+  - A failing search raises an uncertain retry and never creates. An authoritative empty search creates once.
+  - The registered model's name is its own key: a failed create is re-searched.
+- Bounded retry: `OutboxRetryPolicy(max_tries=8, base_seconds=30, factor=2, cap_seconds=3600)`.
+  - The delays are 30, 60, 120, 240, 480, 960, 1920 and 3600 s on the injected clock.
+  - Exhausted definite errors end FAILED, exhausted uncertainty ends UNCERTAIN. Our own refusals (an insecure
+    artifact root, changed evidence) fail at once.
+  - Retries never touch `jobs`, attempts, locks, reservations, dispositions or nodes.
+- HTTPS (Task 6B rules, through the `auth.py` helpers):
+  - `create_keyed_run` repeats `start`'s per-run artifact-root check (an insecure root is terminated FAILED and
+    refused before any upload).
+  - `check_run_artifacts` applies it to adopted runs and before every upload into an existing run, so credentials
+    configured later never reach an HTTP root.
+  - The constructor refusals are unchanged.
+- Destination pinning (D11):
+  - `tracking.tracking_settings_sha256(public)` covers exactly `tracking_uri`, `experiment`, `artifact_location` and
+    `auth_mode` (`oidc`/`token`/`none`, from `current_auth_mode()` on top of `credentials_configured`). It refuses
+    extra keys and userinfo in URIs.
+  - `MLflowTracker.public_settings()` returns these four values. `LazyMLflowTracker.public_settings()` answers
+    without building a client.
+  - A real run whose pinned hash differs stays PENDING with `tracking destination differs from the approved plan;
+    restart the controller with the approved MLflow settings`. That costs no client call and no try.
+- Simulation runs (D7) never touch the tracker. They write immutable receipts at
+  `state/tracking/<run_id>/<event_id>.json` and open the gate the same way.
+- v1 (D10): `register_candidate(..., attempt_id=)` searches first with the key `v1:{manifest sha256}:{attempt_id}`
+  and adopts the lowest version. `runner.run_claimed` and `Factory.reconcile` pass the attempt. A v1 tracking failure
+  (including a failing search) is still FAILED with `tracking-error.txt`.
+- Secrets:
+  - Stored and shown errors pass through `redact`. It removes the configured `MLFLOW_TRACKING_TOKEN`,
+    `MLFLOW_OIDC_CLIENT_SECRET` and `MLFLOW_TRACKING_PASSWORD` values, bearer/basic credentials, `secret=`-style
+    pairs and URL userinfo.
+  - Payloads, receipts, tags, params and `status()` never carry a credential.
+
+8.2 review fixes (from the independent review of `dfac977`):
+- I-1 (required): a node with several selection parents FAILED when any one of them had a failed evaluation.
+  - `compile_node` now checks the failures against the union of its selection parents' evaluations.
+  - It passes each parent's `_compile_select` only that parent's share (`graph_planner.py`).
+  - The PROGRESS 8.2 line that understated the issue is corrected.
+  - Test: `test_a_child_of_two_selections_gets_each_selections_own_failed_evaluations`.
+- I-2 (required): `JobStore.cancel` of a QUEUED graph job (freshly prepared, requeued, or returned unlaunched) left
+  its node READY forever.
+  - New `GraphStore.settle_canceled_jobs(controller_lease)`: such a node becomes CANCELED and its subtree is BLOCKED
+    unless the run is canceled (the 8.1 I1 rule).
+  - `finalize_run` and the gated `prepare_ready(node_ids=…)` apply it too.
+  - Test: `test_a_graph_job_canceled_while_queued_settles_its_node[prepared|requeued]`.
+- I-3 (required): a local selection whose receipt fails verification looped forever, uncounted.
+  - `complete_local_selection` now settles the refusal in its own transaction. A cancel still wins first.
+  - Otherwise the job FAILS, the lock is released, and a counted, terminal `refused_before_launch` disposition is
+    written (chosen over `output_invalid` because a local selection never launches; it matches `failure_kind` and
+    `classify_attempt`'s `launch_started=0` rule). The node is FAILED and its subtree BLOCKED, and the failed
+    attempt's evidence is enqueued.
+  - The 8.2 hand-off to 8.5 is corrected.
+  - Test: `test_a_local_selection_refused_at_verification_is_settled_in_its_transaction[False|True]`.
+- M-1: both lock-releasing branches of `classify_attempt` (the M4 stale-recover release and the Minor B canceled
+  release) rotate the attempt token in that transaction. Test: `test_the_stale_recover_release_fences_the_old_attempt_lease`.
+- M-3: a no-winner selection blocks its model children in its own transaction, so `finalize_run` no longer stalls.
+  Two 8.2 assertions changed accordingly: `test_no_winner_selection_is_recorded_and_blocks_model_children` (also
+  checks `finalize_run` → FAILED) and `test_partial_join_selects_from_surviving_evaluations[one_survivor]`.
+- M-4: an existing disposition now wins in both places.
+  - `failure_kind` answers from the disposition when there is one: a classified kind as recorded,
+    `released_before_contact` as `failed_before_submit`, and `returned_unlaunched` as `canceled`.
+  - `classify_attempt` treats those equivalents as no-ops and returns the existing disposition.
+  - Test: `test_failure_kind_and_classification_honour_an_existing_settlement`.
+- M-5: both `tracking_outbox` inserts name their columns. Test: `test_tracking_outbox_rows_are_inserted_by_column_name`.
+- M-6:
+  - A test now covers the M1 infinity branch (unreadable plan):
+    `test_migration_reserves_infinity_when_even_the_plan_is_unreadable`.
+  - `UNPRICED_ATTEMPT` is cleared from `wait_reason` once the node's attempt settles (`_settle_node`,
+    `record_outputs`, `_return_unlaunched`). Test: `test_settling_an_unpriced_attempt_clears_its_wait_reason`.
+  - The 8.2 M4 rationale is broadened: a crash before `begin_launch` followed by a global recover, or a recover
+    racing the pre-launch checks, gives the same shape, and those attempts also never ran.
+- M-2 (note for 8.5) is not done; see below.
+
+Deviations from the plan:
+- `log_lineage` takes an extra `timestamp_ms` keyword, which carries the payload's timestamp.
+- `TrackingOutbox` gains `claim_ttl_seconds` and a public `defer`. `GraphStore` gains `validate_owner(db, owner)`, so
+  the outbox uses no private store member.
+- A destination mismatch stays PENDING (test 15 and §7) instead of failing permanently, as one §6 sentence lists it.
+- `max_tries=8` means eight retries after the first send (§6's eight delays). An exhausted event shows `tries=9`.
+- `finalize_run` enqueues the `graph_summary` event. §6's table lists it; §4's file list does not.
+- Ancestors are enqueued idempotently at every enqueue point, so `backfill` covers only unacknowledged
+  `tracking_outbox` rows (plus their ancestors).
+- `error.txt` comes from the ledger's error (redacted) in the payload, not from `jobs/<job>/error.txt`, which is per
+  job and overwritten by a retry.
+- Attempts that the store settled as never run (`returned_unlaunched`, `released_before_contact`, a canceled local
+  selection) get no MLflow attempt run.
+- A selection's attempt run uploads `selection.json` and `node-outputs.json`, but not the winner's descriptor (it is
+  another node's artifact).
+- New helpers in `tracking.py`: `current_auth_mode`, `public_tracking_settings`, and the stored
+  `uri`/`experiment`/`artifact_location`/`auth_mode`. `ensure_registered_model` adopts by name after a failed create.
+  v1 `register_candidate` uses it, which is within D10.
+- The v1 key falls back to `run-{run_id}` when no attempt is passed.
+- Files edited beyond the 8.3 list: `graph_planner.py` (I-1) and `attempt_runner.py` (M-4), both for the 8.2 review.
+  Neither is an 8.4 file.
+- Test placement: the 20 plan tests are in `tests/test_tracking_outbox.py`. The review-fix tests are in
+  `tests/test_graph_readiness.py` (7 cases) and `tests/test_graph_store.py` (3).
+
+Actual verification (main tree; no other agent's uncommitted changes):
+- RED:
+  - All 20 tests in `test_tracking_outbox.py` failed on the missing module/API before any `src` edit.
+  - With only the two new `tracking` names stubbed by a temporary plugin, tests 19 and 20 failed for the behavioural
+    reason: v1 created a second version after the lost receipt, and v1 never searched.
+  - The review-fix tests were written after their fixes, so they were RED-checked against a `git archive HEAD`
+    export with the new test files copied in. All 11 changed or new cases failed for the intended reasons; the
+    infinity-branch test passed there, as expected (it guards existing behaviour).
+  - Test-side fixes before GREEN: an owner lease not released in test 1, the event count of test 4 (8, not 10), a
+    missing `prepare` and run-lease renewal in test 17, and a one-node world asserting on `b` in test 18.
+- Mutations, as pytest plugins in `%TEMP%` with no `src` edit:
+
+  | Mutation | Tests that fail |
+  |---|---|
+  | `redact` returns its input | 17 (after test 17 was strengthened to snapshot every pass) |
+  | a failing search counts as empty | 8 |
+  | no destination check | 15 |
+  | evidence bytes not re-hashed | 18 |
+  | intent ignored (always create) | 6, 11 and 14 |
+  | `record_receipt` leaves the gate closed | 1, 4, 5, 12, 16 and 17 |
+- GREEN:
+  - The plan's command (`test_tracking_outbox`, `test_evaluation_tracking`, `test_tracking_https`,
+    `test_runner_cli`, `test_reconciliation`, `test_graph_store`) gave **82 passed**.
+  - `uv run pytest -q` gave **1225 passed, 1 skipped** (1195 + 30 new) on the final tree. An earlier full run,
+    while mutation runs loaded the machine, had one failure: the flake below.
+  - `tests/test_jobs.py::test_recovery_does_not_release_unknown_remote_execution` is a pre-existing Windows
+    clock-resolution flake: `recover(stale_after_seconds=0)` needs `updated < time.time()`. It failed once in a
+    loaded full run and once in five isolated runs, with `jobs.py` and `test_jobs.py` untouched. It is not fixed
+    here.
+- Ruff (`src tests`) is clean, and `check_secrets.py` reports 0 findings. Both GPU locks are unchanged, and every
+  changed file is CR-free.
+  - The main env imports no torch/peft/transformers/safetensors/huggingface_hub, and importing `graph_store` does
+    not import mlflow. httpx was already imported at HEAD.
+  - `mlflow-skinny` 3.17.1's own parsers accept both filter strings offline (`SearchUtils`,
+    `SearchModelVersionUtils`).
+- CPU acceptance (`-I`), run once on the final source:
+  - It exited 0, and all **29** checks passed.
+  - Receipt SHA256 `1ddbabdc717a7a8fbbc2c06f15d9ad941a97133af1f358bce29bffdab73f6ceb`, source_sha256 `eed2680765e1cb5fe85c7fce7c025c29107c775eb9ca5ade8e08dc7734cafc54` (equal to a `git archive` export of the commit),
+    lock_sha256 `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`.
+  - `model_downloaded`, `gpu_used`, `institution_data_used` and `production_promotable` are false.
+  - It supersedes `26a68aee…a117`.
+- Module sizes: new `tracking_outbox.py` 727, `tracking.py` 305 (97), `graph_store.py` 1359 (1229),
+  `graph_planner.py` 1010 (998), `attempt_runner.py` 495 (475).
+
+Not verified or still open:
+- **No real MLflow server was used, and its version is unknown.** Everything ran on `FakeMlflowClient` behind the real
+  `MLflowTracker`. Still unverified against a real server:
+  - tag-filter and pagination behaviour, `search_model_versions` with `run_id`, and `runs:/…/model` sources;
+  - artifact proxying and real upload times.
+
+  The design turns any search error into "wait", never "create".
+- The OIDC refresher was not exercised (it is patched in tests). Eventually consistent registries are untested;
+  duplicates would be adopted lowest-first.
+- Multi-process contention is untested; the races are in-process on one SQLite file.
+- For 8.5:
+  - Run `backfill(owner)` once after acquiring the owner, and `TrackingPublisher.process(owner)` in the tick.
+  - Uploads run inside `process`: renew the owner lease during long model uploads, and keep the claim TTL (600 s
+    default) above the longest single upload.
+  - Use `TrackingOutbox.status(run_id)` for `tracking_status` and `registration_status`.
+  - Call `settle_canceled_jobs` in the settle phase (gated `prepare_ready` and `finalize_run` apply it too).
+  - `failure_kind` now honours dispositions.
+- Task 9 must build `TrackingDestination.public_settings_sha256` with `tracking_settings_sha256` over
+  `public_tracking_settings(...)` (D11); otherwise real runs wait with the destination-mismatch reason.
+- M-2 (8.2 review, for 8.5): the resolver eagerly verifies every completed producer, persisted target and active
+  job's facts. One tampered or corrupt record raises `ValueError`, and the gated `prepare_ready` then FAILS every
+  ready node. 8.5 should separate integrity errors (a run-level `wait_reason` or pause, failing nothing) from
+  node-specific compile refusals. Not done here.
 
 ---
 

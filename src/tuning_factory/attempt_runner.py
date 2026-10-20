@@ -45,7 +45,15 @@ from .graph_planner import (
     NodeModelBinding,
     snapshot_dataset,
 )
-from .graph_store import REMOTE_ATTEMPT, FailureKind, GraphStore, NodeOutputs, accepted_result
+from .graph_store import (
+    CLASSIFIED,
+    REMOTE_ATTEMPT,
+    SETTLED_AS,
+    FailureKind,
+    GraphStore,
+    NodeOutputs,
+    accepted_result,
+)
 from .jobs import ACTIVE, AttemptLease
 from .manifest import source_hash, verify_manifest
 from .operation_dispatch import MODEL_OP_PARENT, write_benchmark_data
@@ -190,12 +198,24 @@ class OperationAttemptRunner:
         - FAILED holding its lock: ``uncertain`` (reconcile the same launch).
         - FAILED with an accepted result: ``remote_failed`` for a FAILED result, else ``output_invalid``.
         - FAILED after ``begin_launch`` without a result: ``failed_before_submit``.
+
+        An attempt the store already settled answers from its disposition, so the two never contradict each other
+        (8.2 review M-4): a classified kind as recorded, ``released_before_contact`` as ``failed_before_submit`` and
+        ``returned_unlaunched`` as ``canceled`` (or ``refused_before_launch``); ``classify_attempt`` accepts those
+        equivalents as no-ops.
         """
         job = self.jobs.get(job_id)
         if job["status"] == "COMPLETED":
             return None
         if job["status"] not in {"FAILED", "CANCELED"}:
             raise ValueError("only a finished attempt has a failure kind")
+        settled = self.graph.attempt_disposition(job_id)
+        if settled is not None and settled["disposition"] in CLASSIFIED:
+            return settled["disposition"]
+        if settled is not None and settled["disposition"] in SETTLED_AS:
+            if settled["disposition"] == "released_before_contact":
+                return "failed_before_submit"
+            return "canceled" if job["status"] == "CANCELED" else "refused_before_launch"
         lease = self.jobs.current_lease(job_id)
         attempt = self._attempt(lease)
         held = self.jobs.holds_lock(lease)

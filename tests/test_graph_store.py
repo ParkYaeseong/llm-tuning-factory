@@ -1006,3 +1006,65 @@ def test_migration_reserves_an_unpriceable_attempt_without_failing_the_store(tmp
     ctl2 = store.acquire_controller('run2')
     store.prepare_ready(ctl2)
     assert store.claim_ready(first, ctl2) is not None   # other runs are unaffected
+
+
+def unpriced_db(tmp_path, plan_text=None):
+    """A pre-Task-8 state directory with one FAILED graph attempt whose manifest cannot be priced."""
+    from tuning_factory.graph_planner import ApprovalGrant
+    from tuning_factory.registry import canonical, digest
+    registry, plan, _ = ledger_plan(tmp_path, simulation=False)
+    body = {'schema_version': 2, 'operation': {'kind': 'train', 'id': 'train.1'}}
+    manifest = canonical({**body, 'sha256': digest(canonical(body))}).decode()
+    path = tmp_path / 'state' / 'jobs.db'
+    path.parent.mkdir()
+    with closing(sqlite3.connect(path)) as db, db:
+        db.executescript(HEAD_DDL)
+        db.execute('INSERT INTO graph_runs VALUES (?,?,?,?,?,?)', ('run1', 'request-1', plan_text or plan.model_dump_json(),
+                   ApprovalGrant.for_plan(plan).model_dump_json(), 'RUNNING', 1.0))
+        db.execute('INSERT INTO nodes VALUES (?,?,?,?,?,?)', ('run1', 'train.1', 'RUNNING', 'job1', manifest, None))
+        db.execute('INSERT INTO jobs (id,request_key,manifest,status,priority,attempts,cancel_requested,error,run_id,'
+                   'created,updated,graph_run_id,graph_node_id,active_attempt_id) '
+                   "VALUES ('job1','graph:run1:train.1',?,'FAILED',0,1,0,'lost',NULL,1,2,'run1','train.1','att1')",
+                   (manifest,))
+        db.execute("INSERT INTO job_attempts VALUES ('att1','job1','token1','existing_runpod:pod1','launch1',1,0,1.0)")
+    return registry, path
+
+
+def test_migration_reserves_infinity_when_even_the_plan_is_unreadable(tmp_path):
+    """8.2 review M-6: the M1 backfill's last resort. The store still opens; that run can claim nothing more."""
+    import math
+
+    from tuning_factory.graph_store import UNPRICED_ATTEMPT, GraphStore
+    registry, path = unpriced_db(tmp_path, plan_text='{"not": "a plan"}')
+    store = GraphStore(path, registry=registry)
+    (reservation,) = reservations(store)
+    assert math.isinf(reservation['max_cost_usd']) and math.isinf(store.reserved_budget('run1'))
+    with store.jobs.connection() as db:
+        assert db.execute('SELECT wait_reason FROM nodes').fetchone()[0] == UNPRICED_ATTEMPT
+    GraphStore(path, registry=registry)   # opens again, unchanged
+    assert len(reservations(store)) == 1
+
+
+def test_settling_an_unpriced_attempt_clears_its_wait_reason(tmp_path):
+    """8.2 review M-6: the unpriced-attempt notice is about that attempt; it goes once the attempt settles."""
+    from tuning_factory.graph_store import UNPRICED_ATTEMPT, GraphStore
+    registry, path = unpriced_db(tmp_path)
+    store = GraphStore(path, registry=registry)
+
+    def reason():
+        return next(node['wait_reason'] for node in store.get_run('run1')['nodes'])
+
+    assert reason() == UNPRICED_ATTEMPT
+    ctl = store.acquire_controller('run1')
+    assert store.classify_attempt(ctl, 'job1', 'failed_before_submit') == 'failed_before_submit'
+    assert reason() is None and node_status(store, 'run1', 'train.1') == 'FAILED'
+
+
+def test_tracking_outbox_rows_are_inserted_by_column_name():
+    """8.2 review M-5: positional inserts would break as soon as tracking_outbox gains a column."""
+    import inspect
+
+    from tuning_factory import graph_store
+    source = inspect.getsource(graph_store)
+    assert 'INTO tracking_outbox VALUES' not in source
+    assert source.count('INTO tracking_outbox (attempt_id,job_id,payload,acknowledged)') == 2

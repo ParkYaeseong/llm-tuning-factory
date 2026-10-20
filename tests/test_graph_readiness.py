@@ -500,7 +500,8 @@ def test_partial_join_selects_from_surviving_evaluations(tmp_path, case):
         assert outputs.model is None
         assert (outputs.selection.status, outputs.selection.reasons) == ('no_winner',
                                                                          ('insufficient_partial_success',))
-        assert states(w)['after'] == ('blocked', 'selection produced no winner')
+        # Blocked in the selection's own transaction (8.2 review M-3), so finalize_run never stalls.
+        assert statuses(w)['after'] == 'BLOCKED' and node_row(w, 'after')['error'] == 'selection produced no winner'
     assert statuses(w)['s'] == 'COMPLETED'
 
 
@@ -517,8 +518,9 @@ def test_no_winner_selection_is_recorded_and_blocks_model_children(tmp_path):
     assert outputs.model is None
     assert (outputs.selection.status, outputs.selection.reasons) == ('no_winner', ('partial_selection_not_allowed',))
     assert outputs.selection.winner is None
-    assert states(w)['after'] == ('blocked', 'selection produced no winner')
-    assert store.block_descendants(w.ctl, 's') == ('after',)
+    # The model child is BLOCKED in the selection's own transaction (8.2 review M-3); blocking again is a no-op.
+    assert states(w)['after'] == ('done', None) and node_row(w, 'after')['error'] == 'selection produced no winner'
+    assert store.block_descendants(w.ctl, 's') == ()
     assert statuses(w)['after'] == 'BLOCKED' and node_row(w, 'after')['job_id'] is None
     payloads = {row['node_id']: json.loads(row['outputs']) for row in table(w, 'node_outputs')}
     assert set(payloads['s']) == {'model', 'evaluation', 'inspected_targets', 'selection'}
@@ -533,6 +535,7 @@ def test_no_winner_selection_is_recorded_and_blocks_model_children(tmp_path):
     forged = gs.NodeOutputs(selection=outputs.selection.model_copy(update={'reasons': ('forged',)}))
     with pytest.raises(ValueError, match='selection receipt mismatch'):
         store.record_outputs(claimed['lease'], forged)
+    assert store.finalize_run(w.ctl) == 'FAILED'   # nothing is left pending behind the no-winner receipt (M-3)
 
 
 def test_local_selection_completes_atomically_and_cancel_wins(tmp_path, monkeypatch):
@@ -842,3 +845,145 @@ def test_finalize_run_statuses(tmp_path):
                     'job_canceled': 'FAILED'}[case]
         assert store.finalize_run(ctl) == expected
         assert store.finalize_run(ctl) == expected and store.get_run(w.run_id)['status'] == expected
+
+
+# -- 8.2 review fixes (folded into 8.3) ------------------------------------------------------------
+
+def two_selections(r):
+    """s1: a partial selection whose base evaluation fails; s2: a selection with none failed; m merges both."""
+    return [evaluate(r, 'e1', r.first), evaluate(r, 'e2', r.second), evaluate(r, 'e3', r.base),
+            select('s1', ('e1', 'e2', 'e3'), allow_partial=True),
+            evaluate(r, 'e4', r.first), evaluate(r, 'e5', r.second), select('s2', ('e4', 'e5')),
+            merge('m', ('s1', 's2'))]
+
+
+def test_a_child_of_two_selections_gets_each_selections_own_failed_evaluations(tmp_path):
+    """I-1: a failed evaluation of one selection parent never makes another parent's recompilation refuse."""
+    w = build(tmp_path, two_selections)
+    store = w.store
+    prepare(w, 'e1', 'e2', 'e3', 'e4', 'e5')
+    for node_id, accuracy in (('e1', 0.9), ('e2', 0.1), ('e4', 0.1), ('e5', 0.9)):
+        complete(w, node_id, evaluation_output, accuracy=accuracy)
+    failed(w, 'e3')
+    prepare(w, 's1', 's2')
+    for node_id in ('s1', 's2'):
+        claimed = claim(w, node_id)
+        assert store.complete_local_selection(w.ctl, claimed).model is not None
+        store.acknowledge_tracking(claimed['lease'])
+    (item,) = [item for item in store.readiness(w.run_id) if item.node_id == 'm']
+    assert item.state == 'ready'
+    assert store.bindings_for(w.run_id, 'm').failed_parent_node_ids == ('e3',)
+    (job_id,) = prepare(w, 'm')   # before the fix: m FAILED with 'unrequested failed evaluation parent'
+    assert statuses(w)['m'] == 'READY' and node_row(w, 'm')['error'] is None
+    models = store.jobs.get(job_id)['manifest']['operation']['models']
+    assert [ModelArtifactRef.model_validate(item['model'] if 'model' in item else item) for item in models] == [
+        w.refs.first, w.refs.second]
+
+
+@pytest.mark.parametrize('case', ['prepared', 'requeued'])
+def test_a_graph_job_canceled_while_queued_settles_its_node(tmp_path, case):
+    """I-2: JobStore.cancel of a QUEUED graph job (freshly prepared, or requeued for a retry) used to leave its node
+    READY forever, so the run never finalized."""
+    w = build(tmp_path, lambda r: [train(r, 'a'), train(r, 'b', 'a')], max_attempts=2)
+    store = w.store
+    (job_id,) = prepare(w, 'a')
+    if case == 'requeued':
+        failed(w, 'a', 'remote_failed')
+        assert store.requeue_retry(w.ctl, job_id) and store.jobs.get(job_id)['active_attempt_id'] is None
+    assert store.jobs.get(job_id)['status'] == 'QUEUED' and statuses(w)['a'] == 'READY'
+    store.jobs.cancel(job_id)
+    assert store.jobs.get(job_id)['status'] == 'CANCELED'
+    if case == 'prepared':
+        assert prepare(w, 'b') == []   # the gated prepare settles it first
+    else:
+        assert store.settle_canceled_jobs(w.ctl) == ('a',)
+    assert statuses(w) == {'a': 'CANCELED', 'b': 'BLOCKED'}
+    assert store.settle_canceled_jobs(w.ctl) == ()
+    assert store.finalize_run(w.ctl) == 'FAILED'
+
+
+def tampered_winner(w):
+    """e2 (first) wins; then a byte of the winner's stored files changes, so the receipt no longer verifies."""
+    store = w.store
+    prepare(w, 'e1', 'e2', 'e3')
+    for node_id, accuracy in (('e1', 0.2), ('e2', 0.9), ('e3', 0.5)):
+        complete(w, node_id, evaluation_output, accuracy=accuracy)
+    prepare(w, 's')
+    claimed = claim(w, 's')
+    target = next(path for path in sorted(store.artifacts.path(w.refs.first).rglob('*')) if path.is_file())
+    target.write_bytes(target.read_bytes() + b'tampered')
+    return claimed
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_a_local_selection_refused_at_verification_is_settled_in_its_transaction(tmp_path, cancel):
+    """I-3: the refusal is counted and terminal (it used to stay PROVISIONING and loop uncounted); a cancel still
+    wins over it."""
+    w = evaluations_world(tmp_path)
+    store = w.store
+    claimed = tampered_winner(w)
+    job_id, lease = claimed['id'], claimed['lease']
+    if cancel:
+        store.jobs.cancel(job_id)
+    assert store.complete_local_selection(w.ctl, claimed) is None
+    assert not store.jobs.holds_lock(lease) and not table(w, 'node_outputs', 'WHERE node_id=?', ('s',))
+    disposition = store.attempt_disposition(job_id)
+    if cancel:
+        assert (store.jobs.get(job_id)['status'], statuses(w)['s']) == ('CANCELED', 'CANCELED')
+        assert (disposition['disposition'], disposition['counted']) == ('canceled', 0)
+    else:
+        job = store.jobs.get(job_id)
+        assert job['status'] == 'FAILED' and 'ValueError' in job['error'] and statuses(w)['s'] == 'FAILED'
+        assert (disposition['disposition'], disposition['counted']) == ('refused_before_launch', 1)
+        assert events(w, job_id)[-1] == ('FAILED', job['error'])
+        from tuning_factory.attempt_runner import OperationAttemptRunner
+        runner = OperationAttemptRunner(store, root=store.state_dir)
+        assert runner.failure_kind(job_id) == 'refused_before_launch'
+        assert store.classify_attempt(w.ctl, job_id, 'refused_before_launch') == 'refused_before_launch'
+    assert statuses(w)['after'] == 'BLOCKED' and store.finalize_run(w.ctl) in {'FAILED', 'CANCELED'}
+    assert store.claim_ready(None, w.ctl) is None   # never claimed again
+
+
+def test_the_stale_recover_release_fences_the_old_attempt_lease(tmp_path):
+    """M-1: classify_attempt's release of a gated, stale-recovered attempt rotates its token in that transaction."""
+    from tuning_factory.jobs import GRAPH_LAUNCH_REFUSED
+    w = build(tmp_path, lambda r: [train(r, 'a')])
+    store = w.store
+    prepare(w, 'a')
+    claimed = claim(w, 'a')
+    job_id, lease = claimed['id'], claimed['lease']
+    store.pause(w.run_id)
+    with pytest.raises(ValueError, match=GRAPH_LAUNCH_REFUSED):
+        store.jobs.begin_launch(lease)
+    store.resume(w.run_id)
+    store.jobs.recover(stale_after_seconds=-1)
+    assert store.classify_attempt(w.ctl, job_id, 'refused_before_launch') == 'refused_before_launch'
+    for stale in (lambda: store.jobs.validated_attempt(lease), lambda: store.jobs.transition(lease, 'QUEUED'),
+                  lambda: store.jobs.begin_launch(lease)):
+        with pytest.raises(ValueError, match='stale attempt lease'):
+            stale()
+    assert store.jobs.get(job_id)['status'] == 'FAILED'
+
+
+def test_failure_kind_and_classification_honour_an_existing_settlement(tmp_path):
+    """M-4: an attempt the store already settled uncounted (released before contact, or returned unlaunched under a
+    cancel) is classified as a no-op instead of raising 'attempt disposition is immutable'."""
+    from tuning_factory.attempt_runner import OperationAttemptRunner
+    w = build(tmp_path, lambda r: [train(r, 'a'), train(r, 'c')], max_attempts=2, max_concurrent=2)
+    store = w.store
+    runner = OperationAttemptRunner(store, root=store.state_dir)
+    prepare(w, 'a', 'c')
+    released = claim(w, 'a')
+    store.jobs.begin_launch(released['lease'])
+    assert store.release_uncontacted(w.ctl, released['id'])
+    assert runner.failure_kind(released['id']) == 'failed_before_submit'
+    assert store.classify_attempt(w.ctl, released['id'], 'failed_before_submit') == 'released_before_contact'
+    with pytest.raises(ValueError, match='attempt disposition is immutable'):
+        store.classify_attempt(w.ctl, released['id'], 'remote_failed')
+    returned = claim(w, 'c')
+    store.jobs.cancel(returned['id'])
+    assert store.return_unlaunched(w.ctl, returned['lease'], reason='job canceled before launch') == 'CANCELED'
+    assert runner.failure_kind(returned['id']) == 'canceled'
+    assert store.classify_attempt(w.ctl, returned['id'], 'canceled') == 'returned_unlaunched'
+    assert [row['disposition'] for row in table(w, 'attempt_dispositions')] == ['released_before_contact',
+                                                                               'returned_unlaunched']

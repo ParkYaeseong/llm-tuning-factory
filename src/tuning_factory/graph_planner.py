@@ -666,6 +666,15 @@ def compile_node(plan: GraphPlan, node_id: str, verified_bindings: VerifiedBindi
     if entry is None:
         raise ValueError("unknown plan node")
     node = entry.node
+    failed = set(bindings.failed_parent_node_ids)
+    graph_nodes = {item.id: item for item in plan.graph.nodes}
+    if not isinstance(node, SelectNode):
+        # Failed evaluations may belong to any of the node's selection parents; each parent is recompiled with
+        # only its own share below (8.2 review I-1).
+        selections = [graph_nodes[ref.node_id] for ref, _ in node_refs(node)
+                      if isinstance(graph_nodes[ref.node_id], SelectNode)]
+        if failed - {ref.node_id for select in selections for ref in select.evaluations}:
+            raise ValueError("unrequested failed evaluation parent")
     completed = _unique(bindings.completed_nodes, lambda item: item.node_id, "node completion evidence")
     for edge in plan.graph.depends_on:
         if edge.node_id == node_id:
@@ -691,7 +700,8 @@ def compile_node(plan: GraphPlan, node_id: str, verified_bindings: VerifiedBindi
             parent = next(item for item in plan.graph.nodes if item.id == value.node_id)
             if isinstance(parent, SelectNode):
                 select_lineage = lineage.model_copy(update={"node_id": parent.id})
-                local = _compile_select(plan, parent, bindings, select_lineage, outputs, verified)
+                share = failed & {ref.node_id for ref in parent.evaluations}
+                local = _compile_select(plan, parent, bindings, select_lineage, outputs, verified, share)
                 receipt = resolve_local_selection(local)
                 if (receipt.status != "selected" or receipt.winner != ref
                         or outputs[value.node_id].selection != receipt):
@@ -734,7 +744,7 @@ def compile_node(plan: GraphPlan, node_id: str, verified_bindings: VerifiedBindi
         return descriptor
 
     if isinstance(node, SelectNode):
-        return _compile_select(plan, node, bindings, lineage, outputs, verified)
+        return _compile_select(plan, node, bindings, lineage, outputs, verified, failed)
     if isinstance(node, TrainNode):
         recipes = {item.revision_sha256: item for item in choices.recipes}
         recipe = _recipe(node, recipes)
@@ -955,11 +965,13 @@ def _merge_descriptors(refs, descriptors):
     check_merge_descriptors(refs, descriptors, require_real=True)
 
 
-def _compile_select(plan, node, bindings, lineage, outputs, verified):
+def _compile_select(plan, node, bindings, lineage, outputs, verified, failed):
+    """``failed``: the failed evaluation parents of this selection only (a child of several selections passes
+    each its own share)."""
     records = _unique(bindings.evaluations, lambda value: value.node_id, "evaluation binding")
     nodes = {item.id: item for item in plan.graph.nodes}
     evaluations, requested, merged = [], [], []
-    failed = set(bindings.failed_parent_node_ids)
+    failed = set(failed)
     allowed_failed = {ref.node_id for ref in node.evaluations}
     if failed - allowed_failed:
         raise ValueError("unrequested failed evaluation parent")

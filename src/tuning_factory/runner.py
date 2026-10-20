@@ -202,7 +202,8 @@ class Factory:
                     self.tracker.finish(run_id, metrics, directory, status, error)
                     if status == "COMPLETED" and not manifest["simulation"] and not manifest["dataset"].get("synthetic"):
                         quality = json.loads((directory / "evaluation.json").read_text())
-                        self.tracker.register_candidate(run_id, manifest, quality["quality_status"] == "qualified")
+                        self.tracker.register_candidate(run_id, manifest, quality["quality_status"] == "qualified",
+                                                       attempt_id=lease.attempt_id)
                 except Exception as exc:
                     (directory / "tracking-error.txt").write_text(str(exc), encoding="utf-8")
                     status, error = "FAILED", "MLflow persistence failed; training artifacts retained; see tracking-error.txt"
@@ -316,7 +317,8 @@ class Factory:
         if self.tracker and job["run_id"]:
             self.tracker.finish(job["run_id"], metrics, directory, status, error)
             if status == "COMPLETED" and not manifest["simulation"] and not manifest["dataset"].get("synthetic"):
-                self.tracker.register_candidate(job["run_id"], manifest, quality["quality_status"] == "qualified")
+                self.tracker.register_candidate(job["run_id"], manifest, quality["quality_status"] == "qualified",
+                                               attempt_id=lease.attempt_id)
         self.store.reconcile_result(lease, status, error)
         (directory / "reconciliation.json").write_bytes(canonical({"status": status, "run_id": job["run_id"], "at": time.time()}))
         return self.store.get(job_id)

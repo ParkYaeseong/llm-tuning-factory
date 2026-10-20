@@ -11,6 +11,10 @@ Readiness and outcomes (Task 8.2): a node compiles only when every parent comple
 acknowledged (or, for a partial selection, every evaluation parent finished). Failures become FAILED and block the
 subtree; each finished attempt gets one immutable disposition, and only a provably finished remote failure (or an
 attempt that provably never ran) is retried, within ``max_attempts`` and after its backoff.
+
+Tracking (Task 8.3): ``submit``, ``claim_ready``, ``record_outputs``, ``complete_local_selection``,
+``classify_attempt`` and ``finalize_run`` enqueue their tracking events (``tracking_outbox.py``) in their own
+transaction. Only rows are written there; the publisher sends them later, outside any ledger transaction.
 """
 import json
 import math
@@ -43,6 +47,16 @@ from .model_artifacts import ModelArtifactStore
 from .operations import LocalSelectSpec, OperationResources, resolve_local_selection
 from .registry import Registry, canonical, digest
 from .target_inspection import verify_inspected_targets
+from .tracking_outbox import (
+    EVENTS_INDEX,
+    EVENTS_TABLE,
+    AttemptFacts,
+    attempt_events,
+    enqueue_event,
+    graph_event,
+    node_event,
+    summary_event,
+)
 
 OWNER_HELD = 'controller already running'
 STALE_OWNER = 'stale controller owner lease'
@@ -59,6 +73,8 @@ MIGRATION_TABLES = (
     '''CREATE TABLE IF NOT EXISTS attempt_dispositions (
       attempt_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, node_id TEXT NOT NULL, job_id TEXT NOT NULL,
       disposition TEXT NOT NULL, counted INTEGER NOT NULL, detail TEXT, created REAL NOT NULL)''',
+    EVENTS_TABLE,   # Task 8.3: the tracking outbox's events; tracking_outbox stays the per-attempt gate
+    EVENTS_INDEX,
 )
 MIGRATION_COLUMNS = (('controller_leases', 'owner_token', 'TEXT'), ('nodes', 'retry_not_before', 'REAL'),
                      ('nodes', 'wait_reason', 'TEXT'), ('nodes', 'updated', 'REAL'))
@@ -81,6 +97,9 @@ STALE_HEARTBEAT = 'worker heartbeat expired; reconcile execution before releasin
 DISPOSITION_IMMUTABLE = 'attempt disposition is immutable'
 NO_WINNER = 'selection produced no winner'
 PARTIAL_REFUSED = 'partial selection is not allowed'
+# 8.2 review M-4: an uncounted settlement already written for the attempt answers these failure kinds.
+SETTLED_AS = {'released_before_contact': frozenset({'failed_before_submit'}),
+              'returned_unlaunched': frozenset({'canceled', 'refused_before_launch'})}
 
 
 @dataclass(frozen=True)
@@ -291,12 +310,40 @@ class GraphStore:
                 run_id = row['id']
             else:
                 run_id = uuid.uuid4().hex
+                plan_json, approval_json = plan.model_dump_json(), approval.model_dump_json()
                 db.execute('INSERT INTO graph_runs VALUES (?,?,?,?,?,?)',
-                           (run_id, request_id, plan.model_dump_json(), approval.model_dump_json(), 'RUNNING', self.clock()))
+                           (run_id, request_id, plan_json, approval_json, 'RUNNING', self.clock()))
                 db.executemany('INSERT INTO nodes (run_id,node_id,status) VALUES (?,?,?)',
                                [(run_id, entry.node.id, 'PENDING') for entry in plan.nodes])
                 db.executemany('INSERT INTO edges VALUES (?,?,?)', [(run_id, a, b) for a, b in graph_edges(plan.graph)])
+                self._track(db, [graph_event(run_id, plan_json, approval_json)])
         return self.get_run(run_id)
+
+    # -- tracking events (Task 8.3): enqueued in the ledger transaction they describe ------------------
+
+    def _track(self, db, events):
+        """Enqueue tracking events in the caller's ledger transaction: both commit, or neither does."""
+        now = self.clock()
+        for event in events:
+            enqueue_event(db, event, now)
+
+    def _attempt_chain(self, db, run, row, attempt_id, status, **evidence):
+        """The graph, node, attempt-run, evidence (and registration) events of one finished attempt."""
+        created = db.execute('SELECT created FROM job_attempts WHERE attempt_id=?', (attempt_id,)).fetchone()[0]
+        manifest = row['manifest']
+        facts = AttemptFacts(run_id=run['id'], node_id=row['graph_node_id'], job_id=row['id'], attempt_id=attempt_id,
+                             launch_id=row['launch_id'], created=created,
+                             manifest=json.loads(manifest) if isinstance(manifest, str) else manifest)
+        return attempt_events(self, facts, run['plan'], run['approval'], status=status, **evidence)
+
+    def _summarize(self, db, run, final):
+        """The run's ``graph_summary`` event, once (the node statuses of its first final status)."""
+        key = f"graph-summary:{run['id']}:{final}"
+        if db.execute('SELECT 1 FROM tracking_events WHERE idempotency_key=?', (key,)).fetchone():
+            return
+        statuses = {row['node_id']: row['status'] for row in db.execute('SELECT node_id,status FROM nodes WHERE run_id=?',
+                                                                         (run['id'],))}
+        self._track(db, [graph_event(run['id'], run['plan'], run['approval']), summary_event(run['id'], final, statuses)])
 
     def get_run(self, run_id):
         with self.jobs.connection() as db:
@@ -334,6 +381,11 @@ class GraphStore:
         if row is None or unexpired and not row['expires'] > self.clock():
             raise ValueError(STALE_OWNER)
         return row
+
+    def validate_owner(self, db, owner: OwnerLease):
+        """The unexpired owner row inside the caller's transaction, else ``stale controller owner lease`` (the
+        tracking outbox fences its claims with it)."""
+        return self._owner(db, owner)
 
     def renew_owner(self, owner: OwnerLease, *, ttl_seconds: float = 60) -> None:
         _owner_ttl(ttl_seconds)
@@ -474,7 +526,11 @@ class GraphStore:
         are compiled (others are skipped untouched), and a compile refusal fails the node and blocks its subtree.
         """
         with self.jobs.connection() as db:   # a fenced controller is refused even when nothing is left to prepare
-            self._controller(db, controller_lease)
+            if node_ids is not None:
+                db.execute('BEGIN IMMEDIATE')   # settle jobs canceled while queued first (8.2 review I-2)
+                self._settle_canceled(db, self._controller(db, controller_lease))
+            else:
+                self._controller(db, controller_lease)
         run = self.get_run(controller_lease.run_id)
         gated = None
         if node_ids is not None:
@@ -545,6 +601,11 @@ class GraphStore:
 
     def materialize_job_evidence(self, job_id):
         return self.jobs.materialize_job_evidence(job_id)
+
+    def _clear_unpriced(self, db, run_id, node_id):
+        """The node's attempt settled: the backfill's unpriced-attempt notice no longer applies (8.2 review M-6)."""
+        db.execute('UPDATE nodes SET wait_reason=NULL WHERE run_id=? AND node_id=? AND wait_reason=?',
+                   (run_id, node_id, UNPRICED_ATTEMPT))
 
     @staticmethod
     def _locked(db, job_id) -> bool:
@@ -684,6 +745,9 @@ class GraphStore:
                 db.execute(RESERVE, (job['lease'].attempt_id, run['id'], row['graph_node_id'], row['id'], resource,
                                      cost, 'RESERVED', self.clock()))
                 db.execute("UPDATE nodes SET status='RUNNING' WHERE run_id=? AND node_id=?", (run['id'], row['graph_node_id']))
+                self._track(db, [graph_event(run['id'], run['plan'], run['approval']),   # the node's MLflow run
+                                 node_event(run['id'], run['plan'], row['graph_node_id'], row['id'],
+                                            json.loads(row['manifest']))])
                 return job
         return None
 
@@ -705,6 +769,7 @@ class GraphStore:
 
     def _return_unlaunched(self, db, run, row, attempt_lease, reason):
         self.jobs._release(db, attempt_lease)
+        self._clear_unpriced(db, run['id'], row['graph_node_id'])
         db.execute("UPDATE budget_reservations SET status='VOID' WHERE attempt_id=?", (attempt_lease.attempt_id,))
         self._dispose(db, run['id'], row, attempt_lease.attempt_id, 'returned_unlaunched', 0, reason)
         now = time.time()
@@ -823,14 +888,24 @@ class GraphStore:
                 raise ValueError('immutable output receipt mismatch')
             db.execute('INSERT OR IGNORE INTO node_outputs VALUES (?,?,?,?)',
                        (job['graph_run_id'], job['graph_node_id'], attempt_lease.attempt_id, payload))
-            db.execute('INSERT OR IGNORE INTO tracking_outbox VALUES (?,?,?,0)',
+            db.execute('INSERT OR IGNORE INTO tracking_outbox (attempt_id,job_id,payload,acknowledged) VALUES (?,?,?,0)',
                        (attempt_lease.attempt_id, job['id'], payload))
             db.execute("UPDATE nodes SET status='COMPLETED' WHERE run_id=? AND node_id=?", (job['graph_run_id'], job['graph_node_id']))
+            self._clear_unpriced(db, job['graph_run_id'], job['graph_node_id'])
+            run = db.execute('SELECT * FROM graph_runs WHERE id=?', (job['graph_run_id'],)).fetchone()
+            self._track(db, self._attempt_chain(db, run, row, attempt_lease.attempt_id, 'COMPLETED',
+                                                outputs_json=payload))
 
     def complete_local_selection(self, controller_lease, claimed) -> NodeOutputs | None:
         """Finish a claimed local selection in one transaction: the receipt, the job's RUNNING -> EVALUATING ->
-        COMPLETED steps, the outputs, the tracking row and the lock release. A cancel (of the run or the job) wins
-        over the join and records nothing; a pause returns the attempt unlaunched. None in both cases."""
+        COMPLETED steps, the outputs, the tracking row and events, and the lock release. A no-winner receipt blocks
+        the model children in the same transaction. A cancel (of the run or the job) wins over the join and records
+        nothing; a pause returns the attempt unlaunched. None in both cases.
+
+        A deterministic refusal while verifying the receipt (e.g. a winner artifact that no longer verifies) is
+        settled here too, after the cancel check (8.2 review I-3): the job FAILS, the lock is released and the
+        attempt gets a counted, terminal ``refused_before_launch`` disposition (a local selection never launches,
+        and this is the analogue of the runner's own pre-launch checks). Returning it would loop uncounted."""
         lease = claimed.get('lease') if isinstance(claimed, dict) else None
         if not isinstance(lease, AttemptLease):
             raise ValueError('a claimed attempt lease is required')
@@ -838,11 +913,14 @@ class GraphStore:
         operation = job['manifest']['operation']
         if not job['graph_run_id'] or operation.get('kind') != 'select':
             raise ValueError('a local selection attempt is required')
-        receipt = resolve_local_selection(LocalSelectSpec.model_validate(operation))
-        node_id = job['graph_node_id']
-        outputs = (NodeOutputs(model=NodeModelBinding(node_id=node_id, model=receipt.winner, selection=receipt))
-                   if receipt.status == 'selected' else NodeOutputs(selection=receipt))
-        payload = self._output_payload(job, lease.attempt_id, outputs)   # verified before the transaction
+        node_id, outputs, payload, refusal = job['graph_node_id'], None, None, None
+        try:   # verified before the transaction; a refusal is settled inside it
+            receipt = resolve_local_selection(LocalSelectSpec.model_validate(operation))
+            outputs = (NodeOutputs(model=NodeModelBinding(node_id=node_id, model=receipt.winner, selection=receipt))
+                       if receipt.status == 'selected' else NodeOutputs(selection=receipt))
+            payload = self._output_payload(job, lease.attempt_id, outputs)
+        except ValueError as exc:
+            refusal = f'{type(exc).__name__}: {exc}'
         with self.jobs.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             run = self._controller(db, controller_lease)
@@ -851,6 +929,8 @@ class GraphStore:
                 raise ValueError('current graph attempt required')
             existing = db.execute('SELECT outputs FROM node_outputs WHERE attempt_id=?', (lease.attempt_id,)).fetchone()
             if row['status'] == 'COMPLETED' and existing:
+                if refusal is not None:
+                    raise ValueError(refusal)
                 if existing['outputs'] != payload:
                     raise ValueError('immutable output receipt mismatch')
                 return outputs   # recorded once; a rerun returns the same receipt
@@ -869,6 +949,15 @@ class GraphStore:
                 if run['status'] != 'CANCELED':
                     self._block_descendants(db, run['id'], GraphPlan.model_validate_json(run['plan']), node_id)
                 return None
+            if refusal is not None:   # deterministic: counted and terminal, never returned to loop
+                db.execute("UPDATE jobs SET status='FAILED',error=?,updated=? WHERE id=?", (refusal, now, row['id']))
+                db.execute('INSERT INTO events VALUES (?,?,?,?)', (row['id'], 'FAILED', now, refusal))
+                self.jobs._release(db, lease)
+                self._dispose(db, run['id'], row, lease.attempt_id, 'refused_before_launch', 1, refusal)
+                self._settle_node(db, run, row, 'refused_before_launch', 1, refusal)
+                self._track(db, self._attempt_chain(db, run, row, lease.attempt_id, 'FAILED',
+                                                    disposition='refused_before_launch', error=refusal))
+                return None
             if run['status'] != 'RUNNING':
                 self._return_unlaunched(db, run, row, lease, 'graph paused before the local selection')
                 return None
@@ -876,10 +965,14 @@ class GraphStore:
                 db.execute('INSERT INTO events VALUES (?,?,?,?)', (row['id'], status, now, None))
             db.execute("UPDATE jobs SET status='COMPLETED',error=NULL,updated=? WHERE id=?", (now, row['id']))
             db.execute('INSERT INTO node_outputs VALUES (?,?,?,?)', (run['id'], node_id, lease.attempt_id, payload))
-            db.execute('INSERT INTO tracking_outbox VALUES (?,?,?,0)', (lease.attempt_id, row['id'], payload))
+            db.execute('INSERT INTO tracking_outbox (attempt_id,job_id,payload,acknowledged) VALUES (?,?,?,0)',
+                       (lease.attempt_id, row['id'], payload))
             db.execute("UPDATE nodes SET status='COMPLETED',updated=? WHERE run_id=? AND node_id=?",
                        (self.clock(), run['id'], node_id))
             self.jobs._release(db, lease)
+            if outputs.model is None:   # a no-winner receipt blocks the model children now (8.2 review M-3)
+                self._block_descendants(db, run['id'], GraphPlan.model_validate_json(run['plan']), node_id)
+            self._track(db, self._attempt_chain(db, run, row, lease.attempt_id, 'COMPLETED', outputs_json=payload))
         return outputs
 
     def acknowledge_tracking(self, attempt_lease):
@@ -944,7 +1037,11 @@ class GraphStore:
         whose accepted result exists for its own persisted launch ID (a crash between the CANCELED transition and
         ``release_gpu``; 7.5 Minor B), and a FAILED attempt whose launch never began (``launch_started=0``: a stale
         recover of an attempt refused at the launch gate). The latter provably never ran, so it is uncounted, its
-        reservation voided and its node retryable at once (D4; 8.1 review M4).
+        reservation voided and its node retryable at once (D4; 8.1 review M4). Both releases rotate the attempt token
+        in the same transaction, so the old actor is fenced at once (8.2 review M-1).
+
+        An attempt the store already settled uncounted (``released_before_contact``, ``returned_unlaunched``) is a
+        no-op for its equivalent kind and returns that existing disposition (8.2 review M-4).
         """
         if kind == 'uncertain':
             raise ValueError('an uncertain attempt is reconciled, never classified')
@@ -957,9 +1054,11 @@ class GraphStore:
             existing = db.execute('SELECT disposition FROM attempt_dispositions WHERE attempt_id=?',
                                   (row['attempt_id'],)).fetchone()
             if existing:
-                if existing['disposition'] != kind:
-                    raise ValueError(DISPOSITION_IMMUTABLE)
-                return kind
+                if existing['disposition'] == kind:
+                    return kind
+                if kind in SETTLED_AS.get(existing['disposition'], ()):
+                    return existing['disposition']   # already settled uncounted by the store (8.2 review M-4)
+                raise ValueError(DISPOSITION_IMMUTABLE)
             canceled = kind == 'canceled'
             if (row['status'] != ('CANCELED' if canceled else 'FAILED') or row['legacy']
                     or not canceled and bool(row['launch_started']) != (kind != 'refused_before_launch')):
@@ -971,16 +1070,22 @@ class GraphStore:
                 elif not (canceled and accepted_result(self.state_dir, job_id, row['launch_id'], row['attempt_id'])):
                     raise ValueError('attempt still holds its lock; reconcile it first')
                 self.jobs._release(db, AttemptLease(job_id, row['attempt_id'], row['lease_token'], row['resource_id']))
+                # The released attempt is over: fence its old actor at once (8.2 review M-1).
+                db.execute('UPDATE job_attempts SET lease_token=? WHERE attempt_id=?',
+                           (uuid.uuid4().hex, row['attempt_id']))
             if not counted:
                 db.execute("UPDATE budget_reservations SET status='VOID' WHERE attempt_id=?", (row['attempt_id'],))
             self._dispose(db, run['id'], row, row['attempt_id'], kind, counted, row['error'])
             self._settle_node(db, run, row, kind, counted)
+            self._track(db, self._attempt_chain(db, run, row, row['attempt_id'], 'CANCELED' if canceled else 'FAILED',
+                                                disposition=kind, error=row['error']))
             return kind
 
     def _settle_node(self, db, run, row, kind, counted, error=None):
         """A finished attempt's node: retry later, or CANCELED/FAILED with its subtree blocked."""
         plan = GraphPlan.model_validate_json(run['plan'])
         node_id, now = row['graph_node_id'], self.clock()
+        self._clear_unpriced(db, run['id'], node_id)
         if run['status'] == 'CANCELED':   # nothing of a canceled run runs again
             db.execute("UPDATE nodes SET status='CANCELED',retry_not_before=NULL,updated=? WHERE run_id=? AND node_id=? "
                        "AND status!='COMPLETED'", (now, run['id'], node_id))
@@ -1097,18 +1202,43 @@ class GraphStore:
             db.execute('BEGIN IMMEDIATE')
             run = self._controller(db, controller_lease)
             if run['status'] in {'COMPLETED', 'FAILED'}:
+                self._summarize(db, run, run['status'])
                 return run['status']
+            self._settle_canceled(db, run)
             statuses = [row['status'] for row in db.execute('SELECT status FROM nodes WHERE run_id=?', (run['id'],))]
             if any(status not in NODE_FINISHED for status in statuses) or db.execute(
                     'SELECT 1 FROM gpu_locks g JOIN jobs j ON g.job_id=j.id WHERE j.graph_run_id=?',
                     (run['id'],)).fetchone():
                 return None
             if run['status'] == 'CANCELED':
+                self._summarize(db, run, 'CANCELED')
                 return 'CANCELED'
             final = ('FAILED' if any(status in {'FAILED', 'BLOCKED'} for status in statuses)
                      else 'CANCELED' if 'CANCELED' in statuses else 'COMPLETED')
             db.execute('UPDATE graph_runs SET status=? WHERE id=?', (final, run['id']))
+            self._summarize(db, run, final)
             return final
+
+    def settle_canceled_jobs(self, controller_lease) -> tuple[str, ...]:
+        """Nodes whose job was canceled while it had no attempt (``JobStore.cancel`` of a QUEUED job: freshly
+        prepared, requeued for a retry, or returned unlaunched) become CANCELED, and their subtree is BLOCKED unless
+        the run itself is canceled (8.2 review I-2). Returns those node IDs. ``finalize_run`` and the gated
+        ``prepare_ready`` apply it too."""
+        with self.jobs.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            return self._settle_canceled(db, self._controller(db, controller_lease))
+
+    def _settle_canceled(self, db, run):
+        rows = db.execute("SELECT n.node_id FROM nodes n JOIN jobs j ON n.job_id=j.id WHERE n.run_id=? "
+                          "AND n.status IN ('READY','RUNNING') AND j.status='CANCELED' AND j.active_attempt_id IS NULL "
+                          "ORDER BY n.node_id", (run['id'],)).fetchall()
+        plan = GraphPlan.model_validate_json(run['plan']) if rows else None
+        for row in rows:
+            db.execute("UPDATE nodes SET status='CANCELED',retry_not_before=NULL,updated=? WHERE run_id=? AND node_id=?",
+                       (self.clock(), run['id'], row['node_id']))
+            if run['status'] != 'CANCELED':   # as a job-level cancel of a returned attempt (8.1 review I1)
+                self._block_descendants(db, run['id'], plan, row['node_id'])
+        return tuple(row['node_id'] for row in rows)
 
     # -- run state ----------------------------------------------------------------------------------
 
