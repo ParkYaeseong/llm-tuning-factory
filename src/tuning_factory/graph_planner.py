@@ -39,7 +39,6 @@ from .graph_schema import (
     node_refs,
 )
 from .model_artifacts import (
-    AdapterMetadata,
     BaseRef,
     HFRootRef,
     ModelArtifactRef,
@@ -559,7 +558,7 @@ def _static_routes(node, nodes, recipes, artifacts, resources):
                 if snapshot.descriptor.adapter and snapshot.descriptor.adapter.method == "oft":
                     raise ValueError("OFT artifact handoff is unsupported")
                 if isinstance(node, MaterializeNode):
-                    _materializable(snapshot.descriptor)
+                    check_materializable(snapshot.descriptor)
     if isinstance(node, MergeNode):
         if all(isinstance(value, ModelArtifactRef) for value in node.models):
             _merge_descriptors(node.models, tuple(artifacts[_artifact_key(ref)].descriptor for ref in node.models))
@@ -573,7 +572,7 @@ def _static_routes(node, nodes, recipes, artifacts, resources):
                 ranks.append(recipe.hyperparameters.lora_rank)
             elif isinstance(value, ModelArtifactRef):
                 descriptor = artifacts[_artifact_key(value)].descriptor
-                _materializable(descriptor)
+                check_materializable(descriptor)
                 ranks.append(descriptor.adapter.rank)
         if sum(ranks) > 256:
             raise ValueError("merged rank exceeds 256")
@@ -680,7 +679,7 @@ def compile_node(plan: GraphPlan, node_id: str, verified_bindings: VerifiedBindi
                 if descriptor.storage_kind != "full_model" or descriptor.quantization_bit is not None:
                     raise ValueError("materialize output must contain full unquantized weights")
             elif isinstance(parent, MergeNode):
-                _materializable(descriptor)
+                check_materializable(descriptor)
             return ref
         return value
 
@@ -778,16 +777,17 @@ def compile_node(plan: GraphPlan, node_id: str, verified_bindings: VerifiedBindi
         return MergeOperation(models=refs, weights=node.weights, resources=resources, lineage=lineage)
     ref = resolve(node.model)
     descriptor = verified(ref)
-    _materializable(descriptor)
+    check_materializable(descriptor)
     _conversion_base_evidence(descriptor, bindings.base_targets, verified)
     return MaterializeOperation(model=ref, resources=resources, lineage=lineage)
 
 
 def _training_parent(recipe, model_input, verified, producers, target_evidence=()):
+    from .model_ops import CONTINUATION_REFUSAL, continuation_mismatches
     policy = model_input.policy
     if policy.adapter:
         descriptor = verified(policy.adapter)
-        _adapter_tensor_shapes(descriptor)
+        adapter_tensor_shapes(descriptor)
         parent_stage = producers[_artifact_key(policy.adapter)].training_stage
         if parent_stage is None:
             raise ValueError("parent training stage evidence is required")
@@ -795,8 +795,10 @@ def _training_parent(recipe, model_input, verified, producers, target_evidence=(
             raise ValueError("SFT to preference training requires explicit materialize")
         evidence = next((item for item in target_evidence if item.base == policy.base), None)
         expected = _expected_adapter(recipe, descriptor.adapter.target_modules, evidence)
-        if descriptor.adapter != expected:
-            raise ValueError("parent adapter settings differ; explicit materialize is required")
+        # PEFT exports always record task_type/inference_mode (plan F7, F10); they are save state, not settings.
+        mismatches = continuation_mismatches(descriptor.adapter, expected)
+        if mismatches:
+            raise ValueError(f"{CONTINUATION_REFUSAL}: {', '.join(mismatches)}")
         if evidence:
             _verify_target_dimensions(evidence, descriptor, verified)
     elif model_input.initialization != ("full_weights" if recipe.training_method in {"full", "freeze"} else "new_adapter"):
@@ -807,25 +809,13 @@ def _training_parent(recipe, model_input, verified, producers, target_evidence=(
 
 
 def _expected_adapter(recipe, actual_targets, evidence=None):
+    from .model_ops import check_continuation_targets, expected_continuation_adapter
     if recipe.training_method not in {"lora", "qlora"}:
         raise ValueError("adapter continuation requires LoRA/QLoRA")
-    hp, options = recipe.hyperparameters, recipe.finetuning_options
     if evidence is None:
         raise ValueError("adapter continuation requires inspected effective-base target/dimension evidence")
-    if hp.lora_target == "all":
-        expected_targets = {item.name for item in evidence.modules}
-    else:
-        expected_targets = {item.name for item in evidence.modules if item.name.split(".")[-1] in {"q_proj", "v_proj"}}
-    expanded = {item.name for item in evidence.modules if any(
-        item.name == target or item.name.endswith("." + target) for target in actual_targets)}
-    if expanded != expected_targets or not expanded:
-        raise ValueError("resolved adapter targets differ from requested targets")
-    return AdapterMetadata(method=recipe.training_method, rank=hp.lora_rank,
-        alpha=options.lora_alpha or hp.lora_rank * 2, target_modules=actual_targets,
-        dropout=options.lora_dropout, use_rslora=options.use_rslora, use_dora=options.use_dora,
-        pissa_init=options.pissa_init, pissa_iter=options.pissa_iter, pissa_convert=options.pissa_convert,
-        quantization_bit=recipe.quantization_bit if recipe.training_method == "qlora" else None,
-        loraplus_lr_ratio=options.loraplus_lr_ratio, loraplus_lr_embedding=options.loraplus_lr_embedding)
+    check_continuation_targets(recipe.hyperparameters.lora_target, actual_targets, evidence)
+    return expected_continuation_adapter(recipe, actual_targets)
 
 
 def _verify_target_dimensions(evidence, descriptor, verified):
@@ -852,7 +842,7 @@ def _conversion_base_evidence(descriptor, evidence_values, verified):
     if len(matches) != 1:
         raise ValueError("conversion requires inspected effective-base target/dimension evidence")
     evidence = matches[0]
-    pairs = _adapter_tensor_shapes(descriptor)
+    pairs = adapter_tensor_shapes(descriptor)
     for module in pairs:
         if not any(module == item.name or module.endswith("." + item.name) for item in evidence.modules):
             raise ValueError("adapter targets are absent from inspected base module inventory")
@@ -861,18 +851,22 @@ def _conversion_base_evidence(descriptor, evidence_values, verified):
     _verify_target_dimensions(evidence, descriptor, verified)
 
 
-def _materializable(descriptor):
+# -- adapter conversion rules (public: shared by planning, model_ops and the worker) ---------------
+
+def check_materializable(descriptor):
+    """A plain causal LoRA/QLoRA adapter of Linear (out, in) weights that merge/materialize can convert."""
     adapter = descriptor.adapter
     if not adapter or adapter.method not in {"lora", "qlora"} or descriptor.has_value_head:
         raise ValueError("materialize requires a causal LoRA/QLoRA adapter without value head")
+    # fan_in_fan_out (Conv1D (in, out) layout) is refused like the worker refuses it: delta = B @ A only.
     if (adapter.use_dora or adapter.use_rslora or adapter.pissa_init or adapter.pissa_convert
-            or adapter.bias != "none" or adapter.modules_to_save or adapter.rank_pattern or adapter.alpha_pattern
-            or adapter.target_parameters or adapter.layer_replication):
+            or adapter.fan_in_fan_out or adapter.bias != "none" or adapter.modules_to_save or adapter.rank_pattern
+            or adapter.alpha_pattern or adapter.target_parameters or adapter.layer_replication):
         raise ValueError("unsupported adapter conversion variant")
-    _adapter_tensor_shapes(descriptor)
+    adapter_tensor_shapes(descriptor)
 
 
-def _adapter_tensor_shapes(descriptor):
+def adapter_tensor_shapes(descriptor):
     pairs = {}
     rank = descriptor.adapter.rank
     for tensor in descriptor.tensors:
@@ -894,12 +888,13 @@ def _adapter_tensor_shapes(descriptor):
     return pairs
 
 
-def _merge_descriptors(refs, descriptors):
+def check_merge_descriptors(refs, descriptors, *, require_real=True):
+    """Merge conversion rules; only the real-only rule is relaxable (synthetic CPU acceptance fixtures)."""
     if len({_artifact_key(ref) for ref in refs}) != len(refs):
         raise ValueError("merge requires distinct actual artifacts")
     for descriptor in descriptors:
-        _materializable(descriptor)
-        if not descriptor.eligible_for_real_use:
+        check_materializable(descriptor)
+        if require_real and not descriptor.eligible_for_real_use:
             raise ValueError("merge requires real completed artifacts")
     if sum(item.adapter.rank for item in descriptors) > 256:
         raise ValueError("merged rank exceeds 256")
@@ -919,6 +914,11 @@ def _merge_descriptors(refs, descriptors):
             return result
         if dimensions(item) != dimensions(first):
             raise ValueError("merge base tensor dimensions differ")
+
+
+def _merge_descriptors(refs, descriptors):
+    """Graph compilation and planning: always real-only."""
+    check_merge_descriptors(refs, descriptors, require_real=True)
 
 
 def _compile_select(plan, node, bindings, lineage, outputs, verified):

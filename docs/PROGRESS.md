@@ -287,12 +287,81 @@ SHA256 `e07c52969951d8efd9b8bbde58247752118aada07805c8b0fdb3c19aa1255774`; sourc
 gave byte-identical receipts. Two used `-I`, where Python picks a random hash seed, and two used `-s -P` with
 `PYTHONHASHSEED` 1 and 3. The superseded pre-fix receipt `4508012d…8f16` was not reproducible. The CPU lock is Windows-only.
 Transformers writes `config.json`/`generation_config.json` with platform newlines, so materialized bytes from Windows and
-Linux may differ.
+Linux may differ. (That receipt is for the 7.1 source; the 7.2 re-run below supersedes it.)
 
-Still open for Task 7 GPU work: merge/materialize tolerances at real model sizes on CUDA (TF32 off) and memory
-(FP32 loads; about 3 base loads per merge), BF16 storage policy (none; F32 doubles size), HF-root snapshots with
-symlinks (the local checks refuse links, so 7.2/7.3 must hand over a link-free verified directory), staging/binding
-(7.2, including F10), worker v2 (7.3), SSH cache/single launch (7.4) and the attempt runner (7.5, including F11).
+Task 7.2 (2026-10-20, sub-plan §3 7.2): path-free model-input staging and training-plan binding. New
+`operation_runner.py` (staging/binding section; no graph_store/jobs import, heavy libraries lazy):
+- `stage_model_inputs` validates train inputs with `ModelArtifactStore.validate_input` first, verifies every role of a
+  train/evaluate/merge/materialize operation in the approved cache, and writes only canonical `model-inputs.json`
+  (`ResolvedModelInputs`: roles, identities, sorted transfers, reference quantization, reward type). It never writes
+  weights and refuses an attempt directory that holds any.
+- `verify_cached_artifact` checks a cache entry's descriptor hash, inventory and payload without lineage.
+  `resolve_hf_root` downloads an exact root with `snapshot_download(local_dir=<HF_HOME>/factory-roots/<owner>/<name>/<rev>)`
+  and loader-only `allow_patterns` (real files, never the symlinked hub cache). It then requires the whole tree to be
+  link-free (`.cache/huggingface/` is walked, never fingerprinted), the config hash and tokenizer fingerprint of that
+  same tree to equal the root, and an unambiguous safetensors layout.
+- `verify_model_paths` re-derives the roles from the operation and the verified cache descriptors, refuses any drift from
+  `model-inputs.json`, and repeats every rule. It reads QLoRA base `config.json` and checks continuation against the
+  worker's own inspected targets; artifact-base evidence must pass `verify_inspected_targets`.
+- `bind_training_plan` substitutes only role sentinels at `training.ROLE_SLOTS` keys with approved, link-free cache
+  paths. It refuses misplaced or leftover sentinels, literal model locations, unapproved paths, `resume_from_checkpoint`
+  and inconsistent `create_new_adapter`/`reward_model_type`/`ref_model_quantization_bit`. `write_bound_plan` writes
+  deterministic `train.bound.yaml`, `model-binding.json` and `binding-evidence.json`.
+- `LlamaFactoryBackend.translate(config, model_input)` returns the logical template. Legacy `translate(config)` is the
+  moved `_legacy_plan` (pure move), `validate_config` validates `GraphTrainingConfig` with its own class, and `prepare`
+  accepts `model_input`.
+
+Rules (enforced at staging and again on the worker unless noted):
+- Continuation compares every effective setting except `inference_mode`/`task_type`, including rank, effective alpha
+  (None → 2·rank), dropout, LF-expanded targets, rsLoRA/DoRA/PiSSA, method, quantization bit and LoRA+. It names the
+  differing fields, starts a fresh optimizer (`create_new_adapter: false`, no resume) and refuses PPO.
+- DPO (non-ORPO/SimPO) and KTO bind `ref_model`(+`ref_model_adapters`) to exactly the policy parent; reference-free
+  losses bind none. QLoRA references are quantized like the policy (Q5).
+- An SFT adapter cannot continue into DPO/KTO. This needs ledger producer evidence, so it runs at compilation and staging
+  only; the worker cannot re-derive a parent's stage.
+- A PPO reward comes only from the typed binding, and `reward_model_type` is derived from it. A LoRA reward must sit on
+  the policy base, and the reward artifact needs `value_head.safetensors`.
+- Every base tokenizer equals the policy's (`<role> tokenizer differs from policy`), and QLoRA needs an unquantized full
+  base.
+
+Carry-forward fixes:
+- F10: `_training_parent` uses `model_ops.continuation_mismatches`; a realistic PEFT 0.18.1 export now compiles.
+- M3: graph_planner exposes `check_materializable`, `adapter_tensor_shapes` and
+  `check_merge_descriptors(require_real=)`. model_ops uses them, with no private imports and no descriptor rewrite.
+  `_merge_descriptors` stays real-only.
+- M2: planning refuses `fan_in_fan_out` like the worker.
+- Shard layout: model_ops refuses a full model with both `model.safetensors` and the index, or with neither (the
+  all-`*.safetensors` fallback is adapter-only), and refuses `config.json` `transformers_weights`.
+
+Deviations:
+- Plan F18's 30-row matrix construction was not recorded and could not be reproduced. The test pins digest
+  `d488f35a…3473` of an explicit matrix computed at HEAD `42064b7` from the unmodified `translate`. The F18
+  example-config digests match exactly, as does the v1 manifest `training_config_sha256`.
+- `stage_model_inputs` gains a `producers=` keyword for the ledger stage rule. Staging also verifies artifact-base
+  target evidence.
+
+Actual verification:
+- RED: 60 failed on the missing module and helpers, including F10's `parent adapter settings differ` on a real export.
+- GREEN: `uv run pytest tests/test_model_inputs.py` **55 passed**. The sub-plan set (`test_model_inputs`, `test_training`,
+  `test_graph_planner`, `test_operation_schema`, `test_model_artifacts`, `test_config_registry`, plus
+  `test_model_ops_contract`) gave **286 passed**.
+- `uv run pytest -q` gave **906 passed, 1 skipped**. Ruff is clean, `check_secrets.py` reports 0 findings, both GPU locks
+  are unchanged, and the main `.venv` has no torch/peft/transformers/safetensors/huggingface_hub.
+- The CPU acceptance re-run (`-I`) exited 0 with all 25 checks passed and unchanged max errors (merge delta 7.78e-9,
+  materialize delta 9.17e-9, parent→child 6.42e-9, logits 3.35e-8/2.98e-8). Receipt SHA256
+  `6a62e78871a8c852c3671495f1a3866e399f9c5dbaa4f875a712a57ac39d447a`, source_sha256
+  `632d468b5bb05e15d038c0ece196716e8a3d48349e46c4316b26f4940f63cc37`, and lock_sha256 unchanged.
+
+Still open for Task 7 GPU work:
+- Hardware and numerics: merge/materialize tolerances at real model sizes on CUDA (TF32 off); memory (FP32 loads;
+  about 3 base loads per merge); a BF16 storage policy (none yet; F32 doubles size).
+- Worker v2 (7.3): wire `verify_model_paths` → `bind_training_plan` → `write_bound_plan`, with
+  `model_ops.inspect_target_modules` as `inspect_targets`.
+- SSH cache and single launch (7.4): remote cache entries must stay link-free (uploaded directories moved with
+  `mv -T`, never symlinked). HF_HOME and the model cache on the GPU host must not sit under a symlink or junction, and
+  HF roots are resolved on the worker, never uploaded.
+- Attempt runner (7.5, including F11), and Task 8's planning-time refusal of PPO continuation.
+- Real LF training on a bound YAML, real DPO/KTO references and PPO remain unverified.
 
 ---
 

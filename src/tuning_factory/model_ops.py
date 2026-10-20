@@ -6,7 +6,9 @@ refusal and after the stdlib finite scan of the (small) adapter inputs. The scan
 ``safetensors_scan`` and the target-module inspector/verifier in ``target_inspection``; both are
 re-exported here. Policy ``model-ops-f32-v1`` computes in FP32 from an exact upcast of
 the inputs and stores every output tensor as F32. Inputs are ``LocalModel`` directories that the
-caller has already verified against their identity; the checks here repeat the cheap ones.
+caller has already verified against their identity; the checks here repeat the cheap ones. The
+adapter conversion rules are graph_planner's public ``check_*`` rules, so planning and the worker agree.
+The continuation helpers at the end decide whether a child training run may resume a parent adapter.
 """
 from __future__ import annotations
 
@@ -49,10 +51,13 @@ from .safetensors_scan import scan_finite_safetensors
 from .target_inspection import inspect_target_modules, verify_inspected_targets
 
 __all__ = [
-    "POLICY_F32_V1", "TOLERANCE_POLICIES", "LocalModel", "MaterializeReceipt", "MergePlan", "MergeReceipt",
-    "StagedLoad", "TolerancePolicy", "adapter_metadata_from_config", "inspect_target_modules",
-    "materialize_model", "merge_adapters", "scan_finite_safetensors", "validate_materialize_input",
-    "validate_merge_inputs", "verify_inspected_targets", "write_adapter_config",
+    "CONTINUATION_REFUSAL", "EXPORT_ONLY_ADAPTER_FIELDS", "POLICY_F32_V1", "TOLERANCE_POLICIES", "LocalModel",
+    "MaterializeReceipt", "MergePlan", "MergeReceipt", "StagedLoad", "TolerancePolicy",
+    "adapter_metadata_from_config", "check_continuation", "check_continuation_targets",
+    "check_full_model_directory", "continuation_mismatches", "expected_continuation_adapter",
+    "inspect_target_modules", "local_tokenizer_fingerprint", "materialize_model", "merge_adapters",
+    "scan_finite_safetensors", "validate_materialize_input", "validate_merge_inputs", "verify_inspected_targets",
+    "write_adapter_config",
 ]
 
 POLICY_F32_V1 = "model-ops-f32-v1"
@@ -64,6 +69,9 @@ LOGITS_FAILED = "reloaded logits differ beyond tolerance policy"
 # Input dtypes with an exact FP32 upcast; F64 would be narrowed and integers are not weights to merge.
 POLICY_DTYPES = frozenset({"F16", "BF16", "F32"})
 SHARD_INDEX = "model.safetensors.index.json"
+SINGLE_WEIGHTS = "model.safetensors"
+# transformers loads config.transformers_weights instead of model.safetensors/the index (modeling_utils).
+WEIGHT_REDIRECT = "config.json transformers_weights redirects the weight loader; refusing"
 
 
 def _quantized(operation: str) -> str:
@@ -147,28 +155,19 @@ def _validation_message(error: ValidationError) -> str:
     return str(error.errors()[0]["msg"]).removeprefix("Value error, ")
 
 
-def _linear_layout(descriptor: ModelDescriptor):
-    # The numerical delta is B @ A for torch.nn.Linear (out, in) weights only.
-    if descriptor.adapter.fan_in_fan_out:
-        raise ValueError(VARIANT)
-
-
 # -- input validation (no torch) -----------------------------------------------------------------
 
 def validate_merge_inputs(refs, descriptors, weights, *, require_real: bool = True) -> MergePlan:
     """Reuse graph compilation's conversion rules; only the real-only rule is relaxable."""
-    from .graph_planner import _merge_descriptors
+    from .graph_planner import check_merge_descriptors
     from .graph_schema import MergeNode
 
     refs = tuple(ModelArtifactRef.model_validate(ref) for ref in refs)
     descriptors = tuple(ModelDescriptor.model_validate(item) for item in descriptors)
     if len(refs) != len(descriptors):
         raise ValueError("merge requires one verified descriptor for each input")
-    checked = descriptors if require_real else tuple(
-        item.model_copy(update={"synthetic": False, "simulation": False}) for item in descriptors)
-    _merge_descriptors(refs, checked)
-    for descriptor in descriptors:
-        _linear_layout(descriptor)
+    # Includes fan_in_fan_out: the numerical delta is B @ A for torch.nn.Linear (out, in) weights only.
+    check_merge_descriptors(refs, descriptors, require_real=require_real)
     weights = tuple(weights)
     if len(weights) != len(refs) or any(isinstance(weight, bool) or not isinstance(weight, (int, float))
                                         or not math.isfinite(weight) or weight <= 0 for weight in weights):
@@ -196,8 +195,12 @@ def _check_adapter_local(model: LocalModel) -> ModelDescriptor:
     return descriptor
 
 
-def _local_tokenizer_fingerprint(directory: Path) -> str:
-    # Same algorithm as model_artifacts.tokenizer_fingerprint, hashing only tokenizer files.
+def local_tokenizer_fingerprint(directory: Path) -> str:
+    """model_artifacts' tokenizer fingerprint, hashing only the tokenizer files (never multi-GB weights).
+
+    Other files (weights, an HF ``local_dir`` download's ``.cache/huggingface/`` metadata) are walked for
+    links but not hashed, so an HFRootRef fingerprint is computed on exactly the tree that is bound.
+    """
     entries = []
     for relative, file in _files(directory):
         if is_tokenizer_file(relative):
@@ -207,12 +210,19 @@ def _local_tokenizer_fingerprint(directory: Path) -> str:
     return _tokenizer_hash(tuple(entries))
 
 
-def _weight_layout(directory: Path) -> tuple[tuple[str, ...], dict | None]:
-    """The safetensors files a loader reads: the indexed shards, else model.safetensors, else all.
+def _weight_layout(directory: Path, *, adapter: bool) -> tuple[tuple[str, ...], dict | None]:
+    """The safetensors files a loader reads.
 
-    Other top-level copies (for example Mistral's consolidated.safetensors) are ignored, as loaders do.
+    Adapter directories: every top-level ``*.safetensors``. Full models: exactly one of
+    ``model.safetensors`` or the shard index (transformers 5.6 loads ``model.safetensors`` first, so having
+    both is ambiguous). Other top-level copies (for example Mistral's consolidated.safetensors) are ignored,
+    as loaders do.
     """
     names = {relative for relative, _ in _files(directory) if "/" not in relative}
+    if adapter:
+        return tuple(sorted(name for name in names if name.endswith(".safetensors"))), None
+    if SHARD_INDEX in names and SINGLE_WEIGHTS in names:
+        raise ValueError("ambiguous single and sharded model weights")
     if SHARD_INDEX in names:
         index = _read_json(directory / SHARD_INDEX)
         weight_map = index.get("weight_map") if isinstance(index, dict) else None
@@ -223,17 +233,17 @@ def _weight_layout(directory: Path) -> tuple[tuple[str, ...], dict | None]:
         if any(shard not in names or not shard.endswith(".safetensors") for shard in shards):
             raise ValueError("missing or mismatched model shard")
         return shards, weight_map
-    if "model.safetensors" in names:
-        return ("model.safetensors",), None
-    return tuple(sorted(name for name in names if name.endswith(".safetensors"))), None
+    if SINGLE_WEIGHTS in names:
+        return (SINGLE_WEIGHTS,), None
+    raise ValueError("full model weights require model.safetensors or a shard index")
 
 
-def _weight_files(directory: Path) -> tuple[str, ...]:
-    return _weight_layout(directory)[0]
+def _weight_files(directory: Path, *, adapter: bool) -> tuple[str, ...]:
+    return _weight_layout(directory, adapter=adapter)[0]
 
 
-def _header_inventory(directory: Path) -> dict:
-    files, weight_map = _weight_layout(directory)
+def _header_inventory(directory: Path, *, adapter: bool) -> dict:
+    files, weight_map = _weight_layout(directory, adapter=adapter)
     inventory = {}
     for relative in files:
         for tensor in _tensor_header(directory / relative, relative):
@@ -269,17 +279,40 @@ def _verified_base(base: LocalModel, operation: str) -> dict:
     config = _read_json(base.path / "config.json")
     if not isinstance(config, dict) or "quantization_config" in config:
         raise ValueError(_quantized(operation))
+    _check_loader_config(config)
     with _open_regular(base.path / "config.json") as stream:
         if hashlib.file_digest(stream, "sha256").hexdigest() != base.config_sha256:
             raise ValueError("model config snapshot fingerprint mismatch")
-    if _local_tokenizer_fingerprint(base.path) != base.tokenizer_fingerprint:
+    if local_tokenizer_fingerprint(base.path) != base.tokenizer_fingerprint:
         raise ValueError("tokenizer snapshot fingerprint mismatch")
-    inventory = _header_inventory(base.path)
+    inventory = _header_inventory(base.path, adapter=False)
     if base.descriptor is not None and set(inventory.values()) != set(base.descriptor.tensors):
         raise ValueError("tensor inventory geometry does not match snapshot")
     if any(tensor.dtype not in POLICY_DTYPES for tensor in inventory.values()):
         raise ValueError(_dtype_refusal(operation))
     return inventory
+
+
+def _check_loader_config(config: dict) -> None:
+    if "transformers_weights" in config:
+        raise ValueError(WEIGHT_REDIRECT)
+
+
+def check_full_model_directory(directory: Path) -> dict:
+    """Loader-relevant checks of a local full-model directory; returns its config.json.
+
+    The tree must be link-free, config.json must not redirect the weight loader, and the safetensors
+    layout must be unambiguous with headers that cover the index. No tensor data is read.
+    """
+    directory = Path(directory).absolute()
+    _check_ancestors(directory)
+    _files(directory)
+    config = _read_json(directory / "config.json")
+    if not isinstance(config, dict):
+        raise ValueError("invalid model config.json")
+    _check_loader_config(config)
+    _header_inventory(directory, adapter=False)
+    return config
 
 
 def _check_policy_dtypes(descriptor: ModelDescriptor, operation: str) -> None:
@@ -288,9 +321,9 @@ def _check_policy_dtypes(descriptor: ModelDescriptor, operation: str) -> None:
 
 
 def _adapter_pairs(descriptor: ModelDescriptor) -> dict:
-    from .graph_planner import _adapter_tensor_shapes
+    from .graph_planner import adapter_tensor_shapes
     pairs = {}
-    for module, pair in _adapter_tensor_shapes(descriptor).items():
+    for module, pair in adapter_tensor_shapes(descriptor).items():
         if not module.startswith(PEFT_PREFIX) or any(
                 tensor.name != f"{module}.lora_{letter}.weight" for letter, tensor in pair.items()):
             raise ValueError("adapter tensors must use PEFT base_model.model.<module>.lora_{A,B}.weight names")
@@ -308,7 +341,7 @@ def _check_base_dimensions(descriptor: ModelDescriptor, inventory: dict, message
 
 
 def validate_materialize_input(load: StagedLoad) -> None:
-    from .graph_planner import _materializable
+    from .graph_planner import check_materializable
     base, adapter = load.base, load.adapter
     descriptor = adapter.descriptor
     if descriptor is None or descriptor.storage_kind != "adapter":
@@ -316,8 +349,7 @@ def validate_materialize_input(load: StagedLoad) -> None:
     _check_adapter_local(adapter)
     if base.identity != descriptor.effective_base:
         raise ValueError("materialize base differs from adapter effective base")
-    _materializable(descriptor)
-    _linear_layout(descriptor)
+    check_materializable(descriptor)   # includes fan_in_fan_out: delta = B @ A for Linear weights only
     _check_policy_dtypes(descriptor, "materialization")
     inventory = _verified_base(base, "materialization")
     if (base.config_sha256, base.tokenizer_fingerprint) != (descriptor.config_sha256,
@@ -439,10 +471,10 @@ def _probe_ids(transformers, base_path: Path, vocab_size: int, probe_ids) -> tup
     return tuple(ids)
 
 
-def _torch_scan(torch, directory: Path) -> int:
+def _torch_scan(torch, directory: Path, *, adapter: bool) -> int:
     from safetensors import safe_open
     checked = 0
-    for relative in _weight_files(directory):
+    for relative in _weight_files(directory, adapter=adapter):
         with safe_open(str(directory / relative), framework="pt") as handle:
             for name in handle.keys():
                 tensor = handle.get_tensor(name)
@@ -452,10 +484,10 @@ def _torch_scan(torch, directory: Path) -> int:
     return checked
 
 
-def _load_tensors(directory: Path) -> dict:
+def _load_tensors(directory: Path, *, adapter: bool) -> dict:
     from safetensors.torch import load_file
     tensors = {}
-    for relative in _weight_files(directory):
+    for relative in _weight_files(directory, adapter=adapter):
         tensors.update(load_file(str(directory / relative), device="cpu"))
     return tensors
 
@@ -465,8 +497,8 @@ def _close(torch, actual, expected, atol: float, rtol: float) -> tuple[bool, flo
     return bool(torch.allclose(actual, expected, atol=atol, rtol=rtol)) and math.isfinite(error), error
 
 
-def _require_f32(directory: Path) -> None:
-    if any(tensor.dtype != "F32" for tensor in _header_inventory(directory).values()):
+def _require_f32(directory: Path, *, adapter: bool) -> None:
+    if any(tensor.dtype != "F32" for tensor in _header_inventory(directory, adapter=adapter).values()):
         raise ValueError("model-operation output tensors must be stored as F32")
 
 
@@ -498,7 +530,7 @@ def _output_files(directory: Path) -> tuple[str, ...]:
 def _expected_deltas(torch, models, weights, scales) -> dict:
     expected = {}
     for model, weight, scale in zip(models, weights, scales):
-        tensors = _load_tensors(Path(model.path).absolute())
+        tensors = _load_tensors(Path(model.path).absolute(), adapter=True)
         for module in _adapter_pairs(model.descriptor):
             a = tensors[f"{PEFT_PREFIX}{module}.lora_A.weight"].to(torch.float64)
             b = tensors[f"{PEFT_PREFIX}{module}.lora_B.weight"].to(torch.float64)
@@ -532,7 +564,7 @@ def merge_adapters(inputs: Sequence[LocalModel], weights: Sequence[float], outpu
     torch, peft, safetensors, transformers = model_ops_runtime()
     target = _device(torch, device)
     base_path = Path(base.path).absolute()
-    checked += _torch_scan(torch, base_path)
+    checked += _torch_scan(torch, base_path, adapter=False)
     model = peft.PeftModel.from_pretrained(_load_fp32(torch, transformers, base_path, target),
                                            str(Path(inputs[0].path).absolute()), adapter_name="a0")
     for index, item in enumerate(inputs[1:], start=1):
@@ -555,11 +587,11 @@ def merge_adapters(inputs: Sequence[LocalModel], weights: Sequence[float], outpu
                              first.root.repo_id)
         config = _read_json(payload / "adapter_config.json")
         _copy_snapshot_files(base_path, payload, config=True)
-        _require_f32(payload)
+        _require_f32(payload, adapter=True)
         if (config.get("r"), config.get("lora_alpha"), sorted(config.get("target_modules") or ())) != (
                 plan.output_rank, plan.output_rank, list(plan.target_modules)):
             raise ValueError(DELTA_FAILED)
-        checked += _torch_scan(torch, payload)
+        checked += _torch_scan(torch, payload, adapter=True)
         delta_error, logits_error = _verify_merge(torch, peft, transformers, inputs, plan, base_path, payload,
                                                   target, tolerance, probe_ids)
         files = _output_files(payload)
@@ -573,7 +605,7 @@ def merge_adapters(inputs: Sequence[LocalModel], weights: Sequence[float], outpu
 
 def _verify_merge(torch, peft, transformers, inputs, plan, base_path, payload, device, tolerance, probe_ids):
     expected = _expected_deltas(torch, inputs, plan.normalized_weights, plan.scales)
-    merged = _load_tensors(payload)
+    merged = _load_tensors(payload, adapter=True)
     names = {f"{PEFT_PREFIX}{module}.lora_{letter}.weight" for module in expected for letter in "AB"}
     if set(merged) != names:
         raise ValueError(DELTA_FAILED)
@@ -614,7 +646,7 @@ def materialize_model(input: StagedLoad, output: Path, *, policy: str = POLICY_F
     target = _device(torch, device)
     base_path = Path(load.base.path).absolute()
     adapter_path = Path(load.adapter.path).absolute()
-    checked += _torch_scan(torch, base_path)
+    checked += _torch_scan(torch, base_path, adapter=False)
     model = peft.PeftModel.from_pretrained(_load_fp32(torch, transformers, base_path, target), str(adapter_path))
     model.eval()
     ids = _probe_ids(transformers, base_path, model.get_input_embeddings().weight.shape[0], probe_ids)
@@ -627,10 +659,10 @@ def materialize_model(input: StagedLoad, output: Path, *, policy: str = POLICY_F
         del merged, model
         (payload / "README.md").unlink(missing_ok=True)
         _copy_snapshot_files(base_path, payload, config=False)
-        _require_f32(payload)
-        if _local_tokenizer_fingerprint(payload) != load.base.tokenizer_fingerprint:
+        _require_f32(payload, adapter=False)
+        if local_tokenizer_fingerprint(payload) != load.base.tokenizer_fingerprint:
             raise ValueError("tokenizer snapshot fingerprint mismatch")
-        checked += _torch_scan(torch, payload)
+        checked += _torch_scan(torch, payload, adapter=False)
         delta_error = _verify_materialized(torch, load.adapter, base_path, payload, tolerance)
         reloaded = _load_fp32(torch, transformers, payload, target)
         ok, logits_error = _close(torch, _logits(torch, reloaded, ids, target), before,
@@ -649,7 +681,7 @@ def materialize_model(input: StagedLoad, output: Path, *, policy: str = POLICY_F
 
 
 def _verify_materialized(torch, adapter: LocalModel, base_path: Path, payload: Path, tolerance) -> float:
-    base, result = _load_tensors(base_path), _load_tensors(payload)
+    base, result = _load_tensors(base_path, adapter=False), _load_tensors(payload, adapter=False)
     if set(base) != set(result):
         raise ValueError(DELTA_FAILED)
     metadata = adapter.descriptor.adapter
@@ -667,3 +699,78 @@ def _verify_materialized(torch, adapter: LocalModel, base_path: Path, payload: P
         elif not torch.equal(tensor, original):
             raise ValueError("materialized non-target tensors differ from the effective base")
     return delta_error
+
+
+# -- continuation of a parent adapter (shared by compilation, staging and the worker) -------------
+
+# PEFT save state (plan F7): every export records inference_mode=True and task_type="CAUSAL_LM". They are not
+# settings of the resumed adapter, so continuation ignores them; every other effective setting must match.
+EXPORT_ONLY_ADAPTER_FIELDS = frozenset({"inference_mode", "task_type"})
+CONTINUATION_REFUSAL = "parent adapter settings differ; explicit materialize is required"
+
+
+def check_continuation_targets(lora_target: str, actual_targets: Sequence[str], evidence) -> None:
+    """The child's requested targets, expanded over the inspected effective base with LLaMA-Factory's rule
+    (``all`` = every inspected Linear module; plan F9), must select exactly the parent adapter's modules."""
+    modules = {item.name for item in evidence.modules}
+    if lora_target == "all":
+        expected = modules
+    else:
+        wanted = set(lora_target.split(","))
+        expected = {name for name in modules if name.split(".")[-1] in wanted}
+    expanded = {name for name in modules
+                if any(name == target or name.endswith("." + target) for target in actual_targets)}
+    if expanded != expected or not expanded:
+        raise ValueError("resolved adapter targets differ from requested targets")
+
+
+def expected_continuation_adapter(config_or_recipe, actual_targets: Sequence[str]) -> AdapterMetadata:
+    """The adapter metadata the child's settings would train, resolved like LLaMA-Factory 0.9.5.
+
+    ``lora_alpha`` None resolves to ``2 * lora_rank``. ``actual_targets`` are the parent's own target names,
+    which ``check_continuation_targets`` has matched against the child's request.
+    """
+    if config_or_recipe.training_method not in {"lora", "qlora"}:
+        raise ValueError("adapter continuation requires LoRA/QLoRA")
+    hyperparameters, options = config_or_recipe.hyperparameters, config_or_recipe.finetuning_options
+    qlora = config_or_recipe.training_method == "qlora"
+    return AdapterMetadata(
+        method=config_or_recipe.training_method, rank=hyperparameters.lora_rank,
+        alpha=options.lora_alpha or hyperparameters.lora_rank * 2, target_modules=tuple(sorted(actual_targets)),
+        dropout=options.lora_dropout, use_rslora=options.use_rslora, use_dora=options.use_dora,
+        pissa_init=options.pissa_init, pissa_iter=options.pissa_iter, pissa_convert=options.pissa_convert,
+        quantization_bit=config_or_recipe.quantization_bit if qlora else None,
+        loraplus_lr_ratio=options.loraplus_lr_ratio, loraplus_lr_embedding=options.loraplus_lr_embedding)
+
+
+def continuation_mismatches(parent: AdapterMetadata, expected: AdapterMetadata) -> tuple[str, ...]:
+    """Sorted names of the effective settings that differ, ignoring EXPORT_ONLY_ADAPTER_FIELDS.
+
+    LoRA+ fields stay compared (plan §6 Q17): they are optimizer settings recorded with the parent.
+    """
+    actual = AdapterMetadata.model_validate(parent).model_dump()
+    wanted = AdapterMetadata.model_validate(expected).model_dump()
+    for values in (actual, wanted):
+        values["target_modules"] = sorted(values["target_modules"])
+    return tuple(sorted(name for name in actual
+                        if name not in EXPORT_ONLY_ADAPTER_FIELDS and actual[name] != wanted[name]))
+
+
+def check_continuation(config_or_recipe, parent: AdapterMetadata, evidence) -> AdapterMetadata:
+    """Refuse resuming a parent adapter whose effective settings differ from the child's.
+
+    LLaMA-Factory resumes the parent with the parent's own saved config and never compares it with the
+    child's lora_rank/lora_alpha (plan F3), so any difference would otherwise be silently ignored.
+    ``evidence`` is the inspected target inventory of the exact effective base.
+    """
+    if config_or_recipe.training_method not in {"lora", "qlora"}:
+        raise ValueError("adapter continuation requires LoRA/QLoRA")
+    if evidence is None:
+        raise ValueError("adapter continuation requires inspected effective-base target/dimension evidence")
+    parent = AdapterMetadata.model_validate(parent)
+    check_continuation_targets(config_or_recipe.hyperparameters.lora_target, parent.target_modules, evidence)
+    expected = expected_continuation_adapter(config_or_recipe, parent.target_modules)
+    mismatches = continuation_mismatches(parent, expected)
+    if mismatches:
+        raise ValueError(f"{CONTINUATION_REFUSAL}: {', '.join(mismatches)}")
+    return expected

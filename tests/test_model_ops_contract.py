@@ -251,14 +251,10 @@ def test_merge_refuses_config_or_tokenizer_mismatch(field):
         module.validate_merge_inputs((ref_for(first, "a"), ref_for(second, "b")), (first, second), (0.5, 0.5))
 
 
-@pytest.mark.parametrize("changes", [
-    {"targets": ("q_proj",), "modules": MODULES[:1]},
-    {"fan_in_fan_out": True},
-])
-def test_merge_refuses_target_module_or_fan_in_mismatch(changes):
+def test_merge_refuses_target_module_mismatch():
     module = api()
     first = lora_descriptor()
-    second = lora_descriptor(**changes, marker="other")
+    second = lora_descriptor(targets=("q_proj",), modules=MODULES[:1], marker="other")
     with pytest.raises(ValueError, match="merge input effective bases/tokenizers/targets differ"):
         module.validate_merge_inputs((ref_for(first, "a"), ref_for(second, "b")), (first, second), (0.5, 0.5))
 
@@ -295,6 +291,8 @@ def variant_cases():
         pytest.param({"alpha_pattern": (AlphaPattern(module="q_proj", alpha=8),)}, variant, id="alpha_pattern"),
         pytest.param({"target_parameters": ("experts.weight",)}, variant, id="target_parameters"),
         pytest.param({"layer_replication": ((0, 1),)}, variant, id="layer_replication"),
+        # Conv1D (in, out) layouts: the worker's delta is B @ A for Linear weights only, so planning refuses too.
+        pytest.param({"fan_in_fan_out": True}, variant, id="fan_in_fan_out"),
         pytest.param({"method": "oft"}, semantic, id="oft"),
         pytest.param({"semantic_kind": "reward_model", "has_value_head": True, "extra_tensors": (head,)},
                      semantic, id="value_head"),
@@ -367,6 +365,20 @@ def test_graph_merge_compilation_stays_real_only():
     api().validate_merge_inputs(refs, descriptors, (0.25, 0.75), require_real=False)
     with pytest.raises(ValueError, match="merge requires real completed artifacts"):
         _merge_descriptors(refs, descriptors)
+
+
+def test_model_ops_uses_the_public_conversion_rules():
+    import inspect
+
+    from tuning_factory import graph_planner
+    refs, descriptors = two_adapters(simulation=True)
+    graph_planner.check_merge_descriptors(refs, descriptors, require_real=False)
+    with pytest.raises(ValueError, match="merge requires real completed artifacts"):
+        graph_planner.check_merge_descriptors(refs, descriptors)
+    source = inspect.getsource(api())
+    # No private graph_planner helpers and no descriptor rewrite to bypass the real-only rule.
+    assert "from .graph_planner import _" not in source
+    assert '"synthetic": False' not in source
 
 
 # -- 11-12. finite scan --------------------------------------------------------------------------
@@ -603,6 +615,48 @@ def test_single_file_base_ignores_a_consolidated_copy(tmp_path):
     write_safetensors(base.path / "consolidated.safetensors", base_tensors())
     module.validate_materialize_input(module.StagedLoad(
         base=base, adapter=adapter_on_disk(tmp_path, "adapter", lora_descriptor())))
+
+
+def test_base_with_single_and_sharded_weights_is_ambiguous(tmp_path):
+    # transformers 5.6 loads model.safetensors before the index, so validating the shards would check other bytes.
+    module = api()
+    write_sharded_base(tmp_path / "base")
+    write_safetensors(tmp_path / "base" / "model.safetensors", base_tensors())
+    load = module.StagedLoad(base=local(tmp_path / "base", root_ref(), None),
+                             adapter=adapter_on_disk(tmp_path, "adapter", lora_descriptor()))
+    with pytest.raises(ValueError, match="ambiguous single and sharded model weights"):
+        module.validate_materialize_input(load)
+
+
+def test_full_model_without_loader_weights_is_refused(tmp_path):
+    module = api()
+    base = hf_base_on_disk(tmp_path)
+    (base.path / "model.safetensors").rename(base.path / "consolidated.safetensors")
+    with pytest.raises(ValueError, match="model.safetensors or a shard index"):
+        module.validate_materialize_input(module.StagedLoad(
+            base=base, adapter=adapter_on_disk(tmp_path, "adapter", lora_descriptor())))
+
+
+def test_adapter_directories_keep_the_all_safetensors_layout(tmp_path):
+    module = api()
+    adapter = adapter_on_disk(tmp_path, "adapter", lora_descriptor())
+    write_safetensors(adapter.path / "value_head.safetensors", {"v_head.summary.weight": f32((1, 16))})
+    assert module._weight_files(adapter.path, adapter=True) == ("adapter_model.safetensors", "value_head.safetensors")
+    with pytest.raises(ValueError, match="model.safetensors or a shard index"):
+        module._weight_files(adapter.path, adapter=False)
+
+
+def test_base_config_weight_redirect_is_refused(tmp_path, monkeypatch):
+    module = api()
+    config = canonical({"model_type": "qwen2", "hidden_size": 16, "transformers_weights": "consolidated.safetensors"})
+    base = hf_base_on_disk(tmp_path, config=config)
+    with pytest.raises(ValueError, match="transformers_weights"):
+        module.validate_materialize_input(module.StagedLoad(
+            base=base, adapter=adapter_on_disk(tmp_path, "adapter", lora_descriptor())))
+    inputs, base = valid_merge(tmp_path, base)
+    block_heavy_imports(monkeypatch)
+    with pytest.raises(ValueError, match="transformers_weights"):
+        module.merge_adapters(inputs, (0.25, 0.75), tmp_path / "out", base=base, require_real=False)
 
 
 def test_merge_refuses_base_that_is_not_the_shared_effective_base(tmp_path, monkeypatch):

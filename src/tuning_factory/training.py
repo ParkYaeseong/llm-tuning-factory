@@ -8,12 +8,47 @@ import subprocess
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
+from types import MappingProxyType
 
 import yaml
 
 from .capabilities import STAGES, compatibility
-from .config import AIConfig
+from .config import AIConfig, GraphTrainingConfig
+from .model_artifacts import ModelInput
 from .registry import canonical, dataset_descriptor, digest, file_digest, parse_dataset
+
+# A v2 logical training template holds no model location. Each model slot holds the sentinel
+# ROLE_PREFIX + role; only the worker replaces it with a hash-verified local path (operation_runner).
+ROLE_PREFIX = "factory-role:"
+ROLE_SLOTS = MappingProxyType({
+    "policy_base": "model_name_or_path", "policy_adapter": "adapter_name_or_path",
+    "reference_base": "ref_model", "reference_adapter": "ref_model_adapters",
+    "reward_base": "reward_model", "reward_adapter": "reward_model"})
+PPO_CONTINUATION = ("PPO adapter continuation is unsupported: its KL reference would revert to the base; "
+                    "materialize the parent first")
+
+
+def requires_frozen_reference(config) -> bool:
+    """LLaMA-Factory 0.9.5 uses a reference model for KTO and for DPO except ORPO/SimPO (plan F2)."""
+    return config.training_stage == "kto" or (
+        config.training_stage == "dpo" and config.stage_options.pref_loss not in {"orpo", "simpo"})
+
+
+def check_model_input_contract(config, model_input: ModelInput) -> ModelInput:
+    """Typed role rules that depend only on the training config and ModelInput (no artifacts)."""
+    model_input = ModelInput.model_validate(model_input)
+    if config.stage_options.reward_model is not None or config.stage_options.reward_model_sha256 is not None:
+        raise ValueError("graph training binds only typed model roles")
+    if (config.training_stage == "ppo") != (model_input.reward_model is not None):
+        raise ValueError("PPO requires a typed reward_model binding; other stages cannot bind reward")
+    if config.training_stage == "ppo" and model_input.initialization == "continue_adapter":
+        raise ValueError(PPO_CONTINUATION)
+    if requires_frozen_reference(config):
+        if model_input.frozen_reference != model_input.policy:
+            raise ValueError("frozen reference must bind the exact policy parent")
+    elif model_input.frozen_reference is not None:
+        raise ValueError("reference-free recipe cannot bind a frozen reference")
+    return model_input
 
 
 class CanceledError(RuntimeError):
@@ -45,9 +80,10 @@ class LlamaFactoryBackend(TrainingBackend):
         self.command = command or ["llamafactory-cli", "train"]
 
     def validate_config(self, config):
-        return AIConfig.model_validate(config.model_dump())
+        model = GraphTrainingConfig if isinstance(config, GraphTrainingConfig) else AIConfig
+        return model.model_validate(config.model_dump())
 
-    def prepare(self, config, directory, dataset):
+    def prepare(self, config, directory, dataset, model_input=None):
         self.validate_config(config)
         directory = Path(directory)
         (directory / "data").mkdir(parents=True, exist_ok=True)
@@ -59,12 +95,44 @@ class LlamaFactoryBackend(TrainingBackend):
         (directory / "data" / "dataset_info.json").write_text(json.dumps({
             "factory_dataset": descriptor
         }), encoding="utf-8")
-        plan = self.translate(config)
+        plan = self.translate(config) if model_input is None else self.translate(config, model_input)
         (directory / "train.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
         (directory / "config.json").write_text(config.model_dump_json(), encoding="utf-8")
 
     @staticmethod
-    def translate(config):
+    def translate(config, model_input: ModelInput | None = None):
+        """Legacy executable plan (``model_input`` None, byte-identical), else a v2 logical template.
+
+        The template carries no repository ID, revision or path: model slots hold role sentinels, the
+        adapter/reference/reward slots exist only for the typed roles present, and ``reward_model_type``
+        is derived from the typed reward binding, never from the config.
+        """
+        plan = LlamaFactoryBackend._legacy_plan(config)
+        if model_input is None:
+            return plan
+        model_input = check_model_input_contract(config, model_input)
+        for key in ("model_name_or_path", "model_revision", "reward_model", "reward_model_type"):
+            plan.pop(key, None)
+        plan["model_name_or_path"] = ROLE_PREFIX + "policy_base"
+        if model_input.policy.adapter is not None:
+            # Resume the exact parent adapter (fresh optimizer); never stack a new adapter on it.
+            plan.update(adapter_name_or_path=ROLE_PREFIX + "policy_adapter", create_new_adapter=False)
+        reference = model_input.frozen_reference
+        if reference is not None:
+            plan["ref_model"] = ROLE_PREFIX + "reference_base"
+            if reference.adapter is not None:
+                plan["ref_model_adapters"] = ROLE_PREFIX + "reference_adapter"
+            if config.training_method == "qlora":
+                # Plan §6 Q5: the frozen reference of a QLoRA policy is quantized like the policy.
+                plan["ref_model_quantization_bit"] = config.quantization_bit
+        reward = model_input.reward_model
+        if reward is not None:
+            plan["reward_model"] = ROLE_PREFIX + ("reward_adapter" if reward.adapter else "reward_base")
+            plan["reward_model_type"] = "lora" if reward.adapter else "full"
+        return plan
+
+    @staticmethod
+    def _legacy_plan(config):
         plan = {"model_name_or_path": config.base_model, "model_revision": config.model_revision,
                 "trust_remote_code": False, "stage": config.training_stage, "do_train": True,
                 "finetuning_type": ("lora" if config.training_method == "qlora" else config.training_method),
