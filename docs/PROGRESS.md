@@ -132,35 +132,34 @@ Commits of the SSH GPU server and MLflow work, in order:
 - Task 6B-1: 6f3c70f (SSH-only recovery executors, refused pre-launch errors), 570498d (desktop actions routed to SSH servers,
   unauthenticated MLflow).
 - Task 6B-2: 16235c6 (refuse misrouted server jobs early), 15b118d (robust job listing and preparation), c0ee9a9 (SSH
-  server connection screen), c8df219 (keep MLflow settings, isolate the connection module), 0b569dc (shared button actions,
+  server connection screen), 1d40ecd (keep MLflow settings, isolate the connection module), 66d23c0 (shared button actions,
   port comparison, pasted key detection).
-- Task 6B-3 docs: e67b90e (guide), 5b5734f (HTTPS statement), and the correction commit `docs: correct SSH server and MLflow
+- Task 6B-3 docs: 5887114 (guide), 17031ff (HTTPS statement), and the correction commit `docs: correct SSH server and MLflow
   guidance against the current code`.
-- Test hygiene: 5447ce5 (Rust fake key headers built at runtime).
-- Follow-ups since: 7c07f92 (protected synthetic sample for the desktop tutorial; the tutorial is a later task), a71049a
-  (`claim()` refuses non-fact observations, receipt lookups are chunked), 61fee6c (tutorial sample trailing-dot alias and race),
-  68021a2 (MLflow credentials refused over plain HTTP in every client path), 74d7df8 (release stuck preparations, one GPU per
-  job, `.ppk` keys refused), 20d6f30 (credentials kept off http artifact roots, fail fast before claiming), acaf393 (count only
-  policy-compliant GPU selections as configured), 24135cb (OIDC counts as configured only with a secret; run artifact roots checked), de2124f (over-limit plans cannot start,
-  `.ppk` trailing-dot check, clearer PREPARING warning), 2f08f67 (tutorial native allowlist and package asset), 65c5183 (tests pin
-  the code revision so concurrent commits cannot break manifests; tighter `run --mock` refusal test), c783878 (finish the SSH
-  server and MLflow doc corrections), 682e84e (flush deferred renders before reading form drafts), 1186832 (explain cross-provider
+- Test hygiene: 0f40418 (Rust fake key headers built at runtime).
+- Follow-ups since: 78bc0f5 (protected synthetic sample for the desktop tutorial; the tutorial is a later task), 338c7bb
+  (`claim()` refuses non-fact observations, receipt lookups are chunked), ace7712 (tutorial sample trailing-dot alias and race),
+  dd930e3 (MLflow credentials refused over plain HTTP in every client path), fb76b52 (release stuck preparations, one GPU per
+  job, `.ppk` keys refused), 1e0f305 (credentials kept off http artifact roots, fail fast before claiming), a0714ce (count only
+  policy-compliant GPU selections as configured), 3463af7 (OIDC counts as configured only with a secret; run artifact roots checked), 3b4e6ae (over-limit plans cannot start,
+  `.ppk` trailing-dot check, clearer PREPARING warning), 861d39e (tutorial native allowlist and package asset), 0a0644f (tests pin
+  the code revision so concurrent commits cannot break manifests; tighter `run --mock` refusal test), 879e855 (finish the SSH
+  server and MLflow doc corrections), 44e0f27 (flush deferred renders before reading form drafts), 7aa6830 (explain cross-provider
   locks; check destinations before resume; refuse the practice dataset at submit; test env isolation; provider-neutral OIDC
-  message and fail-fast), c071985 (drop a stale tutorial plan on exit after destination changes; cost-aware reservation matching
-  and Korean refusal; waiting notice mentions other-provider locks) d6a1201 (the backend returns the fixed Korean
+  message and fail-fast), 2ba206e (drop a stale tutorial plan on exit after destination changes; cost-aware reservation matching
+  and Korean refusal; waiting notice mentions other-provider locks) cf9b86e (the backend returns the fixed Korean
   reservation-release refusal "다른 서버 설정(비용·키 파일 포함)으로 만든 예약입니다. 그 설정으로 바꾼 뒤 해제하세요." for cost and key
-  mismatches; `CROSS_PROVIDER_LOCK` now says "다른 연결 대상(RunPod 등)…"), ecd987b (the UI test uses the backend's Korean refusal;
-  waiting-notice wording aligned), a8fb57d (docs: record final verification, upgrade notes and lock remedy) and the docs commit
+  mismatches; `CROSS_PROVIDER_LOCK` now says "다른 연결 대상(RunPod 등)…"), 745e9d6 (the UI test uses the backend's Korean refusal;
+  waiting-notice wording aligned), 05a8bb2 (docs: record final verification, upgrade notes and lock remedy) and the docs commit
   `docs: record the final review and follow-ups`.
 
-Final independent whole-branch review (06ceb65..c071985, plus d6a1201 and ecd987b as minor follow-ups) returned "Ready to merge: Yes"
+Final independent whole-branch review (06ceb65..2ba206e, plus cf9b86e and 745e9d6 as minor follow-ups) returned "Ready to merge: Yes"
 after fixes.
 
 Remaining follow-ups / deferred: in the reverse direction (an SSH lock or reservation blocking RunPod), RunPod preparation still says
 "Pod is reserved by a job" in English and RunPod execute shows only the waiting notice; `CROSS_PROVIDER_LOCK` in server execute can be
 misattributed when `work` returns None for another reason while a foreign lock exists; the `main.ts` render deferral and the
-per-action provider forks in `desktop.py` should be consolidated in Task 8/9/10; the secret-scan history findings from local commits
-c8df219 and 0b569dc still need a history rewrite or a user decision before any push.
+per-action provider forks in `desktop.py` should be consolidated in Task 8/9/10.
 
 Upgrade / user-facing changes:
 - 0.3.0 settings without `provider` are read as RunPod; the first save writes `existing_runpod`. Without `auth_mode` the mode is `oidc`.
@@ -176,21 +175,21 @@ Upgrade / user-facing changes:
 - Desktop `submit` refuses the practice dataset ("연습용 데이터(tutorial_sample)로는 실제 학습을 시작할 수 없습니다."); resume checks the
   job's destination before resetting it; legacy jobs show "RunPod" in 실행 위치.
 
-MLflow rule as of 24135cb (treat OIDC as configured only with a secret and check run artifact roots): if `MLFLOW_TRACKING_TOKEN`
+MLflow rule as of 3463af7 (treat OIDC as configured only with a secret and check run artifact roots): if `MLFLOW_TRACKING_TOKEN`
 is set, or both `MLFLOW_OIDC_TOKEN_URL` and `MLFLOW_OIDC_CLIENT_SECRET` are set, the tracking URI must be https (CLI and desktop;
 `work` and `run --mock` check before claiming), an http artifact location (including a run's server-assigned one) is refused, and even local `file:`/
 `sqlite:` URIs are refused with credentials set. No-auth http is allowed.
 
-Latest actual verification (2026-10-19, Windows): Python at the code state of 24135cb and later, `uv run pytest -q` **743 passed, 1 skipped**
+Latest actual verification (2026-10-19, Windows): Python at the code state of 3463af7 and later, `uv run pytest -q` **743 passed, 1 skipped**
 in 81.22s and `uv run ruff check src tests` passes. Desktop numbers are the reviewer's clean-tree results from a `git archive`
-export of 343ff78 and of 65c5183: Playwright **53 passed** (connections 30 + workspace 23), `npm run build` (tsc + Vite) passes and
-`cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` **12 passed**. `scripts/check_secrets.py`
-reports only the historical `main.rs` finding below.
-Secret scan: after 5447ce5 the current tree is clean (`git grep` finds no contiguous private-key header). However
-`scripts/check_secrets.py` walks all reachable history and still reports `desktop/src-tauri/src/main.rs: private key` from the
-unpushed local commits c8df219 and 0b569dc (`git log -S "PRIVATE KEY-----"` also lists 5447ce5, which removed it; the stubs are fake
-header text in Rust tests, not key material). Pending: before any push those commits need a history rewrite, or another
-decision from the user.
+export of 0fa046c and of 0a0644f: Playwright **53 passed** (connections 30 + workspace 23), `npm run build` (tsc + Vite) passes and
+`cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` **12 passed**.
+Secret scan history (resolved 2026-10-20): Rust test stubs in two commits had contained fake private-key header text (not key
+material), and `scripts/check_secrets.py` walks all reachable history, so the first push of this branch failed CI. With the user's
+approval the 32 commits after c0ee9a9 were rewritten with `git filter-branch --index-filter`, changing only those header strings in
+`desktop/src-tauri/src/main.rs` (trailing `-----` → `----`); the final tree is byte-identical to the previous HEAD. The branch was
+force-pushed with lease, and `check_secrets.py` now reports **0 findings**. Commit SHAs in this file were updated to the rewritten
+history; a backup bundle of the old history was kept outside the repository.
 
 Still unverified: a real SSH/BOP server, real NVIDIA GPU execution, a real MLflow server (authenticated or not), the real
 Tauri/WebView2 shell and Windows Credential Manager, and installer acceptance (Task 11). All SSH behavior was tested with
@@ -207,17 +206,17 @@ dry-run plan; the connection steps only explain RunPod and GPU servers. Esc or "
 flight) and restores the pre-tour training draft, plan, dataset draft and preview; completion or dismissal is remembered in local
 storage. The sample stays registered, marked synthetic with GPU transfer blocked; the ID `tutorial_sample` is reserved (case and
 trailing-dot variants and S3 import are refused) and it is excluded from the "시작하기" data checklist. A clicked button is no
-longer lost when a field edit re-renders the screen. Commits: 7c07f92, a71049a, 61fee6c (backend sample, reserved ID, claim and
-receipt hardening), 2f08f67 (native allowlist and package asset), f0f33c3, 7104e11, c3891ba (engine and UI, deferred exit,
-on-screen popover, first-click fix), 6eebbe9, 32b9eeb (checklist exclusion, ASCII path hint), aacdd0f (package verifier checks the
+longer lost when a field edit re-renders the screen. Commits: 78bc0f5, 338c7bb, ace7712 (backend sample, reserved ID, claim and
+receipt hardening), 861d39e (native allowlist and package asset), 9a7966d, 1328621, aa30399 (engine and UI, deferred exit,
+on-screen popover, first-click fix), 9c38451, 209528c (checklist exclusion, ASCII path hint), 6684229 (package verifier checks the
 tutorial refusal and registration exactly) and the docs commit `docs: guide first-time users through the desktop tutorial`.
 
-Final actual verification at HEAD ecd987b (2026-10-19, Windows; the later docs commits change no code): `uv run pytest -q` **754 passed,
+Final actual verification at HEAD 745e9d6 (2026-10-19, Windows; the later docs commits change no code): `uv run pytest -q` **754 passed,
 1 skipped** in 75.68s; `uv run ruff check src tests` passes; `npx playwright test` **81 passed**; `npm run build` (tsc + Vite)
 passes; `cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release` **12 passed**;
-`uv run python scripts/check_secrets.py` reports only the historical `main.rs` finding (`Checked 614 staged/historical file
-versions; 1 findings.`) and `git grep` for private-key headers finds nothing (exit 1). Earlier numbers (752/81 at c071985, 743/72 at
-aacdd0f, 743 at 24135cb) are superseded.
+`git grep` for private-key headers finds nothing (exit 1). After the history rewrite, `uv run python scripts/check_secrets.py`
+reports 0 findings (`Checked 617 staged/historical file versions; 0 findings.`). Earlier numbers (752/81 at 2ba206e, 743/72 at
+6684229, 743 at 3463af7) are superseded.
 
 Unverified for the tutorial: the real Tauri/WebView2 rendering and layout of the tour, the installed frozen package and
 `verify_desktop_package.py` (Task 11), and any real GPU, server or MLflow. Known minor limits: a deferred render can fire mid-press
