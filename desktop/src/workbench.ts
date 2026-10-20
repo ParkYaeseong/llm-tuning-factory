@@ -69,13 +69,45 @@ export function focusKey(element: Element | null): string | null {
   return element.dataset.focusKey ?? element.dataset.action ?? (element.id || null);
 }
 
-/** Focuses the element under `root` that `focusKey` named before a re-render (no scrolling). */
+/** The controls under `root` that a focus key names: by `data-focus-key`, else `data-action`, else `id`. */
+export function focusMatches(root: ParentNode, key: string): HTMLElement[] {
+  const quoted = CSS.escape(key);
+  for (const selector of [`[data-focus-key="${quoted}"]`, `[data-action="${quoted}"]`, `#${quoted}`]) {
+    const found = [...root.querySelectorAll<HTMLElement>(selector)];
+    if (found.length) return found;
+  }
+  return [];
+}
+
+/** Focuses the element under `root` that `focusKey` named before a re-render (no scrolling); for the whole document
+ * the page content (`#app main`) is searched first, so the sidebar never wins over the page. */
 export function restoreFocus(root: ParentNode, key: string | null): void {
   if (!key) return;
-  const quoted = CSS.escape(key);
-  const target = root.querySelector<HTMLElement>(`[data-focus-key="${quoted}"]`)
-    ?? root.querySelector<HTMLElement>(`[data-action="${quoted}"]`) ?? root.querySelector<HTMLElement>(`#${quoted}`);
-  target?.focus({ preventScroll: true });
+  const scopes = root === document ? [document.querySelector("#app main"), document] : [root];
+  for (const scope of scopes) {
+    const target = scope ? focusMatches(scope, key)[0] : undefined;
+    if (target) { target.focus({ preventScroll: true }); return; }
+  }
+}
+
+/** The text of an error for the user: its message, never an "Error: " or "BridgeError: " prefix. */
+export const errorText = (error: unknown) => error instanceof Error ? error.message || error.name : String(error);
+
+/** After a dialog closes on a click, the rest of a double click (or a repeated Enter on the opener that got the focus
+ * back) at the same spot within 400 ms is swallowed, so it never activates what was underneath. */
+function swallowRepeat(origin: MouseEvent) {
+  const until = performance.now() + 400;
+  const types = ["mousedown", "click", "dblclick"];
+  const swallow = (event: Event) => {
+    const mouse = event as MouseEvent;
+    if (performance.now() > until) { stop(); return; }
+    if (Math.abs(mouse.clientX - origin.clientX) <= 8 && Math.abs(mouse.clientY - origin.clientY) <= 8) {
+      event.preventDefault(); event.stopImmediatePropagation();
+    }
+  };
+  const stop = () => types.forEach(type => window.removeEventListener(type, swallow, true));
+  types.forEach(type => window.addEventListener(type, swallow, true));
+  setTimeout(stop, 450);
 }
 
 /** A state pill (not a `.badge`): semantic colour for real states only. */
@@ -93,7 +125,8 @@ let dialogs = 0;
 /**
  * A modal `<dialog>` appended to `body`. Resolves null (and opens nothing) when a dialog is already open, and on Esc.
  * The heading takes focus; an action that requires checks stays disabled until they are all checked; the first
- * activation disables every action; on close, focus returns to the control that was focused before opening.
+ * activation disables every action; on close, focus returns to the control that was focused before opening, and the
+ * rest of a double click or a repeated Enter at the same spot is swallowed for 400 ms (`swallowRepeat`).
  */
 export function openDialog(spec: DialogSpec): Promise<{ action: string; checked: string[] } | null> {
   if (document.querySelector("dialog[open]")) return Promise.resolve(null);
@@ -129,8 +162,10 @@ export function openDialog(spec: DialogSpec): Promise<{ action: string; checked:
       resolve(result);
     };
     checks.forEach(input => input.addEventListener("change", update));
-    buttons.forEach((button, index) => button.addEventListener("click", () => {
-      if (!button.disabled) finish({ action: spec.actions[index].id, checked: checked() });
+    buttons.forEach((button, index) => button.addEventListener("click", event => {
+      if (button.disabled) return;
+      finish({ action: spec.actions[index].id, checked: checked() });
+      swallowRepeat(event);
     }));
     dialog.addEventListener("cancel", event => { event.preventDefault(); finish(null); });
   });

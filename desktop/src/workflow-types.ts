@@ -152,6 +152,6 @@ export interface RunListEntry { run_id: string; status: GraphRun["status"]; simu
 export interface TrackingFailure { event_id: Sha256; kind: string; node_id: string | null; status: "FAILED" | "UNCERTAIN"; tries: number; last_error: string | null; action: string | null }
 export interface RunList { runs: (RunListEntry | UnreadableRun)[]; controller: ControllerView }
 export interface RunDetail { run: GraphRun | UnreadableRun; controller: ControllerView; plan: PlanSummary | null; tracking_failures: TrackingFailure[] }
-export interface RunSteered { run: GraphRun; controller: ControllerView }
+export interface RunSteered { run: GraphRun | UnreadableRun; controller: ControllerView }
 export interface SubmitResult { run_id: string; status: string; simulation: boolean; plan_sha256: Sha256; controller: ControllerView }
 export interface TrackingRearmed extends WithWarnings { event_id: Sha256; run_id: string; node_id: string | null; kind: string; status: string }

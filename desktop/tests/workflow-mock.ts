@@ -34,6 +34,9 @@ export async function openWorkbench(page: Page, options: BridgeOptions = {}): Pr
   if (options.clock) await page.clock.install();
   await page.addInitScript(installBridge, { options, config });
   await page.goto("/");
+  // A positive boot signal: the boot task reached its last call (capabilities), and then its notice cleared.
+  await expect.poll(() => page.evaluate(() => (window as any).__testCalls.some((call: any) =>
+    call.command === "factory_action" && call.args?.action === "capabilities")), { message: "boot reached capabilities", timeout: 10_000 }).toBe(true);
   await expect(page.getByText("작업 공간 불러오는 중")).toHaveCount(0);
 }
 

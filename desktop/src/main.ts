@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { version } from "../package.json";
-import { button, field, filterRuns, focusKey, formatDate, icon, isGraphJob, progressView, restoreFocus, select } from "./workbench";
+import { button, errorText, field, filterRuns, focusKey, focusMatches, formatDate, icon, isGraphJob, progressView, restoreFocus, select } from "./workbench";
 import { methodSelect, sourceField, sourceSelect, stageSelect, trainingOptions, type FieldSource, type RecipeFieldContext } from "./components/recipe-fields";
 import { planning as planningApi, projects as projectApi } from "./api";
 import { NAV_GROUPS, navModel, type NavItem } from "./nav-model";
@@ -44,11 +44,11 @@ const ctx: ViewContext = {
   get catalog() { return state.catalog as Catalog; }, get busy() { return Boolean(state.busy); }, store,
   hasPage: id => Object.hasOwn(pages, id) || viewById(id) !== undefined,
   navigate: (page, arg) => action(arg === undefined ? `nav:${page}` : `nav:${page}:${arg}`),
-  render: () => render(),
-  patch: (regionId, html) => patch(regionId, html),
+  render: () => renderKeepingDrafts(),
+  patch: (regionId, html, options) => patch(regionId, html, options),
   task: (label, work) => task(label, work),
-  notify(message) { state.notice = message; if (!state.busy) render(); },
-  fail(message) { state.error = message; if (!state.busy) render(); },
+  notify(message) { state.notice = message; if (!state.busy) renderKeepingDrafts(); },
+  fail(message) { state.error = message; if (!state.busy) renderKeepingDrafts(); },
   async legacy<T>(name: string, data: object = {}) {
     if (!VIEW_LEGACY_ACTIONS.has(name)) throw new Error("허용하지 않은 작업");
     return await api(name, data as Obj) as T;
@@ -80,11 +80,16 @@ async function api(action: string, data: Obj = {}) {
 }
 const gpuServer = serverBridge(api);
 async function task(label: string, operation: () => Promise<void>) {
+  // The control that started the task (e.g. the opener a confirm dialog returned focus to) gets it back afterwards.
+  const opener = focusKey(document.activeElement);
   captureDrafts();
   state.error = ""; state.notice = ""; state.busy = label; render();
   try { await operation(); }
-  catch (error) { state.error = String(error); }
-  finally { state.busy = ""; render(); }
+  catch (error) { state.error = errorText(error); }
+  finally {
+    state.busy = ""; render();
+    if (!document.activeElement || document.activeElement === document.body) restoreFocus(document, opener);
+  }
 }
 function captureDrafts() {
   flushDeferredRender();
@@ -107,7 +112,10 @@ function captureDrafts() {
     export_allowed: (data.elements.namedItem("export_allowed") as HTMLInputElement).checked };
   const checkpoint = document.querySelector<HTMLInputElement>("#checkpoint");
   if (checkpoint) state.checkpoint = checkpoint.value;
-  for (const view of workflowViews) view.capture?.(ctx);
+  // A view whose capture throws must not take boot or the legacy tasks down (the render guard's rule for hooks).
+  for (const view of workflowViews) {
+    try { view.capture?.(ctx); } catch (error) { console.error(error); }
+  }
 }
 function commandSearch() {
   if (document.querySelector("dialog[open]")) return;
@@ -188,7 +196,7 @@ function invalidatePlan() {
 async function configChanged(rerender = false, captured = false) {
   if (!captured) captureConfig(); invalidatePlan();
   if (rerender) render();
-  try { await checkCapabilities(); } catch (error) { state.error = String(error); }
+  try { await checkCapabilities(); } catch (error) { state.error = errorText(error); }
   if (state.page === "training") render();
 }
 function compatibilityView() {
@@ -436,18 +444,26 @@ function comparison() {
 // control before pointerup would make the browser drop the click, so renders wait until the press ends.
 const pressable = "button, summary, label.check, input[type=checkbox], input[type=radio]";
 let pressed = false, presses = 0, armed = 0, renderDeferred = false;
+let pressedControl: Element | null = null;
 /** Before form values are read back into state: a deferred render means the page still shows values that a
  * finished task has since replaced. During the press itself the page is current and stays as it is. */
 function flushDeferredRender() { if (renderDeferred && !pressed) render(); }
 function releasePress() {
   if (!pressed) return;
-  pressed = false;
+  pressed = false; pressedControl = null;
   // Runs after the click this release produces, unless that click has rendered already.
   if (renderDeferred) setTimeout(() => { if (renderDeferred) render(); }, 0);
 }
 window.addEventListener("pointerdown", e => {
-  if ((e.target as Element | null)?.closest?.(pressable)) { pressed = true; presses++; }
+  const control = (e.target as Element | null)?.closest?.(pressable);
+  if (control) { pressed = true; presses++; pressedControl = control; }
 }, true);
+/** A render a view asks for (often after a poll). If a press defers it, what was typed so far is read first, so the
+ * deferred render cannot rebuild the page from older drafts; a task's render already pending keeps precedence. */
+function renderKeepingDrafts() {
+  if (pressed && !renderDeferred) captureDrafts();
+  render();
+}
 for (const type of ["pointerup", "pointercancel"]) window.addEventListener(type, releasePress, true);
 // A release the page never saw (outside the window, on a control disabled meanwhile) must not leave it stale.
 window.addEventListener("pointermove", e => { if (!e.buttons) releasePress(); }, true);
@@ -483,7 +499,7 @@ function guarded(work: () => string) {
   try { return work(); }
   catch (error) {
     console.error(error);
-    return `<div class="wf-banner bad">이 영역을 표시하지 못했습니다. ${esc(String(error))}</div>`;
+    return `<div class="wf-banner bad">이 영역을 표시하지 못했습니다. ${esc(errorText(error))}</div>`;
   }
 }
 /** The sidebar of D1: three groups from the nav model; a child page (such as one project) highlights its parent. */
@@ -516,23 +532,27 @@ function graphJobsNote() {
   return `<p class="graph-jobs-note">그래프 실행 단계 ${state.graphJobs}개는 ‘그래프 실행’에서 확인하세요.${link}</p>`;
 }
 /** Replaces one region of the current page (a poll result) without a full render: its actions are bound again and the
- * focused control, with what was typed in it, survives. A pending press defers it like a render. */
-function patch(regionId: string, html: string) {
-  if (pressed || renderDeferred) { render(); return; }
+ * focused control survives, with what was typed in it when the same single control (same tag and type) comes back
+ * under its key (`keepTyping: false` for a patch that is not a poll result). A press on a control inside the region
+ * defers it like a render (the typed drafts are read first); a press elsewhere is unaffected by the patch. */
+function patch(regionId: string, html: string, options: { keepTyping?: boolean } = {}) {
+  if (renderDeferred) { render(); return; }
   const region = document.getElementById(regionId);
   if (!region || !root.contains(region)) return;
+  if (pressed && pressedControl && region.contains(pressedControl)) { renderKeepingDrafts(); return; }
   const active = document.activeElement;
   const inside = active instanceof HTMLElement && region.contains(active);
   const key = inside ? focusKey(active) : null;
-  const typed = inside && (active instanceof HTMLTextAreaElement || (active instanceof HTMLInputElement
+  const typed = options.keepTyping !== false && inside && (active instanceof HTMLTextAreaElement || (active instanceof HTMLInputElement
     && !["checkbox", "radio", "file", "button", "submit", "reset"].includes(active.type)))
-    ? { value: active.value, start: active.selectionStart, end: active.selectionEnd } : null;
+    ? { tag: active.tagName, type: active.type, value: active.value, start: active.selectionStart, end: active.selectionEnd } : null;
   region.innerHTML = html;
   bindActions(region);
   if (key) {
-    restoreFocus(region, key);
-    const next = document.activeElement;
-    if (typed && region.contains(next) && (next instanceof HTMLTextAreaElement || next instanceof HTMLInputElement)) {
+    const matches = focusMatches(region, key);
+    matches[0]?.focus({ preventScroll: true });
+    const next = matches.length === 1 ? matches[0] : null;
+    if (typed && (next instanceof HTMLTextAreaElement || next instanceof HTMLInputElement) && next.tagName === typed.tag && next.type === typed.type) {
       next.value = typed.value;
       try { next.setSelectionRange(typed.start, typed.end); } catch { /* inputs without a text selection */ }
     }
@@ -582,7 +602,7 @@ async function execute(job: Obj) {
     state.notice = result ? "학습 처리가 끝났습니다. 상태와 평가 결과를 확인하세요." :
       ["PENDING", "QUEUED", "RETRYING"].includes(current?.status) ? waiting : "새로 실행된 작업이 없습니다. 현재 작업 상태를 확인하세요.";
     render();
-  }).catch(async error => { state.error = String(error); await refresh(); render(); });
+  }).catch(async error => { state.error = errorText(error); await refresh(); render(); });
 }
 /** Every action button under `scope` runs its action; while busy, all but navigation (and every submit) are disabled. */
 function bindActions(scope: ParentNode) {
@@ -736,19 +756,19 @@ async function action(name: string) {
     if (!target?.action || !verb) return;
     captureConfig(); captureDrafts();
     try { await target.action(ctx, verb, rest.length ? rest.join(":") : null); }
-    catch (error) { state.error = String(error); render(); }
+    catch (error) { state.error = errorText(error); render(); }
     return;
   }
   if (name.startsWith("nav:")) {
     const [, page, ...rest] = name.split(":");
     if (!Object.hasOwn(pages, page) && !viewById(page)) return;
     captureConfig(); captureDrafts();
-    viewById(state.page)?.leave?.(ctx);
+    try { viewById(state.page)?.leave?.(ctx); } catch (error) { console.error(error); }
     state.page = page; state.arg = rest.length ? rest.join(":") : null;
     render();
     const entered = viewById(page);
     if (entered?.enter) {
-      try { await entered.enter(ctx); } catch (error) { state.error = String(error); render(); }
+      try { await entered.enter(ctx); } catch (error) { state.error = errorText(error); render(); }
     }
     if (state.page === "training" && !state.capabilities && !state.capabilityPending) { await checkCapabilities(); render(); }
     return;
@@ -893,7 +913,7 @@ async function action(name: string) {
       state.modelMetadata = { ...resolved, model };
       state.plan = null; await checkCapabilities(); state.notice = "선택한 모델과 토크나이저 버전을 고정했습니다.";
     }
-    else if (name === "save-profile") { await api("save_profile", { config: state.config }); await catalog(); state.notice = "업무 AI 설정을 저장했습니다."; }
+    else if (name === "save-profile") { await api("save_profile", { config: state.config }); await catalog(); state.notice = "실험 설정을 저장했습니다."; }
     else if (name === "start") {
       // The server destination approved in the dialog is the one the offline plan hashed; submit refuses any other.
       const destination = isServer(state.settings) ? { destination_sha256: state.plan.destination_sha256 } : {};

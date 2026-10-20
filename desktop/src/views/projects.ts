@@ -5,7 +5,7 @@ import "./projects.css";
 import { executorProfiles, newRequestId, projects as projectApi } from "../api";
 import { issueList, issuesAt, localize } from "../issues";
 import { bindingIdFor } from "../project-store";
-import { button, escapeHtml, field, focusKey, openDialog, restoreFocus, select, statusPill } from "../workbench";
+import { button, errorText, escapeHtml, field, focusKey, openDialog, restoreFocus, select, statusPill } from "../workbench";
 import type { View, ViewContext } from "../view-types";
 import type { BindingRole, DatasetBinding, ProjectSpec, ProjectSummary, PublicProfile, RecipeSpec, Sha256, WorkflowIssue,
   WorkflowResult } from "../workflow-types";
@@ -265,7 +265,7 @@ async function enterProject(ctx: ViewContext) {
       }
     }
     try { profiles = (await executorProfiles()).profiles; profilesError = null; }
-    catch (error) { profilesError = String(error instanceof Error ? error.message : error); }
+    catch (error) { profilesError = errorText(error); }
   });
 }
 
@@ -382,11 +382,11 @@ function bindForms(ctx: ViewContext) {
   shell = ctx;
   document.querySelector<HTMLFormElement>("#project-create-form")?.addEventListener("submit", event => {
     event.preventDefault();
-    if (!ctx.busy) void createProject(ctx).catch(error => ctx.fail(String(error)));
+    if (!ctx.busy) void createProject(ctx).catch(error => ctx.fail(errorText(error)));
   });
   document.querySelector<HTMLFormElement>("#project-form")?.addEventListener("submit", event => {
     event.preventDefault();
-    if (!ctx.busy) void saveProject(ctx).catch(error => ctx.fail(String(error)));
+    if (!ctx.busy) void saveProject(ctx).catch(error => ctx.fail(errorText(error)));
   });
 }
 

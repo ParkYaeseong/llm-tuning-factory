@@ -114,12 +114,16 @@ const CODE_TEXTS: Record<string, string> = {
   inspection_failed: "자원을 확인하지 못했습니다.",
 };
 const HANGUL = /[가-힣]/;
+/** Codes whose message is any refusal or exception text (possibly Korean), not a fixed English domain text. */
+const GENERIC_CODES = new Set(["refused", "inspection_failed", "snapshot_failed", "targets_failed"]);
 
 /** Korean text of an issue; `original` is the received message when the text differs from it. */
 export function localize(issue: WorkflowIssue): Localized {
   const message = issue.message ?? "";
-  // Task 9 texts are Korean already; they are shown as written.
-  if (HANGUL.test(message)) return { text: message, original: null };
+  // Task 9 texts are Korean already and are shown as written. A code known to carry an English domain text is
+  // translated even when that text quotes a Korean value (a column or file name); generic refusal codes, whose text
+  // may come from anywhere, keep a Korean message as it is.
+  if (HANGUL.test(message) && (!(issue.code in CODE_TEXTS) || GENERIC_CODES.has(issue.code))) return { text: message, original: null };
   const known = MESSAGE_TEXTS.find(([pattern]) => pattern.test(message))?.[1] ?? CODE_TEXTS[issue.code];
   return known && known !== message ? { text: known, original: message } : { text: message, original: null };
 }

@@ -212,6 +212,42 @@ test("a project draft tracks revision, dirty state and plan validity", async () 
   expect(bindingIdFor("validation", [bound("train")])).toBe("validation");
 });
 
+test("English domain texts that quote Korean values are still shown in Korean", () => {
+  // A known English-carrying code whose message quotes a Korean column or file name.
+  const row = issue("invalid_row", "missing required field '질문'", "/mapping", { row_number: 3 });
+  expect(localize(row)).toEqual({ text: "이 행을 연결한 열로 학습 형식에 맞게 바꿀 수 없습니다.", original: row.message });
+  const codec = issue("invalid_source", "'utf-8' codec can't decode byte 0xb0 in position 2 of '질문.csv'");
+  expect(localize(codec)).toEqual({ text: "문자 인코딩이 맞지 않습니다. Windows에서 만든 CSV라면 CP949로 바꿔 다시 미리보세요.", original: codec.message });
+  // Korean texts (Task 9) and generic refusals keep their own words.
+  const korean = issue("legacy_dataset_missing", "기존 프로필의 데이터 버전을 프로젝트에 연결하지 못했습니다.");
+  expect(localize(korean)).toEqual({ text: korean.message, original: null });
+  const refused = issue("refused", "tutorial_sample은 앱에 포함된 연습용 합성 데이터만 GPU 전송 없이 등록할 수 있습니다.");
+  expect(localize(refused)).toEqual({ text: refused.message, original: null });
+  const inspection = issue("inspection_failed", "SSH 연결이 거부되었습니다.");
+  expect(localize(inspection)).toEqual({ text: inspection.message, original: null });
+});
+
+test("a held plan keeps the generations seen before the plan request", async () => {
+  const first: ProjectRevision = { revision_sha256: hash("1"), project: { schema_version: 1, project_id: "p1", name: "계획",
+    purpose: "", task_type: "", datasets: [], default_executor_profile_id: null, graph: {}, legacy_origin: null } };
+  const store = createProjectStore(fakeBridge(first).bridge);
+  store.adopt(first);
+  // A profile and the connection settings are saved while the plan request is running.
+  const seen = store.generations();
+  store.markProfilesChanged();
+  store.holdPlan("p1", summary(first.revision_sha256), [], seen);
+  expect(store.planUsable("p1")).toBe(false);
+  const settings = store.generations();
+  store.markSettingsChanged();
+  store.holdPlan("p1", summary(first.revision_sha256), [], settings);
+  expect(store.planUsable("p1")).toBe(false);
+  // Planned with the current basis, the plan is usable (and without a snapshot the current basis applies).
+  store.holdPlan("p1", summary(first.revision_sha256), [], store.generations());
+  expect(store.planUsable("p1")).toBe(true);
+  store.holdPlan("p1", summary(first.revision_sha256), []);
+  expect(store.planUsable("p1")).toBe(true);
+});
+
 function fakeTimers() {
   const pending: { fn: () => void; at: number; handle: number }[] = [];
   const delays: number[] = [];

@@ -6,7 +6,7 @@ import { recipes as recipeApi } from "../api";
 import { inputKindFor, methodSelect, readFields, sourceField, sourceSelect, stageSelect, trainingOptions,
   type RecipeFieldContext } from "../components/recipe-fields";
 import { issueList, issuesAt, localize } from "../issues";
-import { button, escapeHtml, focusKey, openDialog, restoreFocus, select, statusPill } from "../workbench";
+import { button, errorText, escapeHtml, focusKey, openDialog, restoreFocus, select, statusPill } from "../workbench";
 import type { View, ViewContext } from "../view-types";
 import type { RecipeRevision, RecipeSpec, RecipeSummary, Sha256, Stage, WorkflowIssue, WorkflowResult } from "../workflow-types";
 
@@ -283,7 +283,7 @@ export const view: View = {
     if (ctx.page !== "recipes") return;
     document.querySelector<HTMLFormElement>("#recipe-form")?.addEventListener("submit", event => {
       event.preventDefault();
-      if (!ctx.busy) void saveRecipe(ctx).catch(error => ctx.fail(String(error)));
+      if (!ctx.busy) void saveRecipe(ctx).catch(error => ctx.fail(errorText(error)));
     });
     // A stage, method or loss choice changes which option fields exist: re-render and keep the focus on the choice.
     for (const path of ["training_stage", "training_method", "stage_options.pref_loss"])

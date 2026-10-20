@@ -15,6 +15,8 @@ export interface PlanningInputs {
 }
 export interface PlanBasis { projectRevision: Sha256; recipeRevisions: Sha256[]; profilesGeneration: number; settingsGeneration: number }
 export interface HeldPlan { summary: PlanSummary; basis: PlanBasis; requestId: string }
+/** The profile and settings generations a plan request started from (`generations()` before calling graph_plan). */
+export interface PlanGenerations { profilesGeneration: number; settingsGeneration: number }
 export interface ProjectDraft {
   projectId: string; saved: ProjectRevision | null; spec: ProjectSpec; dirty: boolean;
   issues: WorkflowIssue[]; warnings: WorkflowIssue[]; conflict: WorkflowIssue[] | null;
@@ -30,7 +32,8 @@ export interface ProjectStore {
   reloadLatest(projectId: string): Promise<WorkflowResult<ProjectRevision>>;    // discards the draft
   overwriteWithDraft(projectId: string): Promise<WorkflowResult<ProjectRevision>>;
   setPlanning(projectId: string, change: (inputs: PlanningInputs) => void): void; // drops the plan
-  holdPlan(projectId: string, summary: PlanSummary, recipeRevisions: Sha256[]): HeldPlan;
+  generations(): PlanGenerations;                                // snapshot before a plan request
+  holdPlan(projectId: string, summary: PlanSummary, recipeRevisions: Sha256[], since?: PlanGenerations): HeldPlan;   // basis: `since`, else now
   dropPlan(projectId: string, reason: string): void;
   planUsable(projectId: string): boolean;                        // basis matches and the draft is clean
   markProfilesChanged(): void; markSettingsChanged(): void; markRecipeChanged(previousRevision: Sha256): void;
@@ -149,12 +152,14 @@ export function createProjectStore(bridge: ProjectStoreBridge, newRequestId: () 
       change(draft.planning);
       drop(draft, PLAN_DROPPED.planning);
     },
-    holdPlan(projectId, summary, recipeRevisions) {
+    generations: () => ({ profilesGeneration, settingsGeneration }),
+    holdPlan(projectId, summary, recipeRevisions, since) {
       const draft = required(projectId);
       let requestId = requestIds.get(summary.plan_sha256);
       if (!requestId) { requestId = newRequestId(); requestIds.set(summary.plan_sha256, requestId); }
       draft.plan = { summary: structuredClone(summary), requestId, basis: { projectRevision: summary.project_revision,
-        recipeRevisions: [...recipeRevisions], profilesGeneration, settingsGeneration } };
+        recipeRevisions: [...recipeRevisions], profilesGeneration: since?.profilesGeneration ?? profilesGeneration,
+        settingsGeneration: since?.settingsGeneration ?? settingsGeneration } };
       draft.planDropped = null;
       return draft.plan;
     },

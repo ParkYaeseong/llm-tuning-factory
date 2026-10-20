@@ -3734,6 +3734,51 @@ Actual verification (main venv, `PYTHONPATH` on the worktree `src`, `--basetemp`
   - `lock_sha256 5883aae6…1437`.
 - No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
 
+## Task 10.1 review fixes: typed drafts across deferred renders, guarded view hooks, 2026-10-21
+
+Commit `fix: keep typed drafts across deferred renders and guard view hooks`, after 10.2 in the main tree. It lands the
+independent review of `6c4b877` ("Ready with fixes": three Important, nothing Critical) and its recommendations.
+Changed: `desktop/src/{main,workbench,issues,project-store,view-types,workflow-types}.ts`, the 10.2 views (message-only
+errors), `desktop/tests/{navigation,workflow-core}.spec.ts`, `desktop/tests/workflow-mock.ts` and this file.
+
+What changed:
+- A poll patch during a press no longer loses typed text. A patch applies at once when the pressed control is outside
+  its region; when it is inside, the typed drafts are read first and the render waits for the release.
+  `ctx.render`/`notify`/`fail` read the drafts first whenever a press defers them (a task's pending render keeps
+  precedence).
+- A view's `capture` or `leave` that throws is logged and skipped (like `bind`), so boot, navigation and every legacy
+  task keep working.
+- After a dialog closes on a click, the rest of a double click or a repeated Enter at the same spot is swallowed for
+  400 ms, so it never activates the control underneath or reopens the dialog through its opener.
+- Recommended: errors show their message without "Error: "/"BridgeError: " (`errorText`); a code known to carry an
+  English domain text is localized even when the text quotes a Korean value (generic refusal codes keep Korean
+  messages); a patch copies typing only into the same single control (same tag and type) and takes
+  `keepTyping: false`, and `view-types.ts` documents unique focus keys per region; `RunSteered.run` may be an
+  unreadable run.
+- Optional, taken: a task gives the focus back to the control that started it when the final render lost it;
+  `restoreFocus(document, …)` searches `#app main` first; `store.generations()` snapshots the profile and settings
+  generations before a plan request and `holdPlan(…, since)` uses them; `openWorkbench` waits for boot to reach its
+  `capabilities` call; the profile-save notice says "실험 설정을 저장했습니다." (D19).
+
+Actual verification:
+- RED first: the four new `navigation.spec.ts` tests failed on the deferred patch, the boot that never reached
+  `capabilities` (a throwing `capture`), the click that reached the page beneath and the ignored `keepTyping`; the two
+  new `workflow-core.spec.ts` tests on the untranslated quoting text and the missing `generations`; test 10 on the
+  "Error: " prefix in the render-guard banner (its expected text was updated). The `#app main`-first assertion was added
+  after the code.
+- Fifteen mutations (each fix and recommendation, including the capture before a deferred render, the leave guard,
+  the task focus restore and the `since` basis) each made a test fail.
+- From `desktop/`: `npx playwright test` **112 passed** (106 + 6 new); `npm run build` passes (before and after the
+  rebases onto `7291742`, Task 9.6, and `d227b7d`, the 9.4 review fixes).
+- From the root: `uv run pytest -q` **1648 passed, 1 skipped** before the rebases, **1671 passed, 1 skipped** on
+  `7291742` and **1678 passed, 1 skipped** on `d227b7d` (their own tests; this commit changes no Python);
+  `uv run ruff check src tests` passes;
+  `scripts/check_secrets.py` reports 0 findings with the change staged; the protected-path `git diff --exit-code` is
+  clean; every changed file is CR-free.
+
+Not verified or still open:
+- Real WebView2 pointer, focus and dialog timing (the 400 ms window, deferred renders): Task 11.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

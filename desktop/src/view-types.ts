@@ -11,7 +11,11 @@ export interface ViewContext {
   hasPage(id: string): boolean;
   navigate(page: string, arg?: string): Promise<void>;
   render(): void;                                                // full render (respects press deferral)
-  patch(regionId: string, html: string): void;                   // replace one region, rebind it, restore focus
+  /** Replaces one region, rebinds its actions and restores the focused control by its focus key (`data-focus-key`,
+   * else `data-action`, else `id`), so every focusable control in a region needs a key unique within it. What was typed
+   * is kept only when the same single control (same tag and type) comes back; `keepTyping: false` for a patch that is
+   * not a poll result (its own values win). */
+  patch(regionId: string, html: string, options?: { keepTyping?: boolean }): void;
   task(label: string, work: () => Promise<void>): Promise<void>;
   notify(message: string): void; fail(message: string): void;
   legacy<T>(action: string, data?: object): Promise<T>;          // factory_action: catalog, model_search, model_inspect
