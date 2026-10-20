@@ -1,16 +1,22 @@
+import contextlib
 import json
 import os
+import sys
+import threading
 import time
 from pathlib import Path
-from typing import Annotated
+from types import MappingProxyType
+from typing import Annotated, Literal
 
 import typer
+from pydantic import Field, ValidationError, model_validator
 
-from .config import load_config
+from .config import StrictModel, load_config
 from .evaluation import CommonEvaluator
 from .execution import Policy, RunPodController, SSHExecutor
 from .managed import ManagedPods
 from .manifest import resolve
+from .projects import LocalId
 from .runner import Factory
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False,
@@ -417,6 +423,459 @@ def guard(ctx: typer.Context, watch: bool = False, interval_seconds: int = 15):
         if not watch:
             return
         time.sleep(interval_seconds)
+
+
+# -- Task 9.6: project and graph commands (Task 9 plan §4 "9.6"; D9, D10, D14) ----------------------------------
+#
+# Each command runs one desktop workflow action through ``desktop_workflows.dispatch_action``: the same action and the
+# same strict request model as the Windows app, printed as its ``WorkflowResult`` (exit 0 for ``ok``, 1 otherwise).
+# ``graph-work`` runs the Task 9.4 controller (``controller_entry.serve``) in the foreground. Credentials come only
+# from files that ``--executor-profiles`` references or from the existing ``.env``/environment, never from an option
+# value, and never reach argv, output, files or the ledger.
+
+PROFILES_MAX_BYTES = REQUEST_MAX_BYTES = 1024 * 1024
+CREDENTIAL_FILE_MAX_BYTES = 64 * 1024
+EXIT_INTERRUPTED = 130   # a second Ctrl+C: the conventional SIGINT exit status
+ONE_CONTROLLER = "a graph controller already runs in this process"
+PROFILES_REQUIRE_APPROVAL = "--approve-execution-and-transfer is required to use executor profiles for real jobs"
+DRAINING = ("Stop requested: no new step starts; steps in flight finish, then the controller releases its owner "
+            "lease. Press Ctrl+C again to exit at once (the next controller reconciles what was in flight).")
+PROFILES_FILE_INVALID = "the executor profiles file must be a readable JSON object of at most 1 MiB"
+REQUEST_FILE_INVALID = "the plan request file must be a readable JSON object of at most 1 MiB"
+CREDENTIAL_FILE_UNREADABLE = "the credential file of this executor profile cannot be read"
+CREDENTIAL_KEY_MISSING = "RunPod key missing from referenced credential file"   # connections.load_connection's text
+CREDENTIAL_FILE_RUNPOD_ONLY = "only RunPod profiles take a credential file; SSH profiles use their key file"
+CREDENTIALS_IN_PROFILES = "; reference a credential file instead"
+PROJECT_FROM_ARGUMENT = "the project comes from the PROJECT_ID argument"
+REAL_FROM_FLAG = "plans are dry runs unless --real is given"
+START_INVALID = "the controller start settings are invalid (state directory or tick interval)"
+TRACKING_INVALID = "the MLflow settings of this environment are invalid"
+STOPPED = "the controller drained and released its owner lease"
+OWNER_LOST = "the controller lost its owner lease (after a sleep or a takeover); start it again"
+CONTROLLER_FAILED = "the controller stopped with an error; see state/controller/current.json"
+# One controller per process, whatever its state directory: MLflow auth is process-wide (Task 9.4 note 1, D7).
+_CONTROLLER = threading.Lock()
+
+
+class CliRefused(Exception):
+    """An input file refused before any action, printed as an ``invalid`` result (exit 1). Its issues never carry an
+    input value."""
+
+    def __init__(self, *issues):
+        super().__init__("; ".join(item.message for item in issues))
+        self.issues = issues
+
+
+def _issue(code: str, message: str, path: str = ""):
+    from .desktop_workflows import issue
+    return issue(code, message, path)
+
+
+def _messages(exc: ValidationError) -> str:
+    """Pydantic's messages only: they never echo an input value."""
+    return "; ".join(dict.fromkeys(error["msg"].removeprefix("Value error, ") for error in exc.errors()))
+
+
+def _native_profile(profile_id: str, fields, saved: bool = False):
+    """``NativeProfile`` of public fields (the per-provider allowlist). Credential names, and pasted private keys in
+    key-file fields, are refused first, by name, so the message says where credentials belong."""
+    from .desktop_workflows import NativeProfile, _refuse_credentials
+    try:
+        _refuse_credentials(dict(fields))
+    except ValueError as exc:
+        raise ValueError(str(exc) + CREDENTIALS_IN_PROFILES) from None
+    try:
+        return NativeProfile.model_validate({"profile_id": profile_id, "fields": dict(fields),
+                                             "RUNPOD_API_KEY_saved": saved})
+    except ValidationError as exc:
+        raise ValueError(_messages(exc)) from None
+
+
+class CliProfile(StrictModel):
+    """One executor profile of an ``--executor-profiles`` file: the desktop's public profile fields
+    (``NativeProfile``'s allowlist) and, for a RunPod profile, an optional reference to a local env file holding
+    ``RUNPOD_API_KEY``, relative to the profiles file. Never a credential value. Without a credential file a RunPod
+    profile uses ``RUNPOD_API_KEY`` from the existing ``.env``/environment (D10)."""
+    profile_id: Annotated[LocalId, Field(max_length=64)]
+    fields: dict[str, str]
+    credential_file: Annotated[str, Field(min_length=1, max_length=1024)] | None = None
+
+    @model_validator(mode="after")
+    def native_fields(self):
+        _native_profile(self.profile_id, self.fields)
+        if self.credential_file is not None and self.fields.get("provider") != "existing_runpod":
+            raise ValueError(CREDENTIAL_FILE_RUNPOD_ONLY)
+        return self
+
+
+class CliProfiles(StrictModel):
+    """An ``--executor-profiles`` file: ``{"schema_version": 1, "profiles": [...]}``, at most 32 profiles whose IDs
+    differ under ``casefold().rstrip(".")`` (as the desktop's profile store)."""
+    schema_version: Literal[1] = 1
+    profiles: tuple[CliProfile, ...] = Field(default=(), max_length=32)
+
+    @model_validator(mode="after")
+    def unique_profiles(self):
+        if len({item.profile_id.casefold().rstrip(".") for item in self.profiles}) != len(self.profiles):
+            raise ValueError("duplicate executor profile ID")
+        return self
+
+
+def _unique_keys(pairs):
+    data = {}
+    for key, value in pairs:
+        if key in data:
+            raise ValueError("duplicate JSON key")
+        data[key] = value
+    return data
+
+
+def _json_object(path: Path, limit: int, code: str, message: str) -> dict:
+    """A JSON object of at most ``limit`` bytes (UTF-8, optional BOM, no duplicate key); else one fixed issue."""
+    try:
+        with open(path, "rb") as stream:
+            raw = stream.read(limit + 1)
+        if len(raw) > limit:
+            raise ValueError(message)
+        data = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=_unique_keys)
+    except (OSError, ValueError, RecursionError):
+        raise CliRefused(_issue(code, message)) from None
+    if not isinstance(data, dict):
+        raise CliRefused(_issue(code, message))
+    return data
+
+
+def load_profiles(path: Path) -> tuple[Path, CliProfiles]:
+    """``(absolute path, profiles)`` of an ``--executor-profiles`` file; refusals point into the file."""
+    from .desktop_workflows import CREDENTIALS_REFUSED, issues_from_validation
+    source = Path(os.path.abspath(path))
+    data = _json_object(source, PROFILES_MAX_BYTES, "profiles_file_invalid", PROFILES_FILE_INVALID)
+    try:
+        return source, CliProfiles.model_validate(data)
+    except ValidationError as exc:
+        found = []
+        for item in issues_from_validation(exc, data=data):
+            message = item.message.removeprefix("Value error, ")
+            code = "credential_field" if CREDENTIALS_REFUSED in message else item.code
+            found.append(item.model_copy(update={"code": code, "message": message}))
+        raise CliRefused(*found) from None
+
+
+def _profile_key(source: Path, index: int, item: CliProfile) -> str:
+    """The RunPod key of one profile: ``RUNPOD_API_KEY`` from its credential file (a local file, relative to the
+    profiles file), else from the existing ``.env``/environment. Read only when a command needs it; never printed."""
+    from .connections import read_env_file
+    from .desktop_workflows import LOCAL_FILE_ONLY, local_file
+    if item.credential_file is None:
+        return os.environ.get("RUNPOD_API_KEY", "")
+    pointer = f"/profiles/{index}/credential_file"
+    try:
+        path = local_file(os.path.abspath(os.path.join(source.parent, os.path.expanduser(item.credential_file))))
+    except (ValueError, RuntimeError):
+        raise CliRefused(_issue("local_file_only", LOCAL_FILE_ONLY, pointer)) from None
+    try:
+        if path.stat().st_size > CREDENTIAL_FILE_MAX_BYTES:
+            raise ValueError(CREDENTIAL_FILE_UNREADABLE)
+        key = read_env_file(path).get("RUNPOD_API_KEY", "")
+    except (OSError, ValueError):
+        raise CliRefused(_issue("credential_file_unreadable", CREDENTIAL_FILE_UNREADABLE, pointer)) from None
+    if not key:
+        raise CliRefused(_issue("credential_missing", CREDENTIAL_KEY_MISSING, pointer))
+    return key
+
+
+def _tracking_scope(ctx: typer.Context):
+    """This process's one MLflow scope (``TrackingScope.from_environment``: ``.env``, ``--connection-file`` and the
+    environment), with ``--tracking-uri`` applied as the v1 commands apply it. Plans and ``graph-work`` use the same
+    scope, so a real plan pins the destination its controller reports (D11)."""
+    from .controller_entry import TrackingScope
+    try:
+        scope = TrackingScope.from_environment()
+        uri = getattr(ctx.obj.tracker, "uri", None) or ""
+        if uri != scope.MLFLOW_TRACKING_URI:
+            scope = TrackingScope.model_validate(
+                {**{name: getattr(scope, name) for name in TrackingScope.model_fields}, "MLFLOW_TRACKING_URI": uri})
+    except ValidationError:
+        raise typer.BadParameter(TRACKING_INVALID) from None
+    return scope
+
+
+def tracking_view(scope) -> dict[str, str | bool]:
+    """The desktop's public settings view of a ``TrackingScope``, as main.rs sends it: public strings and ``*_saved``
+    flags, never a credential value. ``public_auth_mode(view)`` is the auth mode the controller applies with the same
+    scope, and planning checks it with the controller's HTTPS and OIDC rules (D11, D13)."""
+    view: dict[str, str | bool] = {"MLFLOW_TRACKING_URI": scope.MLFLOW_TRACKING_URI,
+                                   "FACTORY_MLFLOW_ARTIFACT_LOCATION": scope.FACTORY_MLFLOW_ARTIFACT_LOCATION,
+                                   "auth_mode": scope.auth_mode}
+    if scope.auth_mode == "token":
+        view["MLFLOW_TRACKING_TOKEN_saved"] = bool(scope.MLFLOW_TRACKING_TOKEN.get_secret_value())
+    elif scope.auth_mode in ("", "oidc"):
+        view.update({"MLFLOW_OIDC_TOKEN_URL": scope.MLFLOW_OIDC_TOKEN_URL,
+                     "MLFLOW_OIDC_CLIENT_ID": scope.MLFLOW_OIDC_CLIENT_ID,
+                     "MLFLOW_OIDC_CLIENT_SECRET_saved": bool(scope.MLFLOW_OIDC_CLIENT_SECRET.get_secret_value())})
+    return view
+
+
+def cli_context(ctx: typer.Context, profiles_file: Path | None, *, scope_secret: str | None = None):
+    """The ``WorkflowContext`` of one command: this state directory, the public tracking view (``tracking_view``),
+    the profiles file's public fields, and only the RunPod key of ``scope_secret`` (the profile that
+    ``executor-profile-inspect`` observes)."""
+    from .desktop_workflows import WorkflowContext
+    profiles, secrets = {}, {}
+    if profiles_file is not None:
+        source, loaded = load_profiles(profiles_file)
+        for index, item in enumerate(loaded.profiles):
+            runpod = item.fields.get("provider") == "existing_runpod"
+            saved = runpod and (item.credential_file is not None or bool(os.environ.get("RUNPOD_API_KEY")))
+            profiles[item.profile_id] = _native_profile(item.profile_id, item.fields, saved)
+            if runpod and item.profile_id == scope_secret:
+                key = _profile_key(source, index, item)
+                if key:
+                    secrets["RUNPOD_API_KEY"] = key
+    return WorkflowContext(state_dir=ctx.obj.root, settings=MappingProxyType(tracking_view(_tracking_scope(ctx))),
+                           profiles=MappingProxyType(profiles), secrets=MappingProxyType(secrets), clock=time.time)
+
+
+def emit(result) -> None:
+    """A ``WorkflowResult`` as JSON on stdout (the v1 ``output`` format); exit 0 for ``ok``, 1 otherwise."""
+    output(result.model_dump(mode="json"))
+    if result.status != "ok":
+        raise typer.Exit(1)
+
+
+def _refused(refusal: CliRefused) -> None:
+    from .desktop_workflows import invalid
+    emit(invalid(*refusal.issues))
+
+
+def _workflow(ctx: typer.Context, action: str, data: dict, *, profiles_file: Path | None = None,
+              scope_secret: str | None = None) -> None:
+    from .desktop_workflows import dispatch_action
+    try:
+        context = cli_context(ctx, profiles_file, scope_secret=scope_secret)
+    except CliRefused as refusal:
+        _refused(refusal)
+        return
+    try:
+        result = dispatch_action(context, action, data)
+    except ValueError as exc:   # an envelope refusal: a fixed text, never an input value
+        raise typer.BadParameter(str(exc)) from None
+    emit(result)
+
+
+@app.command("project-list")
+def project_list(ctx: typer.Context):
+    """List the workflow projects of this state directory."""
+    _workflow(ctx, "projects_list", {})
+
+
+@app.command("executor-profile-inspect")
+def executor_profile_inspect(ctx: typer.Context, profile_id: str,
+                             executor_profiles: Annotated[Path, typer.Option()]):
+    """Observe one executor profile read-only (RunPod status, or the SSH probe) and store the public facts."""
+    _workflow(ctx, "executor_profile_inspect", {"profile_id": profile_id}, profiles_file=executor_profiles,
+              scope_secret=profile_id)
+
+
+@app.command("graph-validate")
+def graph_validate(ctx: typer.Context, project_id: str, revision: str | None = None):
+    """Check a project's graph offline (definitions, recipes, data, models)."""
+    data = {"project_id": project_id}
+    if revision is not None:
+        data["revision"] = revision
+    _workflow(ctx, "graph_validate", data)
+
+
+def _plan_request(path: Path) -> dict:
+    data = _json_object(Path(os.path.abspath(path)), REQUEST_MAX_BYTES, "request_file_invalid", REQUEST_FILE_INVALID)
+    found = [_issue("extra_field", PROJECT_FROM_ARGUMENT, "/project_id")] if "project_id" in data else []
+    if "simulation" in data:
+        found.append(_issue("extra_field", REAL_FROM_FLAG, "/simulation"))
+    if found:
+        raise CliRefused(*found)
+    return data
+
+
+@app.command("graph-plan")
+def graph_plan(ctx: typer.Context, project_id: str, request: Annotated[Path, typer.Option()],
+               executor_profiles: Path | None = None, real: bool = False):
+    """Plan a project's graph offline and store the plan. A dry run unless --real."""
+    try:
+        body = _plan_request(request)
+    except CliRefused as refusal:
+        _refused(refusal)
+        return
+    _workflow(ctx, "graph_plan", {**body, "project_id": project_id, "simulation": not real},
+              profiles_file=executor_profiles)
+
+
+@app.command("graph-submit")
+def graph_submit(ctx: typer.Context, plan_sha256: str, request_id: Annotated[str, typer.Option()],
+                 approve_execution: bool = False, approve_data_transfer: bool = False,
+                 executor_profiles: Path | None = None):
+    """Submit a stored plan. A real plan needs --approve-execution and --approve-data-transfer."""
+    _workflow(ctx, "graph_submit", {"plan_sha256": plan_sha256, "request_id": request_id,
+                                    "approve_execution": approve_execution,
+                                    "approve_data_transfer": approve_data_transfer},
+              profiles_file=executor_profiles)
+
+
+@app.command("graph-status")
+def graph_status_command(ctx: typer.Context, run_id: Annotated[str | None, typer.Argument()] = None):
+    """Show every graph run, or one run's nodes, wait reasons and tracking (from the ledger only)."""
+    if run_id is None:
+        _workflow(ctx, "graph_runs_list", {})
+    else:
+        _workflow(ctx, "graph_run_get", {"run_id": run_id})
+
+
+@app.command("graph-pause")
+def graph_pause(ctx: typer.Context, run_id: str):
+    """Pause a running graph run: no new step starts."""
+    _workflow(ctx, "graph_pause", {"run_id": run_id})
+
+
+@app.command("graph-resume")
+def graph_resume(ctx: typer.Context, run_id: str):
+    """Resume a paused graph run."""
+    _workflow(ctx, "graph_resume", {"run_id": run_id})
+
+
+@app.command("graph-cancel")
+def graph_cancel(ctx: typer.Context, run_id: str):
+    """Cancel a graph run."""
+    _workflow(ctx, "graph_cancel", {"run_id": run_id})
+
+
+@app.command("graph-rearm-tracking")
+def graph_rearm_tracking(ctx: typer.Context, event_id: str):
+    """Re-arm a failed or uncertain tracking event."""
+    _workflow(ctx, "tracking_rearm", {"event_id": event_id})
+
+
+def _profile_starts(profiles_file: Path | None) -> tuple:
+    """``ProfileStart`` of every profile in the file, each RunPod profile with its own key (``ProfileSecrets``
+    only; D7)."""
+    from .controller_entry import ProfileStart
+    if profiles_file is None:
+        return ()
+    source, loaded = load_profiles(profiles_file)
+    starts = []
+    for index, item in enumerate(loaded.profiles):
+        key = _profile_key(source, index, item) if item.fields.get("provider") == "existing_runpod" else ""
+        try:
+            starts.append(ProfileStart(profile_id=item.profile_id, fields=dict(item.fields),
+                                       secrets={"RUNPOD_API_KEY": key} if key else {}))
+        except ValidationError:
+            raise CliRefused(_issue("invalid_value", "executor profile fields are not the native allowlist",
+                                    f"/profiles/{index}")) from None
+    return tuple(starts)
+
+
+def _join(worker: threading.Thread, timeout: float) -> None:
+    worker.join(timeout)
+
+
+def _exit_now(code: int) -> None:
+    """The second Ctrl+C: leave at once, without draining. The owner lease expires after its TTL, and the next
+    controller reconciles what was in flight without relaunching it (Task 8)."""
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
+    os._exit(code)
+
+
+def _wait_for_controller(worker: threading.Thread, stop_event: threading.Event) -> int:
+    """The main thread waits for the controller thread. The first Ctrl+C asks it to drain (D14) and the second exits
+    at once. Returns the number of Ctrl+C presses."""
+    presses, announced = 0, False
+    while True:
+        try:
+            if presses and not announced:
+                announced = True
+                typer.echo(DRAINING, err=True)
+            if not worker.is_alive():
+                return presses
+            _join(worker, 0.2)
+        except KeyboardInterrupt:
+            presses += 1
+            stop_event.set()
+            if presses > 1:
+                _exit_now(EXIT_INTERRUPTED)
+
+
+@app.command("graph-work")
+def graph_work(ctx: typer.Context, executor_profiles: Path | None = None,
+               approve_execution_and_transfer: bool = False,
+               max_ticks: Annotated[int | None, typer.Option(min=1)] = None,
+               tick_seconds: Annotated[float, typer.Option(min=0.05, max=60.0)] = 5.0):
+    """Run the graph controller in the foreground until Ctrl+C (drains first) or --max-ticks. Simulation runs proceed;
+    real runs need --executor-profiles and --approve-execution-and-transfer, otherwise they wait."""
+    from .controller_entry import (
+        EXIT_INTERNAL,
+        EXIT_OK,
+        EXIT_OWNER_HELD,
+        EXIT_SETTINGS_REFUSED,
+        SETTINGS_REFUSED,
+        START_SCHEMA,
+        ControllerStart,
+        StartSettings,
+        TrackingScope,
+        read_current,
+        serve,
+    )
+    from .graph_store import OWNER_HELD
+    if executor_profiles is not None and not approve_execution_and_transfer:
+        raise typer.BadParameter(PROFILES_REQUIRE_APPROVAL, param_hint="--executor-profiles")
+    try:
+        profiles = _profile_starts(executor_profiles) if approve_execution_and_transfer else ()
+    except CliRefused as refusal:
+        _refused(refusal)
+        return
+    tracking = _tracking_scope(ctx) if approve_execution_and_transfer else TrackingScope()
+    owner_id = f"cli.{os.getpid()}.{time.time_ns()}"
+    try:
+        start = ControllerStart(schema=START_SCHEMA, state_root=str(ctx.obj.root), owner_id=owner_id,
+                                tracking=tracking, profiles=profiles,
+                                settings=StartSettings(tick_seconds=float(tick_seconds)))
+    except ValidationError:
+        raise typer.BadParameter(START_INVALID) from None
+    if not _CONTROLLER.acquire(blocking=False):
+        raise typer.BadParameter(ONE_CONTROLLER)
+    stop_event, box = threading.Event(), {}
+
+    def run():
+        try:
+            box["code"] = serve(start, stop_event=stop_event, max_ticks=max_ticks)
+        except BaseException:
+            box["code"] = EXIT_INTERNAL
+        finally:
+            _CONTROLLER.release()
+
+    try:
+        worker = threading.Thread(target=run, name="cli-graph-controller", daemon=True)
+        worker.start()
+    except BaseException:
+        _CONTROLLER.release()
+        raise
+    _wait_for_controller(worker, stop_event)
+    code = box.get("code", EXIT_INTERNAL)
+    current = read_current(ctx.obj.root)
+    mine = current if isinstance(current, dict) and current.get("owner_id") == owner_id else None
+    recorded = (mine or {}).get("code")
+    if code == EXIT_OWNER_HELD:
+        name, message = "owner_held", OWNER_HELD
+    elif code == EXIT_SETTINGS_REFUSED:
+        name, message = "settings_refused", (mine or {}).get("error") or SETTINGS_REFUSED
+    elif code == EXIT_OK:
+        name, message = recorded or "stopped", STOPPED
+    else:
+        name = recorded if recorded in ("owner_lost", "controller_failed") else "controller_failed"
+        message = OWNER_LOST if name == "owner_lost" else CONTROLLER_FAILED
+    typer.echo(json.dumps({"ok": code == EXIT_OK, "exit_code": code, "code": name, "message": message,
+                           "controller": mine}, ensure_ascii=False))
+    if code != EXIT_OK:
+        raise typer.Exit(code)
 
 
 if __name__ == "__main__":

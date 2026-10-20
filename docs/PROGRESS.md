@@ -3478,6 +3478,141 @@ Not verified or still open:
 - Deleting projects or recipes has no action; graph editing (10.5) and data import (10.3) are separate sub-tasks.
 - No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
 
+## Task 9.6 CLI: project and graph commands, 2026-10-21
+
+Commit `feat: add project and graph commands to the factory CLI`, written on `1a9ae29` (Task 9.4) in the worktree
+`D:\llm-tuning-factory-wt94` and rebased onto `0c38b3f` (Tasks 10.1 and 10.2, desktop only; only this file
+conflicted). It follows [Task 9 plan](superpowers/plans/2026-10-20-task9-secure-desktop-broker.md) §4 "9.6" with D9,
+D10 and D14. Changed: `src/tuning_factory/cli.py` (new commands appended; v1 commands untouched), new
+`tests/test_cli_graph.py`, and this file.
+
+What it does:
+- The D10 commands: `project-list`, `executor-profile-inspect PROFILE_ID --executor-profiles FILE`,
+  `graph-validate PROJECT_ID [--revision]`, `graph-plan PROJECT_ID --request FILE [--executor-profiles FILE] [--real]`,
+  `graph-submit PLAN_SHA256 --request-id ID [--approve-execution] [--approve-data-transfer] [--executor-profiles FILE]`,
+  `graph-status [RUN_ID]`, `graph-pause`/`graph-resume`/`graph-cancel RUN_ID`, `graph-rearm-tracking EVENT_ID` and
+  `graph-work`.
+- Every command except `graph-work` runs one desktop workflow action through `desktop_workflows.dispatch_action`, with
+  the same strict request model as the app. It prints the `WorkflowResult` as JSON in the v1 `output` format, and
+  exits 0 for `ok` and 1 for `invalid` or `conflict` (`emit`).
+- `cli_context` builds the `WorkflowContext`:
+  - the `--state-dir` directory;
+  - `settings` = `tracking_view(scope)`: the desktop's public view (URI, artifact location, `auth_mode`, OIDC URL and
+    client ID, `*_saved` flags) of this process's one MLflow scope, `TrackingScope.from_environment()` (the `.env`
+    file, `--connection-file` and the environment), with `--tracking-uri` applied as the v1 commands apply it;
+  - the profiles file's public fields as `NativeProfile`s;
+  - `secrets` = only the RunPod key of the profile that `executor-profile-inspect` observes.
+- The profiles file (`CliProfiles`): `{"schema_version": 1, "profiles": [{"profile_id", "fields",
+  "credential_file"?}]}`, at most 32 profiles, IDs unique under `casefold().rstrip(".")`, at most 1 MiB, no duplicate
+  JSON key.
+  - `fields` follow `NativeProfile`'s per-provider allowlist. A credential name is refused first, as
+    `credential_field`, with "reference a credential file instead". Extra keys (`RUNPOD_API_KEY`, `secrets`) are
+    `extra_field`.
+  - `credential_file` (RunPod only) names a local env file with `RUNPOD_API_KEY`, relative to the profiles file.
+    `~` is expanded. UNC and device paths are refused with `local_file_only`, and files over 64 KiB with
+    `credential_file_unreadable`; a file without the key gives `credential_missing`.
+  - Without a credential file, a RunPod profile uses `RUNPOD_API_KEY` from the existing `.env`/environment (D10).
+  - Keys are read only by `executor-profile-inspect` (the one profile) and by an approved `graph-work`. Planning and
+    submission read public fields only.
+  - Refusals point into the file (`/profiles/<index>/...`) and never echo a value.
+- `graph-plan`'s `--request` file is a `GraphPlanRequest` body without `project_id` and `simulation`. Both are refused
+  as `extra_field`: the argument names the project, and only `--real` makes a real plan.
+- `graph-work` runs the 9.4 controller in the foreground:
+  - It builds `ControllerStart(schema=START_SCHEMA, state_root, owner_id="cli.<pid>.<time_ns>", tracking, profiles,
+    settings=StartSettings(tick_seconds))` and calls `controller_entry.serve` on a worker thread. `serve` pops the
+    inherited credential variables, applies the MLflow scope once, takes the owner lease, writes `current.json` and
+    drains; `GraphController` installs its redaction as `JobStore.error_filter`.
+  - Without `--approve-execution-and-transfer`: `tracking = TrackingScope()` and no profiles. Simulation runs
+    proceed; real runs wait (`executor profile is not configured in this controller`, no tracker).
+  - With it: the scope from the environment, and every profile of `--executor-profiles` with its own key in
+    `ProfileStart.secrets` (and so only in `ProfileSecrets`).
+  - `--executor-profiles` without the approval flag is refused (exit 2) rather than ignored.
+  - One controller per process: a process lock refuses a second `graph-work` in the same process (exit 2), and the
+    owner lease refuses a second controller on the state directory (exit 3, `owner_held`).
+  - The main thread waits. The first Ctrl+C sets the stop event: `run_forever` drains (D14) and releases the owner. A
+    note goes to stderr. A second Ctrl+C exits at once (`os._exit(130)`); the owner lease then expires after its TTL
+    and the next controller reconciles without relaunching.
+  - Stdout is JSON lines: `serve`'s ready line (or `{"ok": false, "code": "owner_held"|"settings_refused"}`), then
+    `{"ok", "exit_code", "code", "message", "controller"}`, where `controller` is this owner's `current.json` (public
+    IDs, revisions and hashes).
+  - Exit codes are `serve`'s: 0 drained stop, 1 lost owner or internal error, 3 `owner_held` ("controller already
+    running"), 4 settings refused (before any owner lease).
+- `release-lock --confirm-execution-stopped` is unchanged and already works for graph jobs:
+  `tests/test_graph_controller.py::test_ambiguous_launch_waits_for_the_operator` runs it through the CLI on a graph
+  job, and it passed in the runs below.
+
+Actual verification (main venv with `PYTHONPATH` on the worktree `src`; `--basetemp` under `%TEMP%`):
+- RED first. All 19 tests written first failed: `cli_module()` reported `tuning_factory.cli.CliProfile (Task 9.6) is
+  missing`. With those names stubbed in a throwaway plugin (outside the tree), the same 19 failed for the intended
+  reason: `No such command 'project-list'` (and `graph-validate`, `executor-profile-inspect`, `graph-submit`,
+  `graph-work`), exit 2, and the command set lacked the D10 names.
+- GREEN: `tests/test_cli_graph.py` **23 passed**: the plan's 10 tests, plus the D11 parity table (6 cases), the
+  synthetic-secret spy test, Ctrl+C (two moments) and a second Ctrl+C, exit 4 before the owner lease, an import check
+  (no torch, peft, transformers, safetensors, huggingface_hub or keyring), and `--tracking-uri`. Four items were added
+  after the first GREEN (19 passed) and were not RED first: exit 4, the import check, the "as soon as running" Ctrl+C
+  moment and `--tracking-uri`. The last two were then checked against mutations (below).
+- The spy test: a credential file key, an MLflow token in the env file, inspection, a real plan, submission and an
+  approved `graph-work` against a fake `executor_for` and a fake `MLflowTracker` that both raise with the secret in
+  their text.
+  - The key reached the provider as a value, from the credential file; `RUNPOD_API_KEY` was never in `os.environ`.
+  - The stored wait reason and the tracking event's `last_error` hold `[redacted]`.
+  - Neither secret is in any argv, stdout, stderr or file under the state directory (`jobs.db` included).
+  - `current.json`'s `tracking_settings_sha256` equals the real plan's pinned `public_settings_sha256` (D11 through
+    the CLI).
+- Mutations of `cli.py`, each restored and checked by SHA256. All 12 were killed:
+  - profiles used without approval;
+  - the MLflow scope applied without approval;
+  - no `*_saved` flags in the view;
+  - the first Ctrl+C not setting the stop event;
+  - the second Ctrl+C ignored;
+  - no process lock;
+  - exit code always 0;
+  - the environment key used instead of the credential file;
+  - the request file choosing `simulation`;
+  - every profile's key scoped;
+  - `emit` exiting 0;
+  - `--tracking-uri` ignored.
+  - In the first round the first-Ctrl+C mutation hung its test (the run was killed by hand, so it did not count), and
+    `--tracking-uri` survived. The Ctrl+C tests now stop a controller that ignores Ctrl+C through its stop request
+    after 30 s and then fail, and the `--tracking-uri` test was added. Both mutations were then killed.
+- `test_cli_graph`, `test_runner_cli`, `test_controller_entry` and `test_workflow_runs` (the plan's list): 23 + 10 +
+  47 + 29 = **109**. With the other CLI modules (`test_connections`, `test_gpu_servers`, `test_graph_controller`,
+  `test_graph_store`, `test_tracking_https`): **340 passed**. `tests/test_runner_cli.py` and the other existing tests
+  are unchanged.
+- Full suite: **1671 passed, 1 skipped** (880 s): the baseline 1648 plus the 23 new tests. The one skip is the
+  real-GPU test.
+- Ruff is clean. `scripts/check_secrets.py` reports 0 findings. `git diff --exit-code containers/ pyproject.toml
+  uv.lock desktop/` is clean. Every changed file is LF only.
+- CPU acceptance: exit 0, **29/29**, passed.
+  - Receipt SHA256 `56a3c0f8d125c743359f1cfb1aa8b904f651d5e83163d923b476c7eec0a0b65f`.
+  - `source_sha256 abf088b61071b975120778179699782d2a9aabba0cd4dbb7c00ccc87fdfdbed7`, equal to `source_hash()` of the
+    tree.
+  - `lock_sha256 5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`.
+
+Not verified:
+- Real RunPod, SSH and MLflow from the CLI controller; only fakes were used.
+- A real terminal Ctrl+C. The tests raise `KeyboardInterrupt` through the `_join` seam, and the second Ctrl+C's
+  `os._exit` is replaced by a stand-in.
+- The Linux CI run (only Windows was run here).
+- Korean issue messages on a console with a legacy code page (the v1 `output` behaviour, unchanged).
+
+Deviations:
+- `graph-work --executor-profiles` without `--approve-execution-and-transfer` is refused (exit 2). The plan ignored
+  the profiles.
+- The request file may not contain `project_id` or `simulation`.
+- `settings.auth_mode` is the controller scope's mode (`TrackingScope.from_environment`), not raw
+  `current_auth_mode()`. They differ only for an OIDC URL without a client secret: the view says `oidc` with no saved
+  secret, so `public_auth_mode` still equals `current_auth_mode()` (`none`), and planning reports
+  `tracking_incomplete` exactly when the controller would refuse to start.
+- `--tracking-uri` applies to the graph commands and to `graph-work`'s scope.
+- `credential_file` is a string (resolved as above), not a `Path` field; a RunPod profile without one uses the
+  environment key.
+- A process lock (exit 2) in addition to the owner lease.
+- `graph-work` prints JSON lines (the ready line, then a final line), not a single document.
+- 13 tests beyond the plan's 10 (above).
+- No CLI command creates projects, recipes, data or HF-root snapshots: D10 lists none, so those come from the app
+  (or the workflow actions).
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
