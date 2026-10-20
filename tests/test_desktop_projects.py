@@ -34,6 +34,8 @@ ACTIONS_92 = ("executor_profile_inspect", "model_root_snapshot", "model_roots_li
 ACTIONS_93 = ("graph_submit", "graph_runs_list", "graph_run_get", "graph_pause", "graph_resume", "graph_cancel",
               "tracking_rearm", "executor_profile_edit_check")
 ACTIONS_94 = ("controller_status", "controller_stop")
+# Task 9.7 adds the header-only HF-root target inspector to the table (root decision Q-A, 2026-10-20).
+ACTIONS_97 = ("model_root_targets",)
 # Copied from desktop/src-tauri/src/main.rs `allowed()` (plan F6 says 35; the list has 34 names).
 LEGACY_ACTIONS = ("catalog", "save_profile", "dataset", "plan", "submit", "execute", "jobs", "logs", "cancel",
                   "recover", "reconcile", "resume", "connection", "pod", "runtime_check", "runtime_prepare",
@@ -223,12 +225,13 @@ def command_like(name):
 # 1
 def test_workflow_action_table_is_closed_and_partitioned():
     wf = workflows()
-    expected = ACTIONS_91 + ACTIONS_92 + ACTIONS_93 + ACTIONS_94
+    expected = ACTIONS_91 + ACTIONS_92 + ACTIONS_93 + ACTIONS_94 + ACTIONS_97
     assert wf.WORKFLOW_ACTIONS == expected
-    assert len(set(wf.WORKFLOW_ACTIONS)) == 32
+    assert len(set(wf.WORKFLOW_ACTIONS)) == 33
     assert set(wf.ACTION_MODULES) == set(wf.WORKFLOW_ACTIONS)
     owners = {"tuning_factory.desktop_workflows": ACTIONS_91, "tuning_factory.workflow_planning": ACTIONS_92,
-              "tuning_factory.workflow_runs": ACTIONS_93, "tuning_factory.controller_entry": ACTIONS_94}
+              "tuning_factory.workflow_runs": ACTIONS_93, "tuning_factory.controller_entry": ACTIONS_94,
+              "tuning_factory.hf_targets": ACTIONS_97}
     assert {name: module for module, names in owners.items() for name in names} == dict(wf.ACTION_MODULES)
     native = (ROOT / "desktop/src-tauri/src/main.rs").read_text(encoding="utf-8")
     allowed = native[native.index("fn allowed("):]
@@ -236,7 +239,8 @@ def test_workflow_action_table_is_closed_and_partitioned():
     assert tuple(re.findall(r'"([a-z0-9_]+)"', allowed)) == LEGACY_ACTIONS
     assert not set(wf.WORKFLOW_ACTIONS) & set(LEGACY_ACTIONS)
     assert dict(wf.SECRET_SCOPES) == {"executor_profile_inspect": frozenset({"RUNPOD_API_KEY"}),
-                                      "model_root_snapshot": frozenset({"HF_TOKEN"})}
+                                      "model_root_snapshot": frozenset({"HF_TOKEN"}),
+                                      "model_root_targets": frozenset({"HF_TOKEN"})}
     assert set(wf.SECRET_SCOPES) <= set(wf.WORKFLOW_ACTIONS)
     assert set().union(*wf.SECRET_SCOPES.values()) <= set(wf.SECRET_FIELDS)
     secrets = re.search(r"const SECRETS: \[&str; 7\] = \[(.*?)\];", native, re.S)[1]

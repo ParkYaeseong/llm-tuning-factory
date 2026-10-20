@@ -43,17 +43,21 @@ WORKFLOW_ACTIONS: tuple[str, ...] = (
     "tracking_rearm", "executor_profile_edit_check",
     # 9.4
     "controller_status", "controller_stop",
+    # 9.7
+    "model_root_targets",
 )
 _OWNERS = (("tuning_factory.desktop_workflows", WORKFLOW_ACTIONS[:14]),
            ("tuning_factory.workflow_planning", WORKFLOW_ACTIONS[14:22]),
            ("tuning_factory.workflow_runs", WORKFLOW_ACTIONS[22:30]),
-           ("tuning_factory.controller_entry", WORKFLOW_ACTIONS[30:]))
+           ("tuning_factory.controller_entry", WORKFLOW_ACTIONS[30:32]),
+           ("tuning_factory.hf_targets", WORKFLOW_ACTIONS[32:]))
 # Fixed here for every sub-task: an action is served only by the module named for it.
 ACTION_MODULES: Mapping[str, str] = MappingProxyType(
     {name: module for module, names in _OWNERS for name in names})
 SECRET_SCOPES: Mapping[str, frozenset[str]] = MappingProxyType({
     "executor_profile_inspect": frozenset({"RUNPOD_API_KEY"}),
     "model_root_snapshot": frozenset({"HF_TOKEN"}),
+    "model_root_targets": frozenset({"HF_TOKEN"}),
 })
 SECRET_FIELDS = ("RUNPOD_API_KEY", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLOW_TRACKING_TOKEN", "S3_ACCESS_KEY_ID",
                  "S3_SECRET_ACCESS_KEY", "S3_SESSION_TOKEN", "HF_TOKEN")          # = main.rs SECRETS

@@ -355,6 +355,12 @@ def tensor_header(path: Path, relative: str) -> tuple[TensorMetadata, ...]:
             raise ValueError("invalid safetensors header length")
         header = _json(stream.read(length))
         data_size = os.fstat(stream.fileno()).st_size - 8 - length
+    return header_tensors(header, data_size, relative)
+
+
+def header_tensors(header, data_size: int, relative: str) -> tuple[TensorMetadata, ...]:
+    """Validate a parsed safetensors header against its payload size: one rule set for local files and for the
+    header-only HTTP range reads of HF roots (``hf_targets``)."""
     if not isinstance(header, dict) or data_size < 0:
         raise ValueError("invalid safetensors tensor header")
     tensors, ranges = [], []

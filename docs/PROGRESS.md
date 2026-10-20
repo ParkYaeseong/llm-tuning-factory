@@ -2707,6 +2707,140 @@ Remaining, for Task 9:
 - Executors built outside `SettingsExecutorProvider` carry no `destination_profile` stamp; the controller's own profile
   check covers them.
 
+## Task 9.7 header-only HF-root target inspector, with the 9.2 review follow-ups, 2026-10-21
+
+Two commits, written in the worktree `codex/task-9.7` on 9.2 (`7f3a4bc`):
+`test: pin D15 lineage branches and planning gates; tighten planning inputs` (the 9.2 review follow-ups, first, so
+they land before D15 is lifted), then `feat: inspect HF base targets from safetensors headers`. Both were then
+rebased onto the 9.5 review fixes (`2b16eee`) and onto the 8.5 review fixes (`b0d2c90`). Only
+`tests/test_native_contract.py` (9.5's new `VAULT_FREE_ACTIONS` assertions are kept beside the Python-only
+declaration) and this file conflicted. After 8.5's fix the end-to-end test claims with `job_id` and `executor`, as
+the controller now does. They implement
+[Task 9 plan](superpowers/plans/2026-10-20-task9-secure-desktop-broker.md) §4 "9.7" (root decision Q-A: required
+before Task 10) and the review of 9.2 (ready to merge; Minor items only).
+
+9.2 review follow-ups (first commit, `workflow_planning.py` and its tests only):
+- Minor 1, tests for behaviour that mutations showed untested. Each new test fails against the mutation it
+  targets (8 mutations, all killed):
+  - The D15 walker: continuation through a selection of HF-root adapters, and from a merge output, is blocked
+    without evidence; training after materialize is not.
+  - A negative observation age is `observation_stale`; `repository_unsupported`; the `root_snapshot_conflict`
+    reuse check; estimate collisions compare casefolded IDs; tokenizer names that collide by case are refused.
+- Minor 2: `public_profile`, `executor_profile_inspect` and planning refuse a relative `ssh_key_file` or
+  `server_ssh_key_file` with `executor_profile_invalid` (`check_key_paths`), before the D11 transport hash would
+  resolve it against the working directory.
+- Minor 3: `model_root_snapshot` maps `TypeError`, `AttributeError` and `KeyError` to `snapshot_failed` with the
+  type name, instead of escaping the issue envelope.
+- Minor 5: `benchmark_save` applies `training.check_generation_benchmark` (`benchmark_unsupported`, the worker's
+  exact text).
+- Minor 6: a failed remote probe (`RemoteCommandFailed`) is `remote_command_failed` with a fixed text and no
+  remote output. The exception carries no exit status, so none is reported.
+- Optional nits done: snapshot downloads refuse a redirect to plain HTTP before it is sent (`insecure_redirect`,
+  shared hook `https_only`); inspection closes the RunPod controller's HTTP client. Not done: an index on
+  `(namespace, revision_sha256)` for `get_by_revision` (a schema change, not trivial).
+
+What 9.7 changed (second commit):
+- New `hf_targets.py` with the action `model_root_targets {repo_id, revision, download_approved}` (secret scope
+  `HF_TOKEN`). It requires `download_approved: true`, refuses repository names Windows would alter, and needs the
+  root indexed by `model_root_snapshot` (`model_root_missing`; two index entries for one `repo@revision` are
+  `model_root_invalid`). All of these are checked before any request.
+- It reads `model.safetensors.index.json` (HTTP 404 means a single `model.safetensors`) through the resolve URLs of
+  the pinned revision, then makes exactly two range requests per shard: `bytes=0-7`, then the header.
+  - A range must be answered `206` with exactly the requested `Content-Range` and length. A `200` is closed with its
+    body unread. A `Content-Encoding` is refused (`Accept-Encoding: identity`), and so is a total size that changes
+    between the two requests.
+  - Caps: header ≤16 MiB (checked before the second request), index ≤16 MiB, a redirect body declared ≤64 KiB
+    (httpx reads redirect bodies before following), at most 256 shards and 5 redirects, and 64 MiB in total
+    (checked before each request).
+  - Every hop must be HTTPS. httpx drops the Authorization header on a cross-origin redirect; the `Range` header
+    is kept.
+- Headers are validated by `model_artifacts.header_tensors`, a pure extraction from `tensor_header`, so local
+  files and HTTP reads share one rule set. The index must name exactly the tensors each shard holds.
+- The evidence is the rule `verify_inspected_targets` applies to full-model artifacts: 2D `*.weight` tensors kept by
+  `target_inspection._not_a_target`, with `(out, in)` dimensions. It is stored through `save_root_targets`.
+  - A repeat call with identical evidence is idempotent.
+  - Different evidence for the same pinned root is `conflict`/`version_exists`, and the stored file is unchanged.
+  - A damaged stored file is `root_targets_invalid`, refused before any request.
+- Refused, not guessed (`architecture_unsupported`, one fixed text):
+  - Profiles outside the reviewed dense text architectures (`qwen2`, `qwen3`, `llama`, `mistral`, `gemma2`,
+    `gemma3_text`, `phi3`) are refused before any request.
+  - So is any tensor with three or more dimensions, any `experts` tensor, a non-float target weight, and a
+    `.qweight`/`.weight_packed` tensor.
+- Errors never echo a server reply or the token: fixed texts or 9.2's English HTTP texts, and the type name for
+  anything unexpected (`TypeError`, `AttributeError` and `KeyError` included, per Minor 3).
+- `desktop_workflows.py` (the one allowed change): `model_root_targets` appended to the action table, mapped to
+  `tuning_factory.hf_targets`, with secret scope `{HF_TOKEN}`.
+
+Deviations:
+- **The native allowlist does not offer `model_root_targets` yet.** `desktop/` stays frozen for 9.7, but
+  `test_native_contract` pins the Rust `WORKFLOW_ACTIONS` and scopes to the Python table. The test now declares
+  `PYTHON_ONLY = ("model_root_targets",)`: native must equal the Python table minus that name, and every other
+  name and scope must still match exactly. The GUI can call the action only after `main.rs` adds it to
+  `WORKFLOW_ACTIONS` and `HF_SCOPED_ACTIONS`; the CLI and tests can call it now. `test_desktop_projects` pins the
+  table at 33 names.
+- `model_artifacts.py` (not in the brief): the extraction of `header_tensors`, with no behaviour change.
+- The architecture allowlist goes beyond the brief's structural refusals. Primary `transformers==5.6.0` fuses or
+  renames MoE, hybrid and multimodal checkpoint tensors at load, so their headers are not the runtime module
+  inventory.
+- `check_key_paths` allows `~` (expanded per user, as the D11 hash already does). Native `profiles.rs` (9.5 fix)
+  is stricter and refuses it.
+- A top-level `score.weight` is kept as a target: `_not_a_target` excludes only `score.`-prefixed modules. This is
+  the verify rule as written, not changed here.
+- The comment "the two scoped actions" in `desktop_workflows.dispatch_action` is now stale (three actions get a
+  scope); it was left as the brief forbids other changes there.
+
+Actual verification (worktree `D:\llm-tuning-factory-wt97`, main venv with `PYTHONPATH` on the worktree `src`;
+`tuning_factory.__file__` resolved into the worktree):
+- RED, before any 9.7 `src` edit: **69 failed**. The 67 cases of `tests/test_hf_targets.py` failed on the missing
+  module (`pytest.fail`, not collection), the table pin on the missing name, and the native contract on the
+  undeclared Python-only action. Added later, test-first: `shifted_range`, `ambiguous_root` and a reversed index
+  order (each killing a surviving mutation), and the three Minor 3 envelope cases (red without the wider catch).
+- 9.2 follow-ups RED: the 13 behaviour cases failed on unpatched code, and the 9 pin cases each failed against
+  their mutation. GREEN: `test_workflow_planning` gave **78 passed**, and the full suite on that commit gave
+  **1464 passed, 2 skipped** (1442 + 22).
+- Mutations of `hf_targets.py` through a harness under `%TEMP%` (each restored): **33 of 33 killed**. They covered
+  reading a 200 body, the Content-Range equality and exact length, the identity check, each refusal rule, the
+  allowlist, the total-size consistency, the header cap, the budget, the HTTPS hook, the redirect bound, an
+  unconditional Authorization header, shard name safety, index consistency, `_not_a_target`, swapped dimensions,
+  the conflict, the early stored-evidence check, echoed errors, approval, repository names, zero and oversized
+  header lengths, the index cap, the shard count, the `.safetensors` suffix, the 404 fallback, shard order and
+  the ambiguous root.
+- GREEN: `test_hf_targets` (72), `test_workflow_planning`, `test_desktop_projects`, `test_simulated_dispatch`,
+  `test_model_artifacts` and `test_graph_planner` gave **349 passed**. The full suite gave **1536 passed,
+  2 skipped** (1464 + 72); the known flake did not occur. Rebased onto `2b16eee`: the same set plus
+  `test_native_contract` gave **355 passed, 1 skipped**, and the full suite **1536 passed, 2 skipped**. Rebased onto
+  `b0d2c90` (the final tree): **356 passed, 1 skipped** and the full suite **1553 passed, 2 skipped** (8.5's 1459 +
+  22 + 72). The known `test_jobs` flake did not occur in any run. Ruff is clean. `check_secrets.py` reports 0 findings
+  with the change staged. `git diff --exit-code containers/ pyproject.toml uv.lock desktop/` is clean. Every
+  changed file is CR-free. A subprocess test shows `hf_targets` imports no torch, peft, transformers,
+  safetensors, huggingface_hub, keyring, paramiko or mlflow.
+- End to end, with fakes: `model_root_snapshot`, then `model_root_targets`, then a simulation `graph_plan`.
+  - The default `lora_target: all` train on the root warned before targets and plans cleanly after them, with
+    `base_targets == (evidence,)`. A continuation, merge and materialize graph on the root went from
+    `base_targets_missing` to planned.
+  - The plan was submitted to a `GraphStore` and claimed through `SimulatedExecutorProvider.for_plan`. The
+    `SimulatedOperationDispatcher` (root snapshots from `root_snapshots_dir`) completed the train, and the adapter
+    covers every evidence module with its dimensions.
+- CPU acceptance (`-I`, the worktree's script and source) exited 0 with all **29** checks passed on every tree. Before
+  the rebases (and on `2b16eee`, byte-identical) the receipt was `ee2f52e1…d6f2`, source `6694651d…fc50`. On the final
+  tree (`b0d2c90` plus both commits): receipt SHA256
+  `cbad9755e3ff210c1f0e5b0e7fe673057abba7d7d8d1aff6ae3d88b48c3d2f8d`, source_sha256
+  `3b1f546a0a827938d217c336d2e30e9902bed4ca66f2c05e514e0c99382a1631` (equal to `source_hash()` of the committed
+  `src`), lock_sha256 `5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437`. Max errors are unchanged
+  (merge delta 7.78e-9, materialize delta 9.17e-9, parent→child 6.42e-9, logits 3.35e-8/2.98e-8). `model_downloaded`,
+  `gpu_used`, `institution_data_used` and `production_promotable` are false. It supersedes 8.5's review-fix receipt
+  `6524aba8…5c1f`.
+
+Not verified or still open:
+- Real Hugging Face behaviour is exercised only with MockTransport and synthetic headers: range support on the
+  resolve URLs and on the LFS/Xet CDN, the `Content-Range` and `Content-Length` it sends (including on redirects),
+  HTTP 404 for a missing index, gated-model access with `HF_TOKEN`, and real checkpoints of the allowed
+  architectures (tied embeddings, biases, `q_norm`/`k_norm`, phi3's fused layers).
+- That header-derived module names equal the runtime module names of `transformers==5.6.0` for the allowed
+  architectures is a reasoned assumption, not a run. The meta-device inspector was not compared on real configs.
+- The GUI cannot call `model_root_targets` until `main.rs` lists it (see the first deviation).
+- No network, GPU, SSH, model download, MLflow, provider call or institution data was used.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
