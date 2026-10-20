@@ -209,7 +209,10 @@ const drafts = {
     + '<button type="button" data-action="wf:drafts:save">밖에서 저장</button>'
     + '<button type="button" data-action="wf:drafts:dialog">확인 열기</button>'
     + '<button type="button" data-action="wf:drafts:confirm-task">확인 후 작업</button>'
-    + '<button type="button" data-action="nav:datasets">데이터 화면</button></div>'
+    + '<button type="button" data-action="nav:datasets">데이터 화면</button>'
+    + '<button type="button" data-action="wf:drafts:server">서버 정리</button>'
+    + '<button type="button" data-action="wf:drafts:overlap">겹친 작업</button></div>'
+    + '<details><summary>세부</summary><p>세부 내용</p></details>'
     + '<button type="button" data-action="wf:drafts:under" style="display:block;width:100%;height:1600px">아래 버튼</button></section>',
   capture() { const input = document.getElementById("draft-note"); if (input) note = input.value; },
   async enter(ctx) { current = ctx; },
@@ -219,6 +222,15 @@ const drafts = {
       const answer = await confirm();
       if (answer?.action === "go") await ctx.task("확인한 작업 중", () => new Promise(resolve => { window.__finish = resolve; }));
       log.push("confirmed"); return;
+    }
+    if (verb === "overlap") {   // two tasks at once, the second finishing first
+      void ctx.task("첫 작업 중", () => new Promise(resolve => { window.__finishFirst = resolve; }));
+      void ctx.task("둘째 작업 중", () => new Promise(resolve => { window.__finishSecond = resolve; }));
+      return;
+    }
+    if (verb === "server") {   // a task whose result replaces the draft (e.g. a value the backend normalized)
+      await ctx.task("서버 정리 중", () => new Promise(resolve => { window.__finishServer = () => { note = "서버가 고친 메모"; resolve(); }; }));
+      return;
     }
     log.push(verb + ":" + note);
   },
@@ -363,4 +375,98 @@ test("a patch copies typing only into the same single control and can opt out", 
   // A key the page shares with the sidebar (nav:datasets) restores focus in the page, not in the sidebar.
   await page.evaluate(async () => (await import("/src/workbench.ts" as string)).restoreFocus(document, "nav:datasets"));
   await expect(page.getByRole("button", { name: "데이터 화면" })).toBeFocused();
+});
+
+// -- review fixes (Task 10.2 review M2, M4, M5) --
+
+test("after a keyboard close only the returned-to opener ignores a repeated Enter", async ({ page }) => {
+  await page.route(REGISTRY_URL, route => route.fulfill({ contentType: "application/javascript", body: DRAFT_REGISTRY }));
+  await openWorkbench(page);
+  await page.locator('nav [data-action="nav:drafts"]').click();
+  const opener = page.getByRole("button", { name: "확인 열기" });
+  await opener.click();
+  await page.getByRole("dialog", { name: "확인" }).getByRole("button", { name: "돌아가기" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(opener).toBeFocused();
+  // Another control activated from the keyboard right away is not swallowed.
+  await page.keyboard.press("Tab");
+  await expect(page.getByRole("button", { name: "확인 후 작업" })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("dialog", { name: "확인" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.locator("dialog")).toHaveCount(0);
+  expect(await draftLog(page)).toEqual(["dialog:back", "confirmed"]);
+});
+
+test.describe("touch", () => {
+  test.use({ hasTouch: true });
+  test("a second tap a little off the closing tap does not reach the page beneath", async ({ page }) => {
+    await page.route(REGISTRY_URL, route => route.fulfill({ contentType: "application/javascript", body: DRAFT_REGISTRY }));
+    await openWorkbench(page);
+    await page.locator('nav [data-action="nav:drafts"]').click();
+    await page.getByRole("button", { name: "확인 열기" }).tap();
+    const back = page.getByRole("dialog", { name: "확인" }).getByRole("button", { name: "돌아가기" });
+    const box = (await back.boundingBox())!;
+    const [x, y] = [box.x + box.width / 2, box.y + box.height / 2];
+    await page.touchscreen.tap(x, y);
+    await page.touchscreen.tap(x + 14, y + 6);
+    await expect(page.locator("dialog")).toHaveCount(0);
+    expect(await draftLog(page)).toEqual(["dialog:back"]);
+    await page.waitForTimeout(500);
+    await page.touchscreen.tap(x + 14, y + 6);
+    await expect.poll(() => draftLog(page)).toEqual(["dialog:back", "under:처음 메모"]);
+  });
+});
+
+test("a patch waits while Korean text is being composed in its region", async ({ page }) => {
+  await page.route(REGISTRY_URL, route => route.fulfill({ contentType: "application/javascript", body: DRAFT_REGISTRY }));
+  await openWorkbench(page);
+  await page.locator('nav [data-action="nav:drafts"]').click();
+  const text = (value: string) => `<input data-focus-key="k" aria-label="영역 입력" value="${value}">`;
+  const patch = (html: string) => page.evaluate(html => (window as any).__patch(html), html);
+  await patch(text("서버 1"));
+  const input = page.getByLabel("영역 입력");
+  await input.fill("한");
+  await input.evaluate(element => { element.setAttribute("data-mark", "composing"); element.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })); });
+  await patch(text("서버 2"));
+  // The IME's input element is not replaced mid-composition.
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(1);
+  await input.evaluate(element => element.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "한" })));
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(0);
+  await expect(input).toBeFocused();
+  await expect(input).toHaveValue("한");
+});
+
+test("overlapping tasks keep the workbench busy until the last one ends", async ({ page }) => {
+  await page.route(REGISTRY_URL, route => route.fulfill({ contentType: "application/javascript", body: DRAFT_REGISTRY }));
+  await openWorkbench(page);
+  await page.locator('nav [data-action="nav:drafts"]').click();
+  await page.getByRole("button", { name: "겹친 작업" }).click();
+  await expect(page.locator(".notice.busy")).toContainText("둘째 작업 중");
+  await page.evaluate(() => (window as any).__finishSecond());
+  // The first task still runs: busy stays (with its label) and the actions stay disabled.
+  await expect(page.locator(".notice.busy")).toContainText("첫 작업 중");
+  await expect(page.getByRole("button", { name: "밖에서 저장" })).toBeDisabled();
+  await page.evaluate(() => (window as any).__finishFirst());
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "밖에서 저장" })).toBeEnabled();
+});
+
+test("a view render during a press after a task finished keeps the task's result", async ({ page }) => {
+  await page.route(REGISTRY_URL, route => route.fulfill({ contentType: "application/javascript", body: DRAFT_REGISTRY }));
+  await openWorkbench(page);
+  await page.locator('nav [data-action="nav:drafts"]').click();
+  await page.getByLabel("메모", { exact: true }).fill("입력한 메모");
+  await page.getByRole("button", { name: "서버 정리" }).click();
+  await expect(page.locator(".notice.busy")).toContainText("서버 정리 중");
+  // The task finishes while a control is pressed, then a poll notice renders during the same press.
+  const box = (await page.locator("summary", { hasText: "세부" }).boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.evaluate(() => (window as any).__finishServer());
+  await page.evaluate(() => (window as any).__notify());
+  await page.mouse.up();
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+  await expect(page.getByLabel("메모", { exact: true })).toHaveValue("서버가 고친 메모");
+  await expect(page.getByText("폴링 알림")).toBeVisible();
 });

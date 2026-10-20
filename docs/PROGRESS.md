@@ -4214,6 +4214,60 @@ Not verified or still open:
 - A RunPod key rotated without any other change, and MLflow credentials re-saved without a public change, need a
   controller restart that polling cannot report; the bar and the key field say so.
 
+## Task 10.2 review fixes: serialized workbench tasks, stable textarea drafts, 2026-10-21
+
+Commit `fix: serialize workbench tasks and keep textarea drafts stable`, written in the worktree
+`D:\llm-tuning-factory-wt102` (branch `codex/task-10.2-fix`, from `128f995`). It lands the independent review of
+`0c38b3f` and `6f05a08` ("Ready with fixes": two Important, nothing Critical; it confirmed D17 byte identity for 41
+stage/method combinations, the request payloads against the strict models and the recipe defaults). Changed:
+`desktop/src/{main,workbench,issues,view-types}.ts`, `desktop/src/views/{projects,recipes}.ts`,
+`desktop/tests/{projects,recipes,navigation,workflow-core}.spec.ts`; new `desktop/tests/recipe-defaults.json` and
+`tests/test_desktop_recipe_defaults.py`; this file. No `src/` Python, Rust, package or lock file changed.
+
+What changed:
+- I1. Tasks may overlap, so busy now lasts until the last running task ends (its label shows the latest one). A view's
+  `enter` waits for running tasks and is skipped if the user left the page meanwhile; messages the waited-for tasks
+  left stay visible. A task's final render reads the drafts first when the user has moved to another page and puts
+  the focus back on the control they were in; on its own page the task's result wins and focus returns to the
+  starting control only there. The views' own focus moves are body-only and same-page; a project created or imported
+  after the user moved on no longer pulls them to its page (a notice says where it is); the views do not read back
+  forms locked while busy, so a reset draft (the created project's name) is not restored from the locked form.
+- I2. Textareas render a leading newline before the value (the parser drops one), and a text that differs from the
+  stored one only in line endings (CRLF from another writer) is kept as stored: no phantom "저장 안 된 변경", and the
+  draft is re-read on reopening.
+- M1. `localize` translates a text containing Korean only by a known English pattern inside it, never by its code
+  (version_exists with hf_targets' Korean TARGETS_CHANGED keeps its own advice).
+- M2. After a keyboard close, only a keyboard activation of the control the focus was returned to is swallowed;
+  touch and pen use a 24 px radius.
+- M3. The project list coerces its counts to numbers. M4. A patch waits while an IME composes in its region and
+  applies after `compositionend`. M5. A test pins that a view render during a press after a task finished keeps the
+  task's result. M6. `desktop/tests/recipe-defaults.json` (generated from `RecipeSpec`) pins the recipe defaults: the
+  Python test compares it with the model, `recipes.spec.ts` with `recipeFromTemplate({})`. M7. The example choice is
+  locked while busy; 저장 is disabled once the channel answered `not_available`; the recipe editor marks OFT as
+  unsupported for PPO and refuses that combination locally with a Korean reason.
+
+Actual verification:
+- Against the worktree's own Vite on port 1440 (a scratch Playwright config under `%TEMP%`; the server answered 200
+  for the worktree's `@fs` root and 403 for the main tree's), never the main tree's 1420.
+- RED first, on `128f995`: busy cleared while a save was still held (and the list read did not wait); a late save
+  render wiped typing on 데이터 (`my_dataset`); a created project pulled the user to its page; a refused create
+  focused the projects page's 만들기; a leading-newline/CRLF purpose and description became dirty; the list rendered an
+  unescaped count (`img` 1); 저장 stayed enabled after `not_available`; the example choice stayed enabled while busy;
+  PPO with OFT reached `recipe_save`; a keyboard activation of another control after a keyboard close was swallowed; a
+  second tap 14 px off went through; a patch replaced the composing input; `version_exists` with Korean text was
+  translated; two overlapping tasks cleared busy when the second ended. M5 and the M6 parity test pass by design (no
+  bug or drift today) and fail under their mutations.
+- Twenty-one mutations (each fix above, including the busy counter, the `enter` wait, the message keeping, the
+  locked-form skip, the same-page focus rule and `!renderDeferred` in `renderKeepingDrafts`) each made a test fail.
+- From `desktop/`: `npx playwright test` **126 passed** (112 + 14 new); `npm run build` passes.
+- From the root (main venv, `PYTHONPATH` = the worktree's `src`): `pytest -q` **1709 passed, 1 skipped** (1707 + the 2 parity tests); `ruff check src tests`
+  passes; `scripts/check_secrets.py` reports 0 findings with the change staged; the protected-path `git diff
+  --exit-code` is clean; every changed file is CR-free.
+
+Not verified or still open:
+- Real WebView2 timing (overlapping tasks, IME composition, touch): Task 11. Full renders during an IME composition
+  (not patches) are not deferred.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

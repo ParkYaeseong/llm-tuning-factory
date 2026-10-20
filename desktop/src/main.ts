@@ -79,17 +79,59 @@ async function api(action: string, data: Obj = {}) {
   return invoke<any>("factory_action", { action, data });
 }
 const gpuServer = serverBridge(api);
+// Tasks may overlap (navigation stays available and a view's `enter` starts its own read), so busy lasts until the last
+// running task ends; `idle()` lets a view's `enter` wait for the running tasks before it starts its own (I1).
+const running: { label: string }[] = [];
+// A view's `enter` that waited for running tasks keeps the notice or error they left (a save's result) visible.
+let keepMessages = false;
+let idleWaiters: (() => void)[] = [];
+const idle = () => running.length ? new Promise<void>(resolve => idleWaiters.push(resolve)) : Promise.resolve();
 async function task(label: string, operation: () => Promise<void>) {
-  // The control that started the task (e.g. the opener a confirm dialog returned focus to) gets it back afterwards.
+  // The control that started the task (e.g. the opener a confirm dialog returned focus to) gets it back afterwards,
+  // but only on the page the task started from.
   const opener = focusKey(document.activeElement);
+  const page = state.page, arg = state.arg;
   captureDrafts();
-  state.error = ""; state.notice = ""; state.busy = label; render();
+  const token = { label };
+  running.push(token);
+  if (!keepMessages) { state.error = ""; state.notice = ""; }
+  state.busy = label; render();
   try { await operation(); }
   catch (error) { state.error = errorText(error); }
   finally {
-    state.busy = ""; render();
-    if (!document.activeElement || document.activeElement === document.body) restoreFocus(document, opener);
+    running.splice(running.indexOf(token), 1);
+    state.busy = running.at(-1)?.label ?? "";
+    // The user moved on: what they typed on this page since is newer than state, and keeps its focus. (On the task's
+    // own page its result wins; the workflow views and the connection form lock their inputs while busy.)
+    const samePage = state.page === page && state.arg === arg;
+    if (!samePage) captureDrafts();
+    const keep = samePage ? null : focusSpot();
+    render();
+    if (!document.activeElement || document.activeElement === document.body) {
+      if (samePage) restoreFocus(document, opener); else keep?.();
+    }
+    if (!running.length) { const waiters = idleWaiters; idleWaiters = []; waiters.forEach(resolve => resolve()); }
   }
+}
+/** Where the focus is, so a full render can put it back on the same control with its text selection (the control's
+ * focus key, else its draft attribute within its form). */
+function focusSpot(): () => void {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || !root.contains(active)) return () => {};
+  const key = focusKey(active);
+  const attribute = ["data-key", "data-config", "data-recipe", "name"].find(name => active.hasAttribute(name));
+  const form = active.closest("form[id]")?.id;
+  const selector = key || !attribute ? null
+    : `${form ? `#${CSS.escape(form)} ` : ""}[${attribute}="${CSS.escape(active.getAttribute(attribute)!)}"]`;
+  const text = active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement;
+  const selection = text ? (() => { try { return [active.selectionStart, active.selectionEnd]; } catch { return null; } })() : null;
+  return () => {
+    if (key) restoreFocus(document, key);
+    else if (selector) document.querySelector<HTMLElement>(selector)?.focus({ preventScroll: true });
+    const next = document.activeElement;
+    if (selection && (next instanceof HTMLTextAreaElement || next instanceof HTMLInputElement))
+      try { next.setSelectionRange(selection[0], selection[1]); } catch { /* inputs without a text selection */ }
+  };
 }
 function captureDrafts() {
   flushDeferredRender();
@@ -445,6 +487,19 @@ function comparison() {
 const pressable = "button, summary, label.check, input[type=checkbox], input[type=radio]";
 let pressed = false, presses = 0, armed = 0, renderDeferred = false;
 let pressedControl: Element | null = null;
+// While an IME composes (Hangul), replacing the composing input would corrupt the text: patches of its region wait.
+let composing = false;
+const composedPatches = new Map<string, { html: string; options: { keepTyping?: boolean } }>();
+window.addEventListener("compositionstart", () => { composing = true; }, true);
+window.addEventListener("compositionend", () => {
+  composing = false;
+  setTimeout(() => {
+    if (composing) return;
+    const waiting = [...composedPatches];
+    composedPatches.clear();
+    for (const [regionId, { html, options }] of waiting) patch(regionId, html, options);
+  }, 0);
+}, true);
 /** Before form values are read back into state: a deferred render means the page still shows values that a
  * finished task has since replaced. During the press itself the page is current and stays as it is. */
 function flushDeferredRender() { if (renderDeferred && !pressed) render(); }
@@ -540,6 +595,7 @@ function patch(regionId: string, html: string, options: { keepTyping?: boolean }
   const region = document.getElementById(regionId);
   if (!region || !root.contains(region)) return;
   if (pressed && pressedControl && region.contains(pressedControl)) { renderKeepingDrafts(); return; }
+  if (composing && region.contains(document.activeElement)) { composedPatches.set(regionId, { html, options }); return; }
   const active = document.activeElement;
   const inside = active instanceof HTMLElement && region.contains(active);
   const key = inside ? focusKey(active) : null;
@@ -768,7 +824,14 @@ async function action(name: string) {
     render();
     const entered = viewById(page);
     if (entered?.enter) {
-      try { await entered.enter(ctx); } catch (error) { state.error = errorText(error); render(); }
+      // A view's reads start after the running tasks (a save still in flight), and only if the page is still shown.
+      const arg = state.arg, waited = running.length > 0;
+      await idle();
+      if (state.page === page && state.arg === arg) {
+        keepMessages = waited;
+        try { await entered.enter(ctx); } catch (error) { state.error = errorText(error); render(); }
+        finally { keepMessages = false; }
+      }
     }
     if (state.page === "training" && !state.capabilities && !state.capabilityPending) { await checkCapabilities(); render(); }
     return;

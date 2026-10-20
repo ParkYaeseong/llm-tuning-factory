@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { calls, config, HOSTILE, issue, ok, openWorkbench } from "./workflow-mock.ts";
+import { calls, config, HOSTILE, invalid, issue, NOT_AVAILABLE, ok, openWorkbench } from "./workflow-mock.ts";
 
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const LEGACY_DATASET_MISSING = "기존 프로필의 데이터 버전을 프로젝트에 연결하지 못했습니다. 데이터를 등록한 뒤 프로젝트에서 직접 연결하세요.";
@@ -272,4 +272,129 @@ test("project forms are not nested and keep focus after saving", async ({ page }
   await page.getByRole("button", { name: "새 레시피", exact: true }).click();
   await expect(page.locator("form form")).toHaveCount(0);
   await expect(page.locator("dialog")).toHaveCount(0);
+});
+
+// -- review fixes: overlapping tasks, late renders, textarea drafts (Task 10.2 review I1, I2, M3, M7) --
+
+const release = (page: Page, name: string) => page.evaluate(name => (window as any).__release(name), name);
+
+test("a save still running keeps the workbench busy and the next page waits for it", async ({ page }) => {
+  await openWorkbench(page, { definitions: true, holds: ["project_save"] });
+  await createProject(page, "느린 저장");
+  await projectForm(page).getByLabel("목적").fill("저장 중인 목적");
+  await projectForm(page).getByRole("button", { name: "저장", exact: true }).click();
+  await expect(page.locator(".notice.busy")).toContainText("프로젝트 저장 중");
+  await page.locator('nav [data-action="nav:projects"]').click();
+  await expect(heading(page)).toHaveText("프로젝트");
+  // The list read waits for the save, and nothing re-enables while the save is in flight.
+  await expect(page.locator(".notice.busy")).toContainText("프로젝트 저장 중");
+  await expect(page.getByRole("button", { name: "만들기", exact: true })).toBeDisabled();
+  await expect(page.locator("#project-create-name")).toBeDisabled();
+  expect(await calls(page, { action: "projects_list" })).toHaveLength(0);
+  await release(page, "project_save");
+  await idle(page);
+  expect(await calls(page, { action: "projects_list" })).toHaveLength(1);
+  await expect(page.locator(".project-list tbody tr", { hasText: "느린 저장" })).toContainText("저장 중인 목적");
+  await expect(page.getByRole("button", { name: "만들기", exact: true })).toBeEnabled();
+});
+
+test("a task finishing after the user moved on keeps their typing, focus and page", async ({ page }) => {
+  await openWorkbench(page, { definitions: true, holds: ["project_save"] });
+  await createProject(page, "멀리 간 사용자");
+  await projectForm(page).getByLabel("목적").fill("저장할 목적");
+  await projectForm(page).getByRole("button", { name: "저장", exact: true }).click();
+  // On another page, the user types into a field that the finishing save must not wipe or blur.
+  await page.locator('nav [data-action="nav:datasets"]').click();
+  const datasetId = page.getByLabel("데이터 ID", { exact: true });
+  await datasetId.fill("새 데이터");
+  await release(page, "project_save");
+  await idle(page);
+  await expect(heading(page)).toHaveText("데이터");
+  await expect(datasetId).toHaveValue("새 데이터");
+  await expect(datasetId).toBeFocused();
+  expect((await calls(page, { action: "project_save" })).at(-1).args.data.spec.purpose).toBe("저장할 목적");
+});
+
+test("a project created after the user moved on does not pull them to its page", async ({ page }) => {
+  await openWorkbench(page, { definitions: true, holds: ["project_create"] });
+  const start = page.locator('#app [data-tour="project-start"]');
+  await start.getByLabel("프로젝트 이름").fill("나중에 만든 프로젝트");
+  await start.getByRole("button", { name: "만들기", exact: true }).click();
+  // The projects page shows its own (locked) create form with the name being created.
+  await page.locator('nav [data-action="nav:projects"]').click();
+  await expect(page.locator("#project-create-name")).toHaveValue("나중에 만든 프로젝트");
+  await release(page, "project_create");
+  await idle(page);
+  await expect(heading(page)).toHaveText("프로젝트");
+  await expect(page.getByText("프로젝트를 만들었습니다: ‘나중에 만든 프로젝트’.", { exact: false })).toBeVisible();
+  await expect(page.locator(".project-list tbody tr", { hasText: "나중에 만든 프로젝트" })).toHaveCount(1);
+  // The created project's name is not read back into the form, where it could be submitted again.
+  await expect(page.locator("#project-create-name")).toHaveValue("");
+  expect(await calls(page, { action: "project_create" })).toHaveLength(1);
+});
+
+test("a finished task never moves the focus onto another page's control", async ({ page }) => {
+  await openWorkbench(page, { holds: ["project_create"], workflow: { projects_list: ok({ projects: [] }),
+    project_create: invalid([issue("invalid_value", "String should have at most 200 characters", "/name")]) } });
+  const start = page.locator('#app [data-tour="project-start"]');
+  await start.getByLabel("프로젝트 이름").fill("거절될 이름");
+  await start.getByRole("button", { name: "만들기", exact: true }).click();
+  // The projects page has its own "만들기" (the same focus key): the refused create must not focus it.
+  await page.locator('nav [data-action="nav:projects"]').click();
+  await expect(heading(page)).toHaveText("프로젝트");
+  await release(page, "project_create");
+  await idle(page);
+  await expect(page.locator("#project-create-form").getByRole("button", { name: "만들기", exact: true })).not.toBeFocused();
+  await expect(page.locator("#project-create-form")).toContainText("입력값이 올바르지 않습니다.");
+});
+
+test("a purpose with a leading newline or Windows line breaks stays clean", async ({ page }) => {
+  await openWorkbench(page, { definitions: true });
+  await createProject(page, "줄바꿈 목적");
+  // Another writer saves a purpose that starts with a newline and uses CRLF line breaks.
+  const listed = await bridge(page, "projects_list", {});
+  const { project_id, revision_sha256 } = listed.data.projects[0];
+  const current = await bridge(page, "project_get", { project_id });
+  const purpose = "\n첫 줄은 비움\r\n둘째 줄";
+  expect((await bridge(page, "project_save", { spec: { ...current.data.project, purpose }, expected_revision: revision_sha256 })).status).toBe("ok");
+  const open = async () => {
+    await page.locator('nav [data-action="nav:history"]').click();
+    await page.locator('nav [data-action="nav:projects"]').click();
+    await idle(page);
+    await page.locator(".project-list tbody tr", { hasText: "줄바꿈 목적" }).getByRole("button", { name: /열기/ }).click();
+    await idle(page);
+  };
+  await open();
+  const form = projectForm(page);
+  await expect(form.getByLabel("목적")).toHaveValue("\n첫 줄은 비움\n둘째 줄");
+  await expect(form.locator(".status-pill")).toContainText("저장된 버전");
+  // Leaving and coming back re-reads it: a clean draft is never kept as if it had unsaved changes.
+  const reads = (await calls(page, { action: "project_get" })).length;
+  await open();
+  expect(await calls(page, { action: "project_get" })).toHaveLength(reads + 1);
+  await expect(form.locator(".status-pill")).toContainText("저장된 버전");
+  // Saving without an edit sends the purpose exactly as stored.
+  await saveProject(page);
+  expect((await calls(page, { action: "project_save" })).at(-1).args.data.spec.purpose).toBe(purpose);
+});
+
+test("the project list escapes every value and saving stops once the channel is unavailable", async ({ page }) => {
+  const created = { project: { schema_version: 1, project_id: "unavailable-project", name: "설치 전 프로젝트", purpose: "", task_type: "",
+    datasets: [], default_executor_profile_id: null, graph: {}, legacy_origin: null }, revision_sha256: "d".repeat(64) };
+  await openWorkbench(page, { workflow: {
+    projects_list: ok({ projects: [{ project_id: "p-1", name: "값 확인", purpose: "", task_type: "", revision_sha256: "e".repeat(64),
+      legacy_origin: null, datasets: [], graph_nodes: HOSTILE }] }),
+    project_create: ok(created) } });
+  await page.locator('nav [data-action="nav:projects"]').click();
+  await idle(page);
+  await expect(page.locator(".project-list tbody tr")).toHaveCount(1);
+  await expect(page.locator("img")).toHaveCount(0);
+  // project_save is not installed (the mock's default answer): 저장 is disabled with the fixed reason.
+  const start = page.locator("#project-create-form");
+  await start.getByLabel("프로젝트 이름").fill("설치 전 프로젝트");
+  await start.getByRole("button", { name: "만들기", exact: true }).click();
+  await expect(heading(page)).toHaveText("설치 전 프로젝트");
+  await saveProject(page);
+  await expect(projectForm(page).getByRole("button", { name: "저장", exact: true })).toBeDisabled();
+  await expect(projectForm(page)).toContainText(NOT_AVAILABLE);
 });

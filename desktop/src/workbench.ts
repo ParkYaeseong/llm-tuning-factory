@@ -93,17 +93,22 @@ export function restoreFocus(root: ParentNode, key: string | null): void {
 /** The text of an error for the user: its message, never an "Error: " or "BridgeError: " prefix. */
 export const errorText = (error: unknown) => error instanceof Error ? error.message || error.name : String(error);
 
-/** After a dialog closes on a click, the rest of a double click (or a repeated Enter on the opener that got the focus
- * back) at the same spot within 400 ms is swallowed, so it never activates what was underneath. */
-function swallowRepeat(origin: MouseEvent) {
+/** After a dialog closes on a click, its repetition within 400 ms is swallowed so it never activates what was underneath:
+ * for a pointer close, a pointer click at the same spot (8 px for a mouse, 24 px for touch and pen); for a keyboard close
+ * (`detail` 0), a keyboard activation of the control the focus was returned to — other keyboard activations pass. */
+function swallowRepeat(origin: MouseEvent, returnedTo: Element | null) {
   const until = performance.now() + 400;
   const types = ["mousedown", "click", "dblclick"];
+  const keyboard = origin.detail === 0;
+  const pointerType = (origin as PointerEvent).pointerType;
+  const radius = pointerType === "touch" || pointerType === "pen" ? 24 : 8;
   const swallow = (event: Event) => {
     const mouse = event as MouseEvent;
     if (performance.now() > until) { stop(); return; }
-    if (Math.abs(mouse.clientX - origin.clientX) <= 8 && Math.abs(mouse.clientY - origin.clientY) <= 8) {
-      event.preventDefault(); event.stopImmediatePropagation();
-    }
+    const repeat = keyboard
+      ? mouse.detail === 0 && returnedTo !== null && event.target instanceof Node && returnedTo.contains(event.target)
+      : mouse.detail !== 0 && Math.abs(mouse.clientX - origin.clientX) <= radius && Math.abs(mouse.clientY - origin.clientY) <= radius;
+    if (repeat) { event.preventDefault(); event.stopImmediatePropagation(); }
   };
   const stop = () => types.forEach(type => window.removeEventListener(type, swallow, true));
   types.forEach(type => window.addEventListener(type, swallow, true));
@@ -165,7 +170,7 @@ export function openDialog(spec: DialogSpec): Promise<{ action: string; checked:
     buttons.forEach((button, index) => button.addEventListener("click", event => {
       if (button.disabled) return;
       finish({ action: spec.actions[index].id, checked: checked() });
-      swallowRepeat(event);
+      swallowRepeat(event, document.activeElement);   // finish() has returned the focus to the opener
     }));
     dialog.addEventListener("cancel", event => { event.preventDefault(); finish(null); });
   });

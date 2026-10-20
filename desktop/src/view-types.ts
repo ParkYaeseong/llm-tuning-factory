@@ -16,6 +16,9 @@ export interface ViewContext {
    * is kept only when the same single control (same tag and type) comes back; `keepTyping: false` for a patch that is
    * not a poll result (its own values win). */
   patch(regionId: string, html: string, options?: { keepTyping?: boolean }): void;
+  /** Runs `work` while busy (busy lasts until the last overlapping task ends). Its final render reads the drafts first
+   * when the user has moved to another page meanwhile, and gives the focus back to the starting control only on its
+   * own page. Never navigate from inside `work`: the new page's `enter` waits for the running tasks, this one included. */
   task(label: string, work: () => Promise<void>): Promise<void>;
   notify(message: string): void; fail(message: string): void;
   legacy<T>(action: string, data?: object): Promise<T>;          // factory_action: catalog, model_search, model_inspect
@@ -27,7 +30,9 @@ export interface ViewContext {
  * - `render` returns the page body; the shell adds the sidebar, heading, notices and busy state.
  * - `bind` runs after every full render that shows this page or one of its slot panels (check `ctx.page`).
  * - `capture` reads this view's form values into its own state before tasks and navigation (every view, every time).
- * - `enter`/`leave` run on navigation to/away from the page; `enter` may run read-only actions as tasks.
+ * - `enter`/`leave` run on navigation to/away from the page; `enter` may run read-only actions as tasks. `enter` starts
+ *   after any running task ends (a save still in flight) and is skipped when the user has left the page meanwhile.
+ * - `capture` must skip controls locked while busy (they were not edited, and the running task's result wins).
  * - Buttons with `data-action="wf:<view id>:<verb>[:<arg>]"` reach `action`; the shell disables them while busy.
  */
 export interface View {

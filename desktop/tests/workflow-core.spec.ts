@@ -212,19 +212,23 @@ test("a project draft tracks revision, dirty state and plan validity", async () 
   expect(bindingIdFor("validation", [bound("train")])).toBe("validation");
 });
 
-test("English domain texts that quote Korean values are still shown in Korean", () => {
-  // A known English-carrying code whose message quotes a Korean column or file name.
-  const row = issue("invalid_row", "missing required field '질문'", "/mapping", { row_number: 3 });
-  expect(localize(row)).toEqual({ text: "이 행을 연결한 열로 학습 형식에 맞게 바꿀 수 없습니다.", original: row.message });
+test("texts containing Korean are translated only by known English patterns, never by their code", () => {
+  // A known English fragment inside a text that quotes a Korean file name is still translated.
   const codec = issue("invalid_source", "'utf-8' codec can't decode byte 0xb0 in position 2 of '질문.csv'");
   expect(localize(codec)).toEqual({ text: "문자 인코딩이 맞지 않습니다. Windows에서 만든 CSV라면 CP949로 바꿔 다시 미리보세요.", original: codec.message });
-  // Korean texts (Task 9) and generic refusals keep their own words.
+  // Otherwise a text with Korean is shown as received, even under a code whose usual text is English: a Korean
+  // message under such a code (version_exists with hf_targets' TARGETS_CHANGED) is specific advice of its own.
+  const targets = issue("version_exists", "이 고정 모델 버전에 이미 저장된 모듈 구조 정보와 읽은 헤더가 다릅니다.", "/repo_id");
+  expect(localize(targets)).toEqual({ text: targets.message, original: null });
+  const row = issue("invalid_row", "missing required field '질문'", "/mapping", { row_number: 3 });
+  expect(localize(row)).toEqual({ text: row.message, original: null });
   const korean = issue("legacy_dataset_missing", "기존 프로필의 데이터 버전을 프로젝트에 연결하지 못했습니다.");
   expect(localize(korean)).toEqual({ text: korean.message, original: null });
   const refused = issue("refused", "tutorial_sample은 앱에 포함된 연습용 합성 데이터만 GPU 전송 없이 등록할 수 있습니다.");
   expect(localize(refused)).toEqual({ text: refused.message, original: null });
-  const inspection = issue("inspection_failed", "SSH 연결이 거부되었습니다.");
-  expect(localize(inspection)).toEqual({ text: inspection.message, original: null });
+  // An English text under a known code still gets the code's Korean text.
+  const english = issue("version_exists", "immutable version already exists", "/version");
+  expect(localize(english)).toEqual({ text: "이미 등록된 버전입니다. 다른 버전을 입력하세요.", original: english.message });
 });
 
 test("a held plan keeps the generations seen before the plan request", async () => {

@@ -5,7 +5,7 @@ import "./projects.css";
 import { executorProfiles, newRequestId, projects as projectApi } from "../api";
 import { issueList, issuesAt, localize } from "../issues";
 import { bindingIdFor } from "../project-store";
-import { button, errorText, escapeHtml, field, focusKey, openDialog, restoreFocus, select, statusPill } from "../workbench";
+import { button, errorText, escapeHtml, field, openDialog, restoreFocus, select, statusPill } from "../workbench";
 import type { View, ViewContext } from "../view-types";
 import type { BindingRole, DatasetBinding, ProjectSpec, ProjectSummary, PublicProfile, RecipeSpec, Sha256, WorkflowIssue,
   WorkflowResult } from "../workflow-types";
@@ -52,6 +52,16 @@ const graphUses = (spec: ProjectSpec, bindingId: string) => {
 const keyOf = (draft: CreateDraft) => JSON.stringify([draft.name, draft.purpose, draft.task_type]);
 const trimmed = (draft: CreateDraft): CreateDraft => ({ name: draft.name.trim(), purpose: draft.purpose.trim(), task_type: draft.task_type.trim() });
 const focusById = (id: string) => document.getElementById(id)?.focus({ preventScroll: false });
+/** A text as a textarea's value holds it: the HTML parser and `.value` turn CRLF and CR into LF. */
+const lf = (value: unknown) => String(value ?? "").replace(/\r\n?/g, "\n");
+/** Whether the user is still on the page an action started from (its follow-up may only then move the focus). */
+const stillOn = (ctx: ViewContext) => { const page = ctx.page, arg = ctx.arg; return () => ctx.page === page && ctx.arg === arg; };
+/** Puts the focus on `key` only when a render lost it (to body) and only on the same page: never across pages. */
+function refocus(still: () => boolean, key: string) {
+  if (still() && (!document.activeElement || document.activeElement === document.body)) restoreFocus(document, key);
+}
+/** A form whose controls are locked while busy was not edited; reading it back could undo the running task's result. */
+const locked = (form: Element) => form.querySelector("fieldset:disabled") !== null;
 
 /** A text input with an ID (focus survives re-renders), a length limit and the issues at its pointer below it. */
 function textInput(label: string, key: string, value: unknown, id: string, options: { max: number; help?: string; required?: boolean; issues?: WorkflowIssue[] }) {
@@ -62,7 +72,7 @@ function textInput(label: string, key: string, value: unknown, id: string, optio
 }
 function textArea(label: string, key: string, value: unknown, id: string, options: { max: number; help?: string; issues?: WorkflowIssue[] }) {
   const issues = options.issues ?? [];
-  return `<label class="field project-wide"><span>${label}</span><textarea id="${id}" aria-label="${escapeHtml(label)}" data-key="${key}" rows="3" maxlength="${options.max}"${issues.length ? ` aria-invalid="true" aria-describedby="${id}-issues"` : ""}>${escapeHtml(value)}</textarea>${options.help ? `<small>${escapeHtml(options.help)}</small>` : ""}</label>${issues.length ? `<div id="${id}-issues" class="project-wide">${issueList(issues)}</div>` : ""}`;
+  return `<label class="field project-wide"><span>${label}</span><textarea id="${id}" aria-label="${escapeHtml(label)}" data-key="${key}" rows="3" maxlength="${options.max}"${issues.length ? ` aria-invalid="true" aria-describedby="${id}-issues"` : ""}>\n${escapeHtml(value)}</textarea>${options.help ? `<small>${escapeHtml(options.help)}</small>` : ""}</label>${issues.length ? `<div id="${id}-issues" class="project-wide">${issueList(issues)}</div>` : ""}`;
 }
 const readKey = (form: Element, key: string) => form.querySelector<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(`[data-key="${key}"]`)?.value ?? "";
 
@@ -82,6 +92,7 @@ function createForm(ctx: ViewContext) {
 
 async function createProject(ctx: ViewContext) {
   captureForms(ctx);
+  const still = stillOn(ctx);
   const values = trimmed(createDraft);
   if (!values.name) {
     createIssues = [localIssue("/name", "프로젝트 이름을 입력하세요.")];
@@ -96,8 +107,10 @@ async function createProject(ctx: ViewContext) {
     createIssues = [];
     if (result.status === "ok" && result.data) {
       const draft = ctx.store.adopt(result.data);
-      created = draft.projectId; fresh.add(created);
       createDraft = { name: "", purpose: "", task_type: "" }; createRequest = null;
+      // A user who moved on meanwhile stays where they are.
+      if (still()) { created = draft.projectId; fresh.add(created); }
+      else ctx.notify(`프로젝트를 만들었습니다: ‘${values.name}’. 프로젝트 목록에서 열 수 있습니다.`);
       return;
     }
     if (notAvailable(result)) unavailable = true;
@@ -105,7 +118,7 @@ async function createProject(ctx: ViewContext) {
     if (result.status === "conflict") createRequest = null;   // request_reused: the next attempt is a new request
   });
   if (created) await openCreated(ctx, created);
-  else restoreFocus(document, "project-create");
+  else refocus(still, "project-create");
 }
 
 async function openCreated(ctx: ViewContext, projectId: string) {
@@ -120,7 +133,7 @@ function projectList() {
   if (!list!.length) return '<div class="empty">아직 만든 프로젝트가 없습니다. 이름과 목적만 정하면 바로 시작할 수 있습니다.</div>';
   return `<div class="table-scroll"><table><thead><tr><th>프로젝트</th><th>작업 유형</th><th>데이터</th><th>그래프 단계</th><th></th></tr></thead><tbody>${list!.map(project => `<tr>
     <td><b>${escapeHtml(project.name)}</b>${project.purpose ? `<small>${escapeHtml(project.purpose)}</small>` : ""}${project.legacy_origin ? `<small>기존 설정에서 가져옴 · ${escapeHtml(project.legacy_origin)}</small>` : ""}</td>
-    <td>${escapeHtml(project.task_type || "—")}</td><td>${project.datasets.length}</td><td>${project.graph_nodes}</td>
+    <td>${escapeHtml(project.task_type || "—")}</td><td>${Array.isArray(project.datasets) ? project.datasets.length : 0}</td><td>${Number(project.graph_nodes) || 0}</td>
     <td><button type="button" class="quiet" data-action="${escapeHtml(`nav:project:${project.project_id}`)}" aria-label="${escapeHtml(project.name)} 열기">열기</button></td></tr>`).join("")}</tbody></table></div>`;
 }
 
@@ -136,6 +149,7 @@ function legacyImport(ctx: ViewContext) {
 }
 
 async function importLegacy(ctx: ViewContext, aiId: string) {
+  const still = stillOn(ctx);
   const requestId = legacyRequests.get(aiId) ?? newRequestId();
   legacyRequests.set(aiId, requestId);
   let created: string | null = null;
@@ -149,8 +163,9 @@ async function importLegacy(ctx: ViewContext, aiId: string) {
     }
     const data = result.data;
     const draft = ctx.store.adopt({ project: data.project, revision_sha256: data.revision_sha256 });
-    created = draft.projectId; fresh.add(created);
-    importNotes.set(created, { origin: aiId, recipe: data.recipe, recipeRevision: data.recipe_revision_sha256, warnings: data.warnings ?? [] });
+    importNotes.set(draft.projectId, { origin: aiId, recipe: data.recipe, recipeRevision: data.recipe_revision_sha256, warnings: data.warnings ?? [] });
+    if (still()) { created = draft.projectId; fresh.add(created); }
+    else ctx.notify(`기존 설정 ‘${aiId}’을(를) 프로젝트로 가져왔습니다. 프로젝트 목록에서 열 수 있습니다.`);
   });
   if (created) await openCreated(ctx, created);
 }
@@ -246,7 +261,7 @@ function projectPage(ctx: ViewContext) {
   ${bindings(ctx, spec, placed("/spec/datasets"))}
   ${links ? `<section class="card"><h3>다음 단계</h3><div class="actions">${links}</div></section>` : ""}
   ${others.length ? `<div class="project-summary" role="status">${issueList(others, { heading: "저장하지 못한 이유" })}</div>` : ""}
-  <div class="actions project-actions"><button type="submit" class="primary" data-focus-key="project-save">저장</button>${button("프로젝트 목록", "nav:projects", "quiet")}<span class="muted">저장해야 다른 화면과 실행 계획에 반영됩니다.</span></div>
+  <div class="actions project-actions"><button type="submit" class="primary" data-focus-key="project-save"${unavailable ? " disabled" : ""}>저장</button>${button("프로젝트 목록", "nav:projects", "quiet")}<span class="muted">${unavailable ? NOT_AVAILABLE : "저장해야 다른 화면과 실행 계획에 반영됩니다."}</span></div>
   </form>`;
 }
 
@@ -274,7 +289,7 @@ async function saving(ctx: ViewContext, label: string, work: (projectId: string)
   const projectId = ctx.arg;
   const draft = projectId ? ctx.store.draft(projectId) : undefined;
   if (!projectId || !draft) return;
-  const key = focusKey(document.activeElement);
+  const still = stillOn(ctx);
   await ctx.task(label, async () => {
     const result = await work(projectId);
     if (result.status === "ok") { ctx.notify("프로젝트를 저장했습니다."); return; }
@@ -282,8 +297,8 @@ async function saving(ctx: ViewContext, label: string, work: (projectId: string)
     // The store keeps a conflict on the draft; an invalid answer (also a failed read before overwriting) shows its issues.
     if (result.status === "invalid") draft.issues = result.issues;
   });
-  restoreFocus(document, key);
-  if (!document.activeElement || document.activeElement === document.body) restoreFocus(document, "project-save");
+  // The shell gives the focus back to the control that started the save; this only covers a control that is gone.
+  refocus(still, "project-save");
 }
 
 async function saveProject(ctx: ViewContext) {
@@ -305,12 +320,13 @@ async function reloadProject(ctx: ViewContext) {
     bodyHtml: "<p>다른 곳에서 저장한 최신 버전으로 바꿉니다. 저장하지 않은 내 변경은 사라집니다.</p>",
     actions: [{ id: "back", label: "돌아가기" }, { id: "reload", label: "불러오기", primary: true }] });
   if (answer?.action !== "reload") return;
+  const still = stillOn(ctx);
   await ctx.task("최신 버전 불러오는 중", async () => {
     const result = await ctx.store.reloadLatest(projectId);
     if (result.status !== "ok") throw new Error(describe(result.issues));
     ctx.notify("최신 버전을 불러왔습니다.");
   });
-  restoreFocus(document, "project-save");
+  refocus(still, "project-save");
 }
 
 async function overwriteProject(ctx: ViewContext) {
@@ -329,7 +345,8 @@ function addBinding(ctx: ViewContext) {
   const draft = projectId ? ctx.store.draft(projectId) : undefined;
   if (!projectId || !draft) return;
   const record = (ctx.catalog.datasets ?? []).find((item: Obj) => `${item.dataset_id}:${item.version}` === bindingDraft.dataset);
-  const refuse = (text: string) => { bindingNote = { kind: "error", text }; ctx.render(); restoreFocus(document, "wf:project:bind"); };
+  const still = stillOn(ctx);
+  const refuse = (text: string) => { bindingNote = { kind: "error", text }; ctx.render(); refocus(still, "wf:project:bind"); };
   if (!record) return refuse("연결할 데이터 버전을 고르세요.");
   if (!HASH.test(String(record.sha256 ?? ""))) return refuse("이 데이터 버전에는 SHA256 기록이 없어 연결할 수 없습니다. 데이터를 다시 등록하세요.");
   if (draft.spec.datasets.some(binding => binding.dataset.dataset_id === record.dataset_id && binding.dataset.version === record.version))
@@ -340,7 +357,7 @@ function addBinding(ctx: ViewContext) {
   ctx.store.edit(projectId, spec => { spec.datasets = [...spec.datasets, binding]; });
   bindingNote = { kind: "ok", text: `${ROLE_LABEL[role]} 데이터로 ${binding.dataset.dataset_id} · v${binding.dataset.version}을(를) 연결했습니다 (연결 ID ${binding.binding_id}). 저장해야 반영됩니다.` };
   bindingDraft = { ...bindingDraft, dataset: "" };
-  ctx.render(); restoreFocus(document, "wf:project:bind");
+  ctx.render(); refocus(still, "wf:project:bind");
 }
 
 function removeBinding(ctx: ViewContext, bindingId: string) {
@@ -354,21 +371,26 @@ function removeBinding(ctx: ViewContext, bindingId: string) {
     ctx.store.edit(projectId, spec => { spec.datasets = spec.datasets.filter(binding => binding.binding_id !== bindingId); });
     bindingNote = { kind: "ok", text: `연결 ID ${bindingId}를 해제했습니다. 저장해야 반영됩니다.` };
   }
-  ctx.render(); restoreFocus(document, "wf:project:bind");
+  ctx.render(); refocus(() => true, "wf:project:bind");
 }
 
 /** Reads the visible project forms into the drafts (the shell calls it before every task and navigation). */
 function captureForms(ctx: ViewContext) {
   const create = document.querySelector<HTMLFormElement>("#project-create-form");
-  if (create) {
+  if (create && !locked(create)) {
     const next = { name: readKey(create, "name"), purpose: readKey(create, "purpose"), task_type: readKey(create, "task_type") };
     if (keyOf(next) !== keyOf(createDraft)) createDraft = next;
   }
   const form = document.querySelector<HTMLFormElement>("#project-form");
   const projectId = form?.dataset.projectId;
   const draft = projectId ? ctx.store.draft(projectId) : undefined;
-  if (form && projectId && draft) {
-    const values = { name: readKey(form, "name"), purpose: readKey(form, "purpose"), task_type: readKey(form, "task_type"),
+  if (form && projectId && draft && !locked(form)) {
+    // A text that differs only in line endings (CRLF from another writer) is the stored one: keep it as it is.
+    const text = (key: "name" | "purpose" | "task_type") => {
+      const shown = readKey(form, key);
+      return lf(shown) === lf(draft.spec[key]) ? draft.spec[key] : shown;
+    };
+    const values = { name: text("name"), purpose: text("purpose"), task_type: text("task_type"),
       default_executor_profile_id: readKey(form, "default_executor_profile_id") || null };
     if ((Object.keys(values) as (keyof typeof values)[]).some(key => draft.spec[key] !== values[key]))
       ctx.store.edit(projectId, spec => Object.assign(spec, values));

@@ -6,7 +6,7 @@ import { recipes as recipeApi } from "../api";
 import { inputKindFor, methodSelect, readFields, sourceField, sourceSelect, stageSelect, trainingOptions,
   type RecipeFieldContext } from "../components/recipe-fields";
 import { issueList, issuesAt, localize } from "../issues";
-import { button, errorText, escapeHtml, focusKey, openDialog, restoreFocus, select, statusPill } from "../workbench";
+import { button, errorText, escapeHtml, openDialog, restoreFocus, select, statusPill } from "../workbench";
 import type { View, ViewContext } from "../view-types";
 import type { RecipeRevision, RecipeSpec, RecipeSummary, Sha256, Stage, WorkflowIssue, WorkflowResult } from "../workflow-types";
 
@@ -72,6 +72,16 @@ const newRecipeId = () => crypto.randomUUID().replace(/-/g, "");
 const stagesOf = (ctx: ViewContext): Stages => ctx.catalog.training_stages ?? [];
 const stageLabel = (ctx: ViewContext, stage: string) => stagesOf(ctx).find(item => item.id === stage)?.label ?? stage.toUpperCase();
 const focusEditor = () => document.getElementById("recipe-editor-title")?.focus();
+/** A text as a textarea's value holds it: the HTML parser and `.value` turn CRLF and CR into LF. */
+const lf = (value: unknown) => String(value ?? "").replace(/\r\n?/g, "\n");
+/** Whether the user is still on the page an action started from (its follow-up may only then move the focus). */
+const stillOn = (ctx: ViewContext) => { const page = ctx.page, arg = ctx.arg; return () => ctx.page === page && ctx.arg === arg; };
+/** Puts the focus on `key` only when a render lost it (to body) and only on the same page: never across pages. */
+function refocus(still: () => boolean, key: string) {
+  if (still() && (!document.activeElement || document.activeElement === document.body)) restoreFocus(document, key);
+}
+const METHODS = ["lora", "qlora", "full", "freeze", "oft"];
+const PPO_WITHOUT_OFT = "PPO 학습에서는 OFT를 쓸 수 없습니다. PPO 전용 학습 엔진(LLaMA-Factory 0.9.3)에 OFT가 없으니 LoRA·QLoRA·Full·Freeze 중에서 고르세요.";
 const summaryOf = (revision: RecipeRevision): RecipeSummary => ({ recipe_id: revision.recipe.recipe_id, version: revision.recipe.version,
   name: revision.recipe.name, description: revision.recipe.description, training_stage: revision.recipe.training_stage,
   training_method: revision.recipe.training_method, input_kind: revision.recipe.input_kind, revision_sha256: revision.revision_sha256 });
@@ -99,7 +109,7 @@ function exampleCard(ctx: ViewContext) {
   const templates = ctx.catalog.templates ?? [];
   return `<section class="card recipe-example" aria-labelledby="recipe-example-title"><div class="section-title"><h3 id="recipe-example-title">예제에서 만들기</h3></div>
     <p>예제의 학습 단계·방법·옵션만 가져와 새 레시피 초안을 만듭니다. 데이터, 기반 모델, GPU·Pod와 승인은 가져오지 않습니다.</p>
-    ${templates.length ? `${select("예제", "recipe_example", example, templates.map((template, index) => [String(index), template.name]))}<div class="actions">${button("예제에서 만들기", "wf:recipes:from-example", "", unavailable)}</div>` : '<div class="empty">불러올 예제가 없습니다.</div>'}</section>`;
+    ${templates.length ? `${select("예제", "recipe_example", example, templates.map((template, index) => [String(index), template.name])).replace("<select ", ctx.busy ? "<select disabled " : "<select ")}<div class="actions">${button("예제에서 만들기", "wf:recipes:from-example", "", unavailable)}</div>` : '<div class="empty">불러올 예제가 없습니다.</div>'}</section>`;
 }
 
 function editor(ctx: ViewContext, recipeId: string, draft: RecipeDraft) {
@@ -112,10 +122,11 @@ function editor(ctx: ViewContext, recipeId: string, draft: RecipeDraft) {
     return `<div class="recipe-field invalid">${html.replace(/<(input|select|textarea) /, `<$1 aria-invalid="true" aria-describedby="${id}" `)}<div id="${id}">${issueList(found)}</div></div>`;
   };
   const fields: RecipeFieldContext = { attr: "data-recipe", value: path => path.split(".").reduce<any>((node, part) => node?.[part], draft.spec),
-    stages: stagesOf(ctx), capabilities: null, recipeMode: true, decorate };
+    stages: stagesOf(ctx), recipeMode: true, decorate,
+    capabilities: draft.spec.training_stage === "ppo" ? { methods: METHODS.filter(method => method !== "oft") } : null };
   const f = (label: string, path: string, type = "text", help = "") => sourceField(fields, label, path, type, help);
   const choice = (label: string, path: string, options: [string, string][]) => sourceSelect(fields, label, path, options);
-  const description = decorate("description", `<label class="field"><span>설명</span><textarea id="recipe-description" aria-label="설명" data-recipe="description" rows="2" maxlength="2000">${escapeHtml(draft.spec.description)}</textarea></label>`);
+  const description = decorate("description", `<label class="field"><span>설명</span><textarea id="recipe-description" aria-label="설명" data-recipe="description" rows="2" maxlength="2000">\n${escapeHtml(draft.spec.description)}</textarea></label>`);
   const body = `<div class="grid">${f("레시피 이름", "name").replace("<input ", '<input id="recipe-name" maxlength="200" aria-required="true" ')}${description}</div>
     <h4>학습 방식</h4><div class="grid">${stageSelect(fields)}${methodSelect(fields)}
     ${f("학습 횟수 (epoch)", "hyperparameters.num_train_epochs", "number")}${f("학습률", "hyperparameters.learning_rate", "number")}
@@ -180,6 +191,7 @@ async function cloneRecipe(ctx: ViewContext, recipeId: string) {
   const base = saved?.recipe.name ?? listed?.name;
   if (!revision || base === undefined) return;
   const name = `${base.slice(0, 196)} 복사본`;
+  const still = stillOn(ctx);
   let cloned = false;
   await ctx.task("레시피 복제 중", async () => {
     const result = await recipeApi.clone({ recipe_id: recipeId, revision, name });
@@ -191,7 +203,7 @@ async function cloneRecipe(ctx: ViewContext, recipeId: string) {
     openId = result.data.recipe.recipe_id; cloned = true;
     ctx.notify("레시피를 복제했습니다. 원본은 바뀌지 않습니다.");
   });
-  if (cloned) focusEditor();
+  if (cloned && still()) focusEditor();
 }
 
 /** Saves `spec` against `expected`; a replaced revision invalidates held plans that pinned it (D8). */
@@ -219,10 +231,14 @@ async function saveRecipe(ctx: ViewContext) {
     draft.issues = [{ code: "required", path: "/spec/name", message: "레시피 이름을 입력하세요." }];
     ctx.render(); document.getElementById("recipe-name")?.focus(); return;
   }
-  const key = focusKey(document.activeElement);
+  if (draft.spec.training_stage === "ppo" && draft.spec.training_method === "oft") {
+    draft.issues = [{ code: "invalid_value", path: "/spec/training_method", message: PPO_WITHOUT_OFT }];
+    ctx.render(); document.querySelector<HTMLElement>('#recipe-form [data-recipe="training_method"]')?.focus(); return;
+  }
+  const still = stillOn(ctx);
   await ctx.task("레시피 저장 중", () => saveAgainst(ctx, draft, draft.saved?.revision_sha256 ?? null));
-  restoreFocus(document, key);
-  if (!document.activeElement || document.activeElement === document.body) restoreFocus(document, "recipe-save");
+  // The shell gives the focus back to the control that started the save; this only covers a control that is gone.
+  refocus(still, "recipe-save");
 }
 
 async function reloadRecipe(ctx: ViewContext) {
@@ -233,6 +249,7 @@ async function reloadRecipe(ctx: ViewContext) {
     bodyHtml: "<p>다른 곳에서 저장한 최신 버전으로 바꿉니다. 저장하지 않은 내 변경은 사라집니다.</p>",
     actions: [{ id: "back", label: "돌아가기" }, { id: "reload", label: "불러오기", primary: true }] });
   if (answer?.action !== "reload") return;
+  const still = stillOn(ctx);
   await ctx.task("최신 버전 불러오는 중", async () => {
     const previous = draft.saved?.revision_sha256;
     const result = await recipeApi.get(recipeId);
@@ -241,7 +258,7 @@ async function reloadRecipe(ctx: ViewContext) {
     if (previous && previous !== result.data.revision_sha256) ctx.store.markRecipeChanged(previous);
     ctx.notify("최신 버전을 불러왔습니다.");
   });
-  restoreFocus(document, "recipe-save");
+  refocus(still, "recipe-save");
 }
 
 async function overwriteRecipe(ctx: ViewContext) {
@@ -252,22 +269,27 @@ async function overwriteRecipe(ctx: ViewContext) {
     bodyHtml: "<p>다른 곳에서 먼저 저장한 변경을 지금 내 초안으로 덮어씁니다. 그 변경은 최신 버전에서 빠지고 이전 버전 기록으로만 남습니다.</p>",
     actions: [{ id: "back", label: "돌아가기" }, { id: "overwrite", label: "덮어쓰기", primary: true }] });
   if (answer?.action !== "overwrite") return;
+  const still = stillOn(ctx);
   await ctx.task("내 변경으로 저장 중", async () => {
     const latest = await recipeApi.get(recipeId);
     if (latest.status !== "ok" || !latest.data) throw new Error(describe(latest.issues));
     await saveAgainst(ctx, draft, latest.data.revision_sha256);
   });
-  restoreFocus(document, "recipe-save");
+  refocus(still, "recipe-save");
 }
 
-/** Reads the open editor (and the example choice) into the module state; the stage decides the input kind. */
+/** Reads the open editor (and the example choice) into the module state; the stage decides the input kind. Controls
+ * locked while busy were not edited and are not read back (the running task's result wins). */
 function captureForm(ctx: ViewContext) {
   const chosen = document.querySelector<HTMLSelectElement>('[data-key="recipe_example"]');
-  if (chosen) example = chosen.value;
+  if (chosen && !chosen.disabled) example = chosen.value;
   const form = document.querySelector<HTMLFormElement>("#recipe-form");
   const draft = form?.dataset.recipeId ? drafts.get(form.dataset.recipeId) : undefined;
-  if (!form || !draft) return;
+  if (!form || !draft || form.querySelector("fieldset:disabled")) return;
+  const description = draft.spec.description;
   readFields(form, "data-recipe", draft.spec);
+  // A description that differs only in line endings (CRLF from another writer) is the stored one.
+  if (lf(draft.spec.description) === lf(description)) draft.spec.description = description;
   draft.spec.input_kind = inputKindFor(draft.spec.training_stage, stagesOf(ctx));
 }
 
@@ -293,14 +315,22 @@ export const view: View = {
       });
   },
   capture: captureForm,
-  async enter(ctx) { await loadList(ctx, ctx.arg); if (ctx.arg && openId === ctx.arg) focusEditor(); },
+  async enter(ctx) {
+    const still = stillOn(ctx);
+    await loadList(ctx, ctx.arg);
+    if (ctx.arg && openId === ctx.arg && still()) focusEditor();
+  },
   async action(ctx, verb, arg) {
     if (verb === "new") startDraft(ctx, {}, "");
     else if (verb === "from-example") {
       const template = (ctx.catalog.templates ?? [])[Number(example)];
       if (template) startDraft(ctx, template.config, template.name);
     }
-    else if (verb === "open" && arg) { await ctx.task("레시피 불러오는 중", () => read(arg)); if (openId === arg) focusEditor(); }
+    else if (verb === "open" && arg) {
+      const still = stillOn(ctx);
+      await ctx.task("레시피 불러오는 중", () => read(arg));
+      if (openId === arg && still()) focusEditor();
+    }
     else if (verb === "clone" && arg) await cloneRecipe(ctx, arg);
     else if (verb === "save") await saveRecipe(ctx);
     else if (verb === "reload") await reloadRecipe(ctx);

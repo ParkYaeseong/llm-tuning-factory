@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { readFileSync } from "node:fs";
 import { calls, config, HOSTILE, invalid, issue, openWorkbench } from "./workflow-mock.ts";
 
 // Every [data-config] control of the training form as "path|control|number flag|optional flag|visible label".
@@ -260,4 +261,64 @@ test("a recipe edit that conflicts keeps the draft", async ({ page }) => {
   await expect(form.getByLabel("설명")).toHaveValue("다른 창에서 저장");
   await expect(page.locator(".wf-banner")).toHaveCount(0);
   expect(await calls(page, { action: "recipe_get" })).toHaveLength(reads + 1);
+});
+
+// -- review fixes (Task 10.2 review I2, M6, M7) --
+
+test("the recipe defaults equal the Python model's (pinned by a shared fixture)", async ({ page }) => {
+  const fixture = JSON.parse(readFileSync(new URL("./recipe-defaults.json", import.meta.url), "utf8"));
+  await openWorkbench(page);
+  const defaults = await page.evaluate(async () =>
+    (await import("/src/views/recipes.ts" as string)).recipeFromTemplate({}, "defaults", "defaults", []));
+  expect(defaults).toEqual(fixture);
+});
+
+test("a description with a leading newline or Windows line breaks stays clean", async ({ page }) => {
+  await openWorkbench(page, { definitions: true });
+  await openRecipes(page);
+  const form = await newRecipe(page, "줄바꿈 레시피");
+  await saveRecipe(page);
+  const [{ args }] = await calls(page, { action: "recipe_save" });
+  const current = await bridge(page, "recipe_get", { recipe_id: args.data.spec.recipe_id });
+  const description = "\n첫 줄은 비움\r\n둘째 줄";
+  expect((await bridge(page, "recipe_save", { spec: { ...current.data.recipe, description }, expected_revision: current.data.revision_sha256 })).status).toBe("ok");
+  const reopen = async () => {
+    await form.getByRole("button", { name: "닫기", exact: true }).click();
+    await page.locator(".recipe-list tbody tr", { hasText: "줄바꿈 레시피" }).getByRole("button", { name: /열기/ }).click();
+    await expect(page.locator(".notice.busy")).toHaveCount(0);
+  };
+  await reopen();
+  await expect(form.getByLabel("설명")).toHaveValue("\n첫 줄은 비움\n둘째 줄");
+  await expect(form.locator(".status-pill")).toContainText("저장된 버전");
+  // Closing and reopening re-reads it: the draft is clean, not "저장 안 된 변경".
+  const reads = (await calls(page, { action: "recipe_get" })).length;
+  await reopen();
+  expect(await calls(page, { action: "recipe_get" })).toHaveLength(reads + 1);
+  await expect(form.locator(".status-pill")).toContainText("저장된 버전");
+  await saveRecipe(page);
+  expect((await calls(page, { action: "recipe_save" })).at(-1).args.data.spec.description).toBe(description);
+});
+
+test("the example choice waits while busy and PPO with OFT is refused before saving", async ({ page }) => {
+  await openWorkbench(page, { definitions: true, holds: ["recipes_list"] });
+  await page.locator('nav [data-action="nav:recipes"]').click();
+  await expect(page.locator(".notice.busy")).toBeVisible();
+  await expect(page.getByLabel("예제", { exact: true })).toBeDisabled();
+  await page.evaluate(() => (window as any).__release("recipes_list"));
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+  await expect(page.getByLabel("예제", { exact: true })).toBeEnabled();
+  // PPO's dedicated engine has no OFT: the choice is marked and a saved combination is refused locally.
+  const form = await newRecipe(page, "PPO 레시피");
+  await form.getByLabel("학습 방법", { exact: true }).selectOption("oft");
+  await form.getByLabel("학습 단계", { exact: true }).selectOption("ppo");
+  await expect(form.getByLabel("학습 방법", { exact: true }).locator('option[value="oft"]')).toContainText("현재 단계 미지원");
+  await saveRecipe(page);
+  expect(await calls(page, { action: "recipe_save" })).toEqual([]);
+  const method = form.locator(".recipe-field", { has: page.getByLabel("학습 방법", { exact: true }) });
+  await expect(method).toContainText("PPO 학습에서는 OFT를 쓸 수 없습니다.");
+  await expect(form.getByLabel("학습 방법", { exact: true })).toHaveAttribute("aria-invalid", "true");
+  await form.getByLabel("학습 방법", { exact: true }).selectOption("lora");
+  await saveRecipe(page);
+  expect((await calls(page, { action: "recipe_save" })).map(call => [call.args.data.spec.training_stage, call.args.data.spec.training_method]))
+    .toEqual([["ppo", "lora"]]);
 });
