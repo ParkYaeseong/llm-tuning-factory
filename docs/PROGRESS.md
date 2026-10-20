@@ -4907,11 +4907,17 @@ Changed: `desktop/src/graph-model.ts`, `desktop/src/views/graph-editor.{ts,css}`
 Actual verification:
 - RED first:
   - `graph-model.spec.ts` failed to load (`does not provide an export named 'graphEdgeCount'`);
-  - the 5 page tests failed on their assertions: the removed ID reused (`train-2` present), the 257th evaluation
-    enabled, focus not on the first starting shape, the threshold enabled without a metric, and the plan dropped by
-    the "0.50" threshold.
+  - the 5 page tests failed on their assertions: the removed ID reused (`train-2` present), the evaluation that would
+    be the 257th connection enabled, focus not on the first starting shape, the threshold enabled without a metric,
+    and the plan dropped by the "0.50" threshold.
 - `npx playwright test` **224 passed** (202 + 13 from 10.6 + 9 new); `npm run build` passes;
   `tests/test_desktop_ui_contract.py` passes.
+- Both commits were rebased onto `d4d81ae` (the 10.7 review fixes and the Task 11 plan). Only this file conflicted, and
+  every entry was kept. Receipts on the rebased tree:
+  - `npx playwright test` **226 passed** in 13 files: 204 at the new base, 13 from 10.6 and 9 from these fixes;
+  - `npm run build` passes;
+  - `pytest -q` **1716 passed, 1 skipped**, and Ruff passes;
+  - `check_secrets.py` reports 0 findings, and the protected-path diff against `d4d81ae` is clean.
 
 ---
 
