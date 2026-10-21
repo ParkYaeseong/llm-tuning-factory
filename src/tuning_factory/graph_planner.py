@@ -455,9 +455,9 @@ class _MergeLineage:
                 targets = self._targets(recipe, policy.base)
             return frozenset({(policy.base.model_dump_json(), targets)})
         if isinstance(node, MergeNode):
-            inputs = [self.candidates(value, active) for value in node.models]
-            shared = _shared_candidates(inputs) if all(inputs) else None
-            return shared or None   # an empty set is this merge's own refusal, never reported again downstream
+            # A merge that compiles gives every input one base and target set, so the known inputs bound it.
+            known = [item for item in (self.candidates(value, active) for value in node.models) if item]
+            return (_shared_candidates(known) or None) if known else None   # empty: this merge's own refusal
         if isinstance(node, SelectNode):
             offered = [self.candidates(self.nodes[ref.node_id].model, active) for ref in node.evaluations
                        if isinstance(self.nodes.get(ref.node_id), EvaluateNode)]
@@ -465,9 +465,10 @@ class _MergeLineage:
         return None
 
     def inputs_differ(self, node: MergeNode) -> bool:
-        """True only when every input's candidates are known and no single base and target set fits them all."""
-        inputs = [self.candidates(value) for value in node.models]
-        return all(inputs) and not _shared_candidates(inputs)
+        """True when at least two inputs' candidates are known and no single base and target set fits those (an
+        unknown input cannot reconcile two known ones that conflict; Task 11.5, R1 m2)."""
+        known = [item for item in (self.candidates(value) for value in node.models) if item]
+        return len(known) >= 2 and not _shared_candidates(known)
 
 
 def _shared_candidates(inputs) -> frozenset:
@@ -482,6 +483,88 @@ def _shared_candidates(inputs) -> frozenset:
         else:
             shared.update((base, value) for value in frozenset.intersection(*known))
     return frozenset(shared)
+
+
+def _sources(value, nodes, active=frozenset()) -> frozenset:
+    """The actual models a model reference can carry at run time: a producing node's own output, an external
+    artifact, or any candidate of a selection (through its evaluations' models). Empty when unresolvable."""
+    if isinstance(value, ModelArtifactRef):
+        return frozenset({("artifact", *_artifact_key(value))})
+    node = nodes.get(value.node_id) if isinstance(value, NodeOutputRef) else None
+    if node is None or node.id in active:
+        return frozenset()
+    if isinstance(node, SelectNode):
+        return frozenset().union(*(_sources(nodes[ref.node_id].model, nodes, active | {node.id})
+                                   for ref in node.evaluations if isinstance(nodes.get(ref.node_id), EvaluateNode)))
+    return frozenset({("node", node.id)})
+
+
+def _distinct_choice_possible(options) -> bool:
+    """Whether one model can be chosen from each option set with all of them distinct (a bipartite matching);
+    unresolvable (empty) sets are left out."""
+    options = [tuple(sorted(item)) for item in options if item]
+    owner = {}
+
+    def assign(index, seen):
+        for choice in options[index]:
+            if choice not in seen:
+                seen.add(choice)
+                if choice not in owner or assign(owner[choice], seen):
+                    owner[choice] = index
+                    return True
+        return False
+
+    return all(assign(index, set()) for index in range(len(options)))
+
+
+def _mergeable(value, nodes, recipes, artifacts, active=frozenset()) -> bool:
+    """False only when a merge input is provably not a plain causal LoRA/QLoRA adapter at run time: a full-model
+    artifact or variant, a materialized model, a training that is not plain LoRA/QLoRA, or a selection none of whose
+    candidates is mergeable. A merge's own output is an adapter (its own checks stand)."""
+    if isinstance(value, ModelArtifactRef):
+        snapshot = artifacts.get(_artifact_key(value))
+        if snapshot is None:
+            return True   # refused elsewhere ("external artifact ... snapshot is not ready")
+        try:
+            check_materializable(snapshot.descriptor)
+        except ValueError:
+            return False
+        return True
+    node = nodes.get(value.node_id) if isinstance(value, NodeOutputRef) else None
+    if node is None or node.id in active:
+        return True
+    if isinstance(node, MaterializeNode):
+        return False
+    if isinstance(node, TrainNode):
+        recipe = _recipe(node, recipes)
+        options = recipe.finetuning_options
+        return (recipe.training_method in {"lora", "qlora"} and recipe.training_stage not in {"rm", "ppo"}
+                and not any((options.use_dora, options.use_rslora, options.pissa_init, options.pissa_convert)))
+    if isinstance(node, SelectNode):
+        return any(_mergeable(nodes[ref.node_id].model, nodes, recipes, artifacts, active | {node.id})
+                   for ref in node.evaluations if isinstance(nodes.get(ref.node_id), EvaluateNode))
+    return True
+
+
+def _rank_floor(value, nodes, recipes, artifacts, active=frozenset()) -> int:
+    """The least adapter rank a merge input can carry: a LoRA training's recipe rank (a continuation must keep it),
+    an artifact adapter's rank, the sum of a merge's inputs, a selection's smallest candidate; 0 when unknown."""
+    if isinstance(value, ModelArtifactRef):
+        snapshot = artifacts.get(_artifact_key(value))
+        return snapshot.descriptor.adapter.rank if snapshot is not None and snapshot.descriptor.adapter else 0
+    node = nodes.get(value.node_id) if isinstance(value, NodeOutputRef) else None
+    if node is None or node.id in active:
+        return 0
+    active = active | {node.id}
+    if isinstance(node, TrainNode):
+        recipe = _recipe(node, recipes)
+        return recipe.hyperparameters.lora_rank if recipe.training_method in {"lora", "qlora"} else 0
+    if isinstance(node, MergeNode):
+        return sum(_rank_floor(item, nodes, recipes, artifacts, active) for item in node.models)
+    if isinstance(node, SelectNode):
+        return min((_rank_floor(nodes[ref.node_id].model, nodes, recipes, artifacts, active)
+                    for ref in node.evaluations if isinstance(nodes.get(ref.node_id), EvaluateNode)), default=0)
+    return 0
 
 
 def _project_root():
@@ -609,6 +692,16 @@ def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: Execu
                 benchmark = benchmarks[evaluation.benchmark_revision].spec
                 if roles.get(_dataset_key(benchmark.dataset)) != "validation":
                     raise ValueError("held-out test evaluation cannot influence selection")
+            # Shapes that can never resolve (Task 11.5, R1 m3): select_best refuses duplicate candidates, and
+            # resolve_local_selection takes one merged candidate beside the originals it falls back to.
+            if not _distinct_choice_possible([_sources(item.model, nodes) for item in evaluation_nodes]):
+                raise ValueError("selection candidates must be distinct models")
+            merged = sum(isinstance(item.model, NodeOutputRef) and isinstance(nodes[item.model.node_id], MergeNode)
+                         for item in evaluation_nodes)
+            if merged > 1:
+                raise ValueError("a selection takes at most one merged candidate")
+            if merged == len(evaluation_nodes):
+                raise ValueError("a selection needs an original candidate beside its merged one")
         _static_routes(node, nodes, recipes, artifacts, allowed, choices.base_targets)
         attempts = graph.retry_policy.max_attempts
         planned.append(NodePlan(node=node, inputs=tuple(InputContract(source=ref, required_port=port)
@@ -700,19 +793,20 @@ def _static_routes(node, nodes, recipes, artifacts, resources, evidence=()):
             _merge_descriptors(node.models, tuple(artifacts[_artifact_key(ref)].descriptor for ref in node.models))
         elif _MergeLineage(nodes, recipes, artifacts, evidence).inputs_differ(node):
             raise ValueError(MERGE_INPUTS_DIFFER)   # artifact adapters or module evidence show it at planning
-        ranks = []
         for value in node.models:
             if isinstance(value, NodeOutputRef) and isinstance(nodes[value.node_id], TrainNode):
-                recipe = _recipe(nodes[value.node_id], recipes)
-                options = recipe.finetuning_options
+                options = _recipe(nodes[value.node_id], recipes).finetuning_options
                 if any((options.use_dora, options.use_rslora, options.pissa_init, options.pissa_convert)):
                     raise ValueError("unsupported adapter merge variant")
-                ranks.append(recipe.hyperparameters.lora_rank)
             elif isinstance(value, ModelArtifactRef):
-                descriptor = artifacts[_artifact_key(value)].descriptor
-                check_materializable(descriptor)
-                ranks.append(descriptor.adapter.rank)
-        if sum(ranks) > 256:
+                check_materializable(artifacts[_artifact_key(value)].descriptor)
+            elif not _mergeable(value, nodes, recipes, artifacts):
+                # A materialized (full) model, or a selection none of whose candidates is a plain adapter (Task 11.5).
+                raise ValueError("merge requires plain causal LoRA/QLoRA parents")
+        # What compile would refuse, carried through nested merges and selections (Task 11.5, R1 m2).
+        if not _distinct_choice_possible([_sources(value, nodes) for value in node.models]):
+            raise ValueError("merge requires distinct actual artifacts")
+        if sum(_rank_floor(value, nodes, recipes, artifacts) for value in node.models) > 256:
             raise ValueError("merged rank exceeds 256")
 
 

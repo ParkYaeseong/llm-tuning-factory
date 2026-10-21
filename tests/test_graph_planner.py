@@ -363,7 +363,12 @@ def test_lora_sft_materialized_into_dpo_binds_policy_and_reference_to_the_materi
     reference base and the materialized artifact all the same full model (a new adapter, no continuation)."""
     from test_model_artifacts import fixture_model, updated
 
-    from tuning_factory.graph_planner import ModelContext, NodeModelBinding, ProducerEvidence, VerifiedBindings
+    from tuning_factory.graph_planner import (
+        ModelContext,
+        NodeModelBinding,
+        ProducerEvidence,
+        VerifiedBindings,
+    )
     from tuning_factory.model_artifacts import ModelArtifactStore
     from tuning_factory.model_hub import ModelProfile
     registry, project, choices, facts = fixture(tmp_path)
@@ -1110,3 +1115,188 @@ def test_merges_of_adapters_with_different_targets_on_one_root_are_refused_when_
     project, choices = merge_case(m, nodes, (root_evidence(m.root, "q_proj", "k_proj", "v_proj"),))
     assert plan_graph(project, choices, (m.facts,)).nodes[-1].node.id == "m"
 
+
+# -- Task 11.5 (R1 m2, m3): provable merge and selection refusals happen at planning -------------------------------
+
+def merged_of(node_id, sources, weights=None):
+    """A merge of node outputs (IDs) and external artifacts (refs), equally weighted by default."""
+    weights = weights or {2: [0.5, 0.5], 3: [0.5, 0.25, 0.25], 4: [0.25, 0.25, 0.25, 0.25]}[len(sources)]
+    return {"kind": "merge", "id": node_id, "label": "Merge", "weights": weights, "executor_profile_ids": ["p"],
+            "models": [{"node_id": source, "output_name": "model"} if isinstance(source, str)
+                       else source.model_dump(mode="json") for source in sources]}
+
+
+def materialized(node_id, source):
+    return {"kind": "materialize", "id": node_id, "label": "Materialize", "executor_profile_ids": ["p"],
+            "model": {"node_id": source, "output_name": "model"}}
+
+
+def evaluated(node_id, model, benchmark):
+    return {"kind": "evaluate", "id": node_id, "label": "Evaluate", "benchmark_revision": benchmark,
+            "executor_profile_ids": ["p"], "model": {"node_id": model, "output_name": "model"}}
+
+
+def chosen(node_id, evaluations):
+    return {"kind": "select", "id": node_id, "label": "Select",
+            "evaluations": [{"node_id": item, "output_name": "evaluation"} for item in evaluations],
+            "selection": {"metric": "accuracy", "direction": "max", "allow_partial": True}}
+
+
+def ranked(m, rank):
+    recipe = RecipeSpec(recipe_id=f"r{rank}", name=f"rank {rank}",
+                        hyperparameters={"lora_rank": rank, "lora_target": "q_proj,v_proj"})
+    revision = Revision(spec=recipe, revision_sha256=digest(canonical(recipe.model_dump(mode="json"))))
+    m.choices = m.choices.model_copy(update={"recipes": (*m.choices.recipes, revision)})
+    return revision.revision_sha256
+
+
+def benchmarked(m, tmp_path):
+    """A validation dataset and a benchmark on the fixture root, so the graph can evaluate and select."""
+    from tuning_factory.benchmarks import BenchmarkSpec
+    from tuning_factory.graph_planner import BenchmarkRevision
+    path = tmp_path / "held.json"
+    path.write_bytes(canonical([{"instruction": "held-out", "output": "a"}, {"instruction": "second", "output": "b"}]))
+    record = m.registry.register_dataset("held", "1", path)
+    held = DatasetRef(dataset_id="held", version="1", sha256=record["sha256"])
+    benchmark = BenchmarkSpec(dataset=held, evaluator_kind="classification", evaluator_version="1",
+                              ordered_sample_ids=("row:1", "row:0"), max_new_tokens=32, cutoff_len=128, seed=42,
+                              precision="bf16", quantization_bit=None,
+                              tokenizer_fingerprint=m.root.tokenizer_fingerprint, template="qwen",
+                              semantic_model_kind="causal_lm")
+    m.project = revise(m.project, None, [*m.project.spec.model_dump(mode="json")["datasets"],
+                                         {"binding_id": "held", "role": "validation", "dataset": held.model_dump()}])
+    m.choices = m.choices.model_copy(update={
+        "benchmarks": (BenchmarkRevision(spec=benchmark, revision_sha256=benchmark.fingerprint()),),
+        "datasets": (*m.choices.datasets, snapshot_dataset(m.registry, held))})
+    return benchmark.fingerprint()
+
+
+def planned_or_refused(m, nodes, evidence=()):
+    project, choices = merge_case(m, nodes, evidence)
+    return project, choices, lambda: plan_graph(project, choices, (m.facts,))
+
+
+@pytest.mark.parametrize("case", ["three_inputs", "nested_with_unknown"])
+def test_known_merge_inputs_that_conflict_are_refused_beside_an_unknown_one(tmp_path, case):
+    """``_MergeLineage`` compares the inputs whose base is known: one adapter whose base exists only at run time (a
+    new adapter on a materialized model) no longer hides two known inputs on different roots."""
+    m = merge_fixture(tmp_path)
+    head = [lora("a", m.default, m.root), lora("x", m.default, m.other), materialized("full", "a"),
+            lora("y", m.default, "full")]
+    nodes = {"three_inputs": [*head, merged_of("m", ("a", "x", "y"))],
+             "nested_with_unknown": [*head, merged_of("ay", ("a", "y")), merged_of("m", ("ay", "x"))]}[case]
+    project, choices, plan = planned_or_refused(m, nodes)
+    assert merge_issues(m, project, choices) == [("merge_bases_differ", MERGE_INPUTS_DIFFER, "m")]
+    with pytest.raises(ValueError, match=f"^merge_bases_differ: {MERGE_INPUTS_DIFFER}$"):
+        plan()
+    # One known input beside an unknown one stays for compile to decide.
+    project, choices, plan = planned_or_refused(m, [*head, merged_of("m", ("x", "y"))])
+    assert merge_issues(m, project, choices) == [] and plan().nodes[-1].node.id == "m"
+
+
+def test_a_materialized_model_fed_straight_into_a_merge_is_refused_at_planning(tmp_path):
+    """Compile refuses a full model as a merge input (``check_materializable``); planning now says so first."""
+    m = merge_fixture(tmp_path)
+    nodes = [lora("a", m.default, m.root), lora("b", m.default, m.root), materialized("full", "a"),
+             merged_of("m", ("full", "b"))]
+    with pytest.raises(ValueError, match="^merge requires plain causal LoRA/QLoRA parents$"):
+        planned_or_refused(m, nodes)[2]()
+
+
+@pytest.mark.parametrize("case, refused", [("only_materialized", True), ("one_adapter", False)])
+def test_a_selection_of_only_materialized_models_fed_into_a_merge_is_refused_at_planning(tmp_path, case, refused):
+    """Provable only when no candidate is an adapter: a selection that may pick the adapter ``b`` still plans."""
+    m = merge_fixture(tmp_path)
+    benchmark = benchmarked(m, tmp_path)
+    nodes = [lora("a", m.default, m.root), lora("b", m.default, m.root), lora("c", m.default, m.root),
+             materialized("full_a", "a"), materialized("full_b", "b"), evaluated("efa", "full_a", benchmark),
+             evaluated("efb", "full_b", benchmark), evaluated("eb", "b", benchmark),
+             chosen("s", ("efa", "efb" if case == "only_materialized" else "eb")), merged_of("m", ("s", "c"))]
+    plan = planned_or_refused(m, nodes)[2]
+    if refused:
+        with pytest.raises(ValueError, match="^merge requires plain causal LoRA/QLoRA parents$"):
+            plan()
+    else:
+        assert plan().nodes[-1].node.id == "m"
+
+
+@pytest.mark.parametrize("case, refused", [("nested", True), ("nested_at_limit", False), ("selected", True),
+                                           ("selected_smaller", False)])
+def test_merged_rank_is_carried_through_nested_merges_and_selections(tmp_path, case, refused):
+    """merge(merge(a128, b128), d8) has rank 264 > 256: refused before any training. A selection contributes its
+    smallest candidate's rank (the least the merge can receive): min(256, 128) + 129 > 256, min(256, 8) + 128 is not."""
+    m = merge_fixture(tmp_path)
+    r128, r129, r8 = ranked(m, 128), ranked(m, 129), ranked(m, 8)
+    benchmark = benchmarked(m, tmp_path)
+    head = [lora("a", r128, m.root), lora("b", r128, m.root), lora("d", r8, m.root), merged_of("ab", ("a", "b"))]
+    nodes = {
+        "nested": [*head, merged_of("m", ("ab", "d"))],
+        "nested_at_limit": [*head, lora("e", r128, m.root), merged_of("m", ("a", "e"))],
+        "selected": [*head, evaluated("eab", "ab", benchmark), evaluated("ea", "a", benchmark),
+                     chosen("s", ("eab", "ea")), lora("f", r129, m.root), merged_of("m", ("s", "f"))],
+        "selected_smaller": [*head, evaluated("eab", "ab", benchmark), evaluated("ed", "d", benchmark),
+                             chosen("s", ("eab", "ed")), lora("f", r128, m.root), merged_of("m", ("s", "f"))],
+    }[case]
+    plan = planned_or_refused(m, nodes)[2]
+    if refused:
+        with pytest.raises(ValueError, match="^merged rank exceeds 256$"):
+            plan()
+    else:
+        assert plan().nodes[-1].node.id == "m"
+
+
+@pytest.mark.parametrize("case, refused", [("only_candidate", True), ("both_candidates", True),
+                                           ("one_of_two", False)])
+def test_duplicate_merge_inputs_through_a_selection_are_refused_at_planning(tmp_path, case, refused):
+    """A merge whose inputs can only be the same artifact (a selection that can only pick a model the merge already
+    takes) fails compile's "distinct actual artifacts"; a selection that may pick another model still plans."""
+    m = merge_fixture(tmp_path)
+    benchmark = benchmarked(m, tmp_path)
+    head = [lora("a", m.default, m.root), lora("b", m.default, m.root), evaluated("ea", "a", benchmark),
+            evaluated("eb", "b", benchmark), evaluated("ea2", "a", benchmark)]
+    nodes = {
+        "only_candidate": [*head, chosen("s", ("ea",)), merged_of("m", ("s", "a"))],
+        "both_candidates": [*head, chosen("s", ("ea",)), chosen("t", ("ea2",)), merged_of("m", ("s", "t"))],
+        "one_of_two": [*head, chosen("s", ("ea", "eb")), merged_of("m", ("s", "a"))],
+    }[case]
+    plan = planned_or_refused(m, nodes)[2]
+    if refused:
+        with pytest.raises(ValueError, match="^merge requires distinct actual artifacts$"):
+            plan()
+    else:
+        assert plan().nodes[-1].node.id == "m"
+
+
+@pytest.mark.parametrize("case, message", [
+    ("repeated_evaluation", "selection candidates must be distinct models"),
+    ("same_model_twice", "selection candidates must be distinct models"),
+    ("same_model_through_a_selection", "selection candidates must be distinct models"),
+    ("two_merged_candidates", "a selection takes at most one merged candidate"),
+    ("only_a_merged_candidate", "a selection needs an original candidate beside its merged one"),
+    ("distinct", None), ("one_merged_candidate", None)])
+def test_selection_shapes_that_can_never_resolve_are_refused_at_planning(tmp_path, case, message):
+    """R1 m3: ``s([e1, e1])``, two evaluations of the same model, and more than one merged candidate always fail at
+    the selection (``select_best``'s duplicate candidates, ``resolve_local_selection``'s one merged candidate); a
+    selection whose only candidate is merged always records no winner."""
+    m = merge_fixture(tmp_path)
+    benchmark = benchmarked(m, tmp_path)
+    head = [lora("a", m.default, m.root), lora("b", m.default, m.root), lora("c", m.default, m.root),
+            merged_of("ab", ("a", "b")), merged_of("bc", ("b", "c")), evaluated("ea", "a", benchmark),
+            evaluated("ea2", "a", benchmark), evaluated("eb", "b", benchmark), evaluated("eab", "ab", benchmark),
+            evaluated("ebc", "bc", benchmark)]
+    tail = {
+        "repeated_evaluation": [chosen("s", ("ea", "ea", "eb"))],
+        "same_model_twice": [chosen("s", ("ea", "ea2", "eb"))],
+        "same_model_through_a_selection": [chosen("t", ("ea",)), evaluated("et", "t", benchmark),
+                                           chosen("s", ("et", "ea2"))],
+        "two_merged_candidates": [chosen("s", ("ea", "eab", "ebc"))],
+        "only_a_merged_candidate": [chosen("s", ("eab",))],
+        "distinct": [chosen("s", ("ea", "eb"))],
+        "one_merged_candidate": [chosen("s", ("ea", "eb", "eab"))],
+    }[case]
+    plan = planned_or_refused(m, [*head, *tail])[2]
+    if message:
+        with pytest.raises(ValueError, match=f"^{message}$"):
+            plan()
+    else:
+        assert plan().nodes[-1].node.id == "s"
