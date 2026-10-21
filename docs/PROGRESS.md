@@ -6122,6 +6122,88 @@ Not verified or still open:
 - The plan-dedupe, synthetic-lineage and merge-fallback docs describe behaviour from parallel batches; they need root's
   re-check against the final code.
 
+## Task 11.5 fixes: Windows UI and native profiles, 2026-10-21
+
+Branch `codex/rc-ui-fixes` from RC `01c8503`, worktree `D:\llm-tuning-factory-wt113`. Findings of the R2, R3 and R5
+reviews in the UI and the native profile store, plus the UI side of the backend's new plan-hash dedupe. Each test was
+written first and seen failing for the reason named; the existing tests that changed are listed.
+
+- R2 I2 `forget_credentials`: **fixed**. The confirmation and the S3 note name "모든 실행 프로필의 RunPod API 키", and the
+  confirmation says that real runs pinned to those profiles stop at the next controller start until the key is saved
+  again. `profile_credentials_forgotten: false` shows `profile_warning` as the error notice instead of "저장된 인증값을
+  삭제했습니다". Test: `forgetting credentials names every profile key and shows a partial failure instead of success`
+  (workflow-regression.spec.ts). No legacy spec asserted the old texts.
+- R2 M1 profile store across processes: **fixed**.
+  - Saves, deletes and the profile part of `forget_credentials` hold an exclusive `std::fs::File::lock` on
+    `executor-profiles.lock` around their read-modify-write (no new crate). Store writes use a unique temporary name
+    (process, counter, time) and `sync_all` before the rename.
+  - The crash window is closed: a new profile is written to the file before its key reaches the vault, and taken out
+    again if the vault refuses the key. A crash in between leaves a profile without a key, never an orphaned key. A
+    rotated key of an existing profile keeps the old order (key, then file, key restored if the file write fails).
+  - Tests: `concurrent_saves_from_separate_lock_handles_keep_every_profile` (8 threads × 4 new profiles, each save with
+    its own lock handle; on the old code entries were lost), `a_new_profile_is_in_the_file_before_its_key_is_in_the_vault`.
+    `a_failed_store_write_restores_the_previous_vault_state` now blocks the rename with a handle that does not share
+    delete (a directory at the old fixed temporary name no longer blocks anything); it is `#[cfg(windows)]`, like every
+    CI cargo run. The atomic-replace test checks that no `.tmp` file is left.
+  - `forget_credentials` still creates nothing without a profile file; with one, it may add the lock file beside it.
+- R2 M4 native key paths: **fixed**. `profiles.rs` refuses what `desktop_workflows.local_file` refuses (NUL; a `:`
+  after the drive, so ADS and `nul:`; DOS device names in any component, `CONIN$`, `COM¹` included; surrounding
+  whitespace, with Python's `isspace` set), plus a trailing dot (Windows drops it). `~` stays refused as before. The
+  device names are Rust constants that `test_rust_key_path_device_names_match_local_file` (test_native_contract.py)
+  compares with `_DEVICE_NAMES`. Test: `profile_key_paths_refuse_what_the_planner_refuses` mirrors the cases of
+  `test_import_source_reads_local_files_only`. `KEY_PATH_RELATIVE` keeps its prefix (native-smoke.mjs matches it) and
+  now names these cases.
+- R3 M1: **fixed**. Row counts, role counts and sizes render only as finite numbers ("—" otherwise). Test: `counts from
+  a malformed answer are never inserted as markup` (HOSTILE in `row_count`, `canonical_size`, `counts.train`).
+- R3 M2: **fixed**.
+  - User names inside sentences sit in `<bdi>` (`workbench.isolate`): the import project banner, the editor's toolbar
+    notes and blocked/evaluation lists, the plan panel's steps and step issues, the approval dialog's project name and
+    waiting steps, and the release dialog.
+  - The release dialog shows the name to type without Unicode format characters (and says so) and compares after
+    removing them on both sides (`workbench.typedForm`); a label of only invisible characters is named by its node ID.
+  - Nit: a train card's recipe choices show the recipe ID beside the name.
+  - Tests (U+200B, U+202E, U+202C built from code points): `a node label with invisible or bidi characters is isolated
+    and can be typed as it is shown`, `step and project names in the plan and its dialog are isolated…`, `the project
+    name in the import banner is isolated…`, `names in toolbar notes are isolated and recipes that share a name differ…`.
+- R3 M3: **fixed**. Issue texts say "전체 모델 확정" (graph-model `KIND_LABELS`), and the runs page's `NODE_KIND` is
+  `KIND_LABELS` ("자동 선택"). The "실행 위치" column shows the profile name (ID beside it) for profiles this PC has,
+  read once per opened run with `executor_profiles_get` (local, never the sidecar; the list page reads nothing new).
+  Tests: `the runs page names kinds as the editor does and shows profile names where they are known`, `issue codes
+  without an English pattern have Korean texts, and the materialize card has one name`. Changed: two assertions of the
+  old "모델 변환(materialize)" text (workflow-core.spec.ts, graph-editor.spec.ts).
+- R3 M4: **fixed**. An unreadable run (`{run_id, error}`) stops detail polling; the banner says so and offers "다시
+  확인" (one read; a run that became readable is followed again). Test: `an unreadable run is not polled again until it
+  is checked by hand` (page.clock, 120 s without a read). Changed: the existing unreadable-run test reads the
+  other-run answer through "다시 확인" instead of a 3 s poll.
+- R3 M5: **fixed**. The run-exists state and notice add: change an input (최대 실행 시간 등) or inspect the profile again,
+  then plan anew; the run's status is shown when known. Test: the existing `a plan that already has a run…` asserts it.
+- R3 M6: **fixed**. `reuseExistingServer: false`, pinned beside `serverOptions` in workflow-core.spec.ts.
+- R3 M7: **fixed**. The PPO recipe fixture of graph-plan.spec.ts uses `input_kind: "prompt"`.
+- R5 M1: **fixed**. Korean texts for `merge_bases_differ`, `executor_profile_invalid`, `tracking_invalid`,
+  `benchmark_invalid`, `sample_id_invalid`, `planning_inputs_invalid` and `graph_schema` (Korean backend messages under
+  these codes stay as received; the original stays under "원문 보기").
+- R5 M5: **fixed**. `workflow-types.ts` declares `GraphRunNode.job_id`, `PlanSummary.nodes[].recipe` (`PlanNodeRecipe`)
+  and `.datasets` (`PlanNodeDataset[]`); the local `RunNode` and `PlanNodeReferences` are gone.
+- Backend plan-hash dedupe (contract of the planning batch): **UI done**. `graph_submit` → `conflict`,
+  `plan_submitted` at `/plan_sha256`, `data: {run_id, status}` shows the run-exists state with the M5 hint and "실행
+  보기", and no approval again; without a run in `data` the localized refusal is shown under the plan. `issues.ts` has
+  the Korean text; `workflow-types.ts` declares `PlanSubmitted`. Tests (mocked): `a submit the backend refuses as
+  already registered shows that run and how to plan anew`, `a plan_submitted refusal without its run is shown as the
+  backend's reason`. Not run against the backend change, which lands separately.
+
+Actual verification (this worktree, its own `.venv` from `uv sync --extra dev --extra tracking --locked`):
+- `npm run build` (tsc + vite) passes.
+- `npx playwright test`: **265 passed** (254 before, plus 11 new), own Vite on 1420 with
+  `TUNING_FACTORY_E2E=1`.
+- `cargo test --locked --offline --release` (src-tauri): **52 passed** (49 plus 3 new); the concurrency test passed 10
+  of 10 repeated runs.
+- `uv run pytest -q`: **1756 passed, 1 skipped** in 13 min 58 s (1755 plus the new device-name contract test).
+  `uv run ruff check src tests`: passes.
+- `uv run python scripts/check_secrets.py`: 1130 file versions, 0 findings. `git diff --check`: clean; LF only; no
+  literal bidi or invisible character in the changed files (byte scan).
+- Not verified: real WebView2 rendering of `<bdi>` and of the release dialog, and two real app windows saving profiles
+  at once (Task 11.6 installed-app checks); the dedupe UI against the real backend change.
+
 ## Windows workbench refinement — 0.2.1
 
 User selected the light Linear/Vercel direction after requesting getdesign.md references and similar open-source
