@@ -5288,6 +5288,88 @@ Not verified: the installer-facing statements (uninstaller checkbox text from th
 SmartScreen wording, the 0.3.0 → 0.4.0 carry-over and the stopped-controller update path) are checked in 11.6, and the
 release notes stay a draft until 11.7.
 
+## Task 11.3a release machinery: version 0.4.0, the extended native smoke and the CI filters, 2026-10-21
+
+Three commits in worktree `D:\llm-tuning-factory-wt113` (branch `codex/task-11.3`), written on `d0415c0` and rebased onto
+`1d938d6` (11.2's seed script and the 11.4 docs; only this file conflicted, both entries kept), with the §4 messages
+of the Task 11 plan: `ci: rebuild the desktop package when bundled examples or configs change`, `test: extend the
+installed-app smoke to workflows, profiles and the background controller`, `chore: version the Windows workbench as
+0.4.0`. They are ordered so that every commit passes its own tests. No `src/` file, Rust source, dependency or
+`scripts/build_desktop.py` changed (F5 still covers every bundled asset).
+
+What changed:
+- D1 version. `0.4.0` in `desktop/package.json` and both `desktop/package-lock.json` fields (`npm version 0.4.0
+  --no-git-tag-version --offline`), `desktop/src-tauri/tauri.conf.json:4` and `desktop/src-tauri/Cargo.toml:3`;
+  `cargo update --offline --workspace` rewrote only the root `Cargo.lock` entry (`alloc-stdlib 0.3.0` untouched).
+  `pyproject.toml` stays `0.1.0`. The footer and `workspace.spec.ts` already read `package.json`.
+  README and WINDOWS_APP are 11.4's files under §3; 11.4 (`1d938d6`) already says 0.4.0 there.
+- `tests/test_release_version.py` (new) pins the six desktop version fields, the native smoke reading `package.json`
+  without a literal, `pyproject.toml` at `0.1.0`, and the D16 path filters.
+- `desktop/tests/native-smoke.mjs` (11.3c sections 1-9).
+  - Footer from `package.json`. The legacy actions are unchanged, except that the live Hugging Face block runs only
+    with `FACTORY_SMOKE_LIVE_HF=1`; without it the output has `live_hf: false`, `modern_hf_model_registered: null` and
+    `network_used: false`.
+  - The legacy vault check, which ends with `forget_credentials`, runs only when no `*_saved` flag is set and
+    `executor_profiles_get` returns no profile. Otherwise it reports `"skipped_existing_credentials"`.
+  - Workflow channel checks: `projects_list`, `project_create`, the project listed, `recipes_list`. It stops before
+    any profile or controller step unless the controller is `absent` and no graph run is active.
+  - Profiles, controller and flow run only on a state without executor profiles; otherwise each reports
+    `"skipped_existing_profiles"`.
+    - Profile: one synthetic RunPod profile `smoke-<suffix>` with a key built at runtime. The key must be masked. A
+      relative SSH key path and a pasted key are refused with their Korean texts, and neither draft is saved.
+    - Controller: `controller_start`, then wait for `running` with this owner's `current.json`. The profile must be
+      in `current.profiles` and not in `skipped_profiles`. A second start gives `already_running`.
+    - D21: five `controller_status` round trips, timed in the page, with the median.
+    - The stop dialog on 실행 프로필: focus on the dialog heading, Esc closes it and changes nothing, focus returns
+      to the opener.
+    - `controller_stop`, then wait for `absent`; the profile is deleted and no profile is left.
+  - `FACTORY_SMOKE_FLOW=1` adds the A1-style chain on the seeded root: a blank project, a mapped CSV, an 80/10/10
+    split, an SFT LoRA recipe with `cutoff_len` 64 (the seed's reviewed limit), a `text` benchmark, then train →
+    evaluate. It plans a simulation, reads it back with `graph_plan_get`, submits it, starts the controller, waits
+    until the run is COMPLETED, and stops the controller.
+  - It visits 프로젝트, 실행 프로필, 그래프 실행 and the overview, with screenshots. It prints one JSON line with
+    `gpu_started: false` and `dataset_transferred: false`.
+  - A cleanup list stops a controller the smoke started and deletes its synthetic profiles, even after a failure.
+- `.github/workflows/windows-desktop.yml`: `paths` adds `scripts/seed_acceptance_root.py`, `examples/**` and
+  `configs/ai/**`. No new job.
+
+Actual verification:
+- RED first: `tests/test_release_version.py` failed 3 of 4 for the intended reasons (every field `0.3.0`, the
+  `내부 검토 0.3.0` literal, the three missing filters); the `pyproject` rule passed as an existing invariant. Then
+  4 of 4 passed.
+- `git diff desktop/src-tauri/Cargo.lock` shows exactly one line (the root package); the `package-lock.json` diff is
+  the two version fields.
+- `node --check desktop/tests/native-smoke.mjs` passes.
+- Scratch harness under `%TEMP%`, not committed and deleted afterwards. It ran the unmodified smoke over CDP port 9223
+  against this tree's Vite frontend in Chromium. The Tauri bridge was forwarded to the worktree's real Python sidecar
+  (`scripts/desktop_entry.py`) and a real `--controller` process. Credential Manager, the profile file and the broker
+  start line were emulated in memory.
+  - Fresh state: exit 0 in 22 s; vault check true; profile, controller and dialog checks true; status median about
+    0.5 s (source sidecar, not the frozen one); no controller alive afterwards; vault and profiles empty.
+  - `FACTORY_SMOKE_FLOW=1` on a state seeded by 11.2's real `seed_acceptance_root.py` (from `5ecfd45`): exit 0 in
+    50 s; the simulated train → evaluate run COMPLETED through the real controller.
+  - A state with a saved legacy key and a user profile: exit 0. `forget_credentials` and `controller_start` were
+    never called, and the user's two keys and profile were untouched.
+  - An injected failure after the controller started: exit 1, but the cleanup stopped the controller and deleted the
+    synthetic profile.
+  - The harness also caught two bugs before commit:
+    - A second identical `graph_plan` returns another `plan_sha256`, because an estimate pins `observed_at = now`.
+      With a fixed clock the hashes are equal; with a moved clock they differ. The smoke checks `graph_plan_get`
+      instead.
+    - The real seed refuses the default `cutoff_len` 1024.
+- `uv run pytest -q` (main venv, `PYTHONPATH` = this worktree's `src`): **1722 passed, 1 skipped** (1718 + 4).
+  `ruff check src tests` passes.
+- `cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --offline --release`: **49 passed**.
+- From `desktop/`: `npm run build` passes; `npx playwright test` against this tree's own Vite on port 1510 (scratch
+  config, `reuseExistingServer: false`): **251 passed**. No spec changed: the footer test reads `package.json`.
+- `scripts/check_secrets.py`: 0 findings with the change staged. Every changed file is CR-free.
+
+Not verified or still open:
+- The smoke against the installed 0.4.0 app (real WebView2, real broker and Credential Manager, the frozen sidecar's
+  round-trip median for D21) and its RED against 0.3.0: Task 11.6.
+- 11.3b (the frozen verifier) follows in this worktree. Its §4 step "graph_plan twice with the same plan_sha256" cannot
+  hold with a real clock (see above); it compares the stored plan instead.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
