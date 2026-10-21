@@ -1247,6 +1247,9 @@ def test_redact_strips_url_queries_and_json_tokens():
         f"token response {{'refresh_token': '{token}'}}": "token response {'refresh_token': '[redacted]'}",
         'GET http://mlflow.internal:5000/api/2.0/mlflow/runs/get failed': (
             'GET http://mlflow.internal:5000/api/2.0/mlflow/runs/get failed'),   # no query: unchanged
+        # RFC 3986 allows ' in a query; the value keeps no tail after it (last review)
+        f"GET https://h.example/o?sig={signature[:6]}'{signature[6:]}&se=1 failed": (
+            'GET https://h.example/o?[redacted] failed'),
     }
     for text, expected in texts.items():
         redacted = outbox_api.redact(text)

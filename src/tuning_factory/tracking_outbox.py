@@ -94,8 +94,9 @@ _QUOTED_SECRET = re.compile(r"(?i)([\"'](?:access_token|refresh_token|id_token|c
 _USERINFO = re.compile(r"://[^/\s@]++@")
 # A URL's query (11.5 R1 m6): signed storage URLs carry their credential there (Azure SAS ``sig=``, GCS
 # ``X-Goog-Signature``/``X-Goog-Credential``, S3 ``X-Amz-Signature``). The scheme, host and path stay readable. Found
-# per whitespace-delimited token by ``str.find``, so each character is looked at a bounded number of times.
-_TOKEN = re.compile(r"[^\s'\"<>]++")
+# per whitespace-delimited token by ``str.find``, so each character is looked at a bounded number of times. A ``'``
+# does not end the token: RFC 3986 allows it in a query.
+_TOKEN = re.compile(r"[^\s\"<>]++")
 
 
 def _strip_queries(match) -> str:
