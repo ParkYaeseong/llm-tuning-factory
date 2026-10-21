@@ -1,6 +1,5 @@
 """Software-only direct SSH contracts; every remote response is a local fixture."""
 import json
-import re
 from datetime import datetime, timezone
 
 import pytest
@@ -1467,6 +1466,7 @@ def test_linux_probe_reports_unreadable_machine_id_instead_of_a_traceback(tmp_pa
 
 
 def test_doctor_rejects_pod_id_combined_with_a_server_profile(tmp_path, monkeypatch):
+    from test_cli_graph import flat
     from typer.testing import CliRunner
 
     from tuning_factory import desktop_runtime
@@ -1480,9 +1480,9 @@ def test_doctor_rejects_pod_id_combined_with_a_server_profile(tmp_path, monkeypa
                                       "--server-profile", str(path)],
                                 env={"NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "200"})
     assert result.exit_code == 2, result.output
-    # Rich may colour, box and wrap usage errors depending on the terminal; compare plain words only.
-    plain = re.sub(r"\s+", " ", re.sub(r"[\u2500-\u257f]", " ", re.sub(r"\x1b\[[0-9;]*m", "", result.output)))
-    assert "pod-id" in plain
+    # Rich may colour, box and wrap usage errors depending on the terminal (Typer forces one on hosted CI); TERM=dumb
+    # keeps them plain today, and flat() compares plain words whatever the terminal.
+    assert "pod-id" in flat(result.output)
 
 
 def test_claim_refuses_an_inspection_as_server_facts(tmp_path):
