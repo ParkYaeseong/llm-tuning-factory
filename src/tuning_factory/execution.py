@@ -44,7 +44,8 @@ COLLECTION_INTERRUPTED = ("remote result collection was interrupted after the ho
 CONTENT_OS_ERRORS = (FileNotFoundError, NotADirectoryError, IsADirectoryError, FileExistsError)
 # Windows maps WinError 206 (file name too long) and 53/67 (network path or name not found) to ENOENT, so CPython
 # raises FileNotFoundError for them: local and fixable (a shorter state path, the share back), never content. So is
-# WinError 3 (path not found) for a path of MAX_PATH or more (11.5 final re-review). Only ``os.*`` functions set
+# WinError 3 (path not found) for a path of MAX_PATH or more while long paths are off (11.5 final re-review; with
+# them on, or for a ``\\?\`` name, the length is no reason). Only ``os.*`` functions set
 # ``winerror``: ``open()`` (paramiko's download, the freeze copy) raises the same failures as a bare FileNotFoundError,
 # so on Windows its path decides (``_windows_path_unreachable``).
 TRANSIENT_WINERRORS = frozenset({206, 53, 67})
@@ -53,12 +54,36 @@ WINDOWS = os.name == "nt"
 _stat = os.stat
 
 
+def _long_paths_enabled() -> bool:
+    """Whether this process may use paths of MAX_PATH or more (Windows' LongPathsEnabled with a long-path-aware
+    executable, which python.exe is); then a long path is no reason for a missing file."""
+    if not WINDOWS:
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.WinDLL("ntdll").RtlAreLongPathsEnabled())
+    except (AttributeError, OSError):
+        return False
+
+
+LONG_PATHS = _long_paths_enabled()
+
+
+def _too_long(name: str) -> bool:
+    """A path Windows refuses for its length: MAX_PATH or more while long paths are off, never a ``\\\\?\\`` name."""
+    return not LONG_PATHS and len(name) >= MAX_PATH and not name.startswith("\\\\?\\")
+
+
 def _windows_path_unreachable(exc: OSError) -> bool:
-    """A bare FileNotFoundError from ``open()`` on Windows whose path is MAX_PATH or longer, or whose folder cannot be
-    reached (its stat fails with WinError 53/67: the network share is gone)."""
-    names = [os.path.abspath(os.fsdecode(name)) for name in (exc.filename, exc.filename2)
-             if isinstance(name, (str, bytes, os.PathLike))]
-    if any(len(name) >= MAX_PATH for name in names):
+    """A bare FileNotFoundError from ``open()`` on Windows whose path is too long (``_too_long``) or whose folder cannot
+    be reached (its stat fails with WinError 53/67: the network share is gone). Never raises: it runs inside the
+    runner's exception handlers."""
+    try:
+        names = [os.path.abspath(os.fsdecode(name)) for name in (exc.filename, exc.filename2)
+                 if isinstance(name, (str, bytes, os.PathLike))]
+    except (ValueError, TypeError):
+        return False
+    if any(_too_long(name) for name in names):
         return True
     for name in names:
         try:
@@ -66,6 +91,8 @@ def _windows_path_unreachable(exc: OSError) -> bool:
         except OSError as error:
             if getattr(error, "winerror", None) in TRANSIENT_WINERRORS:
                 return True
+        except (ValueError, TypeError):
+            pass
     return False
 
 
@@ -77,9 +104,10 @@ def content_os_error(exc: BaseException) -> bool:
     winerror = getattr(exc, "winerror", None)
     if winerror in TRANSIENT_WINERRORS:
         return False
-    if winerror == 3 and any(len(str(name)) >= MAX_PATH for name in (exc.filename, exc.filename2) if name):
+    if winerror == 3 and any(_too_long(str(name)) for name in (exc.filename, exc.filename2) if name):
         return False
-    return not (winerror is None and WINDOWS and _windows_path_unreachable(exc))
+    # Windows raises a path too long or a gone share as ENOENT only, so only a bare FileNotFoundError is judged.
+    return not (winerror is None and WINDOWS and isinstance(exc, FileNotFoundError) and _windows_path_unreachable(exc))
 
 
 def transient_error(exc: BaseException) -> bool:

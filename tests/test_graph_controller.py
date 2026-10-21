@@ -1941,6 +1941,7 @@ def test_outputs_that_cannot_be_saved_locally_name_the_local_fix(tmp_path, monke
 
     if error == 'open_path_too_long':
         monkeypatch.setattr(execution, 'WINDOWS', True)
+        monkeypatch.setattr(execution, 'LONG_PATHS', False)
         monkeypatch.setattr(Path, 'open', long_open)
     else:
         monkeypatch.setattr(Path, 'rename', held)

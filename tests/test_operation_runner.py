@@ -1495,11 +1495,13 @@ def os_error(kind, winerror=None, filename=None):
     (os_error(FileNotFoundError, 67), True), (os_error(FileNotFoundError, 3, "C:/" + "d" * 300), True),
     (os_error(FileNotFoundError, 3, "C:/short"), False), (os_error(PermissionError, 32), True),
     (OSError(28, "no space left on device"), True)])
-def test_windows_path_errors_raised_as_file_not_found_stay_transient(error, transient):
+def test_windows_path_errors_raised_as_file_not_found_stay_transient(monkeypatch, error, transient):
     """Final re-review item 1: Windows raises WinError 206 (path too long) and 53/67 (network path or name gone), and
     WinError 3 (path not found) for a path of MAX_PATH or more, as FileNotFoundError. They are local and fixable
-    (OUTPUTS_NOT_SAVED names the path length), so both the freeze and the collection rule keep them uncertain."""
+    (OUTPUTS_NOT_SAVED names the path length), so both the freeze and the collection rule keep them uncertain. The
+    length rule holds only while Windows enforces MAX_PATH (long paths off)."""
     from tuning_factory import execution
+    monkeypatch.setattr(execution, "LONG_PATHS", False)
     assert api().local_transient(error) is transient
     assert execution.transient_error(error) is transient
 
@@ -1525,8 +1527,35 @@ def test_windows_open_errors_without_a_winerror_are_judged_by_their_path(monkeyp
         return None
 
     monkeypatch.setattr(execution, "WINDOWS", windows)
+    monkeypatch.setattr(execution, "LONG_PATHS", False)
     monkeypatch.setattr(execution, "_stat", stat)
     error = os_error(FileNotFoundError, filename=filename)
     assert getattr(error, "winerror", None) is None
     assert api().local_transient(error) is transient
     assert execution.transient_error(error) is transient
+
+
+LONG = "C:/" + "d" * 300
+
+
+def unstattable(path):
+    raise ValueError("embedded null character in path")
+
+
+@pytest.mark.parametrize("error,long_paths,stat", [
+    (os_error(FileNotFoundError, filename=LONG), True, None),       # long paths on: open() could reach that path
+    (os_error(FileNotFoundError, 3, LONG), True, None),
+    (os_error(FileNotFoundError, filename="\\\\?\\" + LONG), False, None),   # \\?\ is never held to MAX_PATH
+    (os_error(FileExistsError, filename=LONG), False, None),        # the path was usable: the name exists
+    (os_error(FileNotFoundError, filename=b"C:/\xff\xfe/f"), False, None),   # undecodable bytes: judged, not raised
+    (os_error(FileNotFoundError, filename="C:/state/f"), False, unstattable)])
+def test_a_long_or_odd_path_that_open_could_reach_stays_content(monkeypatch, error, long_paths, stat):
+    """Last review: with long paths enabled (python.exe opts in, and the "Disable path length limit" setting turns them
+    on machine-wide) a bare FileNotFoundError at 260+ characters means the file is really missing. A ``\\\\?\\`` name
+    and a FileExistsError show the path was usable. The judgement never raises inside the runner's handlers."""
+    from tuning_factory import execution
+    monkeypatch.setattr(execution, "WINDOWS", True)
+    monkeypatch.setattr(execution, "LONG_PATHS", long_paths)
+    monkeypatch.setattr(execution, "_stat", stat or (lambda path: None))
+    assert api().local_transient(error) is False
+    assert execution.transient_error(error) is False
