@@ -60,7 +60,8 @@ def require_complete_oidc():
 
 
 INSECURE_TRACKING = ("인증값을 사용하는 MLflow 서버 주소는 HTTPS여야 합니다. 인증 없는 로컬·내부 HTTP 서버는 "
-                     "토큰과 OIDC 값을 비우거나 앱에서 ‘인증 없음’을 선택하세요.")
+                     "토큰과 OIDC 값, 기본 인증 환경 변수(MLFLOW_TRACKING_USERNAME/MLFLOW_TRACKING_PASSWORD)를 "
+                     "비우거나 앱에서 ‘인증 없음’을 선택하세요.")
 
 
 def _bearer_configured():

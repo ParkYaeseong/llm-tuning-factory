@@ -67,8 +67,9 @@ def test_http_with_basic_credentials_is_refused(tmp_path, monkeypatch, names):
     values = {"MLFLOW_TRACKING_USERNAME": "operator", "MLFLOW_TRACKING_PASSWORD": "synthetic-" + "basic-password"}
     for name in names:
         monkeypatch.setenv(name, values[name])
-    with pytest.raises(ValueError, match="HTTPS"):
+    with pytest.raises(ValueError, match="HTTPS") as refused:
         require_secure_tracking("http://x")
+    assert all(name in str(refused.value) for name in BASIC)   # the user learns what to clear
     with pytest.raises(ValueError, match="HTTPS"):
         MLflowTracker("http://mlflow.example", client=FakeClient())
     monkeypatch.setattr("tuning_factory.auth.configure_oidc", lambda: None)

@@ -1132,8 +1132,8 @@ def test_a_graph_job_is_never_requeued_outside_the_controller(tmp_path):
     store.prepare_ready(ctl)
     claimed = store.claim_ready(w.facts[0], ctl)
     assert store.jobs.abandon_unlaunched(claimed['lease'], 'refused before launch')
-    with pytest.raises(ValueError, match='graph-owned'):
-        store.jobs.reset_for_resume(claimed['id'])
+    with pytest.raises(ValueError, match='graph-owned.*change an input and plan again'):
+        store.jobs.reset_for_resume(claimed['id'])   # as graph_store.PLAN_SUBMITTED: no graph retry action exists
     from tuning_factory.runner import Factory
     with pytest.raises(ValueError, match='graph-owned'):   # `factory resume <job>`, before the v1 manifest is read
         Factory(tmp_path).resume(claimed['id'])

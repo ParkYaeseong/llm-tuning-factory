@@ -13,8 +13,8 @@ ACTIVE = {'PROVISIONING', 'RUNNING', 'EVALUATING'}
 NON_HARDWARE = ('local:', 'simulation:')
 GRAPH_LAUNCH_REFUSED = 'graph run is not running; launch refused'
 GRAPH_CANCEL_REFUSED = 'graph job cancel requested; launch refused'
-GRAPH_RESUME_REFUSED = ('a graph-owned job is retried only by its graph controller; resume refused '
-                        '(retry or re-run the graph instead)')
+# As graph_store.PLAN_SUBMITTED: a plan is never registered twice, and no graph retry action exists.
+GRAPH_RESUME_REFUSED = 'a graph-owned job is never resumed by hand; to run it again, change an input and plan again'
 RECEIPT_CHUNK = 500  # Stay far below SQLite's variable limit.
 TERMINAL = {'FAILED', 'CANCELED', 'COMPLETED'}
 CANCELLATION_REQUESTED = 'cancellation requested'   # a graph attempt's result after a job or run cancel
