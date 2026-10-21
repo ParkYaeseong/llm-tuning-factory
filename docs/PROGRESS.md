@@ -5706,10 +5706,22 @@ Actual verification:
 - Every changed file is CR-free, and a byte scan finds no bidi control, U+061C or NUL in them.
 - Scratch configs, probes and plugins under `%TEMP%` were deleted.
 
+- Rebased onto `0f84972` (11.2's seed script, 11.3a/b and 11.4). Only this file conflicted, and every entry was kept.
+  On the rebased tree:
+  - `pytest -q` **1735 passed, 1 skipped** (the base's new tests plus these 10), beside a full Playwright run;
+  - `npx playwright test` **254 passed**, and `npm run build` passes;
+  - Ruff passes, and `check_secrets.py` reports 0 findings;
+  - the CPU acceptance gives **29/29** with the same `source_sha256` (the base changed nothing under `src/`).
+
 Not verified or still open:
 - No machine-level reproduction of the two Windows flakes (WinError 5, the 30 s first tick); each fix addresses the
   mechanism found.
 - Hardening a flaky legacy test (`connections.spec.ts`) is the listed deviation of §1.
+- For 11.4 (its files, not edited here), three sentences now lag this change:
+  - `docs/CONFIGURATION.md` "issues point at the offending field": an unknown key points at the object holding it.
+  - `docs/CONFIGURATION.md` on `graph_submit`: the desktop sends `plan-<plan_sha256>` as the request ID.
+  - `docs/TRAINING_WORKFLOWS.md` §6 "다시 실행하려면 다시 계획하세요": the same inputs plan the same hash, which
+    answers with the first run. Change an input to run again.
 
 ---
 
