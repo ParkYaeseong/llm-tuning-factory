@@ -12,6 +12,7 @@ import importlib
 import json
 import os
 import pathlib
+import re
 import signal
 import socket
 import sqlite3
@@ -211,9 +212,15 @@ def lines(result):
     return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
 
 
+# Terminal escape sequences: CSI (colour, bold, cursor) and OSC (hyperlinks, titles). Typer forces a terminal whenever
+# GITHUB_ACTIONS, FORCE_COLOR or PY_COLORS is set, so on hosted CI Rich styles every help screen and error panel.
+TERMINAL_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]")
+
+
 def flat(text):
-    """Typer's error panel without its box: words joined by single spaces, so a wrapped message reads whole."""
-    return " ".join(word for word in text.split() if any(char.isalnum() for char in word))
+    """Typer's help screen or error panel as plain words joined by single spaces: without terminal escapes (however
+    the environment forces a terminal) and without its box, so a wrapped message reads whole."""
+    return " ".join(word for word in TERMINAL_ESCAPE.sub("", text).split() if any(char.isalnum() for char in word))
 
 
 def codes(result):
@@ -658,9 +665,10 @@ def test_cli_profiles_file_refuses_inline_secrets(tmp_path, monkeypatch):
 
 
 # 10
-def test_existing_cli_commands_are_unchanged():
+def test_existing_cli_commands_are_unchanged(tmp_path, monkeypatch):
     """Plan §1 "Legacy stays frozen": every v1 command keeps its flags (``tests/test_runner_cli.py`` and the other
     CLI tests pass unchanged in the same run), and ``--help`` still lists every one of them."""
+    monkeypatch.chdir(tmp_path)   # the default --state-dir and --env-file are relative: never the checkout's
     cli_module()
     group = typer.main.get_command(app)
 
@@ -682,6 +690,25 @@ def test_existing_cli_commands_are_unchanged():
     listed = set(flat(result.output).split())
     for name in [*(name for name in LEGACY if name), *GRAPH_COMMANDS]:
         assert name in listed, name
+
+
+def test_help_reads_the_same_through_a_forced_terminal(tmp_path, monkeypatch):
+    """Typer forces a terminal under GITHUB_ACTIONS, FORCE_COLOR or PY_COLORS, and Rich then styles the help with
+    escape sequences: ``flat`` reads the same words either way (hosted CI was red on exactly this from 9.6 to 11.1)."""
+    import typer.rich_utils
+
+    monkeypatch.chdir(tmp_path)   # ``graph-work --help`` runs the root callback with the relative defaults
+    monkeypatch.setenv("COLUMNS", "200")   # one width for both renders
+    for name in ("TERM", "NO_COLOR"):   # TERM=dumb would keep a forced terminal plain
+        monkeypatch.delenv(name, raising=False)
+    shown = {}
+    for forced in (False, True):
+        monkeypatch.setattr(typer.rich_utils, "FORCE_TERMINAL", forced)
+        shown[forced] = [CliRunner().invoke(app, argv).output for argv in (["--help"], ["graph-work", "--help"])]
+    escape = chr(27)
+    assert all(escape in text for text in shown[True]) and not any(escape in text for text in shown[False])
+    assert [flat(text) for text in shown[True]] == [flat(text) for text in shown[False]]
+    assert "graph-work" in flat(shown[True][0]).split() and "then a final line" in flat(shown[True][1])
 
 
 # 11 (D11 parity: the CLI plans the destination hash its own controller reports)
@@ -1174,9 +1201,14 @@ def test_tracking_uri_option_applies_to_graph_plans_submissions_and_the_controll
     assert current_json(found.state)["tracking_settings_sha256"] == expected and calls == []
 
 
-def test_graph_work_refusals_before_the_start_print_a_final_line(tmp_path):
+def test_graph_work_refusals_before_the_start_print_a_final_line(tmp_path, monkeypatch):
     """Exit 2 (the sidecar's invalid start) with the uniform final line: here MLflow settings that cannot form a
     tracking scope (an over-long URI)."""
+    scratch = tmp_path / "cwd"
+    scratch.mkdir()
+    # ``graph-work --help`` runs the root callback with the relative default --state-dir and --env-file: a scratch
+    # working directory keeps it away from the checkout's state/ and .env.
+    monkeypatch.chdir(scratch)
     cli = cli_module()
     state = tmp_path / "state"
     factory = Cli(state, env_file(tmp_path, MLFLOW_TRACKING_URI="https://mlflow.invalid/" + "a" * 3000))

@@ -5734,6 +5734,52 @@ Not verified or still open:
   - `docs/TRAINING_WORKFLOWS.md` §6 "다시 실행하려면 다시 계획하세요": the same inputs plan the same hash, which
     answers with the first run. Change an input to run again.
 
+## Hosted CI red since 7291742 (Task 9.6), fixed, 2026-10-21
+
+Commit `test: keep CLI help tests stable under hosted CI terminals`, in the worktree `D:\llm-tuning-factory-wt102` on
+`01c8503`. Test only: `tests/test_cli_graph.py`, `tests/test_gpu_servers.py` and this file. Found by integration
+review R5.
+
+- **Red since 9.6.** The hosted workflow "CPU verification" (`.github/workflows/ci.yml`) failed on every push from
+  `7291742` to `01c8503`: 26 consecutive red runs in `gh run list`, 39477435008 to 39534232202 (the review counted
+  29). The last green run was 39475674047 on `0c38b3f`.
+  - Ubuntu: `2 failed, 1748 passed, 5 skipped, 1 deselected`. The failures were
+    `test_cli_graph.py::test_existing_cli_commands_are_unchanged` and
+    `test_graph_work_refusals_before_the_start_print_a_final_line`, which both read `--help` through `flat()`.
+  - Windows: cancelled by fail-fast at about 28 % of its pytest step, after the same two failures. The rest of the
+    Windows suite has not run on hosted CI since `7291742`.
+- **The earlier green claims were local only.** The suite counts in the entries from Task 9.6 to Task 11.1 above
+  (up to "1755 passed, 1 skipped") are local Windows runs without `GITHUB_ACTIONS`. Hosted CI was red throughout.
+- **Cause.** `typer.rich_utils` reads `GITHUB_ACTIONS`, `FORCE_COLOR` and `PY_COLORS` at import and then forces a
+  terminal. Rich styles the help with ANSI escapes even under `CliRunner`, and `flat()` kept the escapes glued to
+  the words, so no command name or help sentence matched. RED locally: with `GITHUB_ACTIONS=true CI=true`, both tests
+  fail on Windows; without them, both pass.
+- **Fix.**
+  - `flat()` strips terminal escape sequences (CSI and OSC) before it joins the words. This holds whatever forces the
+    terminal. A per-test `NO_COLOR` or `_TYPER_FORCE_DISABLE_TERMINAL` would not: Typer has read its variables at
+    import, and `NO_COLOR` keeps bold.
+  - New `test_help_reads_the_same_through_a_forced_terminal`: root `--help` and `graph-work --help`, rendered with
+    `typer.rich_utils.FORCE_TERMINAL` off and on, give the same `flat()` words, and the forced render does carry
+    escapes. RED: with the stripping disabled (a scratch plugin), it fails with no CI variable set.
+  - `test_gpu_servers.py::test_doctor_rejects_pod_id_combined_with_a_server_profile` now uses the same `flat()`
+    instead of its own SGR-only regex. It already passed on hosted CI, because its `TERM=dumb` keeps Rich plain.
+  - Audit: before the fix, the full suite with `GITHUB_ACTIONS=true CI=true` failed only these two tests
+    (`2 failed, 1753 passed, 1 deselected`).
+- **The help tests no longer touch the checkout (review M2).** `graph-work --help` runs the root callback, which
+  builds `Factory(Path("state"))` and loads `.env` relative to the working directory, so the test created or migrated
+  the repository's `./state/jobs.db`. With `state/` moved aside, the old tests recreated it and the new ones do not.
+  Both help tests now `monkeypatch.chdir` into a scratch directory. The other CLI tests already pass `--state-dir`.
+- **Windows.** `ci.yml` and `windows-desktop.yml` show no other blocker. `.gitattributes` pins LF, and
+  `windows-desktop.yml` runs only on pull requests and by hand.
+
+Actual verification (main venv, `PYTHONPATH` set to this worktree's `src`, Windows):
+- `pytest -q`: **1756 passed, 1 skipped**, the 1755 baseline plus the new test.
+- `GITHUB_ACTIONS=true CI=true pytest -q`: **1756 passed, 1 skipped**.
+- `GITHUB_ACTIONS=true CI=true pytest -m "not gpu" -q`, the hosted command: **1756 passed, 1 deselected**.
+- `ruff check src tests` passes, and `scripts/check_secrets.py` reports 0 findings.
+
+Not verified here: the hosted run of this commit. Its result is reported with the push, not in this entry.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
