@@ -13,6 +13,9 @@ const artifact = (c: string) => hex(c, 64);
 const OPERATOR_CONFIRMATION = "operator confirmation required: release-lock --confirm-execution-stopped";
 const AWAITING_RESULT = "waiting for the result of the same launch (its time limit has not passed)";
 const OUTPUTS_REFUSED = "the completed attempt's outputs could not be recorded; an operator must inspect it: ValueError: inventory differs";
+const OUTPUTS_NOT_SAVED = "the result arrived but its outputs could not be saved on this PC; free disk space, check the state folder's "
+  + "permissions, an antivirus scan or the path length; it is retried automatically, or release the lock to give the result up: "
+  + "PermissionError: [WinError 32] in use";
 const BUDGET = "approved budget exhausted: 12 of 10 USD already reserved (historical attempts reserved by the Task 8 migration count too); re-plan with a larger budget";
 const UNPRICED = "a pre-Task-8 attempt could not be priced; it reserves the run's whole approved budget";
 const EVIDENCE_CHANGED_ACTION = "local evidence changed after it was recorded; re-arming cannot repair it. Restore the attempt's original evidence files, or re-run the node in a new graph run";
@@ -295,6 +298,35 @@ test("awaiting a late result is different from needing the operator", async ({ p
     expect(keys.length, attribute).toBeGreaterThan(3);
     expect(new Set(keys).size, attribute).toBe(keys.length);
   }
+  expect(await calls(page, { action: "graph_release_lock" })).toHaveLength(0);
+});
+
+test("a result that arrived but could not be saved offers its release, then shows it released", async ({ page }) => {
+  // graph_controller.OUTPUTS_NOT_SAVED (11.5): uncertain, nothing awaited (the result was accepted), needs the operator.
+  const nodes = [
+    node("train-s", { label: "저장 실패 단계", status: "RUNNING", job_id: J_A, attempt_id: A_A, attempts: 1, counted_attempts: 1,
+      job_status: "FAILED", uncertain: true, needs_operator: true, wait_reason: OUTPUTS_NOT_SAVED }),
+    // Released already: the lock is gone, the reason stays until the controller's next tick (none runs here).
+    node("train-r", { label: "해제된 저장 실패 단계", status: "RUNNING", job_id: J_B, attempt_id: A_B, attempts: 1,
+      counted_attempts: 1, job_status: "FAILED", needs_operator: true, wait_reason: OUTPUTS_NOT_SAVED }),
+  ];
+  await openWorkbench(page, { workflow: { graph_runs_list: listOf(entry(run())), controller_status: controllerStatus("absent"),
+    graph_run_get: detail(run({}, nodes), { controller: controllerView("absent") }) } });
+  await openRun(page, RUN);
+  const unsaved = operatorItem(page, "train-s");
+  await expect(unsaved).toContainText("운영자 확인 필요");
+  await expect(unsaved).toContainText("이 PC에 저장하지 못했습니다");
+  await expect(unsaved).toContainText("결과를 포기");
+  await expect(unsaved).toContainText("output_invalid");
+  await expect(unsaved).not.toContainText("원격 실행이 멈췄는지 알 수 없어");
+  await expect(unsaved.getByRole("button", { name: "실행 잠금 해제" })).toHaveCount(1);
+  await expect(nodeRow(page, "train-s")).toContainText("이 PC에 저장하지 못했습니다");
+  const released = operatorItem(page, "train-r");
+  await expect(released).toContainText("잠금이 이미 해제되었습니다");
+  await expect(released).toContainText("컨트롤러를 시작");
+  await expect(released).not.toContainText("데스크톱에서 해결할 수 없습니다");
+  await expect(released.getByRole("button")).toHaveCount(0);
+  await expect(detailCard(page).getByRole("button", { name: /잠금 해제/ })).toHaveCount(1);
   expect(await calls(page, { action: "graph_release_lock" })).toHaveLength(0);
 });
 

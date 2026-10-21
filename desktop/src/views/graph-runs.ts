@@ -37,10 +37,14 @@ const PRE_OUTBOX = "기록 대기열이 생기기 전에 끝난 실행이라 MLf
 /** An unreadable run needs an operator's repair; it is not read again on its own (11.5 R3 M4). */
 const UNREADABLE_NOTE = "운영자가 실행 기록을 복구해야 합니다. 자동으로 다시 확인하지 않습니다. 복구한 뒤 ‘다시 확인’을 누르세요.";
 const HIDDEN_CHARACTERS = "이름의 보이지 않는 문자(폭 없는 공백, 방향 제어 문자 등)는 빼고 표시했습니다. 입력할 때도 빼고 비교합니다.";
-/** The reasons graph_status gives an uncertain attempt (OPERATOR_CONFIRMATION, RESULT_OVERDUE): with `needs_operator`
- * still true but `uncertain` false, the lock was released (by this app, another session or the CLI) and the
- * controller has not settled the node yet (9.8: until its next tick). */
-const RELEASE_REASON = /^(?:operator confirmation required|no result after the launch's time limit)/;
+/** The reasons graph_status gives an uncertain attempt (OPERATOR_CONFIRMATION, RESULT_OVERDUE, OUTPUTS_NOT_SAVED): with
+ * `needs_operator` still true but `uncertain` false, the lock was released (by this app, another session or the CLI)
+ * and the controller has not settled the node yet (9.8: until its next tick). */
+const RELEASE_REASON = /^(?:operator confirmation required|no result after the launch's time limit|the result arrived but its outputs could not be saved on this PC)/;
+/** graph_controller.OUTPUTS_NOT_SAVED (11.5): the attempt's result arrived, but saving its outputs failed on this PC. */
+const NOT_SAVED_REASON = /^the result arrived but its outputs could not be saved on this PC/;
+const NOT_SAVED_RELEASE = "결과는 도착했지만 이 PC에 저장하지 못해 실행 자원 잠금을 유지하고 있습니다. 위 원인(디스크 여유 공간, 상태 폴더 권한, 백신 검사, 경로 길이)을 고치면 자동으로 다시 저장합니다. 잠금을 해제하면 이 결과를 포기하고 출력 무효(output_invalid)로 기록하며 다시 실행하지 않습니다.";
+const UNKNOWN_STOP_RELEASE = "원격 실행이 멈췄는지 알 수 없어 이 단계의 실행 자원 잠금을 유지하고 있습니다. 원격 서버나 Pod에서 실행이 멈춘 것을 확인한 뒤에만 잠금을 해제하세요.";
 const CLI_NOTE = "설치형 앱에는 factory 명령이 들어 있지 않습니다. 소스로 설치한 운영자 환경에서 같은 상태 폴더를 지정해 실행하세요.";
 const TEXT_METRICS = new Set(["exact_match", "character_f1"]);
 const FORMAT_METRICS = new Set(["json_validity"]);
@@ -291,8 +295,9 @@ function operatorItem(run: GraphRun, node: GraphRunNode, controller: ControllerV
     return `<article ${attrs}>${head(statusPill("neutral", "잠금 해제됨"))}<p>${escapeHtml(RELEASED)}</p>${controller?.state === "running" ? "" : `<p>${escapeHtml(RELEASED_START)}</p>`}</article>`;
   const cli = `<details class="run-cli-details" data-open-key="cli:${escapeHtml(node.node_id)}"><summary data-focus-key="cli:${escapeHtml(node.node_id)}">명령줄로 해제하기(대안)</summary><p class="muted">${CLI_NOTE}</p><pre class="run-cli">${operatorInstruction(run.run_id, node)}</pre></details>`;
   if (releasable(node)) {
+    const body = NOT_SAVED_REASON.test(node.wait_reason ?? "") ? NOT_SAVED_RELEASE : UNKNOWN_STOP_RELEASE;
     return `<article ${attrs}>${head(statusPill("warn", "운영자 확인 필요"))}${reason}
-      <p>원격 실행이 멈췄는지 알 수 없어 이 단계의 실행 자원 잠금을 유지하고 있습니다. 원격 서버나 Pod에서 실행이 멈춘 것을 확인한 뒤에만 잠금을 해제하세요.</p>
+      <p>${escapeHtml(body)}</p>
       <div class="actions">${keyedButton("실행 잠금 해제", `wf:runs:release:${node.node_id}`, `release:${node.node_id}`)}</div>${cli}</article>`;
   }
   const job = node.job_id || "<JOB_ID>";
