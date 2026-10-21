@@ -5921,6 +5921,16 @@ transfer.
   needs an original candidate beside its merged one", it always records no winner). Recorded: not a schema
   validator, so plans and runs stored with such graphs stay readable; `SelectNode.evaluations` keeps no
   `max_length` (64 nodes bound it).
+- **Re-review minors m1-m3: fixed.** m1: `graph_planner.NodeRefusal` (a `ValueError` with `node_id`) is raised by
+  the selection-shape refusals and wraps every `_static_routes` refusal; `graph_plan` reports it as `{"code":
+  "plan_refused", "path": "/graph/nodes/<index>", "node_id": <node>, "message": <unchanged text>}`, and a refusal of
+  the whole plan keeps `path: ""`, `node_id: null` (`tests/test_plan_refusal_nodes.py`, through the channel). m2: the
+  snapshot client sends `Accept-Encoding: identity` and refuses an encoded answer unread (`snapshot_failed`,
+  `hf_targets.ENCODED_RESPONSE`; gzip MockTransport test). m3: a deterministic test holds submit `a` inside its
+  `BEGIN IMMEDIATE` until submit `b` reaches its own, then `b` refuses with `a`'s run; with the check moved before
+  the transaction it fails. Verified: the ten affected test files **396 passed**; `GITHUB_ACTIONS=true CI=true` on
+  `test_plan_refusal_nodes`, `test_workflow_planning`, `test_workflow_runs` **141 passed**; ruff clean;
+  `git diff --check` clean.
 
 Verification (this worktree, Python 3.12, `uv sync --extra dev --extra tracking --locked`):
 - `uv run pytest -q`: **1808 passed, 1 skipped** (755 s; the skip is the opt-in real-GPU test). An earlier full run
