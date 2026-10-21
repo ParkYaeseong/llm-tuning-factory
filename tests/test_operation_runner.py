@@ -1366,3 +1366,36 @@ def test_a_content_error_after_completion_stays_terminal(tmp_path, monkeypatch):
     outcome = run(w)
     assert (outcome.status, outcome.uncertain) == ("FAILED", False) and not held_locks(w)
     assert w.runner.failure_kind(w.job_id) == "output_invalid"
+
+
+@pytest.mark.parametrize("price,gpus", [(0.21, 3), (0.11, 5)])
+def test_a_pinned_total_is_compared_with_the_live_total(tmp_path, monkeypatch, price, gpus):
+    """R1 I-4: the pinned total split per GPU and multiplied back rounds below itself (0.21/3*3 < 0.21), so the
+    unchanged live price of an approved destination was refused before launch. Totals are compared directly."""
+    assert price / gpus * gpus < price   # the rounding the split check tripped on
+    facts = FACTS.model_copy(update={"gpu_count": gpus, "total_hourly_cost_usd": price})
+    w = world(tmp_path, monkeypatch, graph_options={"facts": facts})
+    w.executor.pod = {**POD, "gpu": {**POD["gpu"], "count": gpus}, "costPerHr": price}
+    outcome = run(w)
+    assert outcome.status == "COMPLETED", outcome.error
+    assert w.calls == ["train.bound.yaml"] and len(w.host.launches) == 1
+
+
+@pytest.mark.parametrize("change,message", [("price", "price exceeds approved resource budget"),
+                                            ("count", "GPU count differs from live Pod"),
+                                            ("type", "GPU type differs from live Pod")])
+def test_a_live_pod_above_the_pinned_total_or_another_gpu_is_still_refused(tmp_path, monkeypatch, change, message):
+    import math
+    facts = FACTS.model_copy(update={"gpu_count": 3, "total_hourly_cost_usd": 0.21})
+    w = world(tmp_path, monkeypatch, graph_options={"facts": facts})
+    pod = {**POD, "gpu": {**POD["gpu"], "count": 3}, "costPerHr": 0.21}
+    if change == "price":
+        pod["costPerHr"] = math.nextafter(0.21, 1)   # the smallest real increase
+    elif change == "count":
+        pod["gpu"] = {**pod["gpu"], "count": 2}
+    else:
+        pod["gpu"] = {**pod["gpu"], "id": "H100", "displayName": "H100"}
+    w.executor.pod = pod
+    outcome = run(w)
+    assert (outcome.status, outcome.uncertain) == ("FAILED", False) and message in outcome.error
+    assert w.host.commands == [] and w.calls == [] and not held_locks(w)

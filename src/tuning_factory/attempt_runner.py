@@ -38,7 +38,6 @@ from typing import Literal
 
 from pydantic import TypeAdapter
 
-from .config import ResourceProfile
 from .execution import CachedTransfer, ExecutionUncertain
 from .executor_profiles import ResourceObservation, approval_destination, observation_fits
 from .gpu_servers import SSHServerProfile
@@ -96,12 +95,6 @@ class OperationOutcome:
     outputs: NodeOutputs | None
     inspected_targets: tuple[ModelTargetEvidence, ...] = ()
     error: str | None = None
-
-
-@dataclass(frozen=True)
-class _PinnedResources:
-    """What ``executor.validate_config`` reads: the operation's pinned resource budget."""
-    resource_profile: ResourceProfile
 
 
 class OperationAttemptRunner:
@@ -427,8 +420,10 @@ class OperationAttemptRunner:
         resolved_for = getattr(executor, "destination_profile", None)
         if resolved_for is not None and resolved_for != profile:
             raise mismatch
-        # Live GPU type, count and price against the pinned budget (RunPod Pod or observed SSH selection).
-        executor.validate_config(_PinnedResources(pinned.legacy_resources(resources.timeout_seconds)))
+        # Live GPU type, count and total price against the pinned facts (RunPod Pod or observed SSH selection). The
+        # pinned total itself, never split per GPU and multiplied back: 0.21/3*3 < 0.21 refused an unchanged price
+        # (11.5 R1 I-4), as observation_fits compares totals at claim.
+        executor.validate_budget(pinned.gpu_count, pinned.gpu_type, pinned.total_hourly_cost_usd)
 
     def _check_datasets(self, manifest, operation) -> None:
         expected = ([operation.dataset] if isinstance(operation, TrainOperation) else

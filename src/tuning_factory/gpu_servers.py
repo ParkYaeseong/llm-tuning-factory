@@ -243,12 +243,17 @@ class SSHServerFacts(StrictModel):
                                max_cost_usd=max(self.cost(seconds), 1e-12))
 
     def validate_config(self, config):
+        """A v1 job: its per-GPU price times its GPU count is the hourly budget."""
         resource = config.resource_profile
-        if resource.gpu_count != self.gpu_count:
+        self.validate_budget(resource.gpu_count, resource.gpu_type, resource.hourly_cost_usd * resource.gpu_count)
+
+    def validate_budget(self, gpu_count, gpu_type, total_hourly_cost_usd):
+        """This selection against a GPU count, type and total hourly budget (a v2 operation's pinned total)."""
+        if gpu_count != self.gpu_count:
             raise ValueError("claimed job GPU count differs from observed SSH server selection")
-        if resource.gpu_type != self.gpu_type:
+        if gpu_type != self.gpu_type:
             raise ValueError("claimed job GPU type differs from observed SSH server selection")
-        if self.total_hourly_cost_usd > resource.hourly_cost_usd * resource.gpu_count:
+        if self.total_hourly_cost_usd > total_hourly_cost_usd:
             raise ValueError("claimed job price exceeds approved resource budget")
 
 

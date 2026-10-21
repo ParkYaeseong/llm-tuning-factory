@@ -240,17 +240,23 @@ class SSHExecutor(ExecutionBackend):
         self.model_cache_root = model_cache_root
 
     def validate_config(self, config):
+        """A v1 job: its per-GPU price times its GPU count is the hourly budget."""
+        resource = config.resource_profile
+        self.validate_budget(resource.gpu_count, resource.gpu_type, resource.hourly_cost_usd * resource.gpu_count)
+
+    def validate_budget(self, gpu_count, gpu_type, total_hourly_cost_usd):
+        """The live destination against a GPU selection and a total hourly budget. A v2 operation passes its pinned
+        total directly: split per GPU and multiplied back it can round below itself (11.5 R1 I-4)."""
         if self.server_profile is not None:
             validate_server_binding(self.server_profile, self.server_facts)
-            self.server_facts.validate_config(config)
+            self.server_facts.validate_budget(gpu_count, gpu_type, total_hourly_cost_usd)
             return
         pod = self.pod
-        resource = config.resource_profile
         if not pod:
             raise ValueError("live RunPod metadata required before transfer")
-        if pod.get("gpu", {}).get("count") != resource.gpu_count:
+        if pod.get("gpu", {}).get("count") != gpu_count:
             raise ValueError("claimed job GPU count differs from live Pod")
-        if resource.gpu_type not in {pod.get("gpu", {}).get("id"), pod.get("gpu", {}).get("displayName")}:
+        if gpu_type not in {pod.get("gpu", {}).get("id"), pod.get("gpu", {}).get("displayName")}:
             raise ValueError("claimed job GPU type differs from live Pod")
         try:
             price = float(pod["costPerHr"])
@@ -258,7 +264,7 @@ class SSHExecutor(ExecutionBackend):
             raise ValueError("positive finite live RunPod API price required") from None
         if not math.isfinite(price) or price <= 0:
             raise ValueError("positive finite live RunPod API price required")
-        if price > resource.hourly_cost_usd * resource.gpu_count:
+        if price > total_hourly_cost_usd:
             raise ValueError("claimed job price exceeds approved resource budget")
 
     def mkdir(self, sftp, path):
