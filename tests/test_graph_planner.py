@@ -358,6 +358,65 @@ def test_dpo_transition_requires_materialized_parent_and_exact_reference(tmp_pat
     assert plan_graph(revise(project, graph), choices, (facts,)).nodes[-1].inputs[0].conditional
 
 
+def test_lora_sft_materialized_into_dpo_binds_policy_and_reference_to_the_materialized_model(tmp_path):
+    """Task 11.5 (R5 M6): LoRA SFT -> materialize -> DPO compiles the DPO node with the policy base, the frozen
+    reference base and the materialized artifact all the same full model (a new adapter, no continuation)."""
+    from test_model_artifacts import fixture_model, updated
+
+    from tuning_factory.graph_planner import ModelContext, NodeModelBinding, ProducerEvidence, VerifiedBindings
+    from tuning_factory.model_artifacts import ModelArtifactStore
+    from tuning_factory.model_hub import ModelProfile
+    registry, project, choices, facts = fixture(tmp_path)
+    store = ModelArtifactStore(tmp_path / "models")
+    adapter_directory, adapter = adapter_fixture(tmp_path)
+    adapter_ref = store.freeze(adapter_directory, adapter)
+    full_directory, full = fixture_model(tmp_path, marker="materialized")
+    full = updated(full, producer_job_id="materialized", producer_attempt_id="materialized", parents=(adapter_ref,))
+    full_ref = store.freeze(full_directory, full)
+    root = full.root
+    path = tmp_path / "preference.json"
+    path.write_bytes(canonical([{"instruction": "prefer", "chosen": "yes", "rejected": "no"}]))
+    record = registry.register_dataset("pref", "1", path, kind="preference")
+    dataset = DatasetRef(dataset_id="pref", version="1", sha256=record["sha256"])
+    dpo = RecipeSpec(recipe_id="dpo", name="DPO", training_stage="dpo", input_kind="preference")
+    revision = Revision(spec=dpo, revision_sha256=digest(canonical(dpo.model_dump(mode="json"))))
+    graph = {"nodes": [
+        {**project.spec.graph["nodes"][0], "model_input": ModelInput(
+            policy=ModelLoadRef(base=root), initialization="new_adapter").model_dump(mode="json")},
+        {"kind": "materialize", "id": "full", "label": "Materialize",
+         "model": {"node_id": "train.1", "output_name": "model"}, "executor_profile_ids": ["p"]},
+        {"kind": "train", "id": "dpo", "label": "DPO", "recipe_revision": revision.revision_sha256,
+         "model_input": {"node_id": "full", "output_name": "model"}, "dataset_binding": "pref",
+         "executor_profile_ids": ["p"]}]}
+    project = revise(project, graph, [*project.spec.datasets,
+                                      DatasetBinding(binding_id="pref", role="train", dataset=dataset)])
+    profile = ModelProfile(repo_id=root.repo_id, revision=root.revision, config_sha256=root.config_sha256,
+                           architecture="qwen2", template="qwen")
+    choices = choices.model_copy(update={
+        "recipes": (*choices.recipes, revision), "models": (ModelContext(root=root, profile=profile),),
+        "datasets": (*choices.datasets, snapshot_dataset(registry, dataset)),
+        "node_resources": (*choices.node_resources, NodeResources(node_id="full", timeout_seconds=900),
+                           NodeResources(node_id="dpo", timeout_seconds=900))})
+    plan = plan_graph(project, choices, (facts,))
+
+    def produced(ref, descriptor, node_id, stage):
+        return ProducerEvidence(model=ref, job_id=descriptor.producer_job_id,
+                                attempt_id=descriptor.producer_attempt_id,
+                                manifest_sha256=descriptor.producer_manifest_sha256, runtime_profile="primary",
+                                training_stage=stage, status="completed", tracking_acknowledged=True,
+                                plan_sha256=plan.sha256, node_id=node_id)
+
+    operation = compile_node(plan, "dpo", VerifiedBindings(
+        registry, store, choices.executors[0],
+        outputs=(NodeModelBinding(node_id="train.1", model=adapter_ref), NodeModelBinding(node_id="full", model=full_ref)),
+        producers=(produced(adapter_ref, adapter, "train.1", "sft"), produced(full_ref, full, "full", None))))
+    model_input = operation.model_input
+    assert model_input.initialization == "new_adapter" and model_input.policy == ModelLoadRef(base=full_ref)
+    assert model_input.frozen_reference == model_input.policy
+    assert model_input.policy.base == model_input.frozen_reference.base == full_ref
+    assert operation.config.training_stage == "dpo"
+
+
 def test_external_full_model_materialization_and_ppo_routes_do_not_hide_behind_select(tmp_path):
     _, project, choices, facts, *_ = evaluation_fixture(tmp_path)
     graph = dict(project.spec.graph)
@@ -1050,3 +1109,4 @@ def test_merges_of_adapters_with_different_targets_on_one_root_are_refused_when_
              merged("m", ("c", "u"))]
     project, choices = merge_case(m, nodes, (root_evidence(m.root, "q_proj", "k_proj", "v_proj"),))
     assert plan_graph(project, choices, (m.facts,)).nodes[-1].node.id == "m"
+
