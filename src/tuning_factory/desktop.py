@@ -26,6 +26,7 @@ PROVIDERS = ("existing_runpod", "ssh_server")
 # Withheld for unauthenticated MLflow servers, even if a caller still sends them.
 MLFLOW_AUTH_SETTINGS = ("MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_ID", "MLFLOW_OIDC_CLIENT_SECRET",
                         "MLFLOW_TRACKING_TOKEN")
+BASIC_AUTH_ENV = ("MLFLOW_TRACKING_USERNAME", "MLFLOW_TRACKING_PASSWORD")
 # jobs.server_destination only: the public route without key path, key hash or host pin. server_inspect,
 # connection and runtime_reservations return full transports (with key_reference_sha256 and the pin)
 # because the approved inspection must round-trip into runtime_prepare.
@@ -105,6 +106,10 @@ class DesktopService:
         if self.settings.get("auth_mode") == "none":
             # Defense in depth: native settings also stop sending these for unauthenticated servers.
             self.settings = {key: value for key, value in self.settings.items() if key not in MLFLOW_AUTH_SETTINGS}
+            # Inherited HTTP Basic credentials are never sent either (as the graph controller pops them), so they
+            # cannot make a local HTTP server refused now that they count as credentials (11.5 R1 m5).
+            for key in BASIC_AUTH_ENV:
+                os.environ.pop(key, None)
         for key in ENV_SETTINGS:
             os.environ.pop(key, None)
             if self.settings.get(key):

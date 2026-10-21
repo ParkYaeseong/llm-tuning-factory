@@ -1,4 +1,6 @@
 """Credentials never reach a plain-HTTP MLflow server from any client path; no network is touched."""
+import os
+
 import pytest
 
 from tuning_factory import desktop, diagnostics
@@ -6,6 +8,7 @@ from tuning_factory.auth import require_secure_tracking
 from tuning_factory.tracking import MLflowTracker
 
 CREDENTIALS = ("MLFLOW_TRACKING_TOKEN", "MLFLOW_OIDC_TOKEN_URL", "MLFLOW_OIDC_CLIENT_SECRET")
+BASIC = ("MLFLOW_TRACKING_USERNAME", "MLFLOW_TRACKING_PASSWORD")
 
 
 class FakeClient:
@@ -18,7 +21,8 @@ class FakeClient:
 
 @pytest.fixture(autouse=True)
 def forbid_network(monkeypatch):
-    for key in CREDENTIALS + ("MLFLOW_OIDC_CLIENT_ID", "MLFLOW_TRACKING_URI", "FACTORY_MLFLOW_ARTIFACT_LOCATION"):
+    for key in CREDENTIALS + ("MLFLOW_OIDC_CLIENT_ID", "MLFLOW_TRACKING_URI", "FACTORY_MLFLOW_ARTIFACT_LOCATION",
+                              *BASIC):
         monkeypatch.setenv(key, "x")  # Registers teardown so DesktopService's env export cannot leak.
         monkeypatch.delenv(key)
     created = []
@@ -52,6 +56,32 @@ def test_http_without_credentials_and_file_store_are_allowed(monkeypatch):
     require_secure_tracking("http://mlflow.internal:5000")
     require_secure_tracking("file:///tmp/mlruns")
     MLflowTracker("http://mlflow.internal:5000", client=FakeClient())
+
+
+@pytest.mark.parametrize("names", [BASIC, BASIC[1:]])
+def test_http_with_basic_credentials_is_refused(tmp_path, monkeypatch, names):
+    """Task 11.5 R1 m5: MLflow sends MLFLOW_TRACKING_USERNAME/PASSWORD as HTTP Basic credentials, so a password counts
+    as a credential for the HTTPS rule. It has no auth mode of its own (graph controllers pop it), so the D11 mode
+    and a desktop that chose 'no authentication' are unchanged."""
+    from tuning_factory.auth import current_auth_mode
+    values = {"MLFLOW_TRACKING_USERNAME": "operator", "MLFLOW_TRACKING_PASSWORD": "synthetic-" + "basic-password"}
+    for name in names:
+        monkeypatch.setenv(name, values[name])
+    with pytest.raises(ValueError, match="HTTPS"):
+        require_secure_tracking("http://x")
+    with pytest.raises(ValueError, match="HTTPS"):
+        MLflowTracker("http://mlflow.example", client=FakeClient())
+    monkeypatch.setattr("tuning_factory.auth.configure_oidc", lambda: None)
+    require_secure_tracking("https://mlflow.example")
+    assert current_auth_mode() == "none"
+    # 'No authentication' on a local HTTP server: the desktop drops inherited Basic credentials, as the controller does.
+    desktop.DesktopService(tmp_path, {"MLFLOW_TRACKING_URI": "http://127.0.0.1:5000", "auth_mode": "none"})
+    assert not any(name in os.environ for name in BASIC)
+
+
+def test_a_username_alone_is_not_a_credential(monkeypatch):
+    monkeypatch.setenv("MLFLOW_TRACKING_USERNAME", "operator")
+    require_secure_tracking("http://mlflow.internal:5000")
 
 
 def test_https_with_token_is_allowed(monkeypatch):

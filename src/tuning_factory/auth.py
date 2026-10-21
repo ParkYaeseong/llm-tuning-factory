@@ -63,16 +63,24 @@ INSECURE_TRACKING = ("인증값을 사용하는 MLflow 서버 주소는 HTTPS여
                      "토큰과 OIDC 값을 비우거나 앱에서 ‘인증 없음’을 선택하세요.")
 
 
-def credentials_configured():
+def _bearer_configured():
     # A bare OIDC URL is only a default; configure_oidc refuses before any request without a secret.
     return bool(os.environ.get("MLFLOW_TRACKING_TOKEN")
                 or (os.environ.get("MLFLOW_OIDC_TOKEN_URL") and os.environ.get("MLFLOW_OIDC_CLIENT_SECRET")))
 
 
+def credentials_configured():
+    """Any credential MLflow would send: a bearer token, OIDC client credentials, or an HTTP Basic password
+    (``MLFLOW_TRACKING_USERNAME``/``MLFLOW_TRACKING_PASSWORD``; 11.5 R1 m5). A username alone is not secret."""
+    return _bearer_configured() or bool(os.environ.get("MLFLOW_TRACKING_PASSWORD"))
+
+
 def current_auth_mode():
-    """The MLflow auth scope of this process, never a credential: ``oidc``, ``token`` or ``none``. The same condition
-    as ``credentials_configured``; ``tracking`` re-exports it for ``tracking_settings_sha256`` (D11)."""
-    if not credentials_configured():
+    """The MLflow auth scope of this process, never a credential: ``oidc``, ``token`` or ``none``. Bearer and OIDC
+    credentials only: Basic credentials have no mode of their own (the graph controller pops them, and the desktop
+    drops them for 'no authentication'), so they never change ``tracking_settings_sha256`` (D11), which ``tracking``
+    re-exports this for."""
+    if not _bearer_configured():
         return "none"
     oidc = os.environ.get("MLFLOW_OIDC_TOKEN_URL") and os.environ.get("MLFLOW_OIDC_CLIENT_SECRET")
     return "oidc" if oidc else "token"

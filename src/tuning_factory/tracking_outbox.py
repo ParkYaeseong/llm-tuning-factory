@@ -78,9 +78,17 @@ SECRET_VARIABLES = ("MLFLOW_TRACKING_TOKEN", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLO
 _SAFE_PART = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*")
 
 
+# A URL's query (11.5 R1 m6): signed storage URLs carry their credential there (Azure SAS ``sig=``, GCS
+# ``X-Goog-Signature``/``X-Goog-Credential``, S3 ``X-Amz-Signature``). The scheme, host and path stay readable.
+_URL_QUERY = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s?#'\"<>]*)\?[^\s#'\"<>]*")
+# A token or secret as a JSON (or Python repr) member: ``"access_token": "..."``.
+_QUOTED_SECRET = re.compile(r"(?i)([\"'](?:access_token|refresh_token|id_token|client_secret|token|password)[\"']"
+                            r"\s*:\s*)([\"'])(?:\\.|(?!\2).)*\2")
+
+
 def redact(text, limit=500) -> str:
     """Text that may be stored or shown: configured secret values, bearer/basic credentials, ``secret=`` style
-    pairs and URL userinfo are removed, then it is truncated."""
+    pairs, quoted token members, URL userinfo and URL query strings are removed, then it is truncated."""
     text = str(text)
     for name in SECRET_VARIABLES:
         value = os.environ.get(name)
@@ -88,7 +96,9 @@ def redact(text, limit=500) -> str:
             text = text.replace(value, "[redacted]")
     text = re.sub(r"(?i)\b(bearer|basic)\s+[^\s,;'\"]+", r"\1 [redacted]", text)
     text = re.sub(r"(?i)\b(client_secret|access_token|token|password)=[^\s&;,'\"]+", r"\1=[redacted]", text)
+    text = _QUOTED_SECRET.sub(r"\1\2[redacted]\2", text)
     text = re.sub(r"://[^/\s@]+@", "://[redacted]@", text)
+    text = _URL_QUERY.sub(r"\1?[redacted]", text)
     return text[:limit]
 
 

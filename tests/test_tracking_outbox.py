@@ -1228,3 +1228,26 @@ def test_a_pending_registration_version_is_adopted(tmp_path, monkeypatch):
     row = event(w, key)
     assert row['status'] == 'ACKNOWLEDGED' and identity(row)['adopted'] is True and identity(row)['version'] == '1'
     assert len(w.fake.versions) == 1
+
+
+def test_redact_strips_url_queries_and_json_tokens():
+    """Task 11.5 R1 m6: signed URLs (Azure SAS ``sig=``, GCS ``X-Goog-Signature``/``X-Goog-Credential``) and a JSON
+    ``"access_token"`` in an error text reach the stored ``last_error``. URL query strings and JSON token values are
+    removed; the URL's scheme, host and path stay readable. The fake values are built at runtime."""
+    outbox_api = api()
+    signature = 'q' * 12 + '%2B' + 'z' * 12
+    token = '.'.join(['eyJ' + 'h' * 10, 'p' * 16, 's' * 12])
+    texts = {
+        f'PUT https://acct.blob.core.windows.net/mlflow/run/model.safetensors?sv=2024-11-04&sr=b&sig={signature} '
+        'failed: 403': 'PUT https://acct.blob.core.windows.net/mlflow/run/model.safetensors?[redacted] failed: 403',
+        f'upload to https://storage.googleapis.com/b/o?X-Goog-Credential=svc%2F20261021&X-Goog-Signature={signature}'
+        f'#frag refused': 'upload to https://storage.googleapis.com/b/o?[redacted]#frag refused',
+        f'token response {{"access_token": "{token}", "expires_in": 300}}':
+            'token response {"access_token": "[redacted]", "expires_in": 300}',
+        f"token response {{'refresh_token': '{token}'}}": "token response {'refresh_token': '[redacted]'}",
+        'GET http://mlflow.internal:5000/api/2.0/mlflow/runs/get failed': (
+            'GET http://mlflow.internal:5000/api/2.0/mlflow/runs/get failed'),   # no query: unchanged
+    }
+    for text, expected in texts.items():
+        redacted = outbox_api.redact(text)
+        assert redacted == expected and signature not in redacted and token not in redacted

@@ -1447,3 +1447,19 @@ def test_the_git_revision_child_inherits_no_credentials(tmp_path):
     assert not set(seen["names"]) & set(CREDENTIAL_NAMES) and INHERITED not in seen["values"]
     assert {"PATH", "Path"} & set(seen["names"]) and seen["stdin_null"]
     assert len(seen["revision"]) == 40 or seen["revision"] == "uncommitted"
+
+
+def test_basic_credentials_never_reach_a_none_mode_controller(monkeypatch):
+    """Task 11.5 R1 m5: inherited MLflow Basic credentials now make plain HTTP refused on the v1 paths, but they have no
+    auth mode of their own and the controller pops them, so a 'none' controller on a local HTTP server still starts."""
+    from tuning_factory.auth import current_auth_mode
+    ce = entry()
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
+    monkeypatch.setenv("MLFLOW_TRACKING_USERNAME", "operator")
+    monkeypatch.setenv("MLFLOW_TRACKING_PASSWORD", "synthetic-" + "basic-password")
+    assert current_auth_mode() == "none"
+    scope = ce.TrackingScope.from_environment()
+    assert scope.auth_mode == "none"
+    ce.apply_tracking_scope(scope)
+    assert os.environ["MLFLOW_TRACKING_URI"] == "http://127.0.0.1:5000"
+    assert "MLFLOW_TRACKING_USERNAME" not in os.environ and "MLFLOW_TRACKING_PASSWORD" not in os.environ
