@@ -5675,6 +5675,13 @@ Each item, reproduced first:
   - The test now observes the tick itself (a wrapped `GraphController.tick` sets an event). The bound is
     `LOADED_WAIT` = 120 s, and a controller that returns early fails at once with its result. It passes with the
     coarse clock.
+  - 11.2 reached the same cause independently (its entry above).
+  - No production logic relies on a strict `heartbeat > acquired`:
+    - `acquired` is written and displayed only;
+    - liveness (`running`/`stale`) compares `expires` with now;
+    - `heartbeat_age_seconds` is clamped at 0;
+    - `_clear_stale_stop_request` keeps a request with `requested_at >= acquired_at`, so a same-tick stop request is
+      honoured.
 - Tutorial `end()` (optional): **fixed**. After the end's compatibility check the tour renders through `renderLate`,
   and it re-focuses the launcher only if the focus is still on it or nowhere. RED: typing a project name while that
   answer was held lost the text ("" after the render). A mutant that always re-focuses the launcher fails the new
@@ -5706,12 +5713,16 @@ Actual verification:
 - Every changed file is CR-free, and a byte scan finds no bidi control, U+061C or NUL in them.
 - Scratch configs, probes and plugins under `%TEMP%` were deleted.
 
-- Rebased onto `0f84972` (11.2's seed script, 11.3a/b and 11.4). Only this file conflicted, and every entry was kept.
-  On the rebased tree:
-  - `pytest -q` **1735 passed, 1 skipped** (the base's new tests plus these 10), beside a full Playwright run;
-  - `npx playwright test` **254 passed**, and `npm run build` passes;
-  - Ruff passes, and `check_secrets.py` reports 0 findings;
-  - the CPU acceptance gives **29/29** with the same `source_sha256` (the base changed nothing under `src/`).
+- Rebased onto `0f84972` (11.2's seed script, 11.3a/b and 11.4), then onto `4925049` (11.2's acceptance tests and
+  its planner fix). Only this file conflicted each time, and every entry was kept.
+  - On `0f84972`: `pytest -q` **1735 passed, 1 skipped**; `npx playwright test` **254 passed**; the CPU acceptance
+    gave 29/29 with the same `source_sha256` (that base changed nothing under `src/`).
+  - On `4925049`:
+    - `pytest -q` **1755 passed, 1 skipped** (the base's tests plus these 10), beside a full Playwright run;
+    - `npx playwright test` **254 passed**, and `npm run build` passes;
+    - Ruff passes, and `check_secrets.py` reports 0 findings;
+    - the CPU acceptance gives exit 0, **29/29**, `passed: true`, `source_sha256`
+      `7fd0f911601f4d67ee0cbe7bf73a81e9b447e205aa2796c1dd988281815622dc` (`graph_planner.py` changed in the base).
 
 Not verified or still open:
 - No machine-level reproduction of the two Windows flakes (WinError 5, the 30 s first tick); each fix addresses the
