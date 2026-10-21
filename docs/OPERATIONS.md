@@ -21,6 +21,17 @@ uv run factory --state-dir state/demo compare JOB_ID BASELINE_JOB_ID
 Global options precede the command. For concurrent execution, launch multiple `work` processes with a shared state directory
 and different Pods; increase both max_concurrent and max_gpus deliberately. A Pod is exclusively reserved for a job.
 
+## Training graphs and the background controller (Windows 0.4.0)
+
+- Graph CLI operation (`project-list`, `executor-profile-inspect`, `graph-validate`, `graph-plan`, `graph-submit`,
+  `graph-status`, `graph-pause`, `graph-resume`, `graph-cancel`, `graph-rearm-tracking`, `graph-work`) and the operator
+  lock release for graph runs: [TRAINING_WORKFLOWS.md](TRAINING_WORKFLOWS.md) (Korean), sections 9 and 12.
+- Starting, stopping (drain) and restarting the desktop background controller, and stopping it before an update or
+  uninstall: [WINDOWS_APP.md](WINDOWS_APP.md).
+- File formats, the CLI profiles file, credential files and the controller environment: [CONFIGURATION.md](CONFIGURATION.md).
+- An uncertain graph attempt is released with the same `release-lock JOB_ID ATTEMPT_ID --confirm-execution-stopped` as a
+  single job, only after confirming on the Pod or server that the attempt stopped; `status --job-id JOB_ID` shows the job.
+
 ## MLflow
 
 Reuse your existing authenticated tracking server by setting MLFLOW_TRACKING_URI and, when applicable,

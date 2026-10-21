@@ -5229,6 +5229,65 @@ Actual verification:
 Not verified or still open:
 - Real WebView2 timing of late answers, focus return and a real Windows IME: Task 11.
 
+## Task 11.4 documentation and release-note drafts, 2026-10-21
+
+Commit `docs: guide general-purpose training workflows and the 0.4.0 install`, written in the main tree on `d0415c0` and
+rebased onto `5ecfd45` (11.2's seed script; no conflict). It follows
+[Task 11 plan](superpowers/plans/2026-10-21-task11-release-0-4-0.md) §4 "11.4" with D4, D11, D17 and D20. Changed:
+`README.md`, `docs/CONFIGURATION.md`, `docs/WINDOWS_APP.md`, `docs/OPERATIONS.md` (one pointer section), new
+`docs/TRAINING_WORKFLOWS.md` and this file. No code or test changed.
+
+What changed:
+- `docs/TRAINING_WORKFLOWS.md` (Korean, first-time users): the whole path from a blank project through mapped import
+  (encoding, mapping, row issues, split, binding), recipes, the base-model panel (weights never downloaded), the graph
+  editor, planning and the two approvals, executor profiles (absolute key paths, GPU list, last check, one-hour rule),
+  the background controller (no auto-start, drain can take hours, restart after changes), the runs page ("결과 대기"
+  versus "운영자 확인 필요", the release dialog and the CLI alternative), MLflow tracking and re-arm, the policies, the
+  CLI equivalents, the D20 limits and the verification scope.
+- README and WINDOWS_APP: 0.4.0 and the `v0.4.0` link, the five-step workflow, the D4 update and uninstall procedure
+  (stop, wait for 정지, close, install; the uninstaller's ‘애플리케이션 데이터 삭제하기’ warning), 0.3.0 settings carried
+  over, no downgrade, unsigned/SmartScreen; the dev-branch banners and "not in 0.3.0" sentences are gone; the tutorial is
+  16 steps and about 7 minutes; storage paths and the D20 limits; the 11.3 verifier options and smoke flags.
+- CONFIGURATION (English): state layout, projects and recipes, import mappings and split plans, graph JSON, planning
+  inputs and plans, benchmarks and selection, native and CLI executor profiles with their credential entries and files,
+  the MLflow auth modes, the controller start, `CREDENTIAL_ENV`, the TLS change and `state/controller/` files.
+- Drafts (git-ignored, `git check-ignore` confirms): `.factory/release-0.4.0.md` from the 11.7 template and
+  `.factory/pr-0.4.0.md`. Their angle-bracket placeholders (counts, receipts, installer and bridge SHA256, bytes, commit
+  B, acceptance receipt name, review summary, 11.6 gaps) are for root at 11.7.
+
+Corrections found while checking the docs against the code:
+- `factory status` takes `--job-id JOB_ID`; `status JOB_ID` is a Click usage error (checked with a temporary state
+  directory). WINDOWS_APP now uses `--job-id`. **`docs/OPERATIONS.md` still shows `status JOB_ID` twice in its RunPod
+  lock note**; this sub-task was limited to the pointer section, so root should fix those lines.
+- The engine deduplicates `graph_submit` by request ID only (`graph_store.submit`); the desktop adds the plan-hash check.
+  The docs say the app never registers a plan twice and that a CLI resubmission must reuse its `--request-id`.
+- `forget_credentials` also deletes every executor-profile key, but its confirmation text names only the connection
+  credentials; the docs warn about it.
+- A dry-run plan that names a native profile needs a stored observation of any age (`observation_missing`); only
+  estimates need none.
+
+Doc accuracy (§4 step 5):
+- The plan's quoted-label check over README, WINDOWS_APP and TRAINING_WORKFLOWS prints "all quoted labels exist" (150
+  labels). Four composite UI texts (‘GPU 서버 · 주소’, the plan destination line, ‘N행’, ‘확인됨 · 인증 없음’) were moved to
+  single quotes after checking their templates in `server-connection.ts`, `main.ts` and `data-import.ts`; two section
+  references moved too. Hangul bold spans were also checked: every miss is prose emphasis or a heading.
+- `factory --help` and every command's `--help` (including `graph-work`, `graph-plan`, `graph-submit`, `status`): every
+  `factory` command and flag the docs name exists. Flags of uv, git, cargo, npm, mlflow and WebView2 are external.
+  `verify_desktop_package.py --bridge/--check/--receipt` and `FACTORY_SMOKE_LIVE_HF`/`FACTORY_SMOKE_FLOW` come from 11.3
+  and do not exist at `d0415c0`; they are documented as 11.3 specifies and need a re-check when 11.3 lands.
+- Every relative link and anchor resolves to a tracked file.
+
+Actual verification:
+- `uv run pytest tests/test_repository_text.py -q` with the six files staged: **2 passed**.
+- `uv run python scripts/check_secrets.py` with the six files staged: `Checked 1028 staged/historical file versions; 0 findings.`
+- A byte scan of the five docs and both drafts finds no CR, BOM, control, format or bidirectional character and no
+  backslash escape sequence; the scanner was shown to report a probe holding both. `git ls-files --eol` shows `i/lf w/lf`.
+- No full pytest run: no test or code changed.
+
+Not verified: the installer-facing statements (uninstaller checkbox text from the Tauri 2.12.2 Korean NSIS template,
+SmartScreen wording, the 0.3.0 → 0.4.0 carry-over and the stopped-controller update path) are checked in 11.6, and the
+release notes stay a draft until 11.7.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
