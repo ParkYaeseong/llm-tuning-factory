@@ -76,7 +76,7 @@ test("known codes and English domain texts are shown in Korean with the original
   expect(localize(issue("typed_port", "input requires model output", "", { node_id: "eval-1" })))
     .toEqual({ text: "이 입력에는 모델 출력이 필요합니다.", original: "input requires model output" });
   const transition = localize(issue("parent_transition", "parent transition requires explicit materialize"));
-  expect(transition.text).toContain("materialize");
+  expect(transition.text).toContain("전체 모델 확정");                  // the editor's name of the materialize card (R3 M3)
   expect(transition.text).toMatch(/[가-힣]/);
   expect(transition.original).toBe("parent transition requires explicit materialize");
   const codec = "'utf-8' codec can't decode byte 0xb1 in position 0: invalid start byte";
@@ -397,4 +397,37 @@ test("Playwright's web server runs Vite without HMR or file watching, and npm ru
   expect(serverOptions(false)).toEqual({ port: 1420, strictPort: true, watch: { ignored: ["**/src-tauri/**"] } });
   const { default: config } = await import("../playwright.config.ts");
   expect(config.webServer).toMatchObject({ command: "npm run dev", env: { TUNING_FACTORY_E2E: "1" } });
+});
+
+test("issue codes without an English pattern have Korean texts, and the materialize card has one name", async () => {
+  // 11.5 R5 M1: codes whose message is an exception text (or new in fd9c283) are shown in Korean, the original kept.
+  for (const [code, message, korean] of [
+    ["merge_bases_differ", "merge input effective bases/tokenizers/targets differ", "병합"],
+    ["executor_profile_invalid", "1 validation error for NativeProfile", "실행 프로필"],
+    ["tracking_invalid", "tracking_uri: Input should be a valid URL", "MLflow"],
+    ["benchmark_invalid", "ValueError", "벤치마크"],
+    ["sample_id_invalid", "ordered sample IDs must be unique", "샘플 ID"],
+    ["planning_inputs_invalid", "stored planning inputs are corrupt", "계획 입력"],
+    ["graph_schema", "1 validation error for GraphSpec", "그래프"],
+    // The backend's plan-hash dedupe (11.5): the same plan was registered under another request ID.
+    ["plan_submitted", "plan already submitted as another graph run", "새 계획"],
+  ] as const) {
+    const localized = localize(issue(code, message));
+    expect(localized.text, code).toContain(korean);
+    expect(localized.text, code).toMatch(/[가-힣]/);
+    expect(localized.original, code).toBe(message);
+  }
+  // A Korean backend text under such a code stays as received (it is specific advice).
+  const keyPath = issue("executor_profile_invalid", "SSH 키 파일은 이 PC의 로컬 절대 경로로 지정하세요.", "/profile_id");
+  expect(localize(keyPath)).toEqual({ text: keyPath.message, original: null });
+  // 11.5 R3 M3: the issue texts and the runs page use the graph editor's kind names.
+  const { KIND_LABELS } = await import("../src/graph-model.ts");
+  const { NODE_KIND } = await import("../src/wait-reasons.ts");
+  expect(NODE_KIND).toEqual(KIND_LABELS);
+  for (const message of ["parent transition requires explicit materialize", "SFT to preference training requires explicit materialize",
+    "OFT artifact handoff/evaluation/merge/materialize is unsupported", "PPO adapter continuation is unsupported"]) {
+    const { text } = localize(issue("parent_transition", message));
+    expect(text, message).toContain(KIND_LABELS.materialize);
+    expect(text, message).not.toContain("모델 변환");
+  }
 });

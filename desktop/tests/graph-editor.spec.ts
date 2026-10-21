@@ -222,7 +222,7 @@ test("unsupported connections show their reasons", async ({ page }) => {
   await expect(typed.locator("details")).toContainText("원문 보기");
   await expect(typed.locator("details .issue-original")).toHaveText("input requires model output");
   const transition = card(page, "train-2");
-  await expect(transition).toContainText("이전 단계와 학습 방식이 달라 먼저 모델 변환(materialize) 단계를 넣어야 합니다.");
+  await expect(transition).toContainText("이전 단계와 학습 방식이 달라 먼저 전체 모델 확정 단계를 넣어야 합니다.");
   await expect(transition.locator("details .issue-original")).toHaveText("parent transition requires explicit materialize");
   await expect(card(page, "train-1").locator(".issue-list")).toHaveCount(0);
   await expect(page.locator("img")).toHaveCount(0);
