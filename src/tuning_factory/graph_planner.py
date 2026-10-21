@@ -73,6 +73,15 @@ RUNPOD_PRICE_REQUIRED = "RunPod resource facts require a positive live hourly pr
 MERGE_INPUTS_DIFFER = "merge input effective bases/tokenizers/targets differ"
 
 
+class NodeRefusal(ValueError):
+    """A planning refusal that belongs to one graph node: ``node_id`` names it; the text is the refusal's own
+    (Task 11.5 re-review m1: ``graph_plan`` points its ``plan_refused`` issue at the node)."""
+
+    def __init__(self, message: str, node_id: str):
+        super().__init__(message)
+        self.node_id = node_id
+
+
 class DatasetSnapshot(StrictModel):
     dataset: DatasetRef
     kind: Literal["instruction", "text", "preference", "prompt", "kto"]
@@ -695,14 +704,17 @@ def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: Execu
             # Shapes that can never resolve (Task 11.5, R1 m3): select_best refuses duplicate candidates, and
             # resolve_local_selection takes one merged candidate beside the originals it falls back to.
             if not _distinct_choice_possible([_sources(item.model, nodes) for item in evaluation_nodes]):
-                raise ValueError("selection candidates must be distinct models")
+                raise NodeRefusal("selection candidates must be distinct models", node.id)
             merged = sum(isinstance(item.model, NodeOutputRef) and isinstance(nodes[item.model.node_id], MergeNode)
                          for item in evaluation_nodes)
             if merged > 1:
-                raise ValueError("a selection takes at most one merged candidate")
+                raise NodeRefusal("a selection takes at most one merged candidate", node.id)
             if merged == len(evaluation_nodes):
-                raise ValueError("a selection needs an original candidate beside its merged one")
-        _static_routes(node, nodes, recipes, artifacts, allowed, choices.base_targets)
+                raise NodeRefusal("a selection needs an original candidate beside its merged one", node.id)
+        try:
+            _static_routes(node, nodes, recipes, artifacts, allowed, choices.base_targets)
+        except ValueError as exc:   # every static-route refusal is about this node's own inputs
+            raise NodeRefusal(str(exc), node.id) from exc
         attempts = graph.retry_policy.max_attempts
         planned.append(NodePlan(node=node, inputs=tuple(InputContract(source=ref, required_port=port)
             for ref, port in node_refs(node)), permitted_model_roots=permitted_roots, allowed_resources=tuple(allowed),

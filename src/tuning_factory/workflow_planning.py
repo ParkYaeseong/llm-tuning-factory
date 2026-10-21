@@ -77,6 +77,7 @@ from .graph_planner import (
     GraphPlan,
     ModelContext,
     ModelTargetEvidence,
+    NodeRefusal,
     NodeResources,
     TrackingDestination,
     _check_plan,
@@ -1538,6 +1539,11 @@ def graph_plan(context: WorkflowContext, request: GraphPlanRequest) -> WorkflowR
                                tracking_destination=destination)
     try:
         plan = plan_graph(project, choices, facts, simulation=request.simulation)
+    except NodeRefusal as exc:   # one node's refusal points at its card (Task 11.5 re-review m1)
+        known = exc.node_id in analysis.index
+        analysis.issues.append(issue("plan_refused", _reason(exc), analysis.path(exc.node_id) if known else "",
+                                     node_id=exc.node_id if known else None))
+        return _blocked(analysis)
     except ValueError as exc:
         analysis.issues.append(issue("plan_refused", _reason(exc)))
         return _blocked(analysis)
