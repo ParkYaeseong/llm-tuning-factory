@@ -6,7 +6,7 @@ import { WORKFLOW_ACTIONS, type BenchmarkRevision, type BenchmarkSpec, type Cont
   type LegacyImport, type ModelRoot, type Observation, type PlanningEstimate, type PlanRequest, type PlanSummary, type ProjectRevision,
   type ProjectSpec, type ProjectSummary, type PublicProfile, type RecipeRevision, type RecipeSpec, type RecipeSummary,
   type RootSnapshot, type RootTargets, type RunDetail, type RunList, type RunSteered, type Sha256, type SplitCommitted,
-  type SplitPlan, type SplitPreview, type SubmitResult, type TrackingRearmed, type UnreadableRun, type WorkflowAction,
+  type SplitPlan, type SplitPreview, type PlanSubmitted, type SubmitResult, type TrackingRearmed, type UnreadableRun, type WorkflowAction,
   type WorkflowResult } from "./workflow-types";
 
 export class BridgeError extends Error {
@@ -102,7 +102,9 @@ export const planningInputs = {
   save: (request: PlanningInputsSave) => workflow<PlanningInputsView>("planning_inputs_save", request),
 };
 export const runs = {
-  submit: (r: { plan_sha256: Sha256; request_id: string; approve_execution: boolean; approve_data_transfer: boolean }) => workflow<SubmitResult>("graph_submit", r),
+  /** `ok`: the run (`SubmitResult`); `conflict` `plan_submitted`: the run already registered for the plan (`PlanSubmitted`). */
+  submit: (r: { plan_sha256: Sha256; request_id: string; approve_execution: boolean; approve_data_transfer: boolean }) =>
+    workflow<SubmitResult | PlanSubmitted>("graph_submit", r),
   list: () => workflow<RunList>("graph_runs_list"),
   get: (run_id: string) => workflow<RunDetail>("graph_run_get", { run_id }),
   pause: (run_id: string) => workflow<RunSteered>("graph_pause", { run_id }),

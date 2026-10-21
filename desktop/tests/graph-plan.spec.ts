@@ -36,6 +36,7 @@ const COST_NOTE = "재시도를 포함한 최대 추정치입니다. 제공자 �
 const WARNING_CHANGED = "자원 확인 후 프로필이 바뀌었습니다 · 모의 계획은 확인 당시 자원으로 계산했습니다";
 const DROPPED = "변경되어 다시 계획해야 합니다";
 const WAIT = "대기 후 순차 실행";
+const RERUN_HINT = "다시 실행하려면 입력(최대 실행 시간 등)을 바꾸거나 실행 프로필에서 자원을 다시 확인한 뒤 ‘계획 확인’으로 새 계획을 만드세요.";
 
 const recipeSpec = (recipe_id: string, name: string, training_method: string, training_stage = "sft") => ({ schema_version: 1, recipe_id,
   version: "1", name, description: "", training_backend: "llamafactory", capability_version: "lf-text-v1", training_stage,
@@ -785,6 +786,9 @@ test("a plan that already has a run is never approved again, also after a restar
   await expect(page.getByRole("dialog")).toHaveCount(0);
   const result = panel(page).locator(".plan-summary");
   await expect(result).toContainText("이 계획으로 등록한 실행이 있습니다");
+  // The next step (11.5 R3 M5): the same inputs plan to the same hash, so an input or the resource check must change.
+  for (const text of [RERUN_HINT, "실행 중"]) await expect(result).toContainText(text);
+  await expect(page.locator("#app .notice:not(.busy)")).toContainText(RERUN_HINT);
   await expect(approveButton(page)).toHaveCount(0);
   const open = result.getByRole("button", { name: "실행 보기", exact: true });
   await expect(open).toBeFocused();
@@ -905,4 +909,48 @@ test("step and project names in the plan and its dialog are isolated from the te
   await expect(dialog.locator(".plan-approval-head bdi")).toHaveText(name);
   await dialog.getByRole("button", { name: "돌아가기", exact: true }).click();
   expect(await calls(page, { action: "graph_submit" })).toEqual([]);
+});
+
+// -- 11.5: the backend's plan-hash dedupe (graph_submit's conflict plan_submitted) --
+test("a submit the backend refuses as already registered shows that run and how to plan anew", async ({ page }) => {
+  const other = "d".repeat(32);
+  const already = { status: "conflict", data: { run_id: other, status: "CANCELED" },
+    issues: [issue("plan_submitted", `plan already submitted as graph run ${other}`, "/plan_sha256")] };
+  await openWorkbench(page, options({ workflow: { graph_submit: already } }));
+  await installPlanFake(page, { plans: [ONE_STEP] });
+  await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label: "기준 학습" })]) });
+  await openGraph(page);
+  await plan(page);
+  // The run list does not show it yet (another window registered it a moment ago, under another request ID).
+  await approveButton(page).click();
+  await page.getByRole("dialog", { name: "모의 실행 등록" }).getByRole("button", { name: "모의 실행 등록", exact: true }).click();
+  await idle(page);
+  await expect(heading(page)).toHaveText("학습 그래프");
+  const result = panel(page).locator(".plan-summary");
+  for (const text of ["이 계획으로 등록한 실행이 있습니다", other.slice(0, 12), "취소", RERUN_HINT]) await expect(result).toContainText(text);
+  await expect(page.locator("#app .notice:not(.busy)")).toContainText(RERUN_HINT);
+  await expect(approveButton(page)).toHaveCount(0);
+  const open = result.getByRole("button", { name: "실행 보기", exact: true });
+  await expect(open).toBeFocused();
+  expect(await calls(page, { action: "graph_submit" })).toHaveLength(1);
+  await open.click();
+  await expect(heading(page)).toHaveText("그래프 실행");
+  await idle(page);
+  expect((await dataOf(page, "graph_run_get")).at(-1)).toEqual({ run_id: other });
+  expect(await calls(page, { action: "graph_submit" })).toHaveLength(1);
+});
+
+test("a plan_submitted refusal without its run is shown as the backend's reason", async ({ page }) => {
+  const already = { status: "conflict", data: null, issues: [issue("plan_submitted", "plan already submitted", "/plan_sha256")] };
+  await openWorkbench(page, options({ workflow: { graph_submit: already } }));
+  await installPlanFake(page, { plans: [ONE_STEP] });
+  await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label: "기준 학습" })]) });
+  await openGraph(page);
+  await plan(page);
+  await approveButton(page).click();
+  await page.getByRole("dialog", { name: "모의 실행 등록" }).getByRole("button", { name: "모의 실행 등록", exact: true }).click();
+  await idle(page);
+  const result = panel(page).locator(".plan-summary");
+  await expect(result.locator('li[data-code="plan_submitted"]')).toContainText("새 계획");
+  await expect(result.locator('li[data-code="plan_submitted"] .issue-original')).toHaveText("plan already submitted");
 });

@@ -12,6 +12,7 @@ import { issueList, localize, planSection } from "../issues";
 import { PLAN_DROPPED, type PlanningInputs, type ProjectDraft, type ProjectStore } from "../project-store";
 import type { ViewContext } from "../view-types";
 import type { InspectionSummary } from "../views/executor-profiles";
+import { RUN_STATUS } from "../wait-reasons";
 import { button, errorText, escapeHtml, focusKey, isolate, restoreFocus, statusPill } from "../workbench";
 import type { ControllerView, PlanningEstimate, PlanRequest, PlanSummary, PublicProfile, RecipeSummary, Sha256, WorkflowIssue,
   WorkflowResult } from "../workflow-types";
@@ -47,6 +48,8 @@ const PROJECT_STALE = "다른 곳에서 이 프로젝트를 저장했습니다 �
 const RECIPE_UNKNOWN = "레시피 정보를 확인할 수 없어 실행 환경(primary·ppo)을 정할 수 없습니다";
 const RUNS_UNREAD = "기존 실행을 확인하지 못해 승인하지 않았습니다. 같은 계획이 이미 등록되어 있을 수 있으니 다시 시도하세요.";
 const RUN_EXISTS = "이 계획으로 등록한 실행이 있습니다";
+/** The next step after RUN_EXISTS (11.5 R3 M5): the same inputs plan to the same hash, so something must change. */
+const RERUN_HINT = "다시 실행하려면 입력(최대 실행 시간 등)을 바꾸거나 실행 프로필에서 자원을 다시 확인한 뒤 ‘계획 확인’으로 새 계획을 만드세요.";
 /** Fixed texts of non-blocking warnings shown at their profile; the backend text stays under "원문 보기". */
 const WARNING_TEXTS: Record<string, string> = {
   observation_revision_differs: "자원 확인 후 프로필이 바뀌었습니다 · 모의 계획은 확인 당시 자원으로 계산했습니다",
@@ -56,7 +59,9 @@ const WARNING_TEXTS: Record<string, string> = {
 interface Feedback { revision: Sha256; issues: WorkflowIssue[]; warnings: WorkflowIssue[]; estimates: string[]; nodes: string[] }
 const feedback = new Map<string, Feedback>();            // project → the last plan (or refused inputs save) answer
 const submitFeedback = new Map<string, { plan: Sha256; issues: WorkflowIssue[] }>();
-const submittedRuns = new Map<Sha256, string>();         // plan hash → its run (registered here, or found in the run list)
+/** Plan hash → its run, registered here, found in the run list or named by graph_submit's `plan_submitted` (11.5), with
+ * its status when it was read (a cancelled run still holds its plan). */
+const submittedRuns = new Map<Sha256, { runId: string; status: string | null }>();
 /** Project → the saved revision another window replaced (a submit's `plan_stale` at /project, an inputs save's
  * `revision_conflict`): planning it again cannot be registered, so the latest version is offered instead. */
 const staleRevision = new Map<string, Sha256>();
@@ -502,8 +507,9 @@ function summaryHtml(draft: ProjectDraft, view: PlanView): string {
     <ul class="plan-steps">${steps}</ul>
     ${warnings ? `<p class="plan-hint">계획 경고 ${warnings}건 · 실행을 막지 않습니다. 실행 자원과 카드에 표시했습니다.</p>` : ""}
     ${refused?.plan === summary.plan_sha256 ? issuesWithSteps(refused.issues, summary) : ""}
-    ${submitted ? `<p class="plan-submitted">${RUN_EXISTS} · 실행 <span class="mono">${escapeHtml(submitted.slice(0, 12))}</span> · 같은 계획은 다시 등록하지 않습니다.</p>
-        <div class="actions"><button type="button" data-action="${escapeHtml(`nav:runs:${submitted}`)}" data-focus-key="plan-run-open">실행 보기</button></div>`
+    ${submitted ? `<p class="plan-submitted">${RUN_EXISTS} · 실행 <span class="mono">${escapeHtml(submitted.runId.slice(0, 12))}</span>${submitted.status ? ` · ${escapeHtml(RUN_STATUS[submitted.status as keyof typeof RUN_STATUS] ?? submitted.status)}` : ""} · 같은 계획은 다시 등록하지 않습니다.</p>
+        <p class="plan-hint">${RERUN_HINT}</p>
+        <div class="actions"><button type="button" data-action="${escapeHtml(`nav:runs:${submitted.runId}`)}" data-focus-key="plan-run-open">실행 보기</button></div>`
       : `<div class="actions"><button type="button" class="primary" data-action="wf:graph:plan-approve" data-focus-key="plan-approve">계획 승인·실행…</button></div>
         <p class="muted">${summary.simulation ? "대화상자에서 내용을 확인한 뒤 모의 실행으로 등록합니다." : "대화상자에서 실행과 데이터 전송을 각각 승인해야 등록합니다."} 등록한 뒤에도 컨트롤러는 자동으로 시작하지 않습니다.</p>`}</section>`;
 }
@@ -711,8 +717,9 @@ function registeredText(controller: ControllerView | null): string {
  * "계획 승인·실행…": the approval dialog of the held, usable plan, then graph_submit with the plan's request ID (derived
  * from the plan hash, so the same after a bridge error, a refusal, a restart or in another window). A real plan is sent
  * only with both approvals from the dialog; a dry run with none. `ok` opens the run on the runs page (after the task;
- * the controller is never started here). `plan_stale` drops the plan and names what changed; other refusals are shown
- * with the plan kept.
+ * the controller is never started here). `plan_stale` drops the plan and names what changed; `plan_submitted` (11.5:
+ * the backend holds a run of this plan under another request ID) shows that run like the run list's; other refusals
+ * are shown with the plan kept.
  */
 export async function approveAndSubmit(ctx: ViewContext, projectId: string, env: PlanEnv): Promise<void> {
   const draft = ctx.store.draft(projectId);
@@ -735,9 +742,9 @@ export async function approveAndSubmit(ctx: ViewContext, projectId: string, env:
     found.read = true;
     const match = data.runs.find(entry => isObject(entry) && entry.plan_sha256 === hash && typeof entry.run_id === "string" && entry.run_id);
     if (isObject(match)) {
-      submittedRuns.set(hash, String(match.run_id));
+      submittedRuns.set(hash, { runId: String(match.run_id), status: typeof match.status === "string" ? match.status : null });
       found.run = String(match.run_id);
-      ctx.notify(`${RUN_EXISTS}. 같은 계획을 다시 등록하지 않습니다.`);
+      ctx.notify(`${RUN_EXISTS}. 같은 계획을 다시 등록하지 않습니다. ${RERUN_HINT}`);
     }
   });
   if (found.run) { focusIfLost(still, "plan-run-open"); return; }
@@ -757,15 +764,24 @@ export async function approveAndSubmit(ctx: ViewContext, projectId: string, env:
   if (!simulation && !(choice.approveExecution && choice.approveDataTransfer)) return;
   const request = { plan_sha256: held.summary.plan_sha256, request_id: held.requestId,
     approve_execution: !simulation && choice.approveExecution, approve_data_transfer: !simulation && choice.approveDataTransfer };
-  const outcome: { run?: { id: string; controller: ControllerView | null }; stale?: boolean } = {};
+  const outcome: { run?: { id: string; controller: ControllerView | null }; stale?: boolean; existing?: boolean } = {};
   await ctx.task(simulation ? "모의 실행 등록 중" : "실행 등록 중", async () => {
     submitFeedback.delete(projectId);
     const result = await env.queue.run(() => runs.submit(request));
     if (result.status === "ok") {
       const data: unknown = result.data;
       if (!isObject(data) || typeof data.run_id !== "string" || !data.run_id) throw new Error(MALFORMED);
-      submittedRuns.set(held.summary.plan_sha256, data.run_id);
+      submittedRuns.set(held.summary.plan_sha256, { runId: data.run_id, status: typeof data.status === "string" ? data.status : null });
       outcome.run = { id: data.run_id, controller: isControllerView(data.controller) ? data.controller : null };
+      return;
+    }
+    // 11.5: the backend registers a plan once, whatever the request ID; another window (or the CLI) registered it.
+    const existing: unknown = result.data;
+    if (result.status === "conflict" && result.issues.some(issue => issue.code === "plan_submitted") && isObject(existing)
+        && typeof existing.run_id === "string" && existing.run_id) {
+      submittedRuns.set(held.summary.plan_sha256, { runId: existing.run_id, status: typeof existing.status === "string" ? existing.status : null });
+      outcome.existing = true;
+      ctx.notify(`${RUN_EXISTS}. 같은 계획을 다시 등록하지 않습니다. ${RERUN_HINT}`);
       return;
     }
     const stale = result.status === "conflict" ? result.issues.filter(issue => issue.code === "plan_stale") : [];
@@ -781,6 +797,7 @@ export async function approveAndSubmit(ctx: ViewContext, projectId: string, env:
     ctx.notify("실행을 등록하지 못했습니다. 계획 아래의 확인할 점을 보세요.");
   });
   if (outcome.stale) { focusIfLost(still, projectStale(draft) ? "plan-reload" : "plan-rerun"); return; }
+  if (outcome.existing) { focusIfLost(still, "plan-run-open"); return; }
   const run = outcome.run;
   if (!run) return;
   const message = registeredText(run.controller);

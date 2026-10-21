@@ -23,7 +23,8 @@ export const NATIVE_PENDING: readonly WorkflowAction[] = [];
 export type Sha256 = string;
 export interface WorkflowIssue { code: string; path: string; message: string; node_id?: string | null; row_number?: number | null }
 /** `data` may also be set on `invalid`/`conflict`: a blocked plan carries `{warnings}`, an import preview with row
- * issues carries the preview, and `executor_profile_edit_check`'s `profile_in_use` carries `{jobs}`. */
+ * issues carries the preview, `executor_profile_edit_check`'s `profile_in_use` carries `{jobs}`, and `graph_submit`'s
+ * `plan_submitted` carries the run already registered for the plan (`PlanSubmitted`). */
 export interface WorkflowResult<T> { status: "ok" | "invalid" | "conflict"; issues: WorkflowIssue[]; data: T | null }
 export interface WithWarnings { warnings?: WorkflowIssue[] }
 
@@ -109,6 +110,15 @@ export interface PlanResource {
   profile_id: string; revision: string; resource_id: string; gpu_type: string; gpu_count: number;
   total_hourly_cost_usd: number; cost_source: string;          // "runpod_api" | "estimate" | SSH cost source
 }
+/** A plan node's pinned recipe revision and its public identity (9.8 `_node_references`; null fields when the
+ * revision's spec is not in the plan). Train nodes only. */
+export interface PlanNodeRecipe {
+  recipe_id: string | null; version: string | null; name: string | null; training_stage: string | null;
+  training_method: string | null; revision_sha256: Sha256;
+}
+/** The data a plan node uses: a train node's bound dataset (`binding_id`) or an evaluate node's benchmark dataset
+ * (`benchmark_revision`). */
+export interface PlanNodeDataset extends DatasetRef { binding_id: string | null; benchmark_revision: Sha256 | null }
 /** `graph_plan`/`graph_plan_get` `ok` data. A blocked `graph_plan` answers `invalid` with data `{warnings}` or null. */
 /** A plan node's pinned recipe revision and its public identity (9.8 `_node_references`; null fields when the
  * revision's spec is not in the plan). Train nodes only. */
@@ -166,4 +176,7 @@ export interface RunList { runs: (RunListEntry | UnreadableRun)[]; controller: C
 export interface RunDetail { run: GraphRun | UnreadableRun; controller: ControllerView; plan: PlanSummary | null; tracking_failures: TrackingFailure[] }
 export interface RunSteered { run: GraphRun | UnreadableRun; controller: ControllerView }
 export interface SubmitResult { run_id: string; status: string; simulation: boolean; plan_sha256: Sha256; controller: ControllerView }
+/** `graph_submit`'s `conflict` data with the issue `plan_submitted` at `/plan_sha256` (11.5): the run already registered
+ * for this plan under another request ID, whatever its status (a cancelled run too). */
+export interface PlanSubmitted { run_id: string; status: GraphRun["status"] }
 export interface TrackingRearmed extends WithWarnings { event_id: Sha256; run_id: string; node_id: string | null; kind: string; status: string }
