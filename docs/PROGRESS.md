@@ -5843,6 +5843,101 @@ Synthetic data establishes pipeline behavior, not business quality or numeric re
 
 # Progress and acceptance status — 2026-10-14
 
+## Task 11.5 fixes: planning and workflow (synthetic data, plan dedupe, merges, selections), 2026-10-21
+
+Branch `codex/rc-planning-fixes` from RC `01c8503`, worktree `D:\llm-tuning-factory-wt115`. Each item was test first:
+the new test was run and failed for the stated reason before the fix. No GPU, network, CPU numerics or dataset
+transfer.
+
+- **R1 I-2 (synthetic data), root's option (b): fixed.** `ModelDescriptor.eligible_for_real_use` (neither synthetic
+  nor simulated) now gates only selection (evaluation records carry the flag) and MLflow registration
+  (`tracking_outbox`). The new `ModelDescriptor.usable_in_real_operations` (not simulated) gates every artifact a real
+  operation takes as an input: `graph_planner.compile_node`'s `verified` ("simulation model is ineligible for real
+  execution"), `validate_input` ("simulation artifact is ineligible for real use"), `check_merge_descriptors`
+  ("merge requires real completed artifacts") and `operation_runner._derive` (control plane and worker). Simulated
+  artifacts stay refused as real inputs at each of these layers. Taint was already airtight and is now pinned:
+  training, continuation, merge and materialization outputs inherit `synthetic` from any input or dataset, freeze
+  refuses a child that drops it, and an evaluation record is synthetic when its model or benchmark data is.
+  - RED: R1's probe graphs on a real plan over synthetic, exportable data through the real `OperationAttemptRunner`
+    and the fake GPU host failed `b`, `ea`, `ec` with "synthetic/simulation model is ineligible for real execution".
+  - Tests: `tests/test_synthetic_chains.py` (train a -> evaluate e(a); b continues a on *real* data; m merges two
+    synthetic adapters; s selects with the merged candidate: COMPLETED, one launch per node, every descendant
+    synthetic, `no_winner`, no `model_registration` event and no model version; a real chain still registers;
+    model-input checks; channel `graph_plan` (real) and `graph_submit` accept a chain over synthetic data);
+    `test_graph_planner::test_real_compilation_refuses_only_simulated_input_models`; updated
+    `test_model_artifacts`, `test_model_ops_contract`, `test_model_inputs` cases (simulation refused, synthetic
+    accepted).
+- **R2 I1 (backend plan-hash dedupe): fixed.** `GraphStore.submit(plan, request_id, approval, *, unique_plan=False)`.
+  With `unique_plan=True`, inside the existing `BEGIN IMMEDIATE`, a plan that is already a run under another request
+  ID (any status, cancelled included) raises `PlanSubmitted(run_id, status)` with the text `PLAN_SUBMITTED`
+  ("plan already submitted as another run; to run it again, change an input and plan again"). Only the workflow
+  `graph_submit` passes it; the CLI `graph-submit` goes through it. Answer: `status: "conflict"`, one issue
+  `{"code": "plan_submitted", "path": "/plan_sha256", "message": PLAN_SUBMITTED, "node_id": null, "row_number":
+  null}`, `data: {"run_id": <existing run>, "status": <its status>}`. `desktop_workflows.conflict()` takes an
+  optional `data=`; `CONFLICTS` maps the text to `plan_submitted`. The same request ID and plan stay idempotent.
+  The staleness check (`plan_stale`) and a real plan's approval and data checks still run first.
+  - RED: two concurrent subprocess submits with different IDs made two runs.
+  - Tests (`tests/test_workflow_runs.py`): IDs `a` then `b` (also after a cancel, and as `plan-<sha>`), a re-plan
+    with a changed input succeeds, the engine default keeps request-ID semantics, the CLI through `CliRunner` with
+    `--state-dir` in tmp, two concurrent subprocess submits give exactly one run. Three tests that relied on duplicate
+    submits (`test_simulation_submit_skips_profile_freshness_but_not_the_project`,
+    `test_pause_resume_cancel_map_refusals_to_conflicts`, `test_run_status_is_db_only_and_secret_free`) now use
+    distinct plans (another timeout).
+- **R2 M3: fixed.** `model_root_snapshot`'s `_download` opens through `hf_targets._open` (at most five redirects,
+  each closed with its body unread, HTTPS on every hop, Authorization dropped across origins) and caps the body
+  with `hf_targets._read`. Its hub's metadata `get` uses the same helpers with the 4 MiB limit; the client no longer
+  follows redirects itself. `_open` takes the too-many-redirects issue code (`snapshot_failed` here). Tests
+  (`httpx.MockTransport`, endless undeclared bodies): CDN redirect (no token there, 0 bytes pulled), redirect loop
+  (6 requests, 0 bytes pulled), oversized revision info (refused after one chunk past 4 MiB).
+- **R5 I2: fixed (test).** `test_workflow_planning::test_an_instruction_recipe_bound_to_other_data_is_refused_before_any_run`
+  (preference and text data): `train_contract` on `/graph/nodes/0` through `graph_validate` and `graph_plan`
+  (simulation and real), nothing stored. With `graph_planner.py:349-350` removed both cases fail (checked).
+- **R5 I3 and root's decision on R5 M4: fixed.** `tests/test_merge_fallback.py` (controller world, ScriptedDispatcher):
+  a regression keeps the best original (`merge_regression`), an improvement selects the merged model, an ineligible
+  merged evaluation keeps the original, and the kept fail-closed rule: without `allow_partial` a failed merge or a
+  failed merged evaluation blocks the selection ("partial selection is not allowed", run FAILED); with
+  `allow_partial` the best original is chosen.
+  - Defect found and fixed: a receipt that excluded a nonfinite score was compared with `==` after a JSON round trip
+    (NaN never equals NaN), so the selection failed with "selection receipt mismatch". `benchmarks.same_receipt`
+    compares canonical JSON; the store's two receipt checks and the compiler of a selection's child use it. Test:
+    `test_a_nonfinite_score_never_breaks_the_selection_receipt`.
+  - `partial_selection_not_allowed` next to a selected winner was inconsistent (the pairwise comparison's gating
+    reason). An ineligible merged evaluation now gives the one reason `merged_not_eligible`; the evidence stays in
+    `excluded`. Tests in `test_benchmarks.py`.
+- **R5 M6: fixed (test).** `test_graph_planner::test_lora_sft_materialized_into_dpo_binds_policy_and_reference_to_the_materialized_model`.
+- **R1 m2: fixed at `plan_graph`.** `_MergeLineage` compares the known inputs (`len(known) >= 2`) and a merge's
+  candidates are its known inputs' shared ones (this reaches `validate_graph` too, `merge_bases_differ`); a
+  materialized model fed into a merge, or a selection none of whose candidates is a plain adapter, is refused ("merge
+  requires plain causal LoRA/QLoRA parents"; a selection that may pick an adapter still plans); the merged rank is a
+  floor carried through nested merges (sum) and selections (smallest candidate); duplicates provable through
+  selections are refused ("merge requires distinct actual artifacts", a bipartite matching over each input's possible
+  models). Recorded: these refusals live in `plan_graph` (`graph_plan` shows `plan_refused`), not `validate_graph`,
+  as the existing merge rank and parent-kind refusals do: a new issue code would need its Korean text in
+  `desktop/src/issues.ts`, and artifact snapshots exist only at planning. A merge whose selections may pick the same
+  model at run time is not provable and stays with compile.
+- **R1 m3: fixed at `plan_graph`.** Refused: repeated evaluation refs, two evaluations that can only be the same
+  model (also through a selection) ("selection candidates must be distinct models"), more than one merged candidate
+  ("a selection takes at most one merged candidate"), and a selection whose only candidates are merged ("a selection
+  needs an original candidate beside its merged one", it always records no winner). Recorded: not a schema
+  validator, so plans and runs stored with such graphs stay readable; `SelectNode.evaluations` keeps no
+  `max_length` (64 nodes bound it).
+
+Verification (this worktree, Python 3.12, `uv sync --extra dev --extra tracking --locked`):
+- `uv run pytest -q`: **1808 passed, 1 skipped** (755 s; the skip is the opt-in real-GPU test). An earlier full run
+  on the first version of the R1 m2 change gave 1 failed, 1806 passed, 1 skipped: a merge of two selections whose
+  candidates included a full-model artifact was refused although the selection could pick an adapter. The check was
+  narrowed to provable cases (a selection with no adapter candidate) before the final run.
+- `GITHUB_ACTIONS=true CI=true uv run pytest tests/test_workflow_runs.py tests/test_workflow_planning.py
+  tests/test_synthetic_chains.py tests/test_hf_targets.py -q`: **215 passed**.
+- `uv run ruff check src tests`: all checks passed. `uv run python scripts/check_secrets.py`: 1176 file versions,
+  0 findings. `git diff --check 01c8503..HEAD`: clean; every changed file is LF (`git ls-files --eol`).
+- Mutation check (R5 I2): with the two kind-check lines of `graph_planner._definition_issues` removed, both
+  parametrizations of the new channel test fail; restored.
+- Not run here: CPU numerics, GPU, network, hosted CI (root's).
+
+GPU work still outstanding for this area: the L2b chain on synthetic data (train -> continue -> evaluate -> select ->
+merge -> evaluate) has only run against the fake GPU host; its live run stays as planned in Task 11.
+
 ## Windows workbench refinement — 0.2.1
 
 User selected the light Linear/Vercel direction after requesting getdesign.md references and similar open-source
