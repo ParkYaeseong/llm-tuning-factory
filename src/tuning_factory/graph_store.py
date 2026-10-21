@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from .benchmarks import BenchmarkSpec, SelectionResult
+from .benchmarks import BenchmarkSpec, SelectionResult, same_receipt
 from .graph_planner import (
     ApprovalGrant,
     GraphPlan,
@@ -919,7 +919,8 @@ class GraphStore:
             raise ValueError('evaluation cannot publish a model output')
         if outputs.selection is not None:
             receipt = resolve_local_selection(LocalSelectSpec.model_validate(operation))
-            if receipt.status != 'no_winner' or SelectionResult.model_validate(outputs.selection.model_dump()) != receipt:
+            if receipt.status != 'no_winner' or not same_receipt(
+                    SelectionResult.model_validate(outputs.selection.model_dump()), receipt):
                 raise ValueError('selection receipt mismatch')
         model = descriptor = None
         if outputs.model:
@@ -935,7 +936,8 @@ class GraphStore:
                 raise ValueError('output model simulation differs from plan')
             if kind == 'select':
                 receipt = resolve_local_selection(LocalSelectSpec.model_validate(operation))
-                if model.selection != receipt or model.model != receipt.winner:
+                if (model.selection is None or not same_receipt(model.selection, receipt)
+                        or model.model != receipt.winner):
                     raise ValueError('selection receipt mismatch')
             elif (descriptor.producer_job_id, descriptor.producer_attempt_id, descriptor.producer_manifest_sha256) != (
                     job['id'], attempt_id, job['manifest']['sha256']):

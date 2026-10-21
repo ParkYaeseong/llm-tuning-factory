@@ -223,11 +223,21 @@ def select_best(records, selection: SelectionSpec, *, requested_models=None) -> 
                            requested_models=requested, observed_models=observed)
 
 
+def same_receipt(first: SelectionResult, second: SelectionResult) -> bool:
+    """Whether two selection receipts are the same evidence: compared by their canonical JSON, where a nonfinite
+    score is its ``{"nonfinite": ...}`` marker, because NaN never equals NaN after a round trip (Task 11.5)."""
+    return canonical(first.model_dump(mode="json")) == canonical(second.model_dump(mode="json"))
+
+
 def finalize_with_merge(best_original, merged_record, selection: SelectionSpec) -> SelectionResult:
     """Retain original on invalid/regressed merge; allowance applies directionally.
 
     Within a positive regression allowance, the merged artifact may be retained.
     Exact score ties still use artifact ID order. No service deployment occurs.
+
+    When the merged evaluation is not eligible the original stands with the one reason ``merged_not_eligible``
+    (its exclusion evidence stays in ``excluded``): the pairwise comparison's own gating reasons, such as
+    ``partial_selection_not_allowed``, do not describe a receipt that selects a winner (Task 11.5, R5 M4).
     """
     receipt = select_best((best_original, merged_record), selection)
     if receipt.status == "waiting":
@@ -239,7 +249,7 @@ def finalize_with_merge(best_original, merged_record, selection: SelectionSpec) 
                                           "reasons": (*receipt.reasons, "original_not_eligible")})
     if merged is None:
         return receipt.model_copy(update={"winner": original.model, "status": "selected",
-                                          "reasons": (*receipt.reasons, "merged_not_eligible")})
+                                          "reasons": ("merged_not_eligible",)})
     # Respect decimal JSON/config boundaries (e.g. 0.8 - 0.7 == tolerance 0.1)
     # without introducing an epsilon that could silently permit a real regression.
     difference = Fraction(str(merged.metrics[selection.metric])) - Fraction(str(original.metrics[selection.metric]))

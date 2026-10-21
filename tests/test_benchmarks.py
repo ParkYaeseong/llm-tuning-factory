@@ -313,3 +313,28 @@ def test_merge_finalization_waits_for_pending_evaluation():
                                  SelectionSpec(metric="exact_match", direction="max"))
     assert result.status == "waiting"
     assert result.winner is None
+
+
+@pytest.mark.parametrize("allow_partial", [False, True])
+@pytest.mark.parametrize("merged", [{"score": float("nan")}, {"metrics": {}}, {"synthetic": True},
+                                    {"status": "failed"}])
+def test_a_merge_fallback_never_names_a_partial_refusal_next_to_its_winner(allow_partial, merged):
+    """Task 11.5 (R5 M4): an ineligible merged evaluation leaves the original selected with the one reason
+    ``merged_not_eligible``; the pairwise comparison's ``partial_selection_not_allowed`` or
+    ``insufficient_partial_success`` described a refusal, not this receipt. The exclusion evidence stays."""
+    from tuning_factory.benchmarks import SelectionSpec, finalize_with_merge
+
+    result = finalize_with_merge(record("a"), record("b", **merged),
+                                 SelectionSpec(metric="exact_match", direction="max", allow_partial=allow_partial))
+    assert (result.status, result.winner, result.reasons) == ("selected", model("a"), ("merged_not_eligible",))
+    assert [item.model for item in result.excluded] == [model("b")] and result.excluded[0].reasons
+
+
+def test_receipts_with_a_nonfinite_score_are_the_same_evidence_after_a_round_trip():
+    from tuning_factory.benchmarks import SelectionResult, same_receipt
+
+    receipt = select((record("a"), record("b", float("nan")), record("c", 0.7)), allow_partial=True)
+    again = SelectionResult.model_validate_json(receipt.model_dump_json())
+    assert receipt != again   # NaN never equals NaN: the reason receipts compare by canonical JSON
+    assert same_receipt(receipt, again)
+    assert not same_receipt(receipt, select((record("a"), record("c", 0.7)), allow_partial=True))

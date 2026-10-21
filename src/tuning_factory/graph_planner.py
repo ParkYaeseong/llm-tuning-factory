@@ -18,7 +18,7 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from .benchmarks import BenchmarkSpec, EvaluationRecord, SelectionResult
+from .benchmarks import BenchmarkSpec, EvaluationRecord, SelectionResult, same_receipt
 from .config import GraphTrainingConfig, StrictModel
 from .dataset_splits import assert_no_input_overlap, input_fingerprint, load_dataset
 from .executor_profiles import (
@@ -819,8 +819,9 @@ def compile_node(plan: GraphPlan, node_id: str, verified_bindings: VerifiedBindi
                 share = failed & {ref.node_id for ref in parent.evaluations}
                 local = _compile_select(plan, parent, bindings, select_lineage, outputs, verified, share)
                 receipt = resolve_local_selection(local)
-                if (receipt.status != "selected" or receipt.winner != ref
-                        or outputs[value.node_id].selection != receipt):
+                selection = outputs[value.node_id].selection
+                if (receipt.status != "selected" or receipt.winner != ref or selection is None
+                        or not same_receipt(selection, receipt)):
                     raise ValueError("selection output differs from verified evaluation receipt")
                 return ref
             producer = producers.get(_artifact_key(ref))
