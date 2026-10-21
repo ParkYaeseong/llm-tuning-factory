@@ -291,6 +291,10 @@ class ScriptedDispatcher:
             return None
         status = self.delivered.pop(node)
         self._result(job, lease, attempt['launch_id'], status, None if status == 'COMPLETED' else 'late failure')
+        if job['cancel_requested'] or self.store.get_run(job['graph_run_id'])['status'] == 'CANCELED':
+            # The runner's semantics (11.5 R1 I-1): a late result collected after a cancel is CANCELED.
+            self.jobs.reconcile_result(lease, 'CANCELED', 'cancellation requested')
+            return outcome(job_id, lease.attempt_id, 'CANCELED', error='cancellation requested')
         if status != 'COMPLETED':
             self.jobs.reconcile_result(lease, status, 'late failure')
             return outcome(job_id, lease.attempt_id, status, error='late failure')
@@ -1150,13 +1154,15 @@ def test_status_is_db_only_and_secret_free(tmp_path, monkeypatch):
     assert SECRET not in json.dumps(controller.status())
 
 
-def test_end_to_end_with_the_real_attempt_runner(tmp_path, monkeypatch):
+def host_world(tmp_path, monkeypatch, nodes, **plan):
+    """``world`` with the real ``OperationAttemptRunner`` and the real ``SSHExecutor`` on a fake GPU host
+    (``test_operation_runner.gpu_host``): ``w.runner``, ``w.host``, ``w.engine_calls`` and ``w.host_provider``."""
     from test_operation_runner import gpu_host
 
     from tuning_factory.attempt_runner import OperationAttemptRunner
-    w = world(tmp_path, monkeypatch, lambda r: [train(r, 'a'), evaluate(r, 'e', 'a')])
-    calls = []
-    _, executor = gpu_host(tmp_path, monkeypatch, calls)
+    w = world(tmp_path, monkeypatch, nodes, **plan)
+    w.engine_calls = []
+    w.host, executor = gpu_host(tmp_path, monkeypatch, w.engine_calls)
 
     class HostProvider(FakeProvider):
         @contextmanager
@@ -1166,14 +1172,68 @@ def test_end_to_end_with_the_real_attempt_runner(tmp_path, monkeypatch):
             observed = facts.model_copy(update={'observed_at': datetime.fromtimestamp(self.clock(), tz=timezone.utc)})
             yield ResolvedDestination(profile=pinned, observation=observed, executor=executor)
 
-    runner = OperationAttemptRunner(w.store, root=w.store.state_dir)
-    controller, owner = start(w, dispatcher=runner, provider=HostProvider(pods('pod1'), w.clock))
+        @contextmanager
+        def recover(self, profile_id, approved_revision, *, pinned, pinned_facts, manifest_sha256,
+                    runtime_profile=None):
+            self.recovers.append(profile_id)
+            yield executor
+
+    w.runner = OperationAttemptRunner(w.store, root=w.store.state_dir)
+    w.host_provider = HostProvider(pods('pod1'), w.clock)
+    return w
+
+
+def test_end_to_end_with_the_real_attempt_runner(tmp_path, monkeypatch):
+    w = host_world(tmp_path, monkeypatch, lambda r: [train(r, 'a'), evaluate(r, 'e', 'a')])
+    controller, owner = start(w, dispatcher=w.runner, provider=w.host_provider)
     drive(w, controller, owner)
     assert statuses(w) == {'a': 'COMPLETED', 'e': 'COMPLETED'} and run_row(w)['status'] == 'COMPLETED'
+    calls = w.engine_calls
     assert calls.count('train.bound.yaml') == 1 and calls.count('predict.yaml') == 1   # one launch per node
     for node_id in ('a', 'e'):
         assert status_of(w, node_id)['tracking_status'] == 'saved'
     assert status_of(w, 'a')['cache_seed'] == 'published' and status_of(w, 'a')['registration_status'] == 'registered'
+
+
+@pytest.mark.parametrize('when', ['while_running', 'while_uncertain'])
+@pytest.mark.parametrize('scope', ['run', 'job'])
+def test_a_cancel_wins_over_a_late_completion_through_reconcile(tmp_path, monkeypatch, scope, when):
+    """Task 11.5 R1 I-1 with the real runner: the run (or ``factory cancel <job>``) is canceled while ``a`` runs, or once
+    it is FAILED-uncertain, its start response is lost, and a late COMPLETED result arrives. ``a`` ends CANCELED, its
+    child is never claimed, nothing is registered and ``a`` trained once."""
+    w = host_world(tmp_path, monkeypatch, lambda r: [train(r, 'a'), evaluate(r, 'e', 'a')])
+    w.host.mode = 'lose_start_response'
+
+    def cancel():
+        if scope == 'run':
+            w.store.cancel(w.run_id)
+        else:
+            w.store.jobs.cancel(job_of(w, 'a'))
+
+    if when == 'while_running':
+        launch = w.host.launch
+
+        def canceled_while_running(args):
+            cancel()
+            return launch(args)
+
+        w.host.launch = canceled_while_running
+    controller, owner = start(w, dispatcher=w.runner, provider=w.host_provider)
+    controller.tick(owner)
+    w.pool.run_all()
+    a = job_of(w, 'a')
+    assert w.store.jobs.get(a)['status'] == 'FAILED' and w.store.jobs.gpu_locked('existing_runpod:pod1')
+    if when == 'while_uncertain':
+        cancel()
+    assert w.store.jobs.get(a)['cancel_requested'] == 1
+    w.host.finish()   # the late COMPLETED result
+    drive(w, controller, owner)
+    assert statuses(w) == {'a': 'CANCELED', 'e': 'CANCELED' if scope == 'run' else 'BLOCKED'}
+    assert run_row(w)['status'] == ('CANCELED' if scope == 'run' else 'FAILED')
+    assert job_of(w, 'e') is None   # the child was never compiled or claimed
+    assert [row for row in events(w) if row['kind'] == 'model_registration'] == []
+    assert readiness.table(w, 'node_outputs') == [] and w.store.attempt_disposition(a)['disposition'] == 'canceled'
+    assert w.engine_calls == ['train.bound.yaml'] and len(w.host.launches) == 1   # trained once, launched once
 
 
 def test_run_forever_stops_claiming_and_releases_owner(tmp_path, monkeypatch):

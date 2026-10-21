@@ -1068,3 +1068,34 @@ def test_tracking_outbox_rows_are_inserted_by_column_name():
     source = inspect.getsource(graph_store)
     assert 'INTO tracking_outbox VALUES' not in source
     assert source.count('INTO tracking_outbox (attempt_id,job_id,payload,acknowledged)') == 2
+
+
+# -- Task 11.5 review fixes (R1 I-1, m1, m7) ---------------------------------------------------------
+
+def uncertain(store, claimed):
+    """The claimed attempt launched and lost its result: FAILED, with its lock kept for reconcile."""
+    store.jobs.begin_launch(claimed['lease'])
+    store.jobs.transition(claimed['lease'], 'RUNNING')
+    store.jobs.transition(claimed['lease'], 'FAILED', 'remote execution uncertain; reconcile the same launch')
+    assert store.jobs.gpu_locked(claimed['lease'].resource_id)
+
+
+@pytest.mark.parametrize('scope', ['run', 'job'])
+def test_a_cancel_flags_an_uncertain_attempt_that_keeps_its_lock(tmp_path, scope):
+    """R1 I-1: a run cancel flagged only active jobs and ``JobStore.cancel`` ignored a FAILED one, so reconcile of an
+    uncertain attempt never learned of the cancel. A FAILED attempt holding its lock is flagged; a final one is not."""
+    w = ledger_world(tmp_path, ('pod1', 'pod2'), max_concurrent=2)
+    store, run = w.store, w.run_id
+    ctl = store.acquire_controller(run)
+    store.prepare_ready(ctl)
+    held, final = (store.claim_ready(facts, ctl) for facts in w.facts)
+    uncertain(store, held)
+    uncertain(store, final)
+    store.jobs.release_gpu(final['lease'], execution_stopped=True)   # its result arrived: final
+    if scope == 'run':
+        store.cancel(run)
+    else:
+        for claimed in (held, final):
+            store.jobs.cancel(claimed['id'])
+    assert [store.jobs.get(claimed['id'])['cancel_requested'] for claimed in (held, final)] == [1, 0]
+    assert [store.jobs.get(claimed['id'])['status'] for claimed in (held, final)] == ['FAILED', 'FAILED']

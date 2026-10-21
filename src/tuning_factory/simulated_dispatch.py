@@ -537,8 +537,9 @@ class SimulatedOperationDispatcher:
         """Settle a crashed simulated attempt that still holds its lock; never runs anything.
 
         FAILED after ``begin_launch``: from its published result, or with a FAILED result published here first
-        (``SIMULATION_STOPPED``). COMPLETED: rebuild and release. CANCELED: release on an accepted result, else None.
-        A released attempt is final (``outputs_for`` rebuilds a completed one).
+        (``SIMULATION_STOPPED``), and CANCELED instead after a job or run cancel. COMPLETED: rebuild and release.
+        CANCELED: release on an accepted result, else None. A released attempt is final (``outputs_for`` rebuilds a
+        completed one).
         """
         if executor is not None:
             raise ValueError(NO_EXECUTOR)
@@ -581,7 +582,11 @@ class SimulatedOperationDispatcher:
             if result is None:
                 raise ValueError("the published simulated result is unreadable; inspect the launch directory")
         status, error, outputs, targets = result.status, result.error, None, ()
-        if status == "COMPLETED":
+        current = self.jobs.get(job_id)
+        if current["cancel_requested"] or self.graph.get_run(job["graph_run_id"])["status"] == "CANCELED":
+            # As _launch and the real runner (11.5 R1 I-1): a result settled after a cancel is CANCELED.
+            status, error = "CANCELED", "cancellation requested"
+        elif status == "COMPLETED":
             try:
                 outputs, targets = self._outputs(job, manifest, operation, lease.attempt_id, launch, result)
             except Exception as exc:   # the result exists, so execution stopped: fail, never re-run

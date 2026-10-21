@@ -1385,7 +1385,11 @@ class GraphStore:
                 raise ValueError('a finished graph cannot be canceled')
             db.execute('UPDATE graph_runs SET status=? WHERE id=?', (status, run_id))
             if status == 'CANCELED':
-                db.execute("UPDATE jobs SET cancel_requested=1 WHERE graph_run_id=? AND status IN ('PROVISIONING','RUNNING','EVALUATING')", (run_id,))
+                # Active attempts, and finished ones that still hold their lock (an uncertain attempt, or a crash
+                # before its release): the late result their reconcile collects is CANCELED (11.5 R1 I-1).
+                db.execute("UPDATE jobs SET cancel_requested=1 WHERE graph_run_id=? AND (status IN "
+                           "('PROVISIONING','RUNNING','EVALUATING') OR (status IN ('FAILED','CANCELED') AND (id IN "
+                           "(SELECT job_id FROM gpu_locks) OR id IN (SELECT job_id FROM resource_leases))))", (run_id,))
                 db.execute("UPDATE jobs SET status='CANCELED' WHERE graph_run_id=? AND status IN ('PENDING','QUEUED','RETRYING')", (run_id,))
                 db.execute("UPDATE nodes SET status='CANCELED' WHERE run_id=? AND status IN ('PENDING','READY')", (run_id,))
                 # A node waiting out its retry backoff never runs again (Task 8.2).

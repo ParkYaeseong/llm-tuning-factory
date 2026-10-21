@@ -177,12 +177,19 @@ class OperationAttemptRunner:
         operation = validated_operation(manifest["operation"])
         # From the ledger, never from local files: the executor refuses a command.json that differs from it.
         request = self._request(lease.attempt_id, attempt["launch_id"], manifest, operation)
-        raw = executor.collect_operation_result(self._job_dir(job_id), launch, request)
+        # A canceled attempt without a result yet gets the remote cancel marker (11.5 R1 I-1): only _await_result
+        # sent it, so a launch whose response was lost would otherwise train on to its own deadline.
+        raw = executor.collect_operation_result(self._job_dir(job_id), launch, request,
+                                                cancel=self._cancel_requested(job))
         if raw is None:
             return None
         result = self._accept(raw, request, launch)
         status, error, outputs, targets = result.status, result.error, None, ()
-        if status == "COMPLETED":
+        if self._cancel_requested(self.jobs.get(job_id)):
+            # As _launch (11.5 R1 I-1): a result collected after a cancel is CANCELED, whatever it says, so a late
+            # completion never freezes an output, unblocks a child or registers a model.
+            status, error = "CANCELED", "cancellation requested"
+        elif status == "COMPLETED":
             try:
                 outputs, targets = self._outputs(job, manifest, operation, lease.attempt_id, launch, result)
             except Exception as exc:   # the remote result exists, so execution stopped: fail, never retrain
@@ -476,6 +483,10 @@ class OperationAttemptRunner:
             "status": status, "artifact": ref.model_dump(mode="json"), "source_remote_dir": source, "error": error}))
 
     # -- ledger and file helpers ----------------------------------------------------------------
+
+    def _cancel_requested(self, job) -> bool:
+        """A job-level cancel, or a canceled run (a run canceled before 11.5 never flagged an uncertain attempt)."""
+        return bool(job["cancel_requested"]) or self.graph.get_run(job["graph_run_id"])["status"] == "CANCELED"
 
     def _attempt(self, lease: AttemptLease) -> dict:
         return self.jobs.validated_attempt(lease)

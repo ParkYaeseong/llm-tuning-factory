@@ -1249,3 +1249,60 @@ def test_release_uncontacted_after_a_crash_before_running_launches_once(tmp_path
     outcome = run(w, claimed=again)
     assert outcome.status == "COMPLETED", outcome.error
     assert len(w.host.launches) == 1 and w.calls == ["train.bound.yaml"]
+
+
+# -- 15. Task 11.5 (R1 I-1, I-3, I-4): a cancel through reconcile, a transient collection failure, totals --------
+
+def remote_launch(w):
+    return w.host.sftp.path(f"{RUNPOD_ROOT}/jobs/{w.job_id}/{w.claimed['launch_id']}")
+
+
+@pytest.mark.parametrize("cancel", ["run", "job"])
+def test_a_cancel_wins_over_a_late_completion_collected_by_reconcile(tmp_path, monkeypatch, cancel):
+    """R1 I-1: a cancel of the run or of the job while the attempt is FAILED-uncertain flags it, and the late
+    COMPLETED result that reconcile collects is CANCELED, as in ``_launch``: nothing is frozen, the lock is released."""
+    w = world(tmp_path, monkeypatch)
+    before = artifact_entries(w.store)
+    w.host.mode = "lose_start_response"
+    assert run(w).uncertain and held_locks(w)
+    if cancel == "run":
+        w.store.cancel(w.run["id"])
+    else:
+        w.store.jobs.cancel(w.job_id)   # the CLI/desktop job-level cancel
+    assert w.store.jobs.get(w.job_id)["cancel_requested"] == 1   # flagged although the attempt is FAILED
+    w.host.finish()   # the remote ran on to a COMPLETED result
+    assert json.loads((remote_launch(w) / "result.json").read_bytes())["status"] == "COMPLETED"
+    outcome = w.runner.reconcile(w.job_id, w.executor)
+    assert (outcome.status, outcome.uncertain, outcome.outputs) == ("CANCELED", False, None)
+    assert w.store.jobs.get(w.job_id)["status"] == "CANCELED" and not held_locks(w)
+    assert artifact_entries(w.store) == before   # no output of a canceled attempt is ever frozen
+    assert w.calls == ["train.bound.yaml"] and len(w.host.launches) == 1
+    assert w.runner.failure_kind(w.job_id) == "canceled"
+    assert w.store.classify_attempt(w.ctl, w.job_id, "canceled") == "canceled" and node_status(w) == "CANCELED"
+
+
+def test_a_job_cancel_leaves_a_final_attempt_unchanged(tmp_path, monkeypatch):
+    """R1 I-1: ``JobStore.cancel`` flags a FAILED attempt only while it holds its lock; a final one is untouched."""
+    w = world(tmp_path, monkeypatch, fail="engine exited with status 1")
+    assert run(w).status == "FAILED" and not held_locks(w)
+    w.store.jobs.cancel(w.job_id)
+    job = w.store.jobs.get(w.job_id)
+    assert (job["status"], job["cancel_requested"]) == ("FAILED", 0)
+
+
+def test_reconcile_sends_the_cancel_to_a_worker_that_may_still_run(tmp_path, monkeypatch):
+    """R1 I-1: only ``_await_result`` wrote the remote ``cancel`` marker, so a canceled attempt whose response was
+    lost trained on to its own deadline. While there is no result, reconcile of a canceled attempt writes it."""
+    w = world(tmp_path, monkeypatch)
+    w.host.mode = "lose_start_response"
+    assert run(w).uncertain
+    marker = remote_launch(w) / "cancel"
+    assert w.runner.reconcile(w.job_id, w.executor) is None and not marker.exists()   # no cancel: no marker
+    w.store.cancel(w.run["id"])
+    assert w.runner.reconcile(w.job_id, w.executor) is None and marker.is_file()
+    assert w.runner.reconcile(w.job_id, w.executor) is None and held_locks(w)   # an existing marker is the same signal
+    w.host.finish()   # the worker sees the marker before it trains
+    outcome = w.runner.reconcile(w.job_id, w.executor)
+    assert (outcome.status, outcome.outputs) == ("CANCELED", None) and not held_locks(w)
+    assert w.calls == [] and len(w.host.launches) == 1
+    assert json.loads((remote_launch(w) / "result.json").read_bytes())["status"] == "CANCELED"

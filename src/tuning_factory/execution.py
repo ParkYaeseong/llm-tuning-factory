@@ -1,4 +1,5 @@
 """Infrastructure policy and execution adapters; no implicit paid actions."""
+import contextlib
 import json
 import math
 import os
@@ -423,13 +424,7 @@ class SSHExecutor(ExecutionBackend):
         cancellation_sent = False
         while True:
             if canceled() and not cancellation_sent:
-                try:
-                    with sftp.open(remote + "/cancel", "x"):
-                        pass
-                except OSError:
-                    # SFTP v3 may report existing-file errors without an errno.
-                    # Confirm the competing signal exists; propagate transport errors.
-                    sftp.lstat(remote + "/cancel")
+                self._send_cancel(sftp, remote)
                 cancellation_sent = True
             try:
                 with sftp.open(remote + "/result.json") as f:
@@ -441,6 +436,17 @@ class SSHExecutor(ExecutionBackend):
                 raise ExecutionUncertain("remote worker deadline exceeded; reconcile the remote GPU host "
                                          "and retain GPU lock")
             time.sleep(1)
+
+    @staticmethod
+    def _send_cancel(sftp, remote):
+        """Create the worker's ``cancel`` marker; an existing one is the same signal."""
+        try:
+            with sftp.open(remote + "/cancel", "x"):
+                pass
+        except OSError:
+            # SFTP v3 may report existing-file errors without an errno.
+            # Confirm the competing signal exists; propagate transport errors.
+            sftp.lstat(remote + "/cancel")
 
     @staticmethod
     def save_remote_evidence(sftp, remote, directory, result):
@@ -571,9 +577,11 @@ class SSHExecutor(ExecutionBackend):
                 raise ExecutionUncertain("remote execution uncertain; reconcile before releasing GPU lock") from exc
             raise
 
-    def collect_operation_result(self, job_directory, launch_directory, request):
+    def collect_operation_result(self, job_directory, launch_directory, request, *, cancel=False):
         """Collect a v2 attempt's result; never launches (recovery-safe). None while there is no result: a start
-        marker alone means the worker may still be running, so the attempt stays uncertain. Like
+        marker alone means the worker may still be running, so the attempt stays uncertain. With ``cancel`` (the
+        attempt's job or run was canceled) that worker also gets the ``cancel`` marker, as ``_await_result`` sends
+        it (11.5 R1 I-1); best effort, since the launch directory may never have been created. Like
         ``run_operation`` it returns the trusted result and never downloads the host's ``result.json``."""
         self._require_injected_connection()
         job, launch, request, command_sha256, kind = self._v2_attempt(job_directory, launch_directory, request)
@@ -588,6 +596,9 @@ class SSHExecutor(ExecutionBackend):
                     raw = json.loads(stream.read())
             except OSError as exc:
                 if exc.errno == 2:
+                    if cancel:
+                        with contextlib.suppress(OSError):
+                            self._send_cancel(sftp, remote)
                     return None
                 raise
             result = self._accept_result(raw, request, kind)

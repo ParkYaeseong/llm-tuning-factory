@@ -886,3 +886,48 @@ def test_a_failing_directory_fsync_keeps_the_published_result(tmp_path, monkeypa
     target = tmp_path / "launch.result.json"
     assert sd._publish_exclusive(target, b"result") is True
     assert target.read_bytes() == b"result" and sd._publish_exclusive(target, b"other") is False
+
+
+@pytest.mark.parametrize("when", ["while_running", "while_uncertain"])
+@pytest.mark.parametrize("scope", ["run", "job"])
+@pytest.mark.parametrize("published", [True, False])
+def test_a_cancel_wins_over_a_simulated_result_collected_by_reconcile(tmp_path, monkeypatch, when, scope, published):
+    """Task 11.5 R1 I-1, as the real runner: an attempt that crashed after (or before) publishing its result and was
+    canceled, while running or once FAILED-uncertain, is settled CANCELED by reconcile: nothing frozen, lock freed."""
+    sd = api()
+    w = build(tmp_path, lambda r: [node_train(r, "train")])
+    spy = execution_spy(monkeypatch, fail=None if published else Crash())
+    claimed = claim(w, "train")
+    job_id, before = claimed["id"], artifact_entries(w.store)
+
+    def cancel():
+        if scope == "run":
+            w.store.cancel(w.run_id)
+        else:
+            w.store.jobs.cancel(job_id)
+
+    with monkeypatch.context() as patch:
+        transition = w.store.jobs.transition
+
+        def crash(subject, status, error=None):   # the process dies after the result was published
+            if status == "EVALUATING":
+                raise Crash()
+            return transition(subject, status, error)
+
+        patch.setattr(w.store.jobs, "transition", crash)
+        with pytest.raises(Crash):
+            dispatcher(w).run_claimed(claimed, None, approval=w.approval)
+    if when == "while_running":
+        cancel()
+    assert w.store.recover_stale(w.ctl, stale_before=time.time() + 1) == (job_id,)
+    if when == "while_uncertain":
+        cancel()
+    assert w.store.jobs.get(job_id)["cancel_requested"] == 1 and held(w)
+    d = sd.SimulatedOperationDispatcher(w.store, root=w.state, roots=None)
+    outcome = d.reconcile(job_id, None)
+    assert (outcome.status, outcome.uncertain, outcome.outputs) == ("CANCELED", False, None)
+    assert w.store.jobs.get(job_id)["status"] == "CANCELED" and not held(w)
+    assert artifact_entries(w.store) == before and spy.calls == [launch_dir(w, claimed)]
+    assert d.failure_kind(job_id) == "canceled"
+    assert w.store.classify_attempt(w.ctl, job_id, "canceled") == "canceled"
+    assert w.store.get_run(w.run_id)["nodes"][0]["status"] == "CANCELED"
