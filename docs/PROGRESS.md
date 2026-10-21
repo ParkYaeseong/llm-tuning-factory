@@ -5583,6 +5583,134 @@ Not verified or still open:
     60 s tick.
 - The frozen sidecar (11.3) and the installed app (11.6) layers of D14 are not covered here.
 
+## Task 11.1 deferred nits and flake hardening, 2026-10-21
+
+Commit `fix: close deferred release nits and harden flaky tests`, in the worktree `D:\llm-tuning-factory-wt102` on
+`d0415c0`. It implements the [Task 11 plan](superpowers/plans/2026-10-21-task11-release-0-4-0.md) §4 "11.1" with root's
+item list and the 11.2 finding root added during the work. Changed: `src/tuning_factory/{cli,desktop_workflows,
+controller_entry,model_artifacts}.py`, `desktop/src/{project-store,tutorial,main}.ts`,
+`desktop/src/components/plan-panel.ts`, `desktop/{vite,playwright}.config.ts`, their tests
+(`tests/test_{cli_graph,desktop_projects,controller_entry,model_artifacts,repository_text,workflow_runs}.py`,
+`desktop/tests/{workflow-core,graph-plan,tutorial,connections}.spec.ts`), the stale pointer pins in
+`tests/test_{workbench_backend,hf_targets,workflow_planning}.py` and this file.
+
+Each item, reproduced first:
+- `graph-work` Ctrl+C, N1 (re-entrancy): **fixed**. `_CtrlC` takes the press number from one atomic `next()` first,
+  exits on the second press and only then, on the first, sets the stop event. `presses` is a read-only property.
+  - RED: a new test runs the handler with a second press injected before every bytecode of the first (its own methods,
+    `Event` and `Condition`, through `sys.monitoring` instruction events; `sys.settrace` delivers no opcode events on
+    3.12). The stop event's lock reports a self-deadlock instead of hanging. On the old code, of 74 injection points,
+    46 deadlocked inside `Event.set` and 4 lost a press (no exit). After the fix, all 78 points exit exactly once
+    with 130.
+- N2: **fixed**. The `DRAINING` write is wrapped in `contextlib.suppress(OSError)`. RED: with a stderr that raises
+  `BrokenPipeError` for that note, `graph-work` ended with exit 1 and no final line; now it drains and prints the
+  final line (exit 0). `GRAPH_WORK_HELP` no longer says "always": a second Ctrl+C (exit 130) and a usage error (exit
+  2, the usage message on stderr) print no final line. The test pins the new text and that a usage error prints
+  nothing on stdout. `_final_line`'s docstring says the same.
+- Unknown keys in workflow issue paths: **fixed**. `issues_from_validation` points an `extra_field` at the object
+  holding the key and adds `UNKNOWN_KEY_HIDDEN` (moved from `cli.py` to `desktop_workflows.py`). The CLI's
+  `_file_issues` keeps its stricter truncation and no longer drops a segment or adds the note itself. RED:
+  `project_create` with `zz-secret-name` gave path `/zz-secret-name`.
+  - Deviation: 39 existing test cases pinned the old paths (`/command`, `/spec/<key>`, `/RUNPOD_API_KEY`,
+    `/estimates/0/RUNPOD_API_KEY`, `/graph/nodes/0/foo`, `/a~1b~0c`). They now expect the parent object. The escape
+    test moved to a dict key that is not an unknown key (`/mapping/fields/a~1b~0c/0`). The UI routes issues by
+    prefix and shows its own text per code, so no view changed.
+- Union tag as the last pointer segment (found by 11.2, added by root): **fixed**. Only a `missing` error keeps a
+  trailing key that the request lacks. Any other trailing segment absent from the request is a union member or
+  validator tag and is dropped. RED: "weights must sum to one" and "merge models must be distinct" pointed at
+  `/graph/nodes/<i>/merge`; they now point at `/graph/nodes/<i>`. A missing `weights` stays `/graph/nodes/3/weights`,
+  and a bad model reference stays under `/graph/nodes/4/models/0/…`.
+- `controller_entry._observed_profile`: **fixed**. It pins with `workflow_planning.pin_observation`, the function a
+  real `graph_plan` and `observations_list` use. RED (`test_the_controller_and_planning_skip_a_profile_for_the_same_reason`,
+  9.8's `~` home probe): planning said `observation_revision_differs` while the controller said `invalid_fields`.
+  - Which profiles are usable is unchanged. Two reason labels now follow planning:
+    - a `~` key path whose home changed is `observation_revision_differs` (was `invalid_fields`);
+    - a refused key path with an observation of another revision is `invalid_fields` (was
+      `observation_revision_differs`).
+  - Because the first reason is one `controller_status` re-decides, `restart_required` now names such a profile once
+    `~` points at the observed key again. The test pins that too.
+- Duplicate submit across windows: **fixed**. `project-store.ts` `requestIdFor(planSha256)` gives `plan-<sha256>`
+  (fits `RequestId`), and `holdPlan` uses it. The per-session random ID map and `createProjectStore`'s ID-generator
+  parameter are gone. The runs-list check before the approval stays. RED: `graph-plan.spec.ts` sent a random UUID,
+  and two stores (two windows) held different IDs for one plan.
+  - Backend pin (passes on the old code by design): two submits with `plan-<sha>` give one run, and after a cancel
+    the same plan answers with that run.
+  - **Policy: a plan is never registered twice, not after a cancel or a failure either. To run it again, change an
+    input so planning makes a new plan.**
+- `tests/test_repository_text.py`: **fixed**. Files are read as bytes; a NUL byte marks a binary; the rest decodes
+  with `errors="replace"`. U+061C joins the forbidden set, and every code point is listed as an integer. RED: a
+  mostly-text file with one invalid byte and U+202E was skipped, U+061C was not reported, and a NUL file was
+  scanned. The repository still scans clean.
+- Flake `connections.spec.ts:515`: **not reproduced**; synchronization hardened.
+  - The old test passed 100 of 100 (one worker), then 200 of 200 with 8 workers.
+  - `open()` waited only for the loading notice to be absent, which an unrendered page also satisfies. It now waits
+    for the boot to reach `capabilities` (as `openWorkbench` does), then for the notice.
+  - The test waits for the held plan before leaving 학습 설정 and for the GPU list before saving.
+  - The hardened test passed 100 of 100 with 6 workers. Likely mechanism: the next item.
+- Flake `graph-editor.spec.ts` boot timeout: **mechanism reproduced and fixed**. RED: a scratch spec touched
+  `desktop/src/workbench.ts` (mtime only) while a page was open; Vite reloaded the page, so the mock was reset.
+  - With `TUNING_FACTORY_E2E=1`, which `playwright.config.ts` now sets on its web server, `vite.config.ts` serves
+    with `hmr: false` and `watch: null`, and the page stays. Without it (`npm run dev`), HMR and the watcher are
+    unchanged.
+  - A Node test pins both server option sets and the Playwright env.
+  - **Run Playwright from a tree nobody edits**: a module not yet served is still read from disk when first
+    requested.
+- Flake `test_ambiguous_launch_waits_for_the_operator[False-desktop]` `PermissionError`: **not reproduced**; the
+  rename was hardened.
+  - The test's only renames are `ModelArtifactStore.freeze`'s rename of the finished `.freeze-*` directory
+    (production code). A rename probe plugin under `%TEMP%` found them; pytest's own tmp cleanup catches `OSError`.
+  - 50 separate runs of both `-desktop` cases, partly beside a full Playwright run: 0 failures.
+  - Windows refuses a directory rename with WinError 5 or 32 while another process (an antivirus or indexer scanning
+    the files just written) holds a handle inside it. `_rename_directory` now retries such a rename at most 10 times,
+    50 ms apart, while the destination does not exist, then raises.
+  - RED: a rename that raised WinError 5 (and 32) twice failed `freeze`. A plain `PermissionError` is raised at once;
+    a lasting violation is raised after 10 tries.
+- Flake `test_a_drain_fenced_by_a_successor_is_not_a_clean_stop` (30 s waiting for the first tick): **mechanism
+  reproduced and fixed** (test only).
+  - The wait read "heartbeat > acquired". The first tick renews the owner lease 6–50 ms after acquiring it, and
+    Python 3.12's `time.time()` on Windows is `GetSystemTimeAsFileTime` (resolution 15.625 ms at the default timer
+    rate). Equal timestamps leave the next heartbeat 200 s away.
+  - RED: a scratch plugin coarsening the controller's clock to 500 ms reproduced "timed out after 30 s waiting for the
+    first tick".
+  - The test now observes the tick itself (a wrapped `GraphController.tick` sets an event). The bound is
+    `LOADED_WAIT` = 120 s, and a controller that returns early fails at once with its result. It passes with the
+    coarse clock.
+- Tutorial `end()` (optional): **fixed**. After the end's compatibility check the tour renders through `renderLate`,
+  and it re-focuses the launcher only if the focus is still on it or nowhere. RED: typing a project name while that
+  answer was held lost the text ("" after the render). A mutant that always re-focuses the launcher fails the new
+  test.
+- `reward_binding` route reasons and select candidates in `graph-model.ts` (optional, 10.5 M3): **declined**. The
+  planner's reward rules depend on resolved descriptors (semantic kind, the LoRA reward's exact effective base, select
+  candidates). A local copy would be partial and could disable valid sources; the planner stays authoritative and
+  refuses at validate and plan time.
+- Already closed in 10.8 (checked in the code, not changed):
+  - the navigation sequence number (`main.ts` `navigations`);
+  - one-line name, task type and recipe name (`oneLine` in `projects.ts`, `recipes.ts`);
+  - full renders during an IME (`renderSoft`);
+  - escapes in `data-import.ts` `isolatedText` (no literal isolate bytes);
+  - the 500-choice cap and flags-only blocking notes (10.8 entry).
+
+Actual verification:
+- Python, main venv with `PYTHONPATH` set to this worktree's `src`.
+  - `pytest -q`: **1728 passed, 1 skipped** alone (6 min 11 s), and again **1728 passed, 1 skipped** beside a full
+    Playwright run (8 min 10 s). That is 1718 plus 10 new tests.
+  - `ruff check src tests` passes.
+  - `scripts/check_secrets.py`: 0 findings.
+- From `desktop/`, against this worktree's own Vite on port 1500 (scratch config under `%TEMP%`,
+  `reuseExistingServer: false`, `TUNING_FACTORY_E2E=1` as the repository config sets it):
+  - `npx playwright test` **254 passed**: 251 plus 3 new (the request ID and server-option Node tests, and the
+    tutorial test). Before any change, the same setup gave 251.
+  - `npm run build` passes.
+- CPU acceptance (`src/tuning_factory` changed): `verify_model_ops_cpu.py` exit 0, **29/29**, `passed: true`,
+  `source_sha256` `a388169e8115a691d17dc1215692e44efb09b9089157cb9df66162788683f746`.
+- Every changed file is CR-free, and a byte scan finds no bidi control, U+061C or NUL in them.
+- Scratch configs, probes and plugins under `%TEMP%` were deleted.
+
+Not verified or still open:
+- No machine-level reproduction of the two Windows flakes (WinError 5, the 30 s first tick); each fix addresses the
+  mechanism found.
+- Hardening a flaky legacy test (`connections.spec.ts`) is the listed deviation of §1.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

@@ -408,6 +408,29 @@ test("a centered explanation sits over the content area beside the narrow sideba
   await expect(popover(page)).toBeInViewport({ ratio: 1 });
 });
 
+// Task 11.1 (10.8 re-review): the end of the tour re-checks compatibility, and that answer may come late. Its render
+// takes the late-render path: what was typed meanwhile stays and the focus stays on the control it was on.
+test("a late compatibility answer after the tour keeps what was typed and the focus", async ({ page }) => {
+  await boot(page, { seen: true });
+  const launcher = page.getByRole("button", { name: "튜토리얼", exact: true });
+  await launcher.click();
+  await expectStep(page, "welcome");
+  const release = await holdAction(page, "capabilities");
+  await page.keyboard.press("Escape");
+  await expect(popover(page)).toHaveCount(0);
+  await expect(launcher).toBeFocused();
+  const field = page.getByLabel("프로젝트 이름", { exact: true });
+  await field.fill("늦은 답변 중 입력");
+  await expect(field).toBeFocused();
+  const checks = () => page.evaluate(() => (window as any).__testCalls.filter((c: any) => c.args?.action === "capabilities").length);
+  const before = await checks();
+  await release();
+  await expect.poll(() => page.evaluate(() => !document.querySelector(".compatibility.pending"))).toBe(true);
+  expect(await checks()).toBe(before + 1);   // the end's own check, recorded once answered; nothing else asked
+  await expect(page.getByLabel("프로젝트 이름", { exact: true })).toHaveValue("늦은 답변 중 입력");
+  await expect(page.getByLabel("프로젝트 이름", { exact: true })).toBeFocused();
+});
+
 test("ending the tutorial returns focus to the tutorial button", async ({ page }) => {
   await boot(page, { seen: true });
   const launcher = page.getByRole("button", { name: "튜토리얼", exact: true });

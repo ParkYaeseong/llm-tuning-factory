@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { NATIVE_PENDING, WORKFLOW_ACTIONS, type PlanSummary, type ProjectRevision, type WorkflowIssue } from "../src/workflow-types.ts";
 import { BridgeError, MALFORMED, parseWorkflowResult } from "../src/api.ts";
 import { issueList, issuesAt, localize, nodeIssues, planSection, rowIssues } from "../src/issues.ts";
-import { bindingIdFor, createProjectStore, type ProjectStoreBridge } from "../src/project-store.ts";
+import { bindingIdFor, createProjectStore, requestIdFor, type ProjectStoreBridge } from "../src/project-store.ts";
 import { createPoller, createQueue } from "../src/poller.ts";
 import { NAV_GROUPS, navModel } from "../src/nav-model.ts";
 import type { View } from "../src/view-types.ts";
@@ -130,6 +130,19 @@ const summary = (revision: string): PlanSummary => ({
   plan_sha256: hash("p"), simulation: true, project_id: "p1", project_revision: revision, max_estimated_cost_usd: 1,
   max_duration_seconds: 3600, max_concurrent_gpu_count: 1, retry_policy: { max_attempts: 1, backoff_seconds: 0 },
   nodes: [], datasets: [], tracking: null });
+
+// Task 11.1 (10.6 re-review): graph_submit's request ID comes from the plan hash, so two windows, or one after a restart,
+// that approve the same plan send the same ID and the backend registers one run (its idempotency by request ID).
+test("the submit request ID of a plan is derived from its hash in every store", () => {
+  const first: ProjectRevision = { revision_sha256: hash("1"), project: { schema_version: 1, project_id: "p1", name: "첫 프로젝트",
+    purpose: "", task_type: "", datasets: [], default_executor_profile_id: null, graph: {}, legacy_origin: null } };
+  expect(requestIdFor(hash("p"))).toBe(`plan-${hash("p")}`);
+  expect(requestIdFor(hash("p"))).toMatch(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/);   // desktop_workflows.RequestId
+  const windows = [createProjectStore(fakeBridge(first).bridge), createProjectStore(fakeBridge(first).bridge)];
+  const held = windows.map(store => { store.adopt(first); return store.holdPlan("p1", summary(first.revision_sha256), [hash("r")]); });
+  expect(held.map(plan => plan.requestId)).toEqual([`plan-${hash("p")}`, `plan-${hash("p")}`]);
+  expect(requestIdFor(hash("q"))).not.toBe(requestIdFor(hash("p")));
+});
 
 test("a project draft tracks revision, dirty state and plan validity", async () => {
   const first: ProjectRevision = { revision_sha256: hash("1"), project: { schema_version: 1, project_id: "p1", name: "첫 프로젝트",
@@ -374,4 +387,14 @@ test("no source or test file holds a literal bidirectional control character", (
     }
   }
   expect(found).toEqual([]);
+});
+
+test("Playwright's web server runs Vite without HMR or file watching, and npm run dev keeps both", async () => {
+  // Task 11.1: an edit to a served file during a run made Vite reload the page under test, which reset the mocked
+  // bridge (a boot timeout in graph-editor.spec.ts). playwright.config.ts asks vite.config.ts for the quiet server.
+  const { serverOptions } = await import("../vite.config.ts");
+  expect(serverOptions(true)).toEqual({ port: 1420, strictPort: true, hmr: false, watch: null });
+  expect(serverOptions(false)).toEqual({ port: 1420, strictPort: true, watch: { ignored: ["**/src-tauri/**"] } });
+  const { default: config } = await import("../playwright.config.ts");
+  expect(config.webServer).toMatchObject({ command: "npm run dev", env: { TUNING_FACTORY_E2E: "1" } });
 });

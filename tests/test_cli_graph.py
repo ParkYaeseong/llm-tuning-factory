@@ -963,6 +963,142 @@ def test_a_second_real_ctrl_c_exits_at_once_and_keeps_the_owner_until_its_ttl(tm
     assert final_line(restart, 3)["code"] == "owner_held"   # refused until the owner lease expires
 
 
+class Exited(BaseException):
+    """The stubbed ``_exit_now`` raises this, so a handler ends at its exit as ``os._exit`` ends the process."""
+
+
+class OwnedLock:
+    """``Event._cond``'s non-reentrant lock, reporting a self-deadlock instead of hanging: the owner thread taking it
+    again is exactly what blocks a real ``Event.set`` forever."""
+
+    def __init__(self):
+        self.lock, self.owner = threading.Lock(), None
+
+    def acquire(self, blocking=True, timeout=-1):
+        if blocking and self.owner == threading.get_ident():
+            raise AssertionError("the stop event's lock was taken again by its owner: a real Event deadlocks here")
+        taken = self.lock.acquire(blocking, timeout)
+        if taken:
+            self.owner = threading.get_ident()
+        return taken
+
+    def release(self):
+        self.owner = None
+        self.lock.release()
+
+    __enter__ = acquire
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+def code_objects(*classes):
+    """The code of every function and property of ``classes``."""
+    found = []
+    for owner in classes:
+        for value in vars(owner).values():
+            for function in ((value.fget, value.fset) if isinstance(value, property) else (value,)):
+                if hasattr(function, "__code__"):
+                    found.append(function.__code__)
+    return found
+
+
+def nested_press(cli, monkeypatch, at):
+    """Runs ``_CtrlC`` once with a second SIGINT landing before bytecode number ``at`` of the first handler, counted
+    over the handler's own methods and the stop event's (``Event`` and its ``Condition``), as CPython can run a signal
+    handler between any two bytecodes of another. ``at=None`` presses once and only counts. Uses ``sys.monitoring``
+    instruction events (``sys.settrace`` delivers no opcode events on 3.12). Returns ``(exit codes, the exception
+    that ended the outer handler or None, bytecodes counted)``."""
+    exits = []
+
+    def exit_now(code):
+        exits.append(code)
+        raise Exited
+
+    monkeypatch.setattr(cli, "_exit_now", exit_now)
+    event = threading.Event()
+    event._cond = threading.Condition(OwnedLock())
+    handler = cli._CtrlC(event)
+    counted, nested = [0], []
+
+    def instruction(code, offset):
+        if nested:
+            return   # the nested press itself runs to its end
+        if counted[0] == at:
+            nested.append(True)
+            handler(signal.SIGINT, None)   # its Exited propagates into the first handler, like a process exit
+        counted[0] += 1
+
+    monitoring = sys.monitoring
+    tool = next((tool for tool in range(6) if monitoring.get_tool(tool) is None), None)
+    if tool is None:
+        pytest.skip("every sys.monitoring tool ID is in use")
+    codes = code_objects(cli._CtrlC, threading.Event, threading.Condition)
+    ended = None
+    monitoring.use_tool_id(tool, "nested-ctrl-c")
+    try:
+        monitoring.register_callback(tool, monitoring.events.INSTRUCTION, instruction)
+        for code in codes:
+            monitoring.set_local_events(tool, code, monitoring.events.INSTRUCTION)
+        try:
+            handler(signal.SIGINT, None)
+        except BaseException as exc:   # Exited, or the stand-in for a deadlock
+            ended = exc
+    finally:
+        for code in codes:
+            monitoring.set_local_events(tool, code, 0)
+        monitoring.register_callback(tool, monitoring.events.INSTRUCTION, None)
+        monitoring.free_tool_id(tool)
+    return exits, ended, counted[0]
+
+
+def test_a_ctrl_c_arriving_inside_the_handler_still_exits_on_the_second_press(monkeypatch):
+    """9.6 re-review N1: a second Ctrl+C can run the SIGINT handler re-entrantly, between any two bytecodes of the first
+    press's handler. At every such point the two presses exit exactly once with 130, and the nested press never takes
+    the stop event's non-reentrant lock while the first press holds it (a deadlock of the main thread)."""
+    cli = cli_module()
+    exits, ended, total = nested_press(cli, monkeypatch, None)
+    assert (exits, ended) == ([], None) and total > 10   # one press drains: no exit
+    failures = []
+    for at in range(total):
+        exits, ended, _ = nested_press(cli, monkeypatch, at)
+        if exits != [cli.EXIT_INTERRUPTED] or not isinstance(ended, Exited):
+            failures.append((at, exits, repr(ended)))
+    assert failures == [], failures
+    handler = cli._CtrlC(threading.Event())
+    assert handler.presses == 0
+    handler(signal.SIGINT, None)
+    assert handler.presses == 1 and handler.stop_event.is_set()   # the main loop's DRAINING note reads this
+
+
+def test_a_broken_stderr_does_not_end_the_drain_early(tmp_path, monkeypatch):
+    """9.6 re-review N2: the DRAINING note goes to stderr; a broken stderr pipe (OSError) loses the note only. The
+    command still waits for the drain and prints its final line."""
+    cli = cli_module()
+    found = submitted_simulation(tmp_path, monkeypatch)
+    provider_spies(monkeypatch)
+    echo = cli.typer.echo
+    notes = []
+
+    def broken_stderr(message=None, *args, err=False, **kwargs):
+        if err and message == cli.DRAINING:
+            notes.append(message)
+            raise BrokenPipeError(32, "synthetic broken stderr pipe")
+        return echo(message, *args, err=err, **kwargs)
+
+    monkeypatch.setattr(cli.typer, "echo", broken_stderr)
+    handler, saved = signal.getsignal(signal.SIGINT), sys.stdout
+    try:
+        with CtrlC(found.state, lambda: owner_running(found.state)) as press:
+            result = found.cli("graph-work", "--tick-seconds", "0.05")
+    finally:
+        settle(cli, saved)
+    assert press.fallback == [] and len(press.pressed) == 1 and notes == [cli.DRAINING]
+    assert signal.getsignal(signal.SIGINT) is handler
+    assert final_line(result, 0)["code"] == "stopped", result.output
+    assert owner_row(found.state)["expires"] == 0
+
+
 def test_graph_work_refuses_insecure_tracking_before_the_owner_lease(tmp_path, monkeypatch):
     """The sidecar's exit 4: credentialed MLflow over plain HTTP is refused before any owner lease (Task 9.4)."""
     cli_module()
@@ -1050,9 +1186,15 @@ def test_graph_work_refusals_before_the_start_print_a_final_line(tmp_path):
     assert owner_row(state) is None
     # --help documents the output shapes, the exit codes and what a second Ctrl+C leaves behind (9.6 review Minor 5, 6).
     shown = flat(CliRunner().invoke(app, ["graph-work", "--help"]).output)
-    for fragment in ("always a final line", "2 refused before the start", "130 a second Ctrl+C",
-                     "a restart gets exit 3", "release-lock --confirm-execution-stopped"):
+    for fragment in ("then a final line", "2 refused before the start", "130 a second Ctrl+C",
+                     "a restart gets exit 3", "release-lock --confirm-execution-stopped",
+                     # 9.6 re-review N2: not "always": these two outcomes print no final line.
+                     "A second Ctrl+C (exit 130) and a usage error (exit 2, the usage message on stderr) print no "
+                     "final line"):
         assert fragment in shown, fragment
+    assert "always a final line" not in shown
+    usage = CliRunner().invoke(app, ["--state-dir", str(state), "graph-work", "--max-ticks", "0"])
+    assert usage.exit_code == 2 and usage.stdout.strip() == "", usage.output   # Click's usage error: no final line
 
 
 def test_new_commands_stay_encodable_on_a_legacy_code_page(tmp_path):

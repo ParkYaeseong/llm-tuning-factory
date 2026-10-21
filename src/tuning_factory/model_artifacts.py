@@ -15,6 +15,7 @@ import shutil
 import stat
 import struct
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Literal
@@ -644,6 +645,27 @@ class ArtifactVerifier:
         return model_input
 
 
+# Windows refuses to rename a directory with ERROR_ACCESS_DENIED (5) or ERROR_SHARING_VIOLATION (32) while another
+# process holds a handle inside it, typically an antivirus or indexer scanning the files just written; such a scan
+# ends within moments (Task 11.1 N6).
+SHARING_VIOLATIONS = frozenset({5, 32})
+RENAME_TRIES, RENAME_RETRY_SECONDS = 10, 0.05
+
+
+def _rename_directory(source: Path, destination: Path) -> None:
+    """``source.rename(destination)``, retried at most ``RENAME_TRIES`` times, ``RENAME_RETRY_SECONDS`` apart, while
+    Windows reports a sharing violation and ``destination`` does not exist; then the last error is raised."""
+    for attempt in range(1, RENAME_TRIES + 1):
+        try:
+            source.rename(destination)
+            return
+        except PermissionError as exc:
+            if (getattr(exc, "winerror", None) not in SHARING_VIOLATIONS or attempt == RENAME_TRIES
+                    or destination.exists()):
+                raise
+        time.sleep(RENAME_RETRY_SECONDS)
+
+
 class ModelArtifactStore:
     """Content-addressed local copies; every public read verifies both identities."""
 
@@ -696,7 +718,7 @@ class ModelArtifactStore:
             _check_ancestors(destination)
             destination.parent.mkdir(parents=True, exist_ok=True)
             try:
-                temporary.rename(destination)
+                _rename_directory(temporary, destination)
             except OSError:
                 if not destination.exists():
                     raise

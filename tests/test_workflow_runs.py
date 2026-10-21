@@ -400,6 +400,22 @@ def test_pause_resume_cancel_map_refusals_to_conflicts(tmp_path, monkeypatch):
     assert sorted(row[2] for row in run_rows(state)) == ["CANCELED", "COMPLETED"]
 
 
+def test_a_plan_derived_request_id_never_registers_the_same_plan_twice(tmp_path, monkeypatch):
+    """Task 11.1 (10.6 re-review): the desktop sends ``plan-<plan sha256>`` as graph_submit's request ID, which fits
+    ``RequestId``. Two windows, or one window after a restart, that approve the same plan therefore get one run, and
+    after a cancel the same plan still answers with that run: to run it again, an input must change (a new plan)."""
+    state = tmp_path / "state"
+    found = simulation_world(state, tmp_path, monkeypatch)
+    request_id = "plan-" + found.plan_sha256
+    first = submitted(state, found, approve=None, settings={}, request_id=request_id)
+    assert submitted(state, found, approve=None, settings={}, request_id=request_id) == first   # another window
+    canceled = run(state, "graph_cancel", {"run_id": first})
+    assert canceled["data"]["run"]["status"] == "CANCELED", canceled
+    again = submit(state, found, approve=None, settings={}, request_id=request_id)
+    assert (again["status"], again["data"]["run_id"], again["data"]["status"]) == ("ok", first, "CANCELED"), again
+    assert [(row[0], row[1]) for row in run_rows(state)] == [(first, request_id)]
+
+
 # 7
 def test_run_status_is_db_only_and_secret_free(tmp_path, monkeypatch):
     wp = wpt.planning()
@@ -592,7 +608,7 @@ def test_run_actions_refuse_extra_fields(tmp_path, monkeypatch, action):
         body["run_id"] = run_id
     before = desk.snapshot(state)
     result = run(state, action, {**body, "command": "calc.exe"})
-    issue = desk.only_issue(result, "invalid", "extra_field", "/command")
+    issue = desk.only_issue(result, "invalid", "extra_field", "")
     assert issue["node_id"] is None and "calc.exe" not in json.dumps(result)
     assert desk.snapshot(state) == before
 

@@ -74,6 +74,7 @@ from .tracking import (
 from .workflow_planning import (
     current_profile_revisions,
     load_observation,
+    pin_observation,
     profile_revision,
     public_profile,
     root_snapshots_dir,
@@ -320,7 +321,6 @@ def provider_profiles(start: ControllerStart) -> tuple[dict[str, ProfileSecrets]
     usable, skipped = {}, {}
     for item in start.profiles:
         profile_id, fields = item.profile_id, dict(item.fields)
-        revision = profile_revision(profile_id, fields)   # ProfileStart already holds NativeProfile's allowlist
         settings = dict(fields)
         if fields.get("provider") == "existing_runpod":
             key = item.secrets.get("RUNPOD_API_KEY")
@@ -335,7 +335,7 @@ def provider_profiles(start: ControllerStart) -> tuple[dict[str, ProfileSecrets]
                 continue
             settings["RUNPOD_API_KEY"] = value
         else:
-            public, reason = _observed_profile(state, profile_id, fields, revision)
+            public, reason = _observed_profile(state, profile_id, fields)
             if reason is not None:
                 skipped[profile_id] = reason
                 continue
@@ -343,21 +343,25 @@ def provider_profiles(start: ControllerStart) -> tuple[dict[str, ProfileSecrets]
     return usable, skipped
 
 
-def _observed_profile(state: Path, profile_id: str, fields: Mapping[str, str], revision: str):
-    """``(public SSH profile, None)`` from the stored observation of this revision, or ``(None, reason)``. The
-    controller's start and ``controller_status`` (a restart would now serve it) use the same rule."""
+def _observed_profile(state: Path, profile_id: str, fields: Mapping[str, str]):
+    """``(public SSH profile, None)`` from the stored observation of these fields, or ``(None, reason)``. The
+    controller's start and ``controller_status`` (a restart would now serve it) use this rule, and it pins with
+    ``pin_observation``, the function a real ``graph_plan`` and ``observations_list`` decide with (9.8 follow-up): key
+    paths a plan refuses are ``invalid_fields``; an observation of another revision, or one the current fields no
+    longer rebuild (a ``~`` key path whose home changed), is ``observation_revision_differs``. A profile that rebuilds
+    yet differs from the stored one is ``observation_invalid`` (an altered file)."""
     try:
         observation = load_observation(state, profile_id)
     except ValueError:
         return None, OBSERVATION_INVALID
     if observation is None:
         return None, OBSERVATION_MISSING
-    if observation["revision"] != revision:
-        return None, OBSERVATION_DIFFERS
     try:
-        public = public_profile(profile_id, fields, observation["facts"])
+        public = pin_observation(profile_id, fields, observation)
     except ValueError:
         return None, INVALID_FIELDS
+    if public is None:
+        return None, OBSERVATION_DIFFERS
     if public != observation["profile"]:
         return None, OBSERVATION_INVALID
     return public, None
@@ -856,8 +860,7 @@ def _profiles_restart(current: Mapping, context: WorkflowContext) -> list[str]:
     for profile_id, reason in (skipped.items() if isinstance(skipped, dict) else ()):
         if (reason in (OBSERVATION_MISSING, OBSERVATION_DIFFERS, OBSERVATION_INVALID) and profile_id not in changed
                 and profile_id in revisions and profile_id in context.profiles):
-            public, _ = _observed_profile(Path(context.state_dir), profile_id,
-                                          context.profiles[profile_id].fields, revisions[profile_id])
+            public, _ = _observed_profile(Path(context.state_dir), profile_id, context.profiles[profile_id].fields)
             if public is not None:
                 changed.add(profile_id)
     return sorted(changed)

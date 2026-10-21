@@ -72,6 +72,10 @@ async function open(page: Page, settings: Record<string, unknown> = {}) {
     } };
   }, { config, settings, inspection, secrets: SECRETS });
   await page.goto("/");
+  // A positive boot signal (as workflow-mock.ts's openWorkbench): the loading notice is also absent from a page that has
+  // not rendered yet, so waiting for its absence alone let a slow boot through (Task 11.1, the flake at :515).
+  await expect.poll(() => page.evaluate(() => (window as any).__testCalls.some((call: any) =>
+    call.command === "factory_action" && call.args?.action === "capabilities")), { message: "boot reached capabilities", timeout: 10_000 }).toBe(true);
   await expect(page.getByText("작업 공간 불러오는 중")).toHaveCount(0);
 }
 const calls = (page: Page, action: string) => page.evaluate(name => (window as any).__testCalls
@@ -516,8 +520,10 @@ test("saving an unchanged GPU selection keeps the plan and says nothing changed"
   await open(page, server);
   await trainingPage(page);
   await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  await expect(page.getByText("계획만 확인했습니다.", { exact: true })).toBeVisible();   // the plan is held before leaving
   await connectionsPage(page);
   await page.getByRole("button", { name: "GPU 목록 조회", exact: true }).click();
+  await expect(page.getByLabel(`${GPU_A} 학습에 사용`, { exact: true })).toBeChecked();   // the list is shown before saving
   await page.getByRole("button", { name: "GPU 선택 저장", exact: true }).click();
   await expect(page.locator(".notice")).toHaveText("GPU 선택이 바뀌지 않았습니다.");
   await trainingPage(page);

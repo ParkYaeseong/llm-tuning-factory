@@ -57,12 +57,16 @@ function canonical(value: unknown): string {
 }
 const sameSpec = (a: ProjectSpec, b: ProjectSpec | undefined) => b !== undefined && canonical(a) === canonical(b);
 
-export function createProjectStore(bridge: ProjectStoreBridge, newRequestId: () => string = () => crypto.randomUUID()): ProjectStore {
+/** graph_submit's request ID for a plan (fits desktop_workflows.RequestId). Derived from the plan hash, so every window,
+ * and this one after a restart, sends the same ID for the same plan and the backend's idempotency by request ID
+ * registers it once (Task 11.1). Policy: a plan is never registered twice, not after a cancel or a failure either;
+ * to run it again, change an input so planning makes a new plan. */
+export const requestIdFor = (planSha256: Sha256): string => `plan-${planSha256}`;
+
+export function createProjectStore(bridge: ProjectStoreBridge): ProjectStore {
   const drafts = new Map<string, ProjectDraft>();
   // Planning inputs that no backend stores stay per project for the session, across reloads of its draft.
   const planningInputs = new Map<string, PlanningInputs>();
-  // One request ID per plan hash, reused when the same plan is approved again after an error (D8).
-  const requestIds = new Map<Sha256, string>();
   let profilesGeneration = 0, settingsGeneration = 0;
 
   const required = (projectId: string) => {
@@ -155,9 +159,7 @@ export function createProjectStore(bridge: ProjectStoreBridge, newRequestId: () 
     generations: () => ({ profilesGeneration, settingsGeneration }),
     holdPlan(projectId, summary, recipeRevisions, since) {
       const draft = required(projectId);
-      let requestId = requestIds.get(summary.plan_sha256);
-      if (!requestId) { requestId = newRequestId(); requestIds.set(summary.plan_sha256, requestId); }
-      draft.plan = { summary: structuredClone(summary), requestId, basis: { projectRevision: summary.project_revision,
+      draft.plan = { summary: structuredClone(summary), requestId: requestIdFor(summary.plan_sha256), basis: { projectRevision: summary.project_revision,
         recipeRevisions: [...recipeRevisions], profilesGeneration: since?.profilesGeneration ?? profilesGeneration,
         settingsGeneration: since?.settingsGeneration ?? settingsGeneration } };
       draft.planDropped = null;

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from tuning_factory import desktop
 from tuning_factory.config import AIConfig, StrictModel
@@ -262,7 +262,7 @@ def test_every_workflow_request_refuses_extra_fields(tmp_path, action):
     import_source(state, tmp_path)
     before = snapshot(state)
     result = call(state, action, {**minimal_bodies(tmp_path)[action], "command": "calc.exe"})
-    issue = only_issue(result, "invalid", "extra_field", "/command")
+    issue = only_issue(result, "invalid", "extra_field", "")   # the object holding the unknown key (11.1)
     assert "calc.exe" not in json.dumps(result)
     assert issue["row_number"] is None and issue["node_id"] is None
     assert snapshot(state) == before
@@ -401,7 +401,7 @@ def test_recipe_save_clone_and_strict_spec(tmp_path):
     for name in ("reward_model", "dataset_id", "pod_id", "RUNPOD_API_KEY", "command"):
         result = call(state, "recipe_save", {"spec": {**spec, "recipe_id": "strict", name: SECRET},
                                              "expected_revision": None})
-        only_issue(result, "invalid", "extra_field", f"/spec/{name}")
+        only_issue(result, "invalid", "extra_field", "/spec")
         assert SECRET not in json.dumps(result)
     mismatch = call(state, "recipe_save", {"spec": {"recipe_id": "dpo", "name": "DPO", "training_stage": "dpo"},
                                            "expected_revision": None})
@@ -910,9 +910,64 @@ def test_registration_is_closed_to_unknown_names_foreign_modules_and_command_fie
     assert wf._HANDLERS == before
 
 
+def test_unknown_keys_are_never_echoed_in_workflow_pointers(tmp_path):
+    """9.6 review (deferred to Task 11.1): an unknown request key is a name the caller chose, so its ``extra_field``
+    issue points at the object that holds it, as the CLI's ``_file_issues`` does, and says that the key is hidden."""
+    wf = workflows()
+    state = tmp_path / "state"
+    secret_name, nested_name = "zz-secret-name", "zz-nested-" + "n" * 8
+    created = call(state, "project_create", {"name": "x", "purpose": "", "task_type": "", "request_id": "r1",
+                                             secret_name: 1})
+    issue = only_issue(created, "invalid", "extra_field", "")
+    assert issue["message"].endswith(" (the unknown key is not shown)")
+    estimate = {"profile_id": "estimate-a", "gpu_type": "A100", "gpu_count": 1, "total_hourly_cost_usd": 1.0}
+    planned = call(state, "graph_plan", {"project_id": "p", "estimates": [{**estimate, nested_name: 2}]})
+    only_issue(planned, "invalid", "extra_field", "/estimates/0")
+    escaped = call(state, "projects_list", {"a/b~c": 1})
+    only_issue(escaped, "invalid", "extra_field", "")
+    for result in (created, planned, escaped):
+        text = json.dumps(result)
+        assert secret_name not in text and nested_name not in text and "a/b~c" not in text and "a~1b~0c" not in text
+    # Other codes keep their full pointer.
+    only_issue(call(state, "project_create", {"request_id": "r"}), "invalid", "invalid_value", "/name")
+    assert wf.UNKNOWN_KEY_HIDDEN == " (the unknown key is not shown)"
+
+
+def test_node_validator_issues_point_at_the_node_not_its_kind_tag():
+    """Found by Task 11.2: pydantic reports a node-level validator error at the tagged union's member, e.g.
+    ``('nodes', 1, 'merge')``. The trailing tag is not a field of the request: the pointer ends at the node. A missing
+    field and the fields under a node keep their full pointer."""
+    wf = workflows()
+    from tuning_factory.graph_schema import GraphSpec
+
+    def merge(node_id, models=("a", "b"), **change):
+        body = {"id": node_id, "label": "병합", "kind": "merge", "executor_profile_ids": ["p"],
+                "models": [{"node_id": item, "output_name": "model"} for item in models], "weights": [0.5, 0.5]}
+        return {key: value for key, value in {**body, **change}.items() if value is not None}
+
+    raw = {"nodes": [merge("ok"), merge("sum", weights=[0.5, 0.25]), merge("same", models=("a", "a")),
+                     merge("absent", weights=None), merge("bad-ref", models=("a", "b"))]}
+    raw["nodes"][4]["models"][0]["output_name"] = "weights"
+    with pytest.raises(ValidationError) as caught:
+        GraphSpec.model_validate(raw)
+    found = wf.issues_from_validation(caught.value, "/graph", data=raw)
+    by_node = {}
+    for item in found:
+        by_node.setdefault(item.path.split("/")[3], []).append((item.path, item.message))
+    assert by_node["1"] == [("/graph/nodes/1", "Value error, weights must sum to one")]
+    assert by_node["2"] == [("/graph/nodes/2", "Value error, merge models must be distinct")]
+    assert by_node["3"] == [("/graph/nodes/3/weights", "Field required")]
+    paths = {path for path, _ in by_node["4"]}   # each union member's errors, and the follow-on "too short"
+    assert "/graph/nodes/4/models/0/output_name" in paths and "/graph/nodes/4/models/0/artifact_id" in paths, paths
+    assert all(path.startswith("/graph/nodes/4/models") for path in paths), paths
+    assert "0" not in by_node and not any(path.endswith("/merge") for item in by_node.values() for path, _ in item)
+
+
 def test_validation_issues_use_escaped_json_pointers_without_union_tags(tmp_path):
     state = tmp_path / "state"
-    only_issue(call(state, "projects_list", {"a/b~c": 1}), "invalid", "extra_field", "/a~1b~0c")
+    escaped = call(state, "dataset_import_preview", {"source_id": "0" * 64, "mapping": {
+        "source_format": "csv", "fields": {"a/b~c": [-1]}}})
+    assert [issue["path"] for issue in escaped["issues"]][:1] == ["/mapping/fields/a~1b~0c/0"], escaped
     result = call(state, "dataset_import_preview", {"source_id": "0" * 64, "mapping": {
         "source_format": "csv", "fields": {"instruction": [-1]}}})
     assert result["status"] == "invalid"

@@ -557,7 +557,7 @@ def test_graph_validate_maps_issues_to_paths_and_nodes(tmp_path, monkeypatch):
                                                               "node_count": 1}}
     extra, _ = make_project(state, [{**train("train", recipe, from_root(root)), "foo": 1}], datasets)
     desk.only_issue(run(state, "graph_validate", {"project_id": extra}), "invalid", "extra_field",
-                    "/graph/nodes/0/foo")
+                    "/graph/nodes/0")
     unknown, _ = make_project(state, [train("first", recipe, from_root(root)), train("train", "e" * 64,
                                                                                      from_root(root))], datasets)
     issue = desk.only_issue(run(state, "graph_validate", {"project_id": unknown}), "invalid", "recipe_missing",
@@ -1024,7 +1024,7 @@ def test_planning_requests_refuse_extra_fields(tmp_path, monkeypatch, action):
     secrets = {name: SECRET for name in desk.workflows().SECRET_SCOPES.get(action, ())}
     result = run(state, action, {**minimal_bodies()[action], "command": "calc.exe"}, secrets=secrets,
                  profiles=[runpod_profile(tmp_path)])
-    issue = desk.only_issue(result, "invalid", "extra_field", "/command")
+    issue = desk.only_issue(result, "invalid", "extra_field", "")
     assert issue["node_id"] is None and "calc.exe" not in json.dumps(result)
     assert hub.requests == [] and fake.calls == [] and not state.exists()
 

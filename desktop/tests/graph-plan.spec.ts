@@ -201,7 +201,8 @@ test("a dry run is the default plan and needs no transfer approval", async ({ pa
   await expect(dialog.getByRole("checkbox")).toHaveCount(0);
   await dialog.getByRole("button", { name: "모의 실행 등록", exact: true }).click();
   await expect(heading(page)).toHaveText("그래프 실행");
-  expect(await dataOf(page, "graph_submit")).toEqual([{ plan_sha256: H("f"), request_id: expect.stringMatching(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/),
+  // The request ID is derived from the plan hash (Task 11.1), so every window and restart sends the same one.
+  expect(await dataOf(page, "graph_submit")).toEqual([{ plan_sha256: H("f"), request_id: `plan-${H("f")}`,
     approve_execution: false, approve_data_transfer: false }]);
   await expect(page.locator("img")).toHaveCount(0);
 });

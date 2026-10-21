@@ -1,4 +1,5 @@
 import contextlib
+import itertools
 import json
 import os
 import signal
@@ -445,7 +446,6 @@ DRAINING = ("Stop requested: no new step starts; steps in flight finish, then th
             "lease. Press Ctrl+C again to exit at once: the owner lease then stays held until its 60 s TTL passes "
             "(a restart is refused with exit 3 until then), and a step that was in flight is reconciled by the next "
             "controller or may need release-lock --confirm-execution-stopped.")
-UNKNOWN_KEY_HIDDEN = " (the unknown key is not shown)"
 PROFILES_FILE_INVALID = "the executor profiles file must be a readable JSON object of at most 1 MiB"
 REQUEST_FILE_INVALID = "the plan request file must be a readable JSON object of at most 1 MiB"
 CREDENTIAL_FILE_UNREADABLE = "the credential file of this executor profile cannot be read"
@@ -555,7 +555,8 @@ def _file_issues(exc: ValidationError, data: dict, model) -> tuple:
     """Validation issues of a file the user wrote (profiles or plan request), with pointers that never echo a key
     the user chose: an unknown key (``extra_field``) points at the object holding it, and a pointer stops at the
     first segment that is neither a field name of ``model`` nor a list index (a dict key). Messages are pydantic's
-    and never echo a value. (The workflow channel's own ``desktop_workflows._pointer`` still keeps the key.)"""
+    and never echo a value. ``issues_from_validation`` already points an unknown key at its object and adds
+    ``UNKNOWN_KEY_HIDDEN``; this keeps the stricter truncation."""
     from .desktop_workflows import (
         CREDENTIALS_REFUSED,
         _pointer_part,
@@ -566,8 +567,6 @@ def _file_issues(exc: ValidationError, data: dict, model) -> tuple:
     found = []
     for item in issues_from_validation(exc, data=data):
         parts = [part.replace("~1", "/").replace("~0", "~") for part in item.path.split("/")[1:]] if item.path else []
-        if item.code == "extra_field" and parts:
-            parts = parts[:-1]   # the unknown key itself
         kept = []
         for part in parts:
             if part not in names and not (part.isdigit() and len(part) <= 6):
@@ -575,8 +574,6 @@ def _file_issues(exc: ValidationError, data: dict, model) -> tuple:
             kept.append(part)
         message = item.message.removeprefix("Value error, ")
         code = "credential_field" if CREDENTIALS_REFUSED in message else item.code
-        if code == "extra_field":
-            message += UNKNOWN_KEY_HIDDEN
         found.append(item.model_copy(update={"code": code, "message": message,
                                              "path": "".join("/" + _pointer_part(part) for part in kept)}))
     return tuple(found)
@@ -838,16 +835,29 @@ class _CtrlC:
     A Ctrl+C never raises ``KeyboardInterrupt`` here. Raising it inside ``Thread.join`` would hit the CPython 3.12 bug
     in ``Thread._wait_for_tstate_lock``: the thread is marked stopped while it still runs (9.6 review Critical 1). The
     first press sets the stop event (``run_forever`` drains, D14); the second exits at once (``_exit_now(130)``).
-    Outside the main thread nothing is installed: Python delivers SIGINT to the main thread only."""
+    Outside the main thread nothing is installed: Python delivers SIGINT to the main thread only.
+
+    A second press can run this handler re-entrantly, between any two bytecodes of the first (9.6 re-review N1). So
+    the press number comes first, from one atomic ``next`` (a ``+= 1`` could lose a press), and only the first press
+    touches the stop event: its ``Condition`` lock is not reentrant, and a nested ``set`` while the first press holds
+    it would deadlock the main thread."""
 
     def __init__(self, stop_event: threading.Event):
-        self.stop_event, self.presses, self.previous, self.installed = stop_event, 0, None, False
+        self.stop_event, self.previous, self.installed = stop_event, None, False
+        self._numbers, self._latest = itertools.count(1), 0
+
+    @property
+    def presses(self) -> int:
+        """How many presses arrived (read by the main loop for its DRAINING note)."""
+        return self._latest
 
     def __call__(self, signum, frame) -> None:
-        self.stop_event.set()
-        self.presses += 1
-        if self.presses > 1:
+        press = next(self._numbers)
+        self._latest = max(self._latest, press)
+        if press > 1:
             _exit_now(EXIT_INTERRUPTED)
+            return   # only a stubbed exit returns
+        self.stop_event.set()
 
     def __enter__(self):
         try:
@@ -863,9 +873,10 @@ class _CtrlC:
 
 
 def _final_line(exit_code: int, code: str, message: str, controller=None, issues=None) -> None:
-    """``graph-work``'s last stdout line, for every outcome: ``{"ok", "exit_code", "code", "message", "controller"}``
-    (``controller`` is this owner's ``current.json`` or null), plus ``issues`` for a refused profiles file. ASCII JSON,
-    like ``serve``'s ready line, so redirected output in any code page can print it. Then exits with ``exit_code``."""
+    """``graph-work``'s last stdout line, for every outcome except a second Ctrl+C (``os._exit(130)``) and a Click usage
+    error: ``{"ok", "exit_code", "code", "message", "controller"}`` (``controller`` is this owner's ``current.json``
+    or null), plus ``issues`` for a refused profiles file. ASCII JSON, like ``serve``'s ready line, so redirected
+    output in any code page can print it. Then exits with ``exit_code``."""
     body = {"ok": exit_code == 0, "exit_code": exit_code, "code": code, "message": message, "controller": controller}
     if issues is not None:
         body["issues"] = [item.model_dump(mode="json") for item in issues]
@@ -883,8 +894,9 @@ GRAPH_WORK_HELP = "\n\n".join((
     "second Ctrl+C exits at once with 130: the owner lease stays held until its 60 s TTL passes (a restart gets "
     "exit 3 until then), and a step left in flight may need release-lock --confirm-execution-stopped.",
     'Output is JSON lines: the controller\'s ready line {"ok": true, "owner_id", "pid"} or {"ok": false, "code": '
-    '"owner_held" or "settings_refused"}, then always a final line {"ok", "exit_code", "code", "message", '
-    '"controller"}, with "issues" for a refused profiles file.',
+    '"owner_held" or "settings_refused"}, then a final line {"ok", "exit_code", "code", "message", "controller"}, '
+    'with "issues" for a refused profiles file. A second Ctrl+C (exit 130) and a usage error (exit 2, the usage '
+    'message on stderr) print no final line.',
     "Exit codes: 0 drained stop; 1 lost owner lease or controller error; 2 refused before the start; 3 another "
     "controller owns the state directory; 4 MLflow settings refused; 130 a second Ctrl+C.",
 ))
@@ -954,7 +966,8 @@ def graph_work(ctx: typer.Context, executor_profiles: Path | None = None,
             finished = done.wait(0.2)
             if ctrl_c.presses and not announced:
                 announced = True
-                typer.echo(DRAINING, err=True)
+                with contextlib.suppress(OSError):   # a broken stderr pipe loses the note, never the drain (N2)
+                    typer.echo(DRAINING, err=True)
             if finished:
                 break
         worker.join()

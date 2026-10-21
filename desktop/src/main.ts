@@ -1048,7 +1048,7 @@ async function action(name: string) {
     }
   });
 }
-const tutorial = createTutorial({ state, navigate: page => action("nav:" + page), render, api, checkCapabilities, normalizeConfig });
+const tutorial = createTutorial({ state, navigate: page => action("nav:" + page), render, renderLate, api, checkCapabilities, normalizeConfig });
 render();
 void task("작업 공간 불러오는 중", async () => {
   state.settings = await invoke("settings_get"); await catalog(); await refresh();

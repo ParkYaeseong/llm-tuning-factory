@@ -9,6 +9,8 @@ export interface TutorialHost {
   state: Obj;
   navigate(page: string): Promise<void>;
   render(): void;
+  /** main.ts renderLate: for a render that may come long after the click (drafts read first, focus kept). */
+  renderLate(): void;
   api(action: string, data?: Obj): Promise<any>;
   checkCapabilities(): Promise<unknown>;
   normalizeConfig(): void;
@@ -71,6 +73,10 @@ export function createTutorial(host: TutorialHost, steps: TutorialStep[] = tutor
     if (document.activeElement && document.activeElement !== document.body) return;
     document.querySelector<HTMLElement>('#app aside [data-action="tutorial"]')?.focus();
   }
+  function onLauncherOrNowhere() {
+    const active = document.activeElement;
+    return !active || active === document.body || active.matches('#app aside [data-action="tutorial"]');
+  }
 
   async function go(next: number) {
     const current = run;
@@ -115,7 +121,12 @@ export function createTutorial(host: TutorialHost, steps: TutorialStep[] = tutor
     }
     snapshot = null;
     launcherFocus = true; host.render();
-    if (host.state.config) { await guarded(() => host.checkCapabilities()); if (index < 0) launcherFocus = true; host.render(); }
+    if (host.state.config) {
+      await guarded(() => host.checkCapabilities());
+      // The answer may come late (Task 11.1): what was typed meanwhile is kept and a focus the user moved stays.
+      if (index < 0 && onLauncherOrNowhere()) launcherFocus = true;
+      host.renderLate();
+    }
   }
 
   async function runCta(step: TutorialStep) {

@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENTRY = ROOT / "scripts" / "desktop_entry.py"
 SRC = ROOT / "src"
 WAIT = 30   # seconds: the bound of every wait in this module
+LOADED_WAIT = 120   # seconds: the bound of a wait on an explicit progress signal, generous for a loaded machine
 # Built at runtime: the history-walking secret scan must never see a credential-shaped literal.
 RUNPOD_KEY = "synthetic-" + "runpod-" + "k" * 12
 RUNPOD_KEY_B = "synthetic-" + "runpod-b-" + "k" * 12
@@ -1262,6 +1263,57 @@ def test_restart_required_names_profiles_a_restart_would_now_serve(tmp_path):
     controller.store.release_owner(owner)
 
 
+def test_the_controller_and_planning_skip_a_profile_for_the_same_reason(tmp_path, monkeypatch):
+    """9.8 follow-up (Task 11.1 N5): the controller's start, ``controller_status`` and a real ``graph_plan`` decide an
+    SSH profile's observation with one function (``workflow_planning.pin_observation``). Probe of 9.8 review 2: a key
+    path under ``~``, observed with one home directory and started with another (same fields and revision)."""
+    ce = entry()
+    import test_workflow_planning as wpt
+    from test_gpu_servers import FakeServer
+    state = tmp_path / "state"
+    homes = [tmp_path / "home-a", tmp_path / "home-b"]
+    for home in homes:
+        (home / "keys").mkdir(parents=True)
+
+    def home(index):
+        for name in ("USERPROFILE", "HOME"):
+            monkeypatch.setenv(name, str(homes[index]))
+
+    home(0)
+    lab = wpt.server_profile(server_ssh_key_file="~/keys/lab-key")
+    found = wpt.scenario(state, tmp_path, monkeypatch, profiles=("lab",))
+    FakeServer(tmp_path / "remote").install(monkeypatch)
+    inspected = wpt.run(state, "executor_profile_inspect", {"profile_id": "lab"}, profiles=[lab], clock=wpt.NOW)
+    assert inspected["status"] == "ok", inspected
+    start = ce.ControllerStart.model_validate(start_message(state, "desktop.27.1",
+                                                            profiles=[{**lab, "secrets": {}}]))
+
+    def decisions():
+        planned = wpt.real_plan(state, found, profile=lab, clock=wpt.NOW + 60)
+        plan_codes = [item["code"] for item in planned["issues"] if item["path"] == "/profiles/lab"]
+        usable, skipped = ce.provider_profiles(start)
+        return plan_codes, sorted(usable), skipped
+
+    assert decisions() == ([], ["lab"], {})
+    home(1)   # "~" now names another key file
+    assert decisions() == (["observation_revision_differs"], [], {"lab": "observation_revision_differs"})
+    # A controller started now skips it for that reason; once "~" names the observed key again, controller_status
+    # reports that a restart would serve it (the reason is one the restart check re-decides).
+    ce.apply_tracking_scope(start.tracking)
+    controller, info = ce.build_controller(start)
+    owner = controller.acquire_controller(start.owner_id)
+    try:
+        ce.write_current(state, ce.running_record(start.owner_id, info))
+        controller.pool.shutdown()
+        assert info["skipped_profiles"] == {"lab": "observation_revision_differs"}
+        home(0)
+        status = action(state, "controller_status", profiles=native({**lab, "secrets": {}}))
+        assert status["status"] == "ok", status
+        assert status["data"]["restart_required"]["profiles"] == ["lab"]
+    finally:
+        controller.store.release_owner(owner)
+
+
 def test_a_leftover_stop_request_never_stops_a_new_controller(tmp_path):
     """Review 5: a stop request written before this start (a killed run's, possibly under the same fixed CLI owner
     ID) is removed at the start; a request made after the start still stops the controller."""
@@ -1310,19 +1362,46 @@ def test_a_failed_outbox_backfill_releases_the_owner(tmp_path, monkeypatch, caps
     assert capsys.readouterr().out == ""   # no ready line
 
 
-def test_a_drain_fenced_by_a_successor_is_not_a_clean_stop(tmp_path):
+def wait_for_event(event, thread, result, what, timeout=LOADED_WAIT):
+    """Waits for ``event``, set by the code under test, with a bound generous enough for a loaded machine. A thread
+    that returned first fails at once with its result; a real hang still fails at the bound."""
+    deadline = time.monotonic() + timeout
+    while not event.wait(0.05):
+        if not thread.is_alive():
+            raise AssertionError(f"the controller returned {result} before {what}")
+        if time.monotonic() > deadline:
+            raise AssertionError(f"timed out after {timeout} s waiting for {what}")
+
+
+def test_a_drain_fenced_by_a_successor_is_not_a_clean_stop(tmp_path, monkeypatch):
     """Review 9: when the owner lease is fenced during the drain, ``run_forever`` releases nothing; that is a lost
-    lease (exit 1, ``owner_lost``) even if a successor already holds the owner row."""
+    lease (exit 1, ``owner_lost``) even if a successor already holds the owner row.
+
+    Task 11.1 N6: the first tick is observed through the tick itself. It used to be read as "heartbeat > acquired",
+    but the first tick renews the owner lease within milliseconds of acquiring it, and Python 3.12's ``time.time()``
+    on Windows has the system timer's resolution (15.625 ms by default): equal timestamps then left the test waiting
+    for the next heartbeat (200 s) until its 30 s bound, as seen once under load."""
     ce = entry()
+    from tuning_factory.graph_controller import GraphController
     from tuning_factory.graph_store import GraphStore
     state = tmp_path / "state"
     start = ce.ControllerStart.model_validate(start_message(
         state, "desktop.26.1", settings={"lease_ttl_seconds": 600, "tick_seconds": 60, "lease_heartbeat_seconds": 200}))
+    ticked, tick = threading.Event(), GraphController.tick
+
+    def observed_tick(self, owner):
+        try:
+            return tick(self, owner)
+        finally:
+            ticked.set()
+
+    monkeypatch.setattr(GraphController, "tick", observed_tick)
     stop, result = threading.Event(), []
     thread = threading.Thread(target=lambda: result.append(ce.serve(start, stop_event=stop)), daemon=True)
     thread.start()
     try:
-        wait_for(lambda: owner_row(state)["heartbeat"] > owner_row(state)["acquired"], "the first tick")
+        wait_for_event(ticked, thread, result, "the first tick")
+        assert owner_row(state)["owner_id"] == "desktop.26.1"
         store = GraphStore(state / "jobs.db")
         with store.jobs.connection() as db:   # the lease expired while the machine slept ...
             db.execute("UPDATE controller_owner SET expires=?", (time.time() - 1,))

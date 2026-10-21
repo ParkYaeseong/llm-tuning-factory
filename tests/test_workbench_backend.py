@@ -563,8 +563,8 @@ def test_planning_inputs_refuse_out_of_range_unknown_and_duplicate_values(tmp_pa
          "/node_time_limits/0/node_id"),
         ({"estimates": [estimate, {**estimate, "profile_id": "estimate-A."}]}, "estimate_duplicate",
          "/estimates/1/profile_id"),
-        ({"RUNPOD_API_KEY": SECRET}, "extra_field", "/RUNPOD_API_KEY"),
-        ({"estimates": [{**estimate, "RUNPOD_API_KEY": SECRET}]}, "extra_field", "/estimates/0/RUNPOD_API_KEY"),
+        ({"RUNPOD_API_KEY": SECRET}, "extra_field", ""),   # the object holding the unknown key (11.1)
+        ({"estimates": [{**estimate, "RUNPOD_API_KEY": SECRET}]}, "extra_field", "/estimates/0"),
     ]
     for change, code, path in cases:
         result = run(state, "planning_inputs_save", {**base, **change})
@@ -660,7 +660,7 @@ def test_workbench_actions_are_strict_and_take_no_credentials(tmp_path, action):
     wf = desk.workflows()
     state = tmp_path / "state"
     result = run(state, action, {**minimal_bodies()[action], "command": "calc.exe"})
-    issue = desk.only_issue(result, "invalid", "extra_field", "/command")
+    issue = desk.only_issue(result, "invalid", "extra_field", "")
     assert issue["node_id"] is None and "calc.exe" not in json.dumps(result)
     assert action not in wf.SECRET_SCOPES
     expected = "tuning_factory.workflow_runs" if action == "graph_release_lock" else "tuning_factory.workflow_planning"

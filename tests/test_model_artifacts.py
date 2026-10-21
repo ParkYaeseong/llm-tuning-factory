@@ -2,6 +2,7 @@ import hashlib
 import importlib
 import json
 import struct
+import time
 from pathlib import Path
 
 import pytest
@@ -639,3 +640,55 @@ def test_operation_outputs_uses_only_public_helpers():
     for public, alias in (('list_files', '_files'), ('read_json', '_read_json'), ('tensor_header', '_tensor_header')):
         assert getattr(module, alias) is getattr(module, public)   # the private names are aliases, never copies
     assert dataset_splits._dataset is dataset_splits.load_dataset
+
+
+def sharing_violation(winerror=5):
+    """A Windows ``PermissionError`` with its ``winerror`` (5 access denied, 32 sharing violation), on any OS."""
+    error = PermissionError(13, 'synthetic: the directory is in use by another process')
+    error.winerror = winerror
+    return error
+
+
+@pytest.mark.parametrize('winerror', [5, 32])
+def test_freeze_retries_a_brief_windows_sharing_violation_on_its_rename(tmp_path, monkeypatch, winerror):
+    """Task 11.1 N6: renaming the finished ``.freeze-*`` directory fails on Windows while another process (an
+    antivirus or indexer scanning the files just written) holds a handle inside it. Seen once as WinError 5 in
+    ``test_ambiguous_launch_waits_for_the_operator`` under load. A bounded retry (10 tries, 50 ms apart) rides it out;
+    anything else, or a violation that lasts, is raised as before."""
+    module = api()
+    directory, descriptor = fixture_model(tmp_path)
+    store = module.ModelArtifactStore(tmp_path / 'store')
+    rename, calls, sleeps = Path.rename, [], []
+
+    def busy_twice(self, target):
+        calls.append(self.name)
+        if self.name.startswith('.freeze-') and len(calls) <= 2:
+            raise sharing_violation(winerror)
+        return rename(self, target)
+
+    monkeypatch.setattr(Path, 'rename', busy_twice)
+    monkeypatch.setattr(time, 'sleep', sleeps.append)
+    ref = store.freeze(directory, descriptor)
+    assert store.verify(ref) == descriptor and len(calls) == 3 and sleeps == [0.05, 0.05]
+    assert not [path for path in store.root.iterdir() if path.name.startswith('.freeze-')]
+
+
+def test_freeze_raises_other_rename_errors_and_a_lasting_violation(tmp_path, monkeypatch):
+    module = api()
+    directory, descriptor = fixture_model(tmp_path)
+    store = module.ModelArtifactStore(tmp_path / 'store')
+    calls, sleeps = [], []
+    monkeypatch.setattr(time, 'sleep', sleeps.append)
+    for error, tries in ((PermissionError(13, 'synthetic: access denied'), 1), (sharing_violation(32), 10)):
+        calls.clear()
+
+        def refuse(self, target, error=error):
+            calls.append(self.name)
+            raise error
+
+        monkeypatch.setattr(Path, 'rename', refuse)
+        with pytest.raises(PermissionError):
+            store.freeze(directory, descriptor)
+        assert len(calls) == tries
+        assert not [path for path in store.root.iterdir() if path.name.startswith('.freeze-')]
+    assert sleeps == [0.05] * 9

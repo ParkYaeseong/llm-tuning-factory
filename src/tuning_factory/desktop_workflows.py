@@ -83,6 +83,7 @@ CREDENTIALS_REFUSED = "workflow requests must not carry credentials"
 SCOPE_REFUSED = "this workflow action does not accept these credentials"
 UNSUPPORTED_ACTION = "unsupported workflow action"
 INVALID_ENVELOPE = "invalid workflow request"
+UNKNOWN_KEY_HIDDEN = " (the unknown key is not shown)"
 NOT_AVAILABLE = "이 기능은 아직 설치되지 않았습니다."
 LOCAL_FILE_ONLY = "이 PC의 로컬 파일 경로만 가져올 수 있습니다."
 FILE_UNREADABLE = "이 PC에서 파일을 읽을 수 없습니다. 경로와 읽기 권한을 확인하세요."
@@ -348,28 +349,42 @@ def _pointer_part(part) -> str:
     return str(part).replace("~", "~0").replace("/", "~1")
 
 
-def _pointer(location, data) -> str:
-    """RFC 6901 pointer of a pydantic location, following the request data to drop union-member tags."""
+def _pointer(location, data, kind: str = "") -> str:
+    """RFC 6901 pointer of a pydantic location, following the request data to drop union-member tags. ``kind`` is
+    pydantic's error type. Only a ``missing`` error ends at a key the request lacks; any other trailing segment absent
+    from the request is a union member or validator tag, such as a node's kind (``merge`` for a merge node's own
+    validator) or a member model's name, and is dropped (found by Task 11.2). An ``extra_forbidden`` location ends at
+    a key the model forbids: the pointer stops at the object holding it (Task 11.1)."""
     if data is None:
-        return "".join("/" + _pointer_part(part) for part in location)
-    parts, node = [], data
-    for index, part in enumerate(location):
-        if isinstance(node, Mapping) and isinstance(part, str) and part in node:
-            parts.append(part)
-            node = node[part]
-        elif isinstance(node, list) and type(part) is int and 0 <= part < len(node):
-            parts.append(part)
-            node = node[part]
-        elif isinstance(node, Mapping) and index == len(location) - 1:
-            parts.append(part)          # a missing field
-        # Otherwise a union member or validator tag such as "constrained-str": not part of the request.
+        parts = list(location)
+    else:
+        parts, node = [], data
+        for index, part in enumerate(location):
+            if isinstance(node, Mapping) and isinstance(part, str) and part in node:
+                parts.append(part)
+                node = node[part]
+            elif isinstance(node, list) and type(part) is int and 0 <= part < len(node):
+                parts.append(part)
+                node = node[part]
+            elif kind == "missing" and isinstance(node, Mapping) and index == len(location) - 1:
+                parts.append(part)          # a missing field
+            # Otherwise a union member or validator tag such as "constrained-str": not part of the request.
+    if kind == "extra_forbidden" and parts and location and parts[-1] == location[-1]:
+        parts = parts[:-1]
     return "".join("/" + _pointer_part(part) for part in parts)
 
 
 def issues_from_validation(exc: ValidationError, prefix: str = "", *, data=None) -> tuple[WorkflowIssue, ...]:
-    """One issue per pydantic error; pydantic's ``msg`` never echoes the input value."""
-    return tuple(issue("extra_field" if error["type"] == "extra_forbidden" else "invalid_value",
-                       error["msg"], prefix + _pointer(error["loc"], data)) for error in exc.errors())
+    """One issue per pydantic error; pydantic's ``msg`` never echoes the input value. An unknown key
+    (``extra_field``) is a name the caller chose, so its issue points at the object that holds it and says the key is
+    hidden (9.6 review, Task 11.1); other codes point at the failing value, or at the object a validator refused."""
+    found = []
+    for error in exc.errors():
+        unknown = error["type"] == "extra_forbidden"
+        found.append(issue("extra_field" if unknown else "invalid_value",
+                           error["msg"] + (UNKNOWN_KEY_HIDDEN if unknown else ""),
+                           prefix + _pointer(error["loc"], data, error["type"])))
+    return tuple(found)
 
 
 def _text(exc: Exception) -> str:

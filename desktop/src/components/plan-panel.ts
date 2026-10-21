@@ -708,10 +708,11 @@ function registeredText(controller: ControllerView | null): string {
 }
 
 /**
- * "계획 승인·실행…": the approval dialog of the held, usable plan, then graph_submit with the plan's request ID (reused
- * after a bridge error or a refusal). A real plan is sent only with both approvals from the dialog; a dry run with
- * none. `ok` opens the run on the runs page (after the task; the controller is never started here). `plan_stale`
- * drops the plan and names what changed; other refusals are shown with the plan kept.
+ * "계획 승인·실행…": the approval dialog of the held, usable plan, then graph_submit with the plan's request ID (derived
+ * from the plan hash, so the same after a bridge error, a refusal, a restart or in another window). A real plan is sent
+ * only with both approvals from the dialog; a dry run with none. `ok` opens the run on the runs page (after the task;
+ * the controller is never started here). `plan_stale` drops the plan and names what changed; other refusals are shown
+ * with the plan kept.
  */
 export async function approveAndSubmit(ctx: ViewContext, projectId: string, env: PlanEnv): Promise<void> {
   const draft = ctx.store.draft(projectId);
@@ -719,8 +720,10 @@ export async function approveAndSubmit(ctx: ViewContext, projectId: string, env:
   if (!draft?.saved || !held || ctx.busy || !ctx.store.planUsable(projectId) || submittedRuns.has(held.summary.plan_sha256)) return;
   const hash = held.summary.plan_sha256;
   const still = stillOn(ctx);
-  // The backend dedupes only by request ID, which lives for this session: a run of the same plan made before a restart
-  // (or by another window) is looked up first, so a lost response never leads to a second run. No list, no approval.
+  // The request ID is derived from the plan hash (project-store.ts requestIdFor), so the backend's idempotency already
+  // answers a second submit of this plan, from another window or after a restart, with the first run. The list is
+  // still read first, so such a run is shown instead of an approval for a plan that will not run again. No list, no
+  // approval.
   const found: { run?: string; read?: boolean } = {};
   await ctx.task("이 계획의 기존 실행 확인 중", async () => {
     let result: WorkflowResult<unknown>;

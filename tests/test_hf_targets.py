@@ -238,7 +238,7 @@ def test_refusals_before_any_request(tmp_path, monkeypatch, case):
         "trailing_dot": (request(repo_id="Qwen/model."), ("repository_unsupported", "/repo_id")),
         "not_indexed": (request(), ("model_root_missing", "/repo_id")),
         "ambiguous_root": (request(), ("model_root_invalid", "/repo_id")),
-        "extra_field": (request(command="calc.exe"), ("extra_field", "/command")),
+        "extra_field": (request(command="calc.exe"), ("extra_field", "")),
     }[case]
     result = inspect(state, data, secrets={"HF_TOKEN": HF_SECRET})
     issue = desk.only_issue(result, "invalid", *expected)
