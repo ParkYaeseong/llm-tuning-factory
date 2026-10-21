@@ -29,10 +29,11 @@ export const STOP_CONFIRMED = "원격 서버/Pod에서 해당 실행이 멈춘 �
 const CANCEL_NOTICE = "진행 중인 단계에 취소를 요청합니다. 원격 종료가 확인될 때까지 자원을 해제하지 않습니다.";
 const RELEASE_RISK = "원격 서버나 Pod에서 이 실행이 아직 돌고 있는데 잠금을 해제하면, 같은 GPU에 다른 단계가 배정되어 두 작업이 함께 돌거나 늦게 도착한 결과가 버려질 수 있습니다.";
 const RELEASE_EFFECT = "해제하면 컨트롤러가 다음 확인 때 이 시도를 정리합니다. 결과가 없으면 이 단계는 실패로(취소를 요청한 실행의 시도는 취소로 기록) 기록되고 다시 실행하지 않습니다. 결과가 필요하면 다시 계획해 새로 실행하세요.";
-const RELEASE_CHECK = "RunPod 콘솔이나 서버의 프로세스 목록에서 아래 작업·시도의 실행이 멈춘 것을 직접 확인한 뒤에만 해제하세요.";
+const NOT_SAVED_EFFECT = "해제하면 컨트롤러가 다음 확인 때 이 시도를 정리합니다. 도착한 결과를 포기하고 출력 무효(output_invalid)로 기록하며 다시 실행하지 않습니다. 결과가 필요하면 다시 계획해 새로 실행하세요.";
+const RELEASE_CHECK ="RunPod 콘솔이나 서버의 프로세스 목록에서 아래 작업·시도의 실행이 멈춘 것을 직접 확인한 뒤에만 해제하세요.";
 const RELEASED = "잠금이 이미 해제되었습니다 · 컨트롤러가 다음 확인 때 이 시도를 정리합니다. 결과가 없으면 실패로(취소를 요청한 실행이면 취소로) 기록하고 다시 실행하지 않습니다.";
 const RELEASED_NOT_SAVED = "잠금이 이미 해제되었습니다 · 컨트롤러가 다음 확인 때 이 시도를 정리합니다. 도착한 결과는 저장하지 않고 출력 무효(output_invalid)로 기록하며 다시 실행하지 않습니다.";
-const RELEASED_START ="컨트롤러가 동작 중이 아니어서 아직 정리되지 않습니다. 위에서 컨트롤러를 시작하세요.";
+const RELEASED_START = "컨트롤러가 동작 중이 아니어서 아직 정리되지 않습니다. 위에서 컨트롤러를 시작하세요.";
 const RELEASE_STALE = "실행 상태가 바뀌었습니다. 이 시도는 더 이상 해제할 대상이 아닙니다. 대화 상자를 닫고 다시 확인하세요.";
 const PRE_OUTBOX = "기록 대기열이 생기기 전에 끝난 실행이라 MLflow 기록 상태가 없습니다.";
 /** An unreadable run needs an operator's repair; it is not read again on its own (11.5 R3 M4). */
@@ -563,7 +564,7 @@ async function releaseNode(ctx: ViewContext, nodeId: string) {
   const request = { run_id: run.run_id, node_id: node.node_id, job_id: node.job_id!, attempt_id: node.attempt_id! };
   const pending = openDialog({ title: "실행 잠금 해제",
     bodyHtml: `<p class="run-release-target"><b>${isolate(nameOf(node))}</b> · 작업 <span class="mono">${escapeHtml(request.job_id)}</span> · 시도 <span class="mono">${escapeHtml(request.attempt_id)}</span></p>
-      <p class="run-release-risk">${escapeHtml(RELEASE_RISK)}</p><p>${escapeHtml(RELEASE_EFFECT)}</p><p>${escapeHtml(RELEASE_CHECK)}</p>
+      <p class="run-release-risk">${escapeHtml(RELEASE_RISK)}</p><p>${escapeHtml(NOT_SAVED_REASON.test(node.wait_reason ?? "") ? NOT_SAVED_EFFECT : RELEASE_EFFECT)}</p><p>${escapeHtml(RELEASE_CHECK)}</p>
       <details class="run-cli-details"><summary>명령줄로 해제하기(대안)</summary><p class="muted">${CLI_NOTE}</p><pre class="run-cli">${operatorInstruction(run.run_id, node)}</pre></details>
       <label class="field run-release-label"><span>확인을 위해 단계 이름 ‘${isolate(expected)}’을(를) 그대로 입력하세요</span><input id="run-release-label" type="text" autocomplete="off" spellcheck="false">${hidden ? `<small>${HIDDEN_CHARACTERS}</small>` : ""}</label>
       <p id="run-release-stale" class="run-release-stale"></p>`,

@@ -320,6 +320,12 @@ test("a result that arrived but could not be saved offers its release, then show
   await expect(unsaved).toContainText("output_invalid");
   await expect(unsaved).not.toContainText("원격 실행이 멈췄는지 알 수 없어");
   await expect(unsaved.getByRole("button", { name: "실행 잠금 해제" })).toHaveCount(1);
+  await unsaved.getByRole("button", { name: "실행 잠금 해제" }).click();
+  const dialog = page.locator("dialog[open]");
+  await expect(dialog).toContainText("결과를 포기");
+  await expect(dialog).not.toContainText("결과가 없으면");
+  await dialog.getByRole("button", { name: "돌아가기" }).click();
+  await expect(page.locator("dialog[open]")).toHaveCount(0);
   await expect(nodeRow(page, "train-s")).toContainText("이 PC에 저장하지 못했습니다");
   const released = operatorItem(page, "train-r");
   await expect(released).toContainText("잠금이 이미 해제되었습니다");
