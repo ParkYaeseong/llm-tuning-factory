@@ -6199,6 +6199,15 @@ written first and seen failing for the reason named; the existing tests that cha
   `a_store_write_removes_temporary_files_a_crash_left_behind`, `the channel's shapes declare each type once`, each
   failing first. Then `npm run build` passes, `npx playwright test` **266 passed**, `cargo test` **54 passed**,
   `pytest tests/test_native_contract.py tests/test_repository_text.py` **11 passed**, `git diff --check` clean.
+- Planning batch re-review (root): **fixed**. The five graph_planner refusals sent as `plan_refused` (distinct
+  selection candidates, one merged candidate, an original beside the merged one, distinct merge artifacts, plain
+  LoRA/QLoRA merge parents) have Korean texts in the editor's terms, the original under "원문 보기". A general plan
+  refusal with a `node_id` now also flags that card (`planFeedback`), and stays in "계획 확인 결과". The tutorial's
+  data-register step no longer says the synthetic mark blocks real training ("연습 데이터는 연습 전용이고 GPU 전송이
+  막혀 있어 …(합성 표시도 붙습니다)"); no test asserted the old text. Tests: `the planner's merge and selection refusals
+  are shown in the editor's terms`, `a merge or selection refusal is shown in Korean in the panel and on its card`
+  (mocked), and the tutorial's registered-sample test, each failing first. Then `npm run build` passes, `npx
+  playwright test` **268 passed**, `pytest tests/test_repository_text.py` 3 passed, `git diff --check` clean.
 
 Actual verification (this worktree, its own `.venv` from `uv sync --extra dev --extra tracking --locked`):
 - `npm run build` (tsc + vite) passes.
