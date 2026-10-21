@@ -792,10 +792,10 @@ class GraphController:
     def _queued(self, run_id):
         with self.store.jobs.connection() as db:
             rows = db.execute("SELECT j.id,j.graph_node_id,j.manifest FROM jobs j JOIN nodes n ON n.job_id=j.id "
-                              "WHERE n.run_id=? AND j.status='QUEUED' ORDER BY j.priority DESC,j.created",
-                              (run_id,)).fetchall()
-            active = db.execute("SELECT COUNT(*) FROM jobs WHERE graph_run_id=? AND status IN "
-                                "('PROVISIONING','RUNNING','EVALUATING')", (run_id,)).fetchone()[0]
+                              "WHERE n.run_id=? AND n.status='READY' AND j.status='QUEUED' "
+                              "ORDER BY j.priority DESC,j.created", (run_id,)).fetchall()
+        # claim_ready's own count: a lock-holding (uncertain) attempt holds its slot too (11.5 R1 m1).
+        active = self.store.concurrent_attempts(run_id)
         queued = [(row["id"], row["graph_node_id"], json.loads(row["manifest"])["operation"]) for row in rows]
         return [item for item in queued if item[2]["kind"] != "select"], active
 

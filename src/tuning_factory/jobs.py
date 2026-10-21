@@ -13,6 +13,8 @@ ACTIVE = {'PROVISIONING', 'RUNNING', 'EVALUATING'}
 NON_HARDWARE = ('local:', 'simulation:')
 GRAPH_LAUNCH_REFUSED = 'graph run is not running; launch refused'
 GRAPH_CANCEL_REFUSED = 'graph job cancel requested; launch refused'
+GRAPH_RESUME_REFUSED = ('a graph-owned job is retried only by its graph controller; resume refused '
+                        '(retry or re-run the graph instead)')
 RECEIPT_CHUNK = 500  # Stay far below SQLite's variable limit.
 TERMINAL = {'FAILED', 'CANCELED', 'COMPLETED'}
 TRANSITIONS = {
@@ -557,7 +559,10 @@ class JobStore:
     def reset_for_resume(self, job_id):
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute('SELECT status FROM jobs WHERE id=?', (job_id,)).fetchone()
+            row = db.execute('SELECT status,graph_run_id FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if row is not None and row['graph_run_id'] is not None:
+                # Only the graph controller requeues a graph job: a bounded, classified retry (11.5 R1 m7).
+                raise ValueError(GRAPH_RESUME_REFUSED)
             if row is None or row['status'] not in {'FAILED', 'CANCELED'}:
                 raise ValueError('only failed/canceled jobs can resume')
             if db.execute('SELECT 1 FROM gpu_locks WHERE job_id=?', (job_id,)).fetchone():

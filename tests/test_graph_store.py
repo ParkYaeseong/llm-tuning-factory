@@ -886,8 +886,12 @@ def test_claim_reserves_budget_atomically_and_refuses_over_budget(tmp_path):
         claims = list(pool.map(lambda _: store.claim_ready(facts, ctl), range(4)))
     (second,) = [item for item in claims if item is not None]
     assert store.jobs.abandon_unlaunched(second['lease'], 'refused before launch')   # counted, terminal
-    store.jobs.reset_for_resume(second['id'])   # a manual requeue cannot exceed max_attempts
-    with store.jobs.connection() as db:   # isolate the attempt rule from the budget rule
+    with pytest.raises(ValueError, match='graph-owned'):
+        store.jobs.reset_for_resume(second['id'])   # 11.5 R1 m7: never requeued outside the controller
+    with store.jobs.connection() as db:   # a requeue by any other path still cannot exceed max_attempts
+        db.execute("UPDATE jobs SET status='QUEUED',active_attempt_id=NULL WHERE id=?", (second['id'],))
+        db.execute("UPDATE nodes SET status='READY' WHERE job_id=?", (second['id'],))
+        # isolate the attempt rule from the budget rule
         db.execute("UPDATE budget_reservations SET status='VOID' WHERE attempt_id=?", (second['lease'].attempt_id,))
     with ThreadPoolExecutor(max_workers=4) as pool:
         assert list(pool.map(lambda _: store.claim_ready(facts, ctl), range(4))) == [None] * 4
@@ -1099,3 +1103,47 @@ def test_a_cancel_flags_an_uncertain_attempt_that_keeps_its_lock(tmp_path, scope
             store.jobs.cancel(claimed['id'])
     assert [store.jobs.get(claimed['id'])['cancel_requested'] for claimed in (held, final)] == [1, 0]
     assert [store.jobs.get(claimed['id'])['status'] for claimed in (held, final)] == ['FAILED', 'FAILED']
+
+
+def test_an_uncertain_attempt_counts_toward_max_concurrent(tmp_path):
+    """R1 m1: an attempt that keeps its lock may still run on its GPU, so it holds one of the run's max_concurrent
+    slots until reconcile or the operator releases it."""
+    w = ledger_world(tmp_path, ('pod1', 'pod2'), max_concurrent=1)
+    store, run = w.store, w.run_id
+    ctl = store.acquire_controller(run)
+    store.prepare_ready(ctl)
+    first = store.claim_ready(w.facts[0], ctl)
+    assert store.concurrent_attempts(run) == 1 and store.claim_ready(w.facts[1], ctl) is None
+    uncertain(store, first)
+    assert store.concurrent_attempts(run) == 1 and store.claim_ready(w.facts[1], ctl) is None
+    store.jobs.reconcile_result(first['lease'], 'FAILED', 'late remote failure')   # the result arrived
+    assert store.concurrent_attempts(run) == 0
+    assert store.claim_ready(w.facts[1], ctl)['graph_node_id'] == 'train.2'
+
+
+def test_a_graph_job_is_never_requeued_outside_the_controller(tmp_path):
+    """R1 m7: ``reset_for_resume`` refuses a graph-owned job (only a KeyError in ``Factory.resume`` stopped it), and
+    ``claim_ready`` claims only the job of a READY node."""
+    w = ledger_world(tmp_path, max_attempts=3)
+    store, run = w.store, w.run_id
+    ctl = store.acquire_controller(run)
+    store.prepare_ready(ctl)
+    claimed = store.claim_ready(w.facts[0], ctl)
+    assert store.jobs.abandon_unlaunched(claimed['lease'], 'refused before launch')
+    with pytest.raises(ValueError, match='graph-owned'):
+        store.jobs.reset_for_resume(claimed['id'])
+    from tuning_factory.runner import Factory
+    with pytest.raises(ValueError, match='graph-owned'):   # `factory resume <job>`, before the v1 manifest is read
+        Factory(tmp_path).resume(claimed['id'])
+    assert store.jobs.get(claimed['id'])['status'] == 'FAILED'
+    with store.jobs.connection() as db:   # a requeue by any other path: the job QUEUED while its node is not READY
+        db.execute("UPDATE jobs SET status='QUEUED',active_attempt_id=NULL WHERE id=?", (claimed['id'],))
+    assert node_status(store, run, 'train.1') == 'RUNNING'
+    assert store.claim_ready(w.facts[0], ctl) is None
+    with store.jobs.connection() as db:
+        db.execute("UPDATE nodes SET status='READY' WHERE run_id=? AND node_id='train.1'", (run,))
+    assert store.claim_ready(w.facts[0], ctl)['id'] == claimed['id']   # only the node status held it back
+    legacy = queued(store.jobs, 'legacy')
+    store.jobs.cancel(legacy['id'])
+    store.jobs.reset_for_resume(legacy['id'])   # a v1 job still resumes
+    assert store.jobs.get(legacy['id'])['status'] == 'QUEUED'

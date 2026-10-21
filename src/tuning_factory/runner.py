@@ -8,7 +8,7 @@ from pathlib import Path
 from .config import AIConfig
 from .evaluation import CommonEvaluator
 from .execution import CapacityUnavailable, ExecutionUncertain, LocalExecutor, Policy
-from .jobs import JobStore
+from .jobs import GRAPH_RESUME_REFUSED, JobStore
 from .manifest import resolve, source_hash, verify_manifest
 from .registry import Registry, canonical, file_digest, immutable_write
 from .training import CanceledError, LlamaFactoryBackend, MockTrainingBackend
@@ -44,6 +44,8 @@ class Factory:
 
     def resume(self, job_id, checkpoint=None):
         job = self.store.get(job_id)
+        if job.get("graph_run_id"):   # before the v1 manifest is read (11.5 R1 m7; the store refuses it too)
+            raise ValueError(GRAPH_RESUME_REFUSED)
         directory = self.directory(job_id)
         verify_manifest(job["manifest"])
         from .capabilities import compatibility

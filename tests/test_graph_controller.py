@@ -1864,3 +1864,30 @@ def test_the_dispatcher_must_use_the_controllers_store(tmp_path, monkeypatch):
         OperationAttemptRunner(w.store, root=w.store.state_dir), SimulatedOperationDispatcher(
             w.store, root=w.store.state_dir)), w.tracker, w.clock, pool=ManualPool())
     assert w.store.jobs.error_filter == controller.redact
+
+
+def test_an_uncertain_attempt_holds_a_concurrency_slot(tmp_path, monkeypatch):
+    """Task 11.5 R1 m1: with max_concurrent=1 on two Pods, the first attempt's lost response leaves it uncertain (it
+    may still run on its GPU), so the other node is not dispatched until the late result is reconciled."""
+    gc = api()
+    w = world(tmp_path, monkeypatch, two_pods_two_trains, destinations=pods('pod1', 'pod2'), max_concurrent=1)
+    controller, owner = start(w)
+    controller.tick(owner)
+    (first,) = w.pool.pending
+    held = w.store.jobs.get(first)['graph_node_id']
+    other = ({'x', 'y'} - {held}).pop()
+    w.dispatcher.script[held] = ['uncertain']
+    w.pool.run_all()
+    resolves = len(w.provider.resolves)
+    for _ in range(3):
+        controller.tick(owner)
+        assert not w.pool.pending and w.dispatcher.launches == {held: 1}
+    assert len(w.provider.resolves) == resolves   # the other destination is not even opened
+    assert w.store.jobs.get(job_of(w, other))['status'] == 'QUEUED'
+    assert node(w, other)['wait_reason'] == gc.AT_CONCURRENCY
+    w.dispatcher.deliver(held)
+    for _ in range(2):   # ticks well inside the owner TTL, one reconcile interval in all
+        w.clock.advance(gc.ControllerSettings().reconcile_interval_seconds / 2)
+        controller.tick(owner)
+    drive(w, controller, owner)
+    assert statuses(w) == {'x': 'COMPLETED', 'y': 'COMPLETED'} and w.dispatcher.launches == {'x': 1, 'y': 1}

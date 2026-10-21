@@ -775,6 +775,20 @@ class GraphStore:
             return self._reserved(db, run_id)
 
     @staticmethod
+    def _concurrent(db, run_id) -> int:
+        """The run's attempts that may be running, against ``max_concurrent``: the active ones, and finished ones that
+        still hold their lock (an uncertain attempt may still run on its GPU; 11.5 R1 m1)."""
+        return db.execute("SELECT COUNT(*) FROM jobs j WHERE j.graph_run_id=? AND (j.status IN "
+                          "('PROVISIONING','RUNNING','EVALUATING') OR EXISTS (SELECT 1 FROM gpu_locks g "
+                          "WHERE g.job_id=j.id) OR EXISTS (SELECT 1 FROM resource_leases l WHERE l.job_id=j.id))",
+                          (run_id,)).fetchone()[0]
+
+    def concurrent_attempts(self, run_id) -> int:
+        """``claim_ready``'s count against ``max_concurrent``: active attempts and lock-holding finished ones."""
+        with self.jobs.connection() as db:
+            return self._concurrent(db, run_id)
+
+    @staticmethod
     def _counted_attempts(db, job_id) -> int:
         """Attempts that count against ``max_attempts``: all of the job's attempts but the uncounted dispositions."""
         return db.execute('SELECT COUNT(*) FROM job_attempts a WHERE a.job_id=? AND NOT EXISTS ('
@@ -804,14 +818,14 @@ class GraphStore:
             if run['status'] != 'RUNNING':
                 return None
             plan = GraphPlan.model_validate_json(run['plan'])
-            active = db.execute("SELECT COUNT(*) FROM jobs WHERE graph_run_id=? AND status IN ('PROVISIONING','RUNNING','EVALUATING')",
-                                (run['id'],)).fetchone()[0]
-            if active >= plan.graph.max_concurrent:
+            if self._concurrent(db, run['id']) >= plan.graph.max_concurrent:
                 return None
             reserved = self._reserved(db, run['id'])
             ceiling = plan.max_estimated_cost_usd * (1 + 1e-9)   # defence in depth against float summation order
+            # Only a READY node's job (11.5 R1 m7): a graph job queued by any other path is never claimed.
             for row in db.execute("SELECT j.* FROM jobs j JOIN nodes n ON j.id=n.job_id WHERE n.run_id=? "
-                                  "AND j.status='QUEUED' AND j.id NOT IN (SELECT job_id FROM gpu_locks) ORDER BY j.priority DESC,j.created", (run['id'],)).fetchall():
+                                  "AND n.status='READY' AND j.status='QUEUED' AND j.id NOT IN (SELECT job_id FROM gpu_locks) "
+                                  "ORDER BY j.priority DESC,j.created", (run['id'],)).fetchall():
                 if job_id is not None and row['id'] != job_id:
                     continue
                 operation = json.loads(row['manifest'])['operation']
