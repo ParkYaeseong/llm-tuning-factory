@@ -349,9 +349,10 @@ tests/native-smoke.mjs는 loopback WebView2 debugging을 켜고 실행한 앱에
 `$env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=9223"`를 설정한 뒤 실행하며, 스크립트는 `127.0.0.1:9223`에 붙습니다.
 **스크립트는 이 PC의 실제 앱 상태에 씁니다.** 앱 데이터 폴더와 Windows 자격 증명 저장소 항목은 앱 식별자
 (`kr.kbiofoundry.tuningfactory`)를 따르므로, 디버깅 포트를 켜고 실행한 앱도 평소와 같은 상태를 씁니다.
-실행할 때마다 프로젝트(지울 수 없음)와 `desktop_smoke` 데이터가 남고, `FACTORY_SMOKE_FLOW=1`이면 합성 기반 모델, 데이터 버전,
-레시피, 평가 기준과 모의 그래프 실행도 남습니다. 백그라운드 컨트롤러가 돌고 있거나 진행 중인 그래프 실행이 있으면 아무것도
-쓰기 전에 멈춥니다.
+실행할 때마다 프로젝트(지울 수 없음)와 `desktop_smoke` 데이터가 남습니다. `FACTORY_SMOKE_FLOW=1`이면 데이터 버전, 레시피,
+평가 기준과 모의 그래프 실행도 남습니다(그 전에 별도 명령으로 넣는 합성 기반 모델도 상태에 남습니다).
+`FACTORY_SMOKE_LIVE_HF=1`이면 단일 학습의 모델 목록에 추가된 `Qwen/Qwen3.5-0.8B` 모델 프로필도 남습니다.
+백그라운드 컨트롤러가 돌고 있거나 진행 중인 그래프 실행이 있으면 아무것도 쓰기 전에 멈춥니다.
 
 기본 실행은 네트워크를 쓰지 않습니다. `FACTORY_SMOKE_LIVE_HF=1`이면 Hugging Face 메타데이터 조회를 함께 검사합니다(네트워크 사용).
 저장된 인증값이나 실행 프로필이 있는 상태에서는 인증값 삭제 검사를 건너뜁니다. 실행 프로필, 저장된 인증값, MLflow 주소 중 하나라도

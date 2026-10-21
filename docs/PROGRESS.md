@@ -6107,6 +6107,9 @@ Actual verification:
   unchanged. A planted probe (CR, U+200B, a broken link and a broken anchor) was reported. The new curly- or
   single-quoted labels (“자원 확인”, “계획 확인”, ‘최대 동시 GPU’, ‘대기 후 순차 실행’, “실행 보기”) exist in
   `desktop/src`.
+- Re-review Minors (docs, `git log` for the SHA): the checkbox label ‘일부 평가만 성공해도 선택’, L2b shows no selection
+  outcome with synthetic data, the smoke leftovers name the seed command and the LIVE_HF model, one placeholder `plan-<PLAN_SHA256>`;
+  `test_repository_text` passes, `check_secrets.py` checks 1182 file versions with 0 findings.
 
 Not verified or still open:
 - The verifier test on ubuntu (skipped there) and on hosted windows-latest; root sees hosted CI.

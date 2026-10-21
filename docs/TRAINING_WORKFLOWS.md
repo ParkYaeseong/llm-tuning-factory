@@ -164,7 +164,7 @@
 |---|---|---|
 | 학습 | 레시피, 입력 모델(기반 모델 또는 앞 학습의 결과), 학습 데이터, PPO면 보상 모델, 실행 프로필 | 학습 역할 데이터만. 초기화(새 어댑터·전체 가중치·어댑터 이어 학습)는 레시피의 학습 방법으로 정해집니다. |
 | 평가 | 평가할 모델, 평가 기준(“새 평가 기준”으로 만들 수 있음), 실행 프로필 | 평가 기준은 검증·시험 데이터만 씁니다. |
-| 자동 선택 | 비교할 평가, 선택 지표, 방향, 기준값(선택), 부분 성공 허용과 최소 성공 수(2 이상), 병합 회귀 허용치(기본 0) | 같은 평가 기준의 평가끼리만 비교하며, 그 평가 기준은 검증(validation) 데이터여야 합니다. 시험(test) 데이터 평가는 선택에 쓰지 않습니다. GPU를 쓰지 않습니다. |
+| 자동 선택 | 비교할 평가, 선택 지표, 방향, 기준값(선택), ‘일부 평가만 성공해도 선택’과 최소 성공 수(2 이상), 병합 회귀 허용치(기본 0) | 같은 평가 기준의 평가끼리만 비교하며, 그 평가 기준은 검증(validation) 데이터여야 합니다. 시험(test) 데이터 평가는 선택에 쓰지 않습니다. GPU를 쓰지 않습니다. |
 | 병합 | 병합할 모델 2–4개와 가중치(%) | LoRA·QLoRA 학습 결과만, 가중치 합 정확히 100%, 합친 rank 256 이하. 실제로 끝난 결과만 합칩니다. |
 | 전체 모델 확정 | 확정할 모델 | LoRA·QLoRA 결과만. 학습 방법이 바뀌는 다음 학습 앞에 꼭 넣어야 합니다. |
 
@@ -175,8 +175,8 @@
 - 카드에서 실행 프로필을 여러 개 고르면 비어 있는 곳에서 실행합니다. 프로필 하나만 고른 카드끼리는 같은 자원을 순서대로
   기다립니다(미리보기의 점선 테두리, 카드의 ‘대기’).
 - 자동 선택의 병합 회귀 허용치가 0이면 병합 모델이 원본 최상 모델보다 낮을 때 원본을 유지합니다.
-- 병합이나 병합 모델의 평가가 실패하면, 부분 성공 허용이 꺼진 최종 자동 선택은 진행하지 않고 멈춘 채 운영자를 기다립니다.
-  부분 성공 허용을 켜면 원본 최상 모델을 고릅니다.
+- 병합이나 병합 모델의 평가가 실패하면, ‘일부 평가만 성공해도 선택’이 꺼진 최종 자동 선택은 진행하지 않고 멈춘 채 운영자를
+  기다립니다. 이 확인란을 켜면 원본 최상 모델을 고릅니다.
 - 자동 선택은 추천 결과를 확정할 뿐 배포하지 않습니다. 정확 일치·문자 F1 같은 텍스트 정답 일치 지표는 의미적 품질 점수가
   아니고, JSON 형식 유효성은 품질 지표가 아닙니다.
 
@@ -367,8 +367,8 @@ uv run factory --state-dir "$env:APPDATA\kr.kbiofoundry.tuningfactory\state" rel
   않습니다. 모의 실행 결과는 실제 실행에 쓰지 않으며 확정하거나 등록하지도 않습니다.
 - **같은 계획은 두 번 등록하지 않습니다.** 앱과 CLI 모두 같은 계획 해시의 실행이 이미 있으면 다른 요청 ID로 보낸 등록을
   거부하고(`plan_submitted`) 기존 실행을 알려 줍니다. 그 실행을 취소한 뒤에도 같습니다. 같은 요청 ID로 다시 보내면 같은 실행을
-  돌려줍니다. 앱은 요청 ID로 `plan-<계획 해시>`를 쓰므로 CLI에서도 `--request-id plan-<PLAN_SHA256>`을 쓰면 앱과 CLI가 서로의
-  등록을 같은 요청으로 알아봅니다. 다시 실행하려면 입력을 바꿔 새 계획을 만드세요(6장).
+  돌려줍니다. 앱은 요청 ID로 `plan-<PLAN_SHA256>`(`plan-` 뒤에 계획 해시)을 쓰므로 CLI에서도 `--request-id plan-<PLAN_SHA256>`을
+  쓰면 앱과 CLI가 서로의 등록을 같은 요청으로 알아봅니다. 다시 실행하려면 입력을 바꿔 새 계획을 만드세요(6장).
 - **모의 병합은 거부합니다.** 병합은 실제로 끝난 LoRA·QLoRA 결과만 합칩니다. 모의 실행 계획에서는 병합 단계에서 멈춥니다.
 - **끝난 학습은 다시 하지 않습니다.** 컨트롤러가 멈췄다 다시 시작해도 끝난 단계를 다시 학습하지 않고, 진행 중이던 시도는 원격
   결과를 다시 확인해 이어받습니다. 확인할 수 없으면 ‘운영자 확인 필요’로 기다립니다.
@@ -388,14 +388,16 @@ uv run factory --state-dir "$env:APPDATA\kr.kbiofoundry.tuningfactory\state" rel
 | 자원 확인 | `factory executor-profile-inspect PROFILE_ID --executor-profiles FILE` |
 | 계획 확인(모의 실행) | `factory graph-plan PROJECT_ID --request FILE` |
 | 계획 확인(실제 실행) | `factory graph-plan PROJECT_ID --request FILE --executor-profiles FILE --real` |
-| 모의 실행 등록 | `factory graph-submit PLAN_SHA256 --request-id plan-PLAN_SHA256` |
-| 실행 승인과 데이터 전송 승인 | `factory graph-submit PLAN_SHA256 --request-id plan-PLAN_SHA256 --approve-execution --approve-data-transfer --executor-profiles FILE` |
+| 모의 실행 등록 | `factory graph-submit PLAN_SHA256 --request-id plan-<PLAN_SHA256>` |
+| 실행 승인과 데이터 전송 승인 | `factory graph-submit PLAN_SHA256 --request-id plan-<PLAN_SHA256> --approve-execution --approve-data-transfer --executor-profiles FILE` |
 | 그래프 실행 화면 | `factory graph-status [RUN_ID]` |
 | 일시정지·다시 진행·취소 | `factory graph-pause RUN_ID`, `factory graph-resume RUN_ID`, `factory graph-cancel RUN_ID` |
 | 기록 다시 시도 | `factory graph-rearm-tracking EVENT_ID` |
 | 실행 잠금 해제 | `factory status --job-id JOB_ID`, `factory release-lock JOB_ID ATTEMPT_ID --confirm-execution-stopped` |
 | 컨트롤러 시작·정지 | `factory graph-work` (앞에서 실행, Ctrl+C 한 번은 정지 요청, 두 번은 즉시 종료) |
 
+- 표의 대문자 이름(`PLAN_SHA256` 등)은 실제 값으로 바꿔 입력합니다. 요청 ID `plan-<PLAN_SHA256>`은 `plan-` 뒤에 같은 계획 해시를
+  붙인 값입니다(꺾쇠는 입력하지 않음). 예: 계획 해시가 `3f2a…`이면 `--request-id plan-3f2a…`.
 - `graph-work`는 같은 컨트롤러를 터미널 앞에서 실행합니다. `--approve-execution-and-transfer`가 없으면 모의 실행만 진행하고 실제
   실행은 기다립니다. 실제 실행에는 `--approve-execution-and-transfer --executor-profiles FILE`이 필요하며, 이때만 프로필의 RunPod 키와
   MLflow 인증값을 읽습니다. `--tick-seconds`(기본 5초)로 확인 간격을, `--max-ticks`로 확인 횟수 상한을 정할 수 있습니다. 종료 코드는

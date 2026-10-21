@@ -272,7 +272,7 @@ approvals. It re-checks the project revision (every plan) and, for a real plan, 
 the MLflow destination hash (`plan_stale`). It is idempotent by `request_id`: the same request returns the same run, and
 the same ID with another plan is `request_reused`. A plan runs at most once: submitting a plan that already has a run
 under another request ID is `conflict`/`plan_submitted`, naming the existing run, also after that run was cancelled.
-This holds for the desktop and the CLI alike. The desktop sends `request_id = plan-<plan_sha256>` (and checks
+This holds for the desktop and the CLI alike. The desktop sends `request_id = plan-<PLAN_SHA256>` (and checks
 `graph_runs_list` for the plan hash before it opens the approval); pass `--request-id plan-<PLAN_SHA256>` to
 `graph-submit` too, so the CLI and the desktop treat each other's submission as the same request. The receipt holds IDs
 and approval flags only. Submission never starts the controller.

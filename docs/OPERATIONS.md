@@ -34,8 +34,9 @@ and different Pods; increase both max_concurrent and max_gpus deliberately. A Po
 - Point every graph command that shares borrowed resources with the app at the app's state with `--state-dir`. GPU locks
   live per state directory: `graph-work` refuses to start beside the app's controller (exit 3) only with that state; with
   the default `./state` it starts a second controller that can dispatch to the same borrowed Pod or server.
-- Submit with `graph-submit PLAN_SHA256 --request-id plan-PLAN_SHA256`, the request ID the desktop uses. A plan runs at
-  most once: another request ID for an already submitted plan is refused (`plan_submitted`, naming the existing run).
+- Submit with `graph-submit PLAN_SHA256 --request-id plan-<PLAN_SHA256>`, the request ID the desktop uses: `plan-`
+  followed by the same plan hash, typed without the angle brackets. A plan runs at most once: another request ID for an
+  already submitted plan is refused (`plan_submitted`, naming the existing run).
 
 ## MLflow
 
