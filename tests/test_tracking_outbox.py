@@ -1280,17 +1280,18 @@ def test_redact_is_bounded_on_long_text_without_whitespace(monkeypatch):
     assert outbox_api.redact(texts[0]) == 'GET [truncated]'   # the cut token is replaced, never kept in part
 
 
-@pytest.mark.parametrize('tail', ['userinfo', 'signed_query'])
+@pytest.mark.parametrize('tail', ['userinfo', 'userinfo_apostrophe', 'signed_query'])
 def test_the_redact_window_cut_never_keeps_a_partial_credential(tail):
     """Final re-review item 2: the window cut could leave the start of a URL-userinfo password (``_USERINFO`` needs the
     ``@``), and an earlier substitution (here a long bearer token) then shrank the text until that tail fell within
-    the limit. The token cut by the window is replaced by ``[truncated]``. The fake password is built at runtime."""
+    the limit. The token cut by the window is replaced by ``[truncated]``; a ``'``, which RFC 3986 allows in userinfo,
+    does not end it (last re-review). The fake password is built at runtime."""
     outbox_api = api()
-    secret = 'synthetic' + '-pw-' + '7f3a9c'
+    secret = ('syn' + "'" if tail == 'userinfo_apostrophe' else 'synthetic') + '-pw-' + '7f3a9c'
     head = 'Bearer ' + 't' * 100
-    middle = ' https://user:' if tail == 'userinfo' else ' https://h.example/o?sig='
+    middle = ' https://h.example/o?sig=' if tail == 'signed_query' else ' https://user:'
     filler = 't' * (outbox_api.REDACT_WINDOW - len(head) - len(middle) - len(secret) // 2)
-    text = head + filler + middle + secret + ('@h.example/' if tail == 'userinfo' else '&se=1')
+    text = head + filler + middle + secret + ('&se=1' if tail == 'signed_query' else '@h.example/')
     assert len(text) > outbox_api.REDACT_WINDOW and secret[:4] in text[:outbox_api.REDACT_WINDOW]
     for limit in (500, 4000):
         redacted = outbox_api.redact(text, limit)

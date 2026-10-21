@@ -82,9 +82,10 @@ _SAFE_PART = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*")
 # REDACT_WINDOW characters (11.5 re-review M4: the first URL-query pattern backtracked quadratically on text without
 # whitespace and held the GIL the lease heartbeat needs). The token the cut goes through is replaced by
 # ``[truncated]`` before any pattern runs: an earlier substitution can shrink the text until the cut's tail falls
-# within the limit, and a partial value may no longer match (a URL-userinfo password needs its ``@``).
+# within the limit, and a partial value may no longer match (a URL-userinfo password needs its ``@``). A ``'`` does not
+# end that token: RFC 3986 allows it in userinfo, and ``encodeURIComponent`` leaves it unencoded.
 REDACT_WINDOW = 65536
-_LAST_TOKEN = re.compile(r"[^\s'\"<>]*+")   # matched on the reversed window: the token the cut went through
+_LAST_TOKEN = re.compile(r"[^\s\"<>]*+")   # matched on the reversed window: the token the cut went through
 _BEARER = re.compile(r"(?i)\b(bearer|basic)\s++[^\s,;'\"]++")
 _SECRET_PAIR = re.compile(r"(?i)\b(client_secret|access_token|token|password)=[^\s&;,'\"]++")
 # A token or secret as a JSON (or Python repr) member: ``"access_token": "..."`` (also when cut off unterminated).
