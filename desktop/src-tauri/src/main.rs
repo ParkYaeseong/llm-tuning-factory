@@ -207,7 +207,8 @@ fn settings_save(app: tauri::AppHandle, values: Value, lock: tauri::State<SaveLo
 
 #[tauri::command]
 fn forget_credentials(app: tauri::AppHandle) -> Result<Value, String> {
-    // Resolve the app folder without creating it: forgetting never creates files or folders.
+    // Resolve the app folder without creating it: forgetting never creates the folder, and without a profile file it
+    // creates nothing (with one, the profile store's lock file may be added beside it).
     forget_all_credentials(|| app.path().app_data_dir().map_err(|_| "앱 저장 폴더를 찾을 수 없습니다.".to_owned()),
         &KeyringVault)
 }

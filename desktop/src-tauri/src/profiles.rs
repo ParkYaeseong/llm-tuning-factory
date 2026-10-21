@@ -3,7 +3,7 @@
 //! goes through the `Vault` trait, so tests use an in-memory vault and never touch the real Credential Manager.
 
 use serde_json::{json, Map, Value};
-use std::{collections::BTreeSet, fs, path::Path, sync::Mutex};
+use std::{collections::BTreeSet, fs, path::Path, sync::{atomic::{AtomicU64, Ordering}, Mutex}};
 
 pub const SERVICE: &str = "kr.kbiofoundry.tuningfactory";
 pub const PROFILE_SECRETS: [&str; 1] = ["RUNPOD_API_KEY"];
@@ -14,6 +14,14 @@ pub const SERVER_PROFILE_FIELDS: [&str; 10] = ["provider", "name", "server_ssh_h
 pub const MAX_PROFILES: usize = 32;
 pub const MAX_PROFILE_ID: usize = 64;
 pub const PROFILES_FILE: &str = "executor-profiles.json";
+/// Locked (`File::lock`) around every read-modify-write of `PROFILES_FILE`, across processes: two app windows share no
+/// `SaveLock`. An empty file; the OS releases the lock when its holder exits.
+pub const PROFILES_LOCK: &str = "executor-profiles.lock";
+/// DOS device names `desktop_workflows.local_file` refuses in any key path component (its `_DEVICE_NAMES`): these
+/// stems, and each port name followed by one of `DEVICE_PORT_DIGITS`. test_native_contract.py compares both sides.
+pub const DEVICE_STEMS: [&str; 6] = ["con", "prn", "aux", "nul", "conin$", "conout$"];
+pub const DEVICE_PORTS: [&str; 2] = ["com", "lpt"];
+pub const DEVICE_PORT_DIGITS: &str = "0123456789¹²³";
 /// The sidecar check of D5 (9.3): `{"profile_id"}` in, `conflict`/`profile_in_use` or `ok` with `affected_runs` out.
 pub const EDIT_CHECK_ACTION: &str = "executor_profile_edit_check";
 
@@ -34,7 +42,7 @@ const TOO_LONG: &str = "실행 프로필 값이 너무 깁니다.";
 const PROVIDER: &str = "실행 프로필의 연결 대상은 RunPod 또는 GPU 서버여야 합니다.";
 const PROVIDER_FIXED: &str = "저장된 실행 프로필의 연결 대상은 바꿀 수 없습니다. 새 실행 프로필을 만드세요.";
 const NAME_REQUIRED: &str = "실행 프로필 이름을 200자 이내로 입력하세요.";
-const KEY_PATH_RELATIVE: &str = "SSH 키 파일은 이 PC의 전체 경로(예: C:\\Users\\이름\\.ssh\\id_ed25519)로 입력하세요.";
+const KEY_PATH_RELATIVE: &str = "SSH 키 파일은 이 PC의 전체 경로(예: C:\\Users\\이름\\.ssh\\id_ed25519)로 입력하세요. 네트워크(UNC)·장치 경로, 장치 이름(CON, NUL, COM1 등), 드라이브 뒤의 콜론(:)과 앞뒤 공백·끝의 마침표는 쓸 수 없습니다.";
 const KEY_CONTENT: &str ="실행 프로필에는 개인키 내용을 입력할 수 없습니다. 키 파일 경로만 입력하세요.";
 const GPU_SELECTION: &str = "선택한 GPU 목록은 중복 없는 GPU UUID 문자열 최대 8개의 JSON 배열이어야 합니다.";
 const COST: &str = "시간당 비용은 0 이상의 숫자(예: 0, 2.75)로 입력하세요.";
@@ -157,16 +165,42 @@ fn validate_fields(fields: &Map<String, Value>) -> Result<(), String> {
     let valid_port = port.len() <= 5 && port.bytes().all(|byte| byte.is_ascii_digit())
         && port.parse::<u32>().is_ok_and(|number| (1..=65535).contains(&number));
     if !port.is_empty() && !valid_port { return Err(PORT.into()); }
-    // The D11 transport hash resolves the key path, so a relative one would depend on each process's working
-    // directory (planning sidecar versus controller). UNC and device paths (`\\server\share`, `\\?\`, `\\.\`,
-    // any two leading separators) are network or device access (D12). Profiles only; the legacy connection settings
-    // are unchanged.
-    let local_absolute = |path: &str| Path::new(path).is_absolute()
-        && !(path.len() >= 2 && path.as_bytes()[..2].iter().all(|byte| matches!(byte, b'\\' | b'/')));
-    if crate::KEY_FILE_FIELDS.iter().any(|name| !text(name).is_empty() && !local_absolute(text(name))) {
+    // Profiles only; the legacy connection settings are unchanged.
+    if crate::KEY_FILE_FIELDS.iter().any(|name| !text(name).is_empty() && !local_key_path(text(name))) {
         return Err(KEY_PATH_RELATIVE.into());
     }
     Ok(())
+}
+
+/// Python's `str.isspace()`: Rust's whitespace plus the information separators U+001C–U+001F.
+fn python_space(character: char) -> bool { character.is_whitespace() || (0x1c..=0x1f).contains(&u32::from(character)) }
+
+/// A path component that names a DOS device: its stem (before the first dot), without surrounding whitespace, is a
+/// device name in any case (`NUL`, `aux .txt`, `COM1.log`, `conin$`, `COM¹`).
+fn device_component(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or_default().trim_matches(python_space).to_lowercase();
+    let port = |prefix: &str| stem.strip_prefix(prefix).is_some_and(|rest| {
+        let mut digits = rest.chars();
+        digits.next().is_some_and(|digit| DEVICE_PORT_DIGITS.contains(digit)) && digits.next().is_none()
+    });
+    DEVICE_STEMS.contains(&stem.as_str()) || DEVICE_PORTS.iter().any(|prefix| port(prefix))
+}
+
+/// A key path the planner and the controller accept (11.5 R2 M4), checked at save instead of failing later at inspect,
+/// plan or controller start. As `desktop_workflows.local_file` (through `check_key_paths`): no surrounding whitespace
+/// and no NUL; not UNC or device paths (any two leading separators: `\\server\share`, `\\?\`, `\\.\`), which are network
+/// or device access (D12); no `:` after the drive (`nul:`, `COM1:`, alternate data streams); no DOS device name in any
+/// component; and absolute, because the D11 transport hash resolves the path, so a relative one would depend on each
+/// process's working directory (planning sidecar versus controller). Stricter than Python in two ways: no `~` (Python
+/// expands it per user) and no trailing dot (Windows drops it, so the file opened would not be the one named).
+fn local_key_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if path.is_empty() || path.starts_with(python_space) || path.ends_with(python_space) || path.ends_with('.')
+        || path.contains(char::from(0u8)) || (bytes.len() >= 2 && bytes[..2].iter().all(|byte| matches!(byte, b'\\' | b'/'))) {
+        return false;
+    }
+    let after_drive = if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' { &path[2..] } else { path };
+    !after_drive.contains(':') && !path.split(['\\', '/']).any(device_component) && Path::new(path).is_absolute()
 }
 
 /// A non-negative decimal such as `0`, `12` or `2.75` (no sign, exponent, NaN or infinity).
@@ -218,19 +252,38 @@ fn without_key_content(value: &Value) -> Option<Value> {
 /// drops an ID whose vault entry `forget_credentials` must still find. The file is written to a temporary file and
 /// renamed over the old one: `std::fs::rename` replaces an existing file atomically on Windows
 /// (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`) and on POSIX, so a reader or a crash sees the old or the new
-/// store, never a partial one. Credentials stay exclusively in Credential Manager.
+/// store, never a partial one. The temporary name is unique per write (process, counter, time), so two writers never
+/// share one; the callers hold `StoreLock`. Credentials stay exclusively in Credential Manager.
 fn write_store(root: &Path, store: &Map<String, Value>) -> Result<(), String> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let served: Map<String, Value> = served(store).into_iter().map(|(id, fields)| (id, Value::Object(fields))).collect();
     let profiles: Map<String, Value> = store.iter().map(|(id, entry)| (id.clone(), served.get(id).cloned()
         .unwrap_or_else(|| without_key_content(entry).unwrap_or(Value::Null)))).collect();
     let body = serde_json::to_vec_pretty(&json!({"schema_version": 1, "profiles": profiles})).map_err(|_| SAVE_FAILED)?;
-    let temporary = root.join("executor-profiles.tmp");
-    fs::write(&temporary, body).map_err(|_| SAVE_FAILED)?;
-    if fs::rename(&temporary, root.join(PROFILES_FILE)).is_err() {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.subsec_nanos());
+    let (process, write) = (std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+    let temporary = root.join(format!("executor-profiles.{process}-{write}-{nanos}.tmp"));
+    let written = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, &body).and_then(|()| file.sync_all()));
+    if written.is_err() || fs::rename(&temporary, root.join(PROFILES_FILE)).is_err() {
         let _ = fs::remove_file(&temporary);
         return Err(SAVE_FAILED.into());
     }
     Ok(())
+}
+
+/// An exclusive lock on `PROFILES_LOCK` for one read-modify-write of the store (11.5 R2 M1): saves and deletes in other
+/// app windows (other processes) wait for it, so none of them writes a store read before this one's write. Released
+/// when dropped, or by the OS when the process ends.
+struct StoreLock(#[allow(dead_code)] fs::File);
+
+impl StoreLock {
+    fn acquire(root: &Path) -> Result<Self, String> {
+        let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(root.join(PROFILES_LOCK)).map_err(|_| LOCK_FAILED)?;
+        file.lock().map_err(|_| LOCK_FAILED)?;
+        Ok(Self(file))
+    }
 }
 
 /// Another stored ID (served or not) that Windows treats as the same name, so it shares the vault entry.
@@ -274,7 +327,7 @@ pub fn profile_secret(root: &Path, vault: &dyn Vault, id: &str) -> Result<Option
     vault.get(&profile_secret_entry(id, PROFILE_SECRETS[0]))
 }
 
-struct PreparedSave { store: Map<String, Value>, fields: Map<String, Value>, secret: Option<String> }
+struct PreparedSave { store: Map<String, Value>, fields: Map<String, Value>, secret: Option<String>, new: bool }
 
 /// Every check of a save, before any write: ID, collisions, count, fields and where a key may go.
 fn prepare_save(root: &Path, id: &str, input: &Map<String, Value>, legacy_key: Option<String>)
@@ -299,16 +352,34 @@ fn prepare_save(root: &Path, id: &str, input: &Map<String, Value>, legacy_key: O
     if typed.is_some() && legacy_key.is_some() { return Err(LEGACY_AND_INPUT.into()); }
     let secret = typed.or(legacy_key);
     if secret.is_some() && !is_runpod(&fields) { return Err(SECRET_PROVIDER.into()); }
-    Ok(PreparedSave { store, fields, secret })
+    let new = existing.is_none();
+    Ok(PreparedSave { store, fields, secret, new })
 }
 
-/// Saves one profile: validates everything first, then writes a non-empty key to that profile's vault entry, then the
-/// public file. If the file cannot be written, the vault entry is restored to what it was (removed for a new
-/// profile), so no key is orphaned. Returns the public view.
+/// Saves one profile under `StoreLock`: validates everything first, then writes the file and the profile's key in the
+/// order that never leaves a key without a profile naming it (`forget_credentials` finds keys by the IDs the file
+/// names). A new profile is written to the file first, then its key; if the vault refuses the key, the file is put
+/// back. An existing profile's new key is written first, then the file; if the file cannot be written, the vault
+/// entry is restored to what it was. A crash in between leaves a profile without its (new) key, never an orphaned
+/// key. Returns the public view.
 pub fn save_profile(root: &Path, vault: &dyn Vault, id: &str, input: &Map<String, Value>,
                     legacy_key: Option<String>) -> Result<Value, String> {
-    let PreparedSave { mut store, fields, secret } = prepare_save(root, id, input, legacy_key)?;
+    if !valid_profile_id(id) { return Err(INVALID_ID.into()); }
+    let _lock = StoreLock::acquire(root)?;
+    let PreparedSave { store: before, fields, secret, new } = prepare_save(root, id, input, legacy_key)?;
     let entry = profile_secret_entry(id, PROFILE_SECRETS[0]);
+    let mut store = before.clone();
+    store.insert(id.to_owned(), Value::Object(fields.clone()));
+    if new {
+        write_store(root, &store)?;
+        if let Some(secret) = &secret {
+            if let Err(error) = vault.set(&entry, secret) {
+                let _ = write_store(root, &before);
+                return Err(error);
+            }
+        }
+        return view(id, &fields, vault, false);
+    }
     let previous = match &secret {
         Some(secret) => {
             let previous = vault.get(&entry)?;
@@ -317,7 +388,6 @@ pub fn save_profile(root: &Path, vault: &dyn Vault, id: &str, input: &Map<String
         }
         None => None,
     };
-    store.insert(id.to_owned(), Value::Object(fields.clone()));
     if let Err(error) = write_store(root, &store) {
         match previous {
             Some(Some(old)) => { let _ = vault.set(&entry, &old); }
@@ -339,8 +409,11 @@ fn prepare_delete(root: &Path, id: &str) -> Result<Map<String, Value>, String> {
     Ok(store)
 }
 
-/// Deletes that profile's vault entry, then its public entry. A profile that does not exist is a no-op.
+/// Deletes that profile's vault entry, then its public entry, under `StoreLock`. A profile that does not exist is a
+/// no-op.
 pub fn delete_profile(root: &Path, vault: &dyn Vault, id: &str) -> Result<(), String> {
+    if !valid_profile_id(id) { return Err(INVALID_ID.into()); }
+    let _lock = StoreLock::acquire(root)?;
     let mut store = prepare_delete(root, id)?;
     for name in PROFILE_SECRETS { vault.delete(&profile_secret_entry(id, name))?; }
     if store.remove(id).is_some() { write_store(root, &store)?; }
@@ -350,10 +423,12 @@ pub fn delete_profile(root: &Path, vault: &dyn Vault, id: &str) -> Result<(), St
 /// Deletes the vault entries of every profile ID the file names (`forget_credentials`); the public profiles stay. The
 /// IDs are read leniently (any `profiles` object, whatever the schema version), every entry is tried even after a
 /// failure, and the first problem (an unexpected, unreadable or unparsable file, a failed delete) is returned at the
-/// end. A missing file is nothing to forget.
+/// end. A missing file is nothing to forget (and creates nothing); otherwise the IDs are read under `StoreLock`, so a
+/// save in another window that already stored its key also has its ID in the file.
 pub fn forget_profile_secrets(root: &Path, vault: &dyn Vault) -> Result<(), String> {
     let path = root.join(PROFILES_FILE);
     if !path.exists() { return Ok(()); }
+    let _lock = StoreLock::acquire(root)?;
     let bytes = fs::read(&path).map_err(|_| READ_FAILED)?;
     let parsed: Value = serde_json::from_slice(&bytes).map_err(|_| CORRUPT)?;
     let profiles = parsed.get("profiles").and_then(Value::as_object).ok_or(CORRUPT)?;
@@ -514,6 +589,11 @@ mod tests {
         values
     }
     fn key_of(vault: &MemoryVault, id: &str) -> Option<String> { vault.value(&profile_secret_entry(id, "RUNPOD_API_KEY")) }
+    /// Temporary store files left in the app folder (a write that failed or was interrupted).
+    fn temporaries(root: &Path) -> Vec<String> {
+        fs::read_dir(root).unwrap().filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".tmp")).collect()
+    }
     fn file_bytes(root: &Path) -> Option<Vec<u8>> { fs::read(root.join(PROFILES_FILE)).ok() }
     fn answer_ok(affected: Value) -> Value { json!({"status": "ok", "issues": [], "data": {"affected_runs": affected}}) }
     fn answer_in_use() -> Value {
@@ -869,23 +949,137 @@ mod tests {
         assert_eq!(fs::read(&reader).unwrap(), before, "the store was rewritten in place instead of replaced");
         let stored: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
         assert_eq!(stored["profiles"].as_object().unwrap().len(), 2);
-        assert!(!root.path().join("executor-profiles.tmp").exists());
+        assert_eq!(temporaries(root.path()), Vec::<String>::new());
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_failed_store_write_restores_the_previous_vault_state() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
         let root = TempRoot::new("rollback");
         let vault = MemoryVault::default();
         let (first, second) = (synthetic("first"), synthetic("second"));
         save_profile(root.path(), &vault, "b", &with_key(runpod("B", "pod-b"), &first), None).unwrap();
         let before = file_bytes(root.path());
-        // A directory where the temporary file belongs makes every store write fail after the vault write.
-        fs::create_dir(root.path().join("executor-profiles.tmp")).unwrap();
+        // The store held open without delete sharing (a scanner, an indexer, an editor) cannot be replaced: every store
+        // write fails, after the vault write for an existing profile.
+        let held = fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(root.path().join(PROFILES_FILE)).unwrap();
         assert!(save_profile(root.path(), &vault, "a", &with_key(runpod("A", "pod-a"), &synthetic("new")), None).is_err());
         assert_eq!(key_of(&vault, "a"), None, "a new profile's key was orphaned");
         assert!(save_profile(root.path(), &vault, "b", &with_key(Map::new(), &second), None).is_err());
         assert_eq!(key_of(&vault, "b"), Some(first), "an existing profile's key no longer matches its file");
+        drop(held);
         assert_eq!(file_bytes(root.path()), before);
+        assert_eq!(temporaries(root.path()), Vec::<String>::new());
+    }
+
+    /// Records, at each `set`, whether the profile file already names the profile the key belongs to; fails every
+    /// `set` when asked (a locked or full Credential Manager).
+    struct ProbeVault<'a> { inner: &'a MemoryVault, root: &'a Path, named_at_set: Mutex<Vec<bool>>, fail_set: bool }
+
+    impl Vault for ProbeVault<'_> {
+        fn get(&self, name: &str) -> Result<Option<String>, String> { self.inner.get(name) }
+        fn set(&self, name: &str, value: &str) -> Result<(), String> {
+            let id = name.strip_prefix("executor-profile/").and_then(|rest| rest.split('/').next()).unwrap_or_default();
+            let named = file_bytes(self.root).and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|stored| stored["profiles"].get(id).is_some());
+            self.named_at_set.lock().unwrap().push(named);
+            if self.fail_set { return Err("인증값 보안 저장 실패".into()); }
+            self.inner.set(name, value)
+        }
+        fn delete(&self, name: &str) -> Result<(), String> { self.inner.delete(name) }
+    }
+
+    #[test]
+    fn a_new_profile_is_in_the_file_before_its_key_is_in_the_vault() {
+        // 11.5 R2 M1: forget_credentials finds keys by the IDs the file names, so a crash between the two writes of a
+        // new profile must leave a profile without a key, never a key that no profile names.
+        let root = TempRoot::new("new-order");
+        let vault = MemoryVault::default();
+        let probe = ProbeVault { inner: &vault, root: root.path(), named_at_set: Mutex::default(), fail_set: false };
+        save_profile(root.path(), &probe, "a", &with_key(runpod("A", "pod-a"), &synthetic("a")), None).unwrap();
+        save_profile(root.path(), &probe, "a", &with_key(Map::new(), &synthetic("a2")), None).unwrap();   // a rotation
+        assert_eq!(*probe.named_at_set.lock().unwrap(), [true, true]);
+        assert_eq!(key_of(&vault, "a"), Some(synthetic("a2")));
+        // A vault that refuses the new key: the new profile leaves the file again; the others stay as they were.
+        let before = file_bytes(root.path());
+        let failing = ProbeVault { inner: &vault, root: root.path(), named_at_set: Mutex::default(), fail_set: true };
+        assert!(save_profile(root.path(), &failing, "b", &with_key(runpod("B", "pod-b"), &synthetic("b")), None).is_err());
+        assert_eq!(*failing.named_at_set.lock().unwrap(), [true]);
+        assert_eq!(file_bytes(root.path()), before);
+        assert_eq!(key_of(&vault, "b"), None);
+        assert_eq!(temporaries(root.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn concurrent_saves_from_separate_lock_handles_keep_every_profile() {
+        // 11.5 R2 M1: two app instances share no SaveLock. Every save opens its own handle on the lock file, as another
+        // process would, and saves a different new profile at the same moment: none is lost and no key is orphaned.
+        let root = TempRoot::new("concurrent");
+        let vault = MemoryVault::default();
+        let (threads, each) = (8, MAX_PROFILES / 8);
+        let start = std::sync::Barrier::new(threads);
+        std::thread::scope(|scope| {
+            for thread in 0..threads {
+                let (root, vault, start) = (root.path(), &vault, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    for index in 0..each {
+                        let id = format!("t{thread}-p{index}");
+                        save_profile(root, vault, &id, &with_key(runpod(&id, "pod"), &synthetic(&id)), None)
+                            .unwrap_or_else(|error| panic!("{id}: {error}"));
+                    }
+                });
+            }
+        });
+        let stored: Value = serde_json::from_slice(&file_bytes(root.path()).unwrap()).unwrap();
+        let ids: BTreeSet<String> = stored["profiles"].as_object().unwrap().keys().cloned().collect();
+        assert_eq!(ids.len(), threads * each, "lost profiles: {ids:?}");
+        let names = vault.names();
+        assert_eq!(names.len(), threads * each);
+        for name in names {
+            let id = name.strip_prefix("executor-profile/").and_then(|rest| rest.split('/').next()).unwrap();
+            assert!(ids.contains(id), "the key {name} is named by no profile");
+        }
+        assert_eq!(temporaries(root.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn profile_key_paths_refuse_what_the_planner_refuses() {
+        // 11.5 R2 M4: desktop_workflows.local_file (through workflow_planning.check_key_paths) refuses these, so a profile
+        // saved with one failed later at inspect, plan or controller start. The cases of test_desktop_projects.py
+        // (test_import_source_reads_local_files_only), under a key folder.
+        let nul = char::from(0u8);
+        let unit_separator = char::from(0x1fu8);                         // Python's str.isspace() counts it, Rust's not
+        let mut refused: Vec<String> = ["CON", "nul.csv", "Com1.txt", "LPT9", "conout$", "AUX .csv", "nul:", "CON:x", "COM1:",
+            "CONIN$:", " NUL", "NUL .", "inbox\\x.csv:stream", "inbox\\x.csv::$DATA", "NUL", "conin$", "COM¹", "lpt3.key",
+            "com0", "keys:ads\\id"].iter().map(|name| format!("C:\\keys\\{name}")).collect();
+        refused.extend([" C:\\keys\\inbox\\x.csv".to_owned(), "C:\\k\\id:ads".to_owned(), "C:\\keys\\id_ed25519 ".to_owned(),
+            "C:\\keys\\id_ed25519\t".to_owned(), format!("C:\\keys\\id_ed25519{unit_separator}"), format!("C:\\keys\\id{nul}x"),
+            "C:\\keys\\id_ed25519.".to_owned(), "C:\\keys\\id_ed25519. .".to_owned(), "C:/keys/NUL/id".to_owned(),
+            "C:\\keys\\con\\id".to_owned()]);
+        for (fields, name) in [(runpod("p", "pod"), "ssh_key_file"), (server("lab"), "server_ssh_key_file")] {
+            for path in &refused {
+                let mut input = fields.clone();
+                input.insert(name.into(), json!(path));
+                let error = merge_profile(None, &input).expect_err(&format!("{path:?} was accepted"));
+                assert!(error.starts_with("SSH 키 파일은 이 PC의 전체 경로"), "{path:?}: {error}");
+            }
+            // Names that only contain or start like a device name are ordinary files (Python accepts them too).
+            for path in ["console.csv", "com10.csv", "null.json", "my con.csv", "id.con", "lpt", "aux_key", "conin"] {
+                let mut input = fields.clone();
+                input.insert(name.into(), json!(format!("C:\\keys\\{path}")));
+                assert!(merge_profile(None, &input).is_ok(), "{path:?} was refused");
+            }
+        }
+        // A refused path saves neither the profile nor its key.
+        let root = TempRoot::new("device-key");
+        let vault = MemoryVault::default();
+        let mut input = with_key(runpod("p", "pod"), &synthetic("key"));
+        input.insert("ssh_key_file".into(), json!("C:\\keys\\NUL"));
+        assert!(save_profile(root.path(), &vault, "p", &input, None).is_err());
+        assert!(vault.names().is_empty() && file_bytes(root.path()).is_none());
     }
 
     #[test]

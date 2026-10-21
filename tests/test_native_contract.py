@@ -129,6 +129,15 @@ def test_rust_profile_fields_and_secret_names_match_python():
     assert str_array(main, "KEY_FILE_FIELDS") == wf.KEY_FILE_FIELDS == ("ssh_key_file", "server_ssh_key_file")
 
 
+def test_rust_key_path_device_names_match_local_file():
+    """11.5 R2 M4: a profile key path is refused at save for the DOS device names ``local_file`` refuses later."""
+    profiles = source("profiles.rs")
+    digits = str_const(profiles, "DEVICE_PORT_DIGITS")
+    rust = {*str_array(profiles, "DEVICE_STEMS"),
+            *(port + digit for port in str_array(profiles, "DEVICE_PORTS") for digit in digits)}
+    assert rust == wf._DEVICE_NAMES
+
+
 def desktop_main(monkeypatch, capsys, request) -> dict:
     """One request through ``desktop.main`` exactly as the native side sends it (one stdin line, one stdout line)."""
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(request) + "\n"))
