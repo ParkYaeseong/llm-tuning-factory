@@ -247,6 +247,9 @@ test("an already registered practice sample completes the registration step", as
   await expect(tourButton(page, "다음")).toBeEnabled();
   await expect(tourButton(page, "건너뛰기")).toHaveCount(0);
   await expect(popover(page)).toContainText("완료했습니다");
+  // 11.5: synthetic data may feed real runs; practice data and a missing transfer approval are what block them.
+  await expect(popover(page)).toContainText("연습 데이터는 연습 전용이고 GPU 전송이 막혀 있어 실제 학습에는 쓸 수 없습니다");
+  await expect(popover(page)).not.toContainText("합성 표시가 붙고");
 });
 
 test("Ctrl+K starts the tutorial and each step moves focus to its title", async ({ page }) => {

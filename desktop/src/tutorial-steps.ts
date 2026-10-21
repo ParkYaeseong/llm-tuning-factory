@@ -45,7 +45,7 @@ export const tutorialSteps: TutorialStep[] = [
     } },
     done: (state, sample) => Boolean(sample && state.preview?.rows === sample.rows && state.datasetDraft?.path === sample.path) },
   { id: "data-register", page: "datasets", anchor: "dataset-submit", kind: "practice", title: "연습 데이터 등록",
-    body: "‘검사하고 등록’을 눌러 연습 데이터를 이 PC에 등록하세요. 등록한 버전은 바뀌지 않는 사본으로 보관됩니다.\n연습 데이터는 합성 표시가 붙고 GPU 전송이 막혀 있어 실제 학습에는 쓸 수 없습니다. 이미 등록했다면 바로 다음으로 넘어갈 수 있습니다.",
+    body: "‘검사하고 등록’을 눌러 연습 데이터를 이 PC에 등록하세요. 등록한 버전은 바뀌지 않는 사본으로 보관됩니다.\n연습 데이터는 연습 전용이고 GPU 전송이 막혀 있어 실제 학습에는 쓸 수 없습니다(합성 표시도 붙습니다). 이미 등록했다면 바로 다음으로 넘어갈 수 있습니다.",
     done: state => (state.catalog?.datasets || []).some((d: Obj) => practiceData(d.dataset_id, d.version)) },
   { id: "training-dataset", page: "training", anchor: "train-dataset", kind: "practice", title: "학습 데이터 선택",
     body: "예제 설정 ‘paper_extraction’을 불러왔습니다. ‘학습 데이터’에서 tutorial_sample · v1을 선택하세요.\n학습 단계의 SFT는 질문·답변 예시로 배우는 지도 학습입니다. 학습 방법의 LoRA는 모델 전체 대신 작은 추가 가중치만 학습해 GPU 메모리를 아끼고, QLoRA는 모델을 4비트로 불러와 메모리를 더 줄입니다.",
