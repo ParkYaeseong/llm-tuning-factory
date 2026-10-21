@@ -552,6 +552,10 @@ async function pick(ctx: ViewContext) {
     const format = guessFormat(path);
     if (format) setFormat(format);
     draft.sourceIssues = [];
+    // The render may wait for an IME composition and read the page back first: the page shows the pick already.
+    const input = document.querySelector<HTMLInputElement>("#import-path"), select = document.querySelector<HTMLSelectElement>("#import-format");
+    if (input) input.value = path;
+    if (select) select.value = draft.format;
     ctx.render();
     document.querySelector<HTMLElement>('#data-import-page [data-focus-key="import-source"]')?.focus();
   } finally { picking = false; }

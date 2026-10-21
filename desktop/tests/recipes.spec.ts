@@ -295,6 +295,15 @@ test("a description with a leading newline or Windows line breaks stays clean", 
   await reopen();
   expect(await calls(page, { action: "recipe_get" })).toHaveLength(reads + 1);
   await expect(form.locator(".status-pill")).toContainText("저장된 버전");
+  // An edit typed and then undone is no change either (10.8 review M4, the textarea's rule).
+  await form.getByLabel("설명").fill("다른 설명");
+  await reopen();
+  await expect(form.locator(".status-pill")).toHaveText("저장 안 된 변경");
+  await form.getByLabel("설명").fill("\n첫 줄은 비움\n둘째 줄");
+  const again = (await calls(page, { action: "recipe_get" })).length;
+  await reopen();
+  expect(await calls(page, { action: "recipe_get" })).toHaveLength(again + 1);
+  await expect(form.locator(".status-pill")).toContainText("저장된 버전");
   await saveRecipe(page);
   expect((await calls(page, { action: "recipe_save" })).at(-1).args.data.spec.description).toBe(description);
 });
@@ -321,6 +330,15 @@ test("a recipe name with a line break from another writer stays clean", async ({
   const reads = (await calls(page, { action: "recipe_get" })).length;
   await reopen();
   expect(await calls(page, { action: "recipe_get" })).toHaveLength(reads + 1);
+  await expect(form.locator(".status-pill")).toContainText("저장된 버전");
+  // An edit typed and then undone is no change either (10.8 review M4).
+  await form.getByLabel("레시피 이름").fill("두 줄레시피 수정");
+  await reopen();
+  await expect(form.locator(".status-pill")).toHaveText("저장 안 된 변경");
+  await form.getByLabel("레시피 이름").fill("두 줄레시피");
+  const again = (await calls(page, { action: "recipe_get" })).length;
+  await reopen();
+  expect(await calls(page, { action: "recipe_get" })).toHaveLength(again + 1);
   await expect(form.locator(".status-pill")).toContainText("저장된 버전");
   await saveRecipe(page);
   expect((await calls(page, { action: "recipe_save" })).at(-1).args.data.spec.name).toBe(name);

@@ -388,11 +388,12 @@ function captureForms(ctx: ViewContext) {
   const draft = projectId ? ctx.store.draft(projectId) : undefined;
   if (form && projectId && draft && !locked(form)) {
     // A text that differs only in what its control cannot hold (CRLF in the purpose's textarea; any line break in the
-    // one-line name and task type inputs, from another writer) is the stored one: keep it as it is.
+    // one-line name and task type inputs, from another writer) is the draft's or, after an edit typed back, the saved one.
     const text = (key: "name" | "purpose" | "task_type") => {
       const shown = readKey(form, key);
-      const same = key === "purpose" ? lf(shown) === lf(draft.spec[key]) : oneLine(shown) === oneLine(draft.spec[key]);
-      return same ? draft.spec[key] : shown;
+      const same = (stored: unknown) => key === "purpose" ? lf(shown) === lf(stored) : oneLine(shown) === oneLine(stored);
+      const saved = draft.saved?.project[key];
+      return same(draft.spec[key]) ? draft.spec[key] : saved !== undefined && same(saved) ? saved : shown;
     };
     const values = { name: text("name"), purpose: text("purpose"), task_type: text("task_type"),
       default_executor_profile_id: readKey(form, "default_executor_profile_id") || null };

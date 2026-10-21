@@ -33,6 +33,8 @@ export interface ViewContext {
  * - `enter`/`leave` run on navigation to/away from the page; `enter` may run read-only actions as tasks. `enter` starts
  *   after any running task ends (a save still in flight) and is skipped when the user has left the page meanwhile.
  * - `capture` must skip controls locked while busy (they were not edited, and the running task's result wins).
+ * - A render that waits for an IME composition reads every view's form back first: state a view sets from an async
+ *   answer (not a task's result) must also be put into the controls it shows before `ctx.render()` (data-import's pick).
  * - Buttons with `data-action="wf:<view id>:<verb>[:<arg>]"` reach `action`; the shell disables them while busy.
  */
 export interface View {

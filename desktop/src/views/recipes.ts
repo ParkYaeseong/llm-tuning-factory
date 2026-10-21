@@ -290,10 +290,13 @@ function captureForm(ctx: ViewContext) {
   if (!form || !draft || form.querySelector("fieldset:disabled")) return;
   const { description, name } = draft.spec;
   readFields(form, "data-recipe", draft.spec);
-  // A description that differs only in line endings (CRLF from another writer) is the stored one; so is a name that
-  // differs only in line breaks, which its one-line input cannot hold.
+  // A description that differs only in line endings (CRLF from another writer) is the draft's or, after an edit typed
+  // back, the saved one; so is a name that differs only in line breaks, which its one-line input cannot hold.
+  const saved = draft.saved?.recipe;
   if (lf(draft.spec.description) === lf(description)) draft.spec.description = description;
+  else if (saved && lf(draft.spec.description) === lf(saved.description)) draft.spec.description = saved.description;
   if (oneLine(draft.spec.name) === oneLine(name)) draft.spec.name = name;
+  else if (saved && oneLine(draft.spec.name) === oneLine(saved.name)) draft.spec.name = saved.name;
   draft.spec.input_kind = inputKindFor(draft.spec.training_stage, stagesOf(ctx));
 }
 

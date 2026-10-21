@@ -76,7 +76,7 @@ export const tutorialSteps: TutorialStep[] = [
   { id: "graph-editor", page: "graph", anchor: "graph-editor", kind: "explain", title: "학습 그래프 만들기",
     body: "단계 카드를 직렬(다음 단계)이나 병렬(나란히)로 추가하고 입력을 연결합니다. 미리보기는 카드와 같은 내용으로 그려집니다.\n계획은 기본이 모의 실행이며, 실제 실행은 실행 승인과 데이터 전송 승인을 따로 받습니다." },
   { id: "graph-runs", page: "runs", anchor: "graph-runs", kind: "explain", title: "그래프 실행 따라가기",
-    body: "등록한 실행의 단계별 상태, 대기 이유, 기록 저장 상태와 선택 결과를 봅니다. 화면이 보이는 동안만 상태를 다시 읽습니다.\n‘운영자 확인 필요’는 앱이 아니라 관리자가 원격 종료를 확인한 뒤 처리합니다." },
+    body: "등록한 실행의 단계별 상태, 대기 이유, 기록 저장 상태와 선택 결과를 봅니다. 화면이 보이는 동안만 상태를 다시 읽습니다.\n‘운영자 확인 필요’는 원격 서버나 Pod에서 실행이 멈춘 것을 직접 확인한 뒤에만 ‘실행 잠금 해제’로 풀 수 있습니다." },
   { id: "finish", page: "overview", anchor: "overview-setup", kind: "explain", title: "튜토리얼 완료",
     body: "실제 학습은 두 방법으로 진행합니다. 프로젝트·그래프는 ① 실행 프로필에 배정받은 Pod나 GPU 서버 저장 ② 프로젝트를 만들어 데이터를 가져오고 레시피 준비 ③ 학습 그래프를 저장하고 모의 실행부터 계획 확인 순서입니다. 단일 학습은 ① 연결 설정에서 배정받은 RunPod 또는 GPU 서버 연결 ② 실제 데이터 등록과 GPU 전송 허용 선택 ③ 학습 설정과 실행 계획 확인 순서입니다.\n등록한 tutorial_sample은 연습용으로 남으며 실제 학습에는 쓸 수 없습니다. 튜토리얼은 왼쪽 메뉴의 ‘튜토리얼’에서 다시 볼 수 있습니다.",
     cta: { label: "연결 설정으로 이동", async run(context) { await context.finish(); await context.navigate("connections"); } } },

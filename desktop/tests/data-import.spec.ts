@@ -697,6 +697,29 @@ test("what is typed while the file dialog is open is kept", async ({ page }) => 
   await expect(form.getByLabel("이 데이터를 선택한 GPU로 전송해도 됩니다")).toBeChecked();
 });
 
+test("a picked file that arrives during a Korean composition survives the render that waited for it", async ({ page }) => {
+  // 10.8 review M2: the waiting render reads the page back first, so the picked file must already show on it.
+  await openWorkbench(page, { holds: ["pick_file"], native: { pick_file: String.raw`C:\data\picked.jsonl` },
+    workflow: { dataset_import_source: sourceOk, dataset_import_preview: [discovery(), mappedPreview("2".repeat(64))] } });
+  await readyToRegister(page);
+  await sourceCard(page).getByRole("button", { name: "파일 찾기" }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__held("pick_file"))).toBe(1);
+  const datasetId = page.locator("#import-register-form").getByLabel("데이터 ID", { exact: true });
+  await datasetId.focus();
+  await datasetId.evaluate(element => { element.setAttribute("data-mark", "composing");
+    element.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })); });
+  await page.evaluate(() => (window as any).__release("pick_file"));
+  await expect.poll(async () => (await calls(page, { command: "pick_file" })).length).toBe(1);
+  await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 50)));
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(1);
+  await datasetId.evaluate(element => { (element as HTMLInputElement).value = "조합한-id";
+    element.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "d" })); });
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(0);
+  await expect(sourceCard(page).getByLabel("파일 경로", { exact: true })).toHaveValue(String.raw`C:\data\picked.jsonl`);
+  await expect(page.getByLabel("원본 형식", { exact: true })).toHaveValue("jsonl");
+  await expect(datasetId).toHaveValue("조합한-id");
+});
+
 test("previews stay bounded: file problems first, capped columns, choices and samples", async ({ page }) => {
   const many = Array.from({ length: 600 }, (_, index) => `col${String(index).padStart(3, "0")}`);
   const row = (n: number) => Object.fromEntries(many.map(field => [field, `${field}-${n}`]));

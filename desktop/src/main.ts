@@ -242,7 +242,7 @@ async function configChanged(rerender = false, captured = false) {
   if (!captured) captureConfig(); invalidatePlan();
   if (rerender) render();
   try { await checkCapabilities(); } catch (error) { state.error = errorText(error); }
-  if (state.page === "training") render();
+  if (state.page === "training") renderLate();
 }
 function compatibilityView() {
   const result = state.capabilities;
@@ -508,10 +508,16 @@ window.addEventListener("compositionend", () => {
     for (const [regionId, { html, options }] of waiting) patch(regionId, html, options);
   }, 0);
 }, true);
-/** Whether an IME composes in a control of the page that a full render would replace. The control must still have the
- * focus, so one that a task's render already replaced (its composition never ended) holds no render back. */
+/** The control an IME composes in, only while that very control has the focus. A composition whose control a render
+ * replaced never ends, and its flag stays set; it holds back neither renders nor patches, because a replaced (detached)
+ * control never has the focus again. */
+function composingControl(): Element | null {
+  return composing && composingTarget instanceof Element && document.activeElement === composingTarget ? composingTarget : null;
+}
+/** Whether an IME composes in a control of the page that a full render would replace. */
 function composingInPage() {
-  return composing && composingTarget instanceof Element && document.activeElement === composingTarget && root.contains(composingTarget);
+  const control = composingControl();
+  return control !== null && root.contains(control);
 }
 /** A full render that carries no task result (a poll, a view's own render or notice, the history filter). While an IME
  * composes in the page it waits until the composition ends. A task's render never waits (its result may change the
@@ -523,10 +529,16 @@ function renderSoft() {
 /** The render that waited for a composition: the composed text is read into the drafts first, and the focus returns to
  * the same control with its selection. */
 function renderAfterComposition() {
-  if (!composeDeferred) return;
+  if (composeDeferred) renderLate();
+}
+/** The render of a legacy step that may finish long after its click, on whatever page the user is on by then (a job's
+ * execution answer, a compatibility check, the jobs poll, an error a view's action left): what was typed since is read
+ * into the drafts first, it waits for an IME composition like every render without a task result, and the focus goes
+ * back to the control it was on (with its selection) when the render dropped it. */
+function renderLate() {
   captureDrafts();
   const keep = focusSpot();
-  render();
+  renderSoft();
   if (!document.activeElement || document.activeElement === document.body) keep();
 }
 /** Before form values are read back into state: a deferred render means the page still shows values that a
@@ -559,7 +571,8 @@ function render() {
     if (armed !== presses) { const press = armed = presses; setTimeout(() => { if (pressed && presses === press) releasePress(); }, 1000); }
     return;
   }
-  renderDeferred = false; composeDeferred = false;
+  // A full render covers every patch that waited for a composition (applying one later would bring back older data).
+  renderDeferred = false; composeDeferred = false; composedPatches.clear();
   const legacyViews: Obj = { overview, connections, datasets, training, jobs, history };
   const view = viewById(state.page);
   const title = view ? view.title : pages[state.page];
@@ -624,7 +637,8 @@ function patch(regionId: string, html: string, options: { keepTyping?: boolean }
   const region = document.getElementById(regionId);
   if (!region || !root.contains(region)) return;
   if (pressed && pressedControl && region.contains(pressedControl)) { renderKeepingDrafts(); return; }
-  if (composing && region.contains(document.activeElement)) { composedPatches.set(regionId, { html, options }); return; }
+  const composingIn = composingControl();
+  if (composingIn && region.contains(composingIn)) { composedPatches.set(regionId, { html, options }); return; }
   const active = document.activeElement;
   const inside = active instanceof HTMLElement && region.contains(active);
   const key = inside ? focusKey(active) : null;
@@ -676,6 +690,8 @@ function settingsFromForm(form: HTMLFormElement) {
   return values;
 }
 async function execute(job: Obj) {
+  // The job's task may have run while the user typed on another page, which this switch to 실행 관리 replaces.
+  captureDrafts();
   state.active = job.id; state.jobCapabilities = null; state.page = "jobs"; await refresh(); render();
   // Deliberately do not block navigation: a separate bridge process owns this attempt.
   api("execute", { job_id: job.id, approved: true }).then(async result => {
@@ -686,8 +702,8 @@ async function execute(job: Obj) {
       + ((current ?? job).server_destination ? " 다른 작업이나 다른 연결 대상(RunPod 등)의 끝나지 않은 작업 잠금이 남아 있을 수 있습니다. 실행 관리에서 확인하세요." : "");
     state.notice = result ? "학습 처리가 끝났습니다. 상태와 평가 결과를 확인하세요." :
       ["PENDING", "QUEUED", "RETRYING"].includes(current?.status) ? waiting : "새로 실행된 작업이 없습니다. 현재 작업 상태를 확인하세요.";
-    render();
-  }).catch(async error => { state.error = errorText(error); await refresh(); render(); });
+    renderLate();
+  }).catch(async error => { state.error = errorText(error); await refresh(); renderLate(); });
 }
 /** Every action button under `scope` runs its action; while busy, all but navigation (and every submit) are disabled. */
 function bindActions(scope: ParentNode) {
@@ -844,7 +860,7 @@ async function action(name: string) {
     if (!target?.action || !verb) return;
     captureConfig(); captureDrafts();
     try { await target.action(ctx, verb, rest.length ? rest.join(":") : null); }
-    catch (error) { state.error = errorText(error); render(); }
+    catch (error) { state.error = errorText(error); renderLate(); }
     return;
   }
   if (name.startsWith("nav:")) {
@@ -863,16 +879,16 @@ async function action(name: string) {
       await idle();
       if (visit === navigations && state.page === page && state.arg === arg) {
         keepMessages = waited;
-        try { await entered.enter(ctx); } catch (error) { state.error = errorText(error); render(); }
+        try { await entered.enter(ctx); } catch (error) { state.error = errorText(error); renderLate(); }
         finally { keepMessages = false; }
       }
     }
-    if (state.page === "training" && !state.capabilities && !state.capabilityPending) { await checkCapabilities(); render(); }
+    if (state.page === "training" && !state.capabilities && !state.capabilityPending) { await checkCapabilities(); renderLate(); }
     return;
   }
   if (name.startsWith("template:")) {
     state.config = structuredClone(state.catalog.templates[Number(name.split(":")[1])].config);
-    normalizeConfig(); state.plan = null; state.capabilities = null; state.page = "training"; render(); await checkCapabilities(); render(); return;
+    normalizeConfig(); state.plan = null; state.capabilities = null; state.page = "training"; render(); await checkCapabilities(); renderLate(); return;
   }
   if (name.startsWith("pick:")) {
     const dataset = name.endsWith("dataset");
@@ -1043,9 +1059,9 @@ window.addEventListener("keydown", e => { if ((e.ctrlKey || e.metaKey) && e.key.
 let polling = false;
 setInterval(() => {
   if (state.page !== "jobs" || state.busy || polling) return;
-  polling = true; captureDrafts();
+  polling = true;
   refresh().then(async () => {
     if (state.liveProgress && state.active) state.progress = await api("job_progress", { job_id: state.active, remote: true });
-    renderSoft();
+    renderLate();
   }).catch(() => { state.liveProgress = false; }).finally(() => polling = false);
 }, 10000);

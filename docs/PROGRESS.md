@@ -5164,6 +5164,71 @@ Actual verification:
 - `pytest -q` **1716 passed, 1 skipped**; Ruff passes; `check_secrets.py` 0 findings; the protected-path diff is clean;
   every changed file is CR-free.
 
+## Task 10.8 review fixes: drafts and compositions across legacy job renders, stale composing flags, 2026-10-21
+
+Commit `fix: keep drafts and compositions across legacy job renders and stale composing flags`, written in the main tree
+on `7321c1b` and moved onto `024ce14` (the 10.6 review fixes) before committing. It answers the independent review of
+`46f9f0c` and `7321c1b` ("Ready with fixes": one Important). The review confirmed the 16-step keyboard tour, the plan
+fake's requests against the real Pydantic models, a repository without bidi characters and the mocked journey from a
+blank project to an operator release. Changed: `desktop/src/{main,tutorial-steps,view-types}.ts`,
+`desktop/src/views/{projects,recipes,data-import}.ts`, `desktop/tests/{navigation,projects,recipes,data-import,
+tutorial}.spec.ts`, new `tests/test_repository_text.py` and this file. No `src/` Python, Rust, package or lock file
+changed; the files 10.6's fix owns (`plan-panel.ts`, `plan-dialog.ts`, `graph-editor.ts`, `workbench.ts`, `api.ts`) were
+not touched.
+
+What changed:
+- I1 (Important). A legacy step that finishes long after its click now renders through `renderLate`: it reads the
+  drafts first, waits for an IME composition like every render without a task result, and gives the focus (with its
+  selection) back to the control it was on when the render dropped it.
+  - It covers both branches of a job's `execute` answer, which can arrive hours later. Before, typing on the project
+    page reverted, the focus fell to `body` and a composition broke.
+  - It also covers the other late legacy renders found in `main.ts`: the compatibility answer after a training change
+    or on entering 학습 설정 or after an example, an error left by a view's action or `enter`, and the 실행 관리 poll
+    (it read the drafts before its call, so typing during the call was lost, and every poll dropped the focus).
+  - `execute()` reads the drafts before it switches to 실행 관리, because the job's task may have run while the user
+    typed on another page.
+  - The tutorial's own renders are unchanged; they follow clicks in the tour.
+- M1. A patch waits for a composition only while the composing control itself has the focus and lies in its region.
+  A flag left by an input a render replaced (its composition never ends) no longer queues the polls of a focused region
+  forever. A full render clears the patches that waited, so a later composition end cannot bring older data back.
+  - The flag itself is not reset: every check requires the composing element to hold the focus, which a detached
+    element never does, so a reset was unobservable (its mutant survived) and was left out.
+- M2. 파일 찾기's answer is written into the path and format controls before the render, because a render that waits
+  for a composition reads the page back first. `view-types.ts` states that rule for every view.
+- M3. The `graph-runs` step now says the operator state can be released with ‘실행 잠금 해제’ only after confirming on
+  the remote server or Pod that the run stopped (root's replacement of D11); the spec checks the sentence.
+- M4. A line-break text edited and typed back (project name, task type and purpose; recipe name and description) takes
+  the saved revision's text again, so no phantom "저장 안 된 변경" is left.
+- M5. `tests/test_repository_text.py` scans every tracked text file for U+202A–U+202E, U+2066–U+2069, U+200E and U+200F.
+  The code points are built from integers, and a second case proves the scan reports each one.
+
+Actual verification:
+- Against this tree's own Vite on port 1492 through a scratch config under `%TEMP%` (`reuseExistingServer: false`).
+- RED first, before any `src` edit:
+  - the held execute answer reverted the typed project name ("늦은 완료");
+  - the submit's switch to 실행 관리 lost the typed 데이터 ID (`my_dataset`);
+  - the queued patch came back after a later composition end (`.stale` present);
+  - edit-then-revert re-read nothing (project name, purpose, recipe name);
+  - the picked path stayed `C:\data\qa.csv` after the waiting render;
+  - the `graph-runs` body lacked the new sentence.
+  - The late compatibility and poll test was written after the code, then checked by mutation.
+  - M5 passes on the clean repository; staged with a probe file holding U+200F, it failed and named
+    `docs/zz-bidi-probe.md:1: U+200F` (the probe was removed).
+- 14 distinct mutations of the fixes; 13 fail a test: both `execute` branches, the draft read before the switch, the
+  patch going back to the raw flag, the composing-control focus check, the queue clearing in `render`, the path and
+  format writes, the project, recipe-name and recipe-description saved-text rules, the compatibility answer and the
+  poll. The flag reset survived and was dropped (above).
+- From `desktop/`: `npx playwright test` **251 passed** (`024ce14`'s 246 plus 5 new; 5 tests were extended);
+  `npm run build` passes.
+  - One full run on `7321c1b` had a single boot timeout in `graph-editor.spec.ts` ("boot reached capabilities"). That
+    spec then passed `--repeat-each=3` (48 of 48), and the next full run passed 242 of 242.
+- From the root: `uv run pytest -q` **1718 passed, 1 skipped** (1716 + the 2 repository-text cases); `uv run ruff check src tests` passes;
+  `scripts/check_secrets.py` reports 0 findings with the change staged; the protected-path diff against `024ce14` is
+  clean; every changed file is CR-free and the new repository scan passes.
+
+Not verified or still open:
+- Real WebView2 timing of late answers, focus return and a real Windows IME: Task 11.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

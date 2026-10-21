@@ -605,3 +605,161 @@ test("the history filter applies when a Korean composition in its search ends", 
   await expect(page.locator("[data-run]")).toHaveCount(1);
   await expect(page.locator("[data-run]")).toHaveAttribute("data-run", "run-b");
 });
+
+// -- 10.8 review: late legacy renders keep drafts and compositions (I1); stale composing flags (M1) --
+
+/** Holds every legacy call of the given actions (or only the first one, `once`) until `window.__releaseLegacy(action,
+ * outcome)`; `{ reject }` rejects. */
+async function holdLegacy(page: Page, actions: string[], once = false) {
+  await page.evaluate(([actions, once]) => {
+    const w = window as any, original = w.__TAURI_INTERNALS__.invoke;
+    const pending: Record<string, (outcome: { reject?: string }) => void> = {}, held = new Set<string>();
+    w.__releaseLegacy = (action: string, outcome: { reject?: string } = {}) => pending[action]?.(outcome);
+    w.__TAURI_INTERNALS__.invoke = async (command: string, args: any) => {
+      const answer = await original(command, args);   // recorded at once; only the answer waits
+      if (command !== "factory_action" || !actions.includes(args.action) || (once && held.has(args.action))) return answer;
+      held.add(args.action);
+      const outcome = await new Promise<{ reject?: string }>(resolve => { pending[args.action] = resolve; });
+      if (outcome.reject) throw outcome.reject;
+      return answer;
+    };
+  }, [actions, once] as const);
+}
+const queuedJob = { id: "a".repeat(32), status: "QUEUED", attempts: 0, updated: 1791960000, graph_run_id: null,
+  manifest: { config, simulation: true } };
+async function openProject(page: Page, name: string) {
+  await page.locator('nav [data-action="nav:projects"]').click();
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+  await page.locator(".project-list tbody tr", { hasText: name }).getByRole("button", { name: /열기/ }).click();
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+}
+async function runQueuedJob(page: Page) {
+  await page.locator('nav [data-action="nav:jobs"]').click();
+  await page.getByRole("button", { name: "선택", exact: true }).click();
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+  await page.getByRole("button", { name: "대기 작업 실행", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+}
+
+test("a legacy job that finishes later keeps the typing, focus and composition of the page the user moved to", async ({ page }) => {
+  await openWorkbench(page, { definitions: true, jobs: [queuedJob] });
+  await holdLegacy(page, ["execute"]);
+  const start = page.locator('#app [data-tour="project-start"]');
+  await start.getByLabel("프로젝트 이름").fill("늦은 완료");
+  await start.getByRole("button", { name: "만들기", exact: true }).click();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("늦은 완료");
+  // The queued job starts; its bridge process keeps the attempt, so the execution may answer hours later.
+  await runQueuedJob(page);
+  expect(await calls(page, { action: "execute" })).toHaveLength(1);
+  await openProject(page, "늦은 완료");
+  const name = page.locator("#project-form").getByLabel("프로젝트 이름");
+  await name.fill("늦은 완료 수정");
+  const jobsRead = (await calls(page, { action: "jobs" })).length;
+  await page.evaluate(() => (window as any).__releaseLegacy("execute"));
+  await expect(page.getByText("학습 처리가 끝났습니다. 상태와 평가 결과를 확인하세요.")).toBeVisible();
+  expect((await calls(page, { action: "jobs" })).length).toBe(jobsRead + 1);
+  await expect(name).toHaveValue("늦은 완료 수정");
+  await expect(name).toBeFocused();
+  // A failing execution answering during a Korean composition waits for it, then keeps the composed text.
+  await runQueuedJob(page);
+  await openProject(page, "늦은 완료");
+  await name.fill("조합");
+  await name.evaluate(compose.start);
+  const reads = (await calls(page, { action: "jobs" })).length;
+  await page.evaluate(() => (window as any).__releaseLegacy("execute", { reject: "GPU 연결이 끊겼습니다." }));
+  await expect.poll(async () => (await calls(page, { action: "jobs" })).length).toBe(reads + 1);
+  await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 50)));
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(1);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await name.evaluate(compose.end, "조합 중인 이름");
+  await expect(page.getByRole("alert")).toHaveText("GPU 연결이 끊겼습니다.");
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(0);
+  await expect(name).toHaveValue("조합 중인 이름");
+  await expect(name).toBeFocused();
+});
+
+test("a submitted job that switches to 실행 관리 keeps what was typed on another page", async ({ page }) => {
+  await openWorkbench(page);
+  await holdLegacy(page, ["submit"]);
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice.busy")).toBeVisible();
+  // While the submit is held, the user types on the data page; the submit's execution then opens 실행 관리 by itself.
+  await page.locator('nav [data-action="nav:datasets"]').click();
+  await page.getByLabel("데이터 ID", { exact: true }).fill("제출 중 입력");
+  await page.evaluate(() => (window as any).__releaseLegacy("submit"));
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("실행 관리");
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+  await page.locator('nav [data-action="nav:datasets"]').click();
+  await expect(page.getByLabel("데이터 ID", { exact: true })).toHaveValue("제출 중 입력");
+});
+
+test("a late compatibility answer and the jobs poll keep what is typed and where the focus is", async ({ page }) => {
+  await openWorkbench(page, { jobs: [queuedJob], clock: true });
+  await holdLegacy(page, ["capabilities"], true);
+  // A changed training choice asks for compatibility; while that answer is out, the user types a model search.
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByLabel("학습 방법", { exact: true }).selectOption("qlora");
+  const search = page.getByLabel("HF 모델 검색", { exact: true });
+  await search.fill("Qwen3 작은 모델");
+  await page.evaluate(() => (window as any).__releaseLegacy("capabilities"));
+  await expect(page.locator(".compatibility.pending")).toHaveCount(0);
+  await expect(search).toHaveValue("Qwen3 작은 모델");
+  await expect(search).toBeFocused();
+  // The 10-second jobs poll renders the page again; the checkpoint being typed keeps its text and focus.
+  await page.locator('nav [data-action="nav:jobs"]').click();
+  await page.getByRole("button", { name: "선택", exact: true }).click();
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+  const checkpoint = page.getByLabel("재개할 체크포인트");
+  await checkpoint.fill("checkpoint-20");
+  const polls = (await calls(page, { action: "jobs" })).length;
+  await page.clock.runFor(10_500);
+  await expect.poll(async () => (await calls(page, { action: "jobs" })).length).toBe(polls + 1);
+  await page.locator(".page-heading h1").evaluate(element => element.setAttribute("data-before-poll", ""));
+  await page.clock.runFor(10_500);
+  await expect(page.locator(".page-heading h1[data-before-poll]")).toHaveCount(0);
+  await expect(checkpoint).toHaveValue("checkpoint-20");
+  await expect(checkpoint).toBeFocused();
+});
+
+test("a composing flag left by a replaced input never holds poll patches back, and a full render drops queued ones", async ({ page }) => {
+  await page.route(REGISTRY_URL, route => route.fulfill({ contentType: "application/javascript", body: DRAFT_REGISTRY }));
+  await openWorkbench(page);
+  await page.locator('nav [data-action="nav:drafts"]').click();
+  const region = (tick: string, extra = "") => `<p class="tick">${tick}</p>${extra}<input data-focus-key="k" aria-label="영역 입력" value="서버">`;
+  const patch = (html: string) => page.evaluate(html => (window as any).__patch(html), html);
+  const input = page.getByLabel("영역 입력");
+  // A composition in the region queues a patch; a task's full render then replaces the region and the input.
+  await page.getByRole("button", { name: "서버 정리" }).click();
+  await expect(page.locator(".notice.busy")).toBeVisible();
+  await patch(region("갱신 A"));
+  await input.focus();
+  await input.evaluate(compose.start);
+  await patch(region("갱신 B", '<p class="stale">낡은 패치</p>'));
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(1);
+  await page.evaluate(() => (window as any).__finishServer());
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+  await expect(page.locator('[data-mark="composing"]')).toHaveCount(0);
+  // The replaced input's composition never ends; an end elsewhere must not apply the patch queued before the render.
+  await page.locator("#draft-note").evaluate(element => element.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "" })));
+  await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 50)));
+  await expect(page.locator("#draft-region .stale")).toHaveCount(0);
+  // A stale flag (a composition start whose input was replaced) does not queue the next polls of a focused region.
+  await page.getByRole("button", { name: "서버 정리" }).click();
+  await expect(page.locator(".notice.busy")).toBeVisible();
+  await patch(region("갱신 C"));
+  await input.focus();
+  await input.evaluate(compose.start);
+  await page.evaluate(() => (window as any).__finishServer());
+  await expect(page.locator(".notice.busy")).toHaveCount(0);
+  await patch(region("갱신 D"));
+  await page.getByLabel("영역 입력").focus();
+  for (const tick of ["갱신 E", "갱신 F"]) {
+    await patch(region(tick));
+    await expect(page.locator("#draft-region .tick")).toHaveText(tick);
+  }
+  await expect(page.getByLabel("영역 입력")).toBeFocused();
+});

@@ -373,6 +373,15 @@ test("a purpose with a leading newline or Windows line breaks stays clean", asyn
   await open();
   expect(await calls(page, { action: "project_get" })).toHaveLength(reads + 1);
   await expect(form.locator(".status-pill")).toContainText("저장된 버전");
+  // An edit typed and then undone is no change either (10.8 review M4, the textarea's rule).
+  await form.getByLabel("목적").fill("다른 목적");
+  await open();
+  await expect(form.locator(".status-pill")).toHaveText("저장 안 된 변경");
+  await form.getByLabel("목적").fill("\n첫 줄은 비움\n둘째 줄");
+  const again = (await calls(page, { action: "project_get" })).length;
+  await open();
+  expect(await calls(page, { action: "project_get" })).toHaveLength(again + 1);
+  await expect(form.locator(".status-pill")).toContainText("저장된 버전");
   // Saving without an edit sends the purpose exactly as stored.
   await saveProject(page);
   expect((await calls(page, { action: "project_save" })).at(-1).args.data.spec.purpose).toBe(purpose);
@@ -406,6 +415,15 @@ test("a name or task type with a line break from another writer stays clean", as
   const reads = (await calls(page, { action: "project_get" })).length;
   await open();
   expect(await calls(page, { action: "project_get" })).toHaveLength(reads + 1);
+  await expect(form.locator(".status-pill")).toContainText("저장된 버전");
+  // An edit typed and then undone is no change either (10.8 review M4): the stored text comes back, not the one-line copy.
+  await form.getByLabel("프로젝트 이름").fill("줄바꿈이름 수정");
+  await open();
+  await expect(form.locator(".status-pill")).toHaveText("저장 안 된 변경");
+  await form.getByLabel("프로젝트 이름").fill("줄바꿈이름");
+  const again = (await calls(page, { action: "project_get" })).length;
+  await open();
+  expect(await calls(page, { action: "project_get" })).toHaveLength(again + 1);
   await expect(form.locator(".status-pill")).toContainText("저장된 버전");
   // Saving without an edit sends both texts exactly as stored; an edit replaces them as typed.
   await saveProject(page);

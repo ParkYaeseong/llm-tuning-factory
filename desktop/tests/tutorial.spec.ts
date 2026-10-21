@@ -184,6 +184,11 @@ test("the tour explains the project screens without creating anything", async ({
     await expect(popover(page)).not.toHaveClass(/centered/);
     await expect(popover(page)).not.toContainText("화면 요소를 찾지 못했습니다");
     await expect(popover(page).locator(".tour-meta .badge")).toHaveText("설명");
+    // The operator state is released in the app after a confirmed remote stop (the root decision replacing D11).
+    if (id === "graph-runs") {
+      await expect(popover(page).locator("#tour-body")).toContainText("원격 서버나 Pod에서 실행이 멈춘 것을 직접 확인한 뒤에만 ‘실행 잠금 해제’로 풀 수 있습니다.");
+      await expect(popover(page).locator("#tour-body")).not.toContainText("관리자가");
+    }
     await tourButton(page, "다음").click();
   }
   await expectStep(page, "finish");
