@@ -847,13 +847,43 @@ def https_only(request: httpx.Request) -> None:
         raise _Refused("insecure_redirect", INSECURE_REDIRECT)
 
 
+METADATA_LIMIT = 4 * 1024 * 1024
+METADATA_TOO_LARGE = "Hugging Face metadata exceeds the inspection size limit"   # ModelHub.get's text
+
+
+class _BoundedHub(ModelHub):
+    """``ModelHub`` whose metadata reads go through ``hf_targets._open`` and ``_read`` (Task 11.5, R2 M3): at most
+    ``MAX_REDIRECTS`` redirects, each closed with its body unread, and at most ``METADATA_LIMIT`` body bytes (one
+    chunk more refuses) instead of a whole body read before the check."""
+
+    def get(self, url, optional=False, **kwargs):
+        from .hf_targets import _open, _read
+        if kwargs:
+            raise TypeError("the snapshot client reads plain metadata URLs only")
+        try:
+            response = _open(self.client, url, code="snapshot_failed")
+            try:
+                if optional and response.status_code == 404:
+                    return None
+                if response.status_code != 200:
+                    raise ValueError(f"Hugging Face metadata request failed (HTTP {response.status_code}); "
+                                     "check model access")
+                body = _read(response, METADATA_LIMIT, ValueError(METADATA_TOO_LARGE))
+            finally:
+                response.close()
+        except httpx.HTTPError:
+            raise ValueError(HF_CONNECTION) from None
+        return httpx.Response(200, content=body, request=response.request)
+
+
 def _hub(token: str | None, *, transport: httpx.BaseTransport | None = None) -> ModelHub:
     """The Hugging Face client; an Authorization header only when ``HF_TOKEN`` was scoped to this request.
 
-    httpx drops the header on redirects to another origin (the CDN); a redirect to plain HTTP is refused."""
+    Redirects are followed by ``hf_targets._open``, never by httpx: its ``next_request`` drops the header on
+    redirects to another origin (the CDN), and the request hook refuses a hop to plain HTTP."""
     headers = {"Authorization": "Bearer " + token} if token else {}
-    return ModelHub(client=httpx.Client(timeout=20, follow_redirects=True, headers=headers, transport=transport,
-                                        event_hooks={"request": [https_only]}))
+    return _BoundedHub(client=httpx.Client(timeout=20, follow_redirects=False, headers=headers, transport=transport,
+                                           event_hooks={"request": [https_only]}))
 
 
 def _selected_files(info) -> tuple[str, ...]:
@@ -884,28 +914,30 @@ def _selected_files(info) -> tuple[str, ...]:
 
 
 def _download(hub: ModelHub, url: str, target: Path, budget: int) -> int:
-    """Stream one file into ``target`` within the per-file and remaining total caps; the byte count."""
+    """One file into ``target`` within the per-file and remaining total caps; the byte count. Read through
+    ``hf_targets._open`` and ``_read`` (Task 11.5, R2 M3): redirect bodies stay unread and the body is capped."""
+    from .hf_targets import _open, _read
     limit = min(MAX_ROOT_FILE_BYTES, budget)
+    too_large = _Refused("size_limit", ROOT_FILE_TOO_LARGE)
     try:
-        with hub.client.stream("GET", url) as response:
+        response = _open(hub.client, url, code="snapshot_failed")
+        try:
             if response.status_code != 200:
                 raise ValueError(f"Hugging Face file request failed (HTTP {response.status_code}); "
                                  "check model access")
-            declared = response.headers.get("content-length", "")
+            declared = response.headers.get("content-length", "").strip()
             if declared.isdigit() and int(declared) > limit:
-                raise _Refused("size_limit", ROOT_FILE_TOO_LARGE)
-            size = 0
-            with target.open("xb") as stream:
-                for chunk in response.iter_bytes():
-                    size += len(chunk)
-                    if size > limit:
-                        raise _Refused("size_limit", ROOT_FILE_TOO_LARGE)
-                    stream.write(chunk)
-                stream.flush()
-                os.fsync(stream.fileno())
+                raise too_large
+            body = _read(response, limit, too_large)
+        finally:
+            response.close()
     except httpx.HTTPError:
         raise ValueError(HF_CONNECTION) from None
-    return size
+    with target.open("xb") as stream:
+        stream.write(body)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return len(body)
 
 
 def _publish(temporary: Path, final: Path, root: HFRootRef, roots: Path) -> bool:

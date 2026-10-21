@@ -113,10 +113,12 @@ def _client(token: str | None, *, transport: httpx.BaseTransport | None = None) 
                         event_hooks={"request": [https_only]})
 
 
-def _open(client: httpx.Client, url: str, headers: dict[str, str] | None = None) -> httpx.Response:
+def _open(client: httpx.Client, url: str, headers: dict[str, str] | None = None, *,
+          code: str = "targets_failed") -> httpx.Response:
     """A streamed GET that follows at most ``MAX_REDIRECTS`` redirects. Each redirect is closed with its body unread;
     the next hop is httpx's ``next_request``, which drops Authorization across origins and keeps ``Range``. The
-    caller closes the returned response."""
+    caller closes the returned response. ``code`` is the issue code of the too-many-redirects refusal
+    (``model_root_snapshot`` reads through here too)."""
     request = client.build_request("GET", url, headers=headers)
     for _ in range(MAX_REDIRECTS + 1):
         response = client.send(request, stream=True, follow_redirects=False)
@@ -124,7 +126,7 @@ def _open(client: httpx.Client, url: str, headers: dict[str, str] | None = None)
             return response
         request = response.next_request
         response.close()
-    raise _Refused("targets_failed", TOO_MANY_REDIRECTS)
+    raise _Refused(code, TOO_MANY_REDIRECTS)
 
 
 def _failed(status: int) -> _Refused:

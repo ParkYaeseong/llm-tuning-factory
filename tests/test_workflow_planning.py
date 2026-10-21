@@ -1436,3 +1436,85 @@ def test_runpod_inspection_closes_its_http_client(tmp_path, monkeypatch, fails):
     result = run(state, "executor_profile_inspect", {"profile_id": "pod-a"}, profiles=[runpod_profile(tmp_path)],
                  secrets={"RUNPOD_API_KEY": SECRET})
     assert result["status"] == ("invalid" if fails else "ok") and closed == [True]
+
+
+# -- Task 11.5 (R2 M3): model_root_snapshot reads through hf_targets' bounded _open/_read -----------------------
+
+MIB = 1024 * 1024
+CDN = "https://cdn-lfs.hf.example"
+
+
+class BoundedHub(FakeHub):
+    """A tokenizer file that redirects to a CDN origin (or to itself, ``loop``) with an undeclared, endless redirect
+    body, and optionally revision info whose undeclared body never ends (``huge_info``). ``pulled`` counts every
+    body byte of those streams the client takes."""
+
+    def __init__(self, *, loop=False, huge_info=False, **options):
+        super().__init__(**options)
+        self.loop, self.huge_info, self.pulled = loop, huge_info, 0
+
+    def endless(self, total=64 * MIB):
+        def chunks():
+            while self.pulled < total:
+                self.pulled += MIB
+                yield bytes(MIB)
+        return chunks()
+
+    def respond(self, request):
+        path = unquote(request.url.path)
+        if request.url.host == "huggingface.co" and path == f"/api/models/{self.repo}/revision/{self.commit}" \
+                and self.huge_info:
+            self.requests.append(request)
+            return httpx.Response(200, content=self.endless())
+        if request.url.host == "huggingface.co" and path.endswith("/resolve/" + self.commit + "/tokenizer.json"):
+            self.requests.append(request)
+            location = str(request.url) if self.loop else CDN + path + "?signature=1"
+            return httpx.Response(302, headers={"Location": location}, content=self.endless())
+        return super().respond(request)
+
+
+def test_model_root_snapshot_follows_redirects_without_reading_their_bodies(tmp_path, monkeypatch):
+    """Every hop stays on HTTPS, the token never leaves huggingface.co, and a redirect body is never read."""
+    wp = planning()
+    state = tmp_path / "state"
+    hub = BoundedHub().install(monkeypatch)
+    result = run(state, "model_root_snapshot", {"repo_id": REPO, "revision": COMMIT, "download_approved": True},
+                 secrets={"HF_TOKEN": HF_SECRET})
+    assert result["status"] == "ok", result
+    cdn = [item for item in hub.requests if item.url.host == "cdn-lfs.hf.example"]
+    origin = [item for item in hub.requests if item.url.host == "huggingface.co"]
+    assert [unquote(item.url.path) for item in cdn] == [f"/{REPO}/resolve/{COMMIT}/tokenizer.json"]
+    assert not any("authorization" in item.headers for item in cdn)
+    assert all(item.headers.get("authorization") == "Bearer " + HF_SECRET for item in origin)
+    assert all(item.url.scheme == "https" for item in hub.requests)
+    assert hub.pulled == 0
+    directory = wp.root_snapshots_dir(state) / "Qwen" / "Qwen2.5-0.5B-Instruct" / COMMIT
+    assert (directory / "tokenizer.json").read_bytes() == TOKENIZER["tokenizer.json"]
+
+
+def test_model_root_snapshot_stops_a_redirect_loop_unread(tmp_path, monkeypatch):
+    wp = planning()
+    from tuning_factory import hf_targets as ht
+    state = tmp_path / "state"
+    hub = BoundedHub(loop=True).install(monkeypatch)
+    result = run(state, "model_root_snapshot", {"repo_id": REPO, "revision": COMMIT, "download_approved": True},
+                 secrets={"HF_TOKEN": HF_SECRET})
+    issue = desk.only_issue(result, "invalid", "snapshot_failed", "/repo_id")
+    assert issue["message"] == ht.TOO_MANY_REDIRECTS
+    loops = [item for item in hub.requests if unquote(item.url.path).endswith("/tokenizer.json")]
+    assert len(loops) == ht.MAX_REDIRECTS + 1 and hub.pulled == 0
+    assert files(wp.root_snapshots_dir(state)) == [] and not (state / "workflows" / "root-index").exists()
+    assert HF_SECRET not in json.dumps(result)
+
+
+def test_model_root_snapshot_caps_an_undeclared_metadata_body(tmp_path, monkeypatch):
+    """Revision info is metadata: at most 4 MiB is read (one chunk more refuses), as ModelHub's limit says."""
+    wp = planning()
+    state = tmp_path / "state"
+    hub = BoundedHub(huge_info=True).install(monkeypatch)
+    result = run(state, "model_root_snapshot", {"repo_id": REPO, "revision": COMMIT, "download_approved": True})
+    issue = desk.only_issue(result, "invalid", "snapshot_failed", "/repo_id")
+    assert issue["message"] == "Hugging Face metadata exceeds the inspection size limit"
+    assert 4 * MIB < hub.pulled <= 5 * MIB
+    assert files(wp.root_snapshots_dir(state)) == []
+
