@@ -287,10 +287,10 @@ class JobStore:
                 self.validate_lease(db, subject)
             if row is not None and row['status'] == status:
                 return status
-            if status == 'COMPLETED' and row is not None and self._graph_canceled(db, row):
-                status, error = 'CANCELED', CANCELLATION_REQUESTED
             if row is None or status not in TRANSITIONS.get(row['status'], set()):
-                raise ValueError(f'invalid state transition to {status}')
+                raise ValueError(f'invalid state transition to {status}')   # checked before any rewrite below
+            if status == 'COMPLETED' and self._graph_canceled(db, row):
+                status, error = 'CANCELED', CANCELLATION_REQUESTED   # valid too: CANCELED follows EVALUATING
             now = time.time()
             db.execute('UPDATE jobs SET status=?,error=?,updated=? WHERE id=?', (status, error, now, job_id))
             db.execute('INSERT INTO events VALUES (?,?,?,?)', (job_id, status, now, error))

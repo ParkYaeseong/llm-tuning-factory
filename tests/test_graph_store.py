@@ -1149,3 +1149,21 @@ def test_a_graph_job_is_never_requeued_outside_the_controller(tmp_path):
     store.jobs.cancel(legacy['id'])
     store.jobs.reset_for_resume(legacy['id'])   # a v1 job still resumes
     assert store.jobs.get(legacy['id'])['status'] == 'QUEUED'
+
+
+def test_an_invalid_completed_request_is_refused_even_after_a_cancel(tmp_path):
+    """Final re-review nit: COMPLETED is checked against TRANSITIONS before a cancel rewrites it to CANCELED, so a
+    RUNNING attempt (COMPLETED only follows EVALUATING) is still refused, not silently CANCELED."""
+    w = ledger_world(tmp_path)
+    store = w.store
+    ctl = store.acquire_controller(w.run_id)
+    store.prepare_ready(ctl)
+    claimed = store.claim_ready(w.facts[0], ctl)
+    store.jobs.begin_launch(claimed['lease'])
+    store.jobs.transition(claimed['lease'], 'RUNNING')
+    store.jobs.cancel(claimed['id'])
+    with pytest.raises(ValueError, match='invalid state transition to COMPLETED'):
+        store.jobs.transition(claimed['lease'], 'COMPLETED')
+    assert store.jobs.get(claimed['id'])['status'] == 'RUNNING'
+    store.jobs.transition(claimed['lease'], 'EVALUATING')
+    assert store.jobs.transition(claimed['lease'], 'COMPLETED') == 'CANCELED'   # the valid request: CANCELED
