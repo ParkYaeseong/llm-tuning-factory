@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import time
 from contextlib import closing
 from pathlib import Path
 
@@ -272,12 +273,15 @@ def test_simulation_submit_skips_profile_freshness_but_not_the_project(tmp_path,
     wr = runs()
     state = tmp_path / "state"
     found = wpt.real_scenario(state, tmp_path, monkeypatch)
-    planned = wpt.run(state, "graph_plan", wpt.plan_request(found.project_id, estimates=()), profiles=[found.profile])
-    assert planned["status"] == "ok", planned
-    sha = planned["data"]["plan_sha256"]
     renamed = {**found.profile, "fields": {**found.profile["fields"], "name": "Renamed"}}
     for index, (profiles, settings) in enumerate((([renamed], TOKEN_SETTINGS), ([], {}),
                                                   ([found.profile], {"MLFLOW_TRACKING_URI": "https://other.invalid"}))):
+        # One plan is one run (Task 11.5, R2 I1): each case is its own plan (another training timeout).
+        planned = wpt.run(state, "graph_plan", wpt.plan_request(found.project_id, estimates=(),
+                                                                resources=(("train", 1800 - index),)),
+                          profiles=[found.profile])
+        assert planned["status"] == "ok", planned
+        sha = planned["data"]["plan_sha256"]
         result = submit(state, found, sha=sha, request_id=f"sim-{index}", approve=None, profiles=profiles,
                         settings=settings)
         assert result["status"] == "ok" and result["data"]["simulation"] is True, result
@@ -373,7 +377,10 @@ def test_pause_resume_cancel_map_refusals_to_conflicts(tmp_path, monkeypatch):
     state = tmp_path / "state"
     found = simulation_world(state, tmp_path, monkeypatch)
     run_id = submitted(state, found, approve=None, settings={})
-    finished = submitted(state, found, approve=None, settings={}, request_id="submit-2")
+    other = wpt.run(state, "graph_plan", wpt.plan_request(found.project_id), clock=NOW + 1)   # another plan
+    assert other["status"] == "ok" and other["data"]["plan_sha256"] != found.plan_sha256, other
+    finished = submitted(state, found, approve=None, settings={}, request_id="submit-2",
+                         sha=other["data"]["plan_sha256"])
 
     def steer(action, target=run_id):
         return run(state, action, {"run_id": target})
@@ -416,6 +423,143 @@ def test_a_plan_derived_request_id_never_registers_the_same_plan_twice(tmp_path,
     assert [(row[0], row[1]) for row in run_rows(state)] == [(first, request_id)]
 
 
+# -- Task 11.5 (R2 I1): one plan is one run, whatever the request ID -------------------------------------------
+
+def plan_submitted(result, run_id, status):
+    """``graph_submit``'s refusal of a plan that is already a run under another request ID."""
+    from tuning_factory.graph_store import PLAN_SUBMITTED
+    issue = desk.only_issue(result, "conflict", "plan_submitted", "/plan_sha256")
+    assert issue["message"] == PLAN_SUBMITTED and issue["node_id"] is None
+    assert result["data"] == {"run_id": run_id, "status": status}, result
+
+
+def test_the_backend_refuses_a_second_run_of_one_plan_under_another_request_id(tmp_path, monkeypatch):
+    """A real plan approved as request ``a`` is one run: request ``b`` names run ``a`` and makes nothing, also after
+    ``a`` is canceled. The same request ID stays idempotent, and a re-plan with a changed input is a new plan."""
+    state = tmp_path / "state"
+    found = real_world(state, tmp_path, monkeypatch)
+    first = submitted(state, found, request_id="a")
+    assert submit(state, found, request_id="a", clock=SUBMIT_AT + 30)["data"]["run_id"] == first
+    plan_submitted(submit(state, found, request_id="b"), first, "RUNNING")
+    canceled = run(state, "graph_cancel", {"run_id": first})
+    assert canceled["data"]["run"]["status"] == "CANCELED", canceled
+    plan_submitted(submit(state, found, request_id="b"), first, "CANCELED")
+    plan_submitted(submit(state, found, request_id="plan-" + found.plan_sha256), first, "CANCELED")
+    again = submit(state, found, request_id="a")
+    assert (again["status"], again["data"]["run_id"], again["data"]["status"]) == ("ok", first, "CANCELED"), again
+    assert [(row[0], row[1]) for row in run_rows(state)] == [(first, "a")]
+    assert sorted(path.name for path in (state / "workflows" / "submissions").iterdir()) == [f"{first}.json"]
+    # A changed input (here the training timeout) is another plan: it runs, even under a refused request ID.
+    replanned = wpt.real_plan(state, found, resources=(("train", 1700),))
+    assert replanned["status"] == "ok" and replanned["data"]["plan_sha256"] != found.plan_sha256, replanned
+    second = submitted(state, found, request_id="b", sha=replanned["data"]["plan_sha256"])
+    assert second != first
+    assert sorted((row[0], row[1]) for row in run_rows(state)) == sorted([(first, "a"), (second, "b")])
+
+
+def test_the_engine_keeps_request_id_semantics_unless_the_workflow_asks(tmp_path, monkeypatch):
+    """``GraphStore.submit(unique_plan=False)`` (the default) keeps the engine's request-ID-only rule; only the
+    workflow action passes ``unique_plan=True``. The refusal is a ``PlanSubmitted`` naming the existing run."""
+    from tuning_factory.graph_planner import ApprovalGrant
+    from tuning_factory.graph_store import PLAN_SUBMITTED, PlanSubmitted
+    state = tmp_path / "state"
+    found = simulation_world(state, tmp_path, monkeypatch)
+    plan = wpt.planning().stored_plan(state, found.plan_sha256)
+    store = ledger(state)
+    first = store.submit(plan, "a", ApprovalGrant.for_plan(plan), unique_plan=True)
+    assert store.submit(plan, "a", ApprovalGrant.for_plan(plan), unique_plan=True)["id"] == first["id"]
+    with pytest.raises(PlanSubmitted) as refused:
+        store.submit(plan, "b", ApprovalGrant.for_plan(plan), unique_plan=True)
+    assert (str(refused.value), refused.value.run_id, refused.value.status) == (PLAN_SUBMITTED, first["id"], "RUNNING")
+    assert isinstance(refused.value, ValueError)
+    second = store.submit(plan, "c", ApprovalGrant.for_plan(plan))
+    assert second["id"] != first["id"]
+    assert desk.workflows().classify(PLAN_SUBMITTED) == ("conflict", "plan_submitted")
+
+
+def test_the_cli_submit_refuses_a_second_run_of_one_plan(tmp_path, monkeypatch):
+    """``factory graph-submit`` goes through the workflow action: the CLI gets the same refusal (exit 1)."""
+    from typer.testing import CliRunner
+
+    from tuning_factory.cli import app
+    state = tmp_path / "state"
+    found = simulation_world(state, tmp_path, monkeypatch)
+    env = tmp_path / "factory.env"
+    env.write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    def cli(request_id):
+        return CliRunner().invoke(app, ["--state-dir", str(state), "--env-file", str(env), "graph-submit",
+                                        found.plan_sha256, "--request-id", request_id])
+
+    accepted = cli("cli-a")
+    assert accepted.exit_code == 0, accepted.output
+    first = json.loads(accepted.stdout)["data"]["run_id"]
+    retried = cli("cli-a")
+    assert retried.exit_code == 0 and json.loads(retried.stdout)["data"]["run_id"] == first, retried.output
+    refused = cli("cli-b")
+    assert refused.exit_code == 1, refused.output
+    plan_submitted(json.loads(refused.stdout), first, "RUNNING")
+    assert run(state, "graph_cancel", {"run_id": first})["status"] == "ok"
+    refused = cli("cli-b")
+    assert refused.exit_code == 1, refused.output
+    plan_submitted(json.loads(refused.stdout), first, "CANCELED")
+    assert [(row[0], row[1]) for row in run_rows(state)] == [(first, "cli-a")]
+
+
+RACE = textwrap.dedent("""
+    import json, sys, time
+    from pathlib import Path
+    from tuning_factory import desktop_workflows as wf
+    import tuning_factory.workflow_runs
+    state, sha, request_id, signals = Path(sys.argv[1]), sys.argv[2], sys.argv[3], Path(sys.argv[4])
+    (signals / ("ready-" + request_id)).write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 60
+    while not (signals / "go").exists():
+        if time.monotonic() > deadline:
+            raise SystemExit("no start signal")
+        time.sleep(0.005)
+    context = wf.WorkflowContext(state_dir=state, settings={}, profiles={}, secrets={}, clock=time.time)
+    result = wf.dispatch_action(context, "graph_submit", {"plan_sha256": sha, "request_id": request_id})
+    print(json.dumps(result.model_dump(mode="json")))
+""")
+
+
+def test_concurrent_submits_of_one_plan_make_one_run(tmp_path, monkeypatch):
+    """Two processes submit the same plan under different request IDs at the same moment: the check runs inside
+    ``GraphStore.submit``'s ``BEGIN IMMEDIATE``, so exactly one run exists and the other process is told its ID."""
+    state = tmp_path / "state"
+    found = simulation_world(state, tmp_path, monkeypatch)
+    signals = tmp_path / "signals"
+    signals.mkdir()
+    names = ("race-a", "race-b")
+    processes = [subprocess.Popen([sys.executable, "-c", RACE, str(state), found.plan_sha256, name, str(signals)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=tmp_path)
+                 for name in names]
+    try:
+        deadline = time.monotonic() + 120
+        while not all((signals / f"ready-{name}").exists() for name in names):
+            assert time.monotonic() < deadline, "the submitting processes never became ready"
+            assert all(process.poll() is None for process in processes), [
+                process.communicate() for process in processes if process.poll() is not None]
+            time.sleep(0.01)
+        (signals / "go").write_text("go", encoding="utf-8")
+        outputs = [process.communicate(timeout=120) for process in processes]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+    assert [process.returncode for process in processes] == [0, 0], outputs
+    results = [json.loads(stdout.strip().splitlines()[-1]) for stdout, _ in outputs]
+    rows = run_rows(state)
+    assert len(rows) == 1, (rows, results)
+    [(run_id, request_id, status)] = rows
+    winner = names.index(request_id)
+    assert status == "RUNNING" and results[winner]["status"] == "ok" and results[winner]["data"]["run_id"] == run_id
+    plan_submitted(results[1 - winner], run_id, "RUNNING")
+
+
 # 7
 def test_run_status_is_db_only_and_secret_free(tmp_path, monkeypatch):
     wp = wpt.planning()
@@ -424,7 +568,9 @@ def test_run_status_is_db_only_and_secret_free(tmp_path, monkeypatch):
     state = tmp_path / "state"
     found = real_world(state, tmp_path, monkeypatch)
     run_id = submitted(state, found)
-    broken = submitted(state, found, request_id="submit-2")
+    other = wpt.real_plan(state, found, resources=(("train", 1700),))   # another plan: one plan is one run
+    assert other["status"] == "ok" and other["data"]["plan_sha256"] != found.plan_sha256, other
+    broken = submitted(state, found, request_id="submit-2", sha=other["data"]["plan_sha256"])
     calls = provider_spies(monkeypatch)
     monkeypatch.setenv("MLFLOW_TRACKING_TOKEN", MLFLOW_SECRET)
     execute(state, "UPDATE nodes SET wait_reason=? WHERE run_id=?",

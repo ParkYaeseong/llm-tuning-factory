@@ -110,6 +110,7 @@ CONFLICTS: Mapping[str, str] = MappingProxyType({   # exact domain texts (F12, F
     "only a running graph can pause": "run_state", "only a paused graph can resume": "run_state",
     "canceled graph cannot resume": "run_state", "a finished graph cannot be canceled": "run_state",
     "only a failed or uncertain tracking event can be re-armed": "tracking_state",
+    "plan already submitted as another run": "plan_submitted",   # graph_store.PLAN_SUBMITTED (Task 11.5, R2 I1)
 })
 INVALID_CODES: Mapping[str, str] = MappingProxyType({   # exact domain texts -> invalid code; prefix match
     "dataset exceeds 32 MiB limit": "size_limit", "import has validation issues": "import_issues",
@@ -339,10 +340,10 @@ def invalid(*issues: WorkflowIssue, data=None) -> WorkflowResult:
     return WorkflowResult(status="invalid", issues=issues, data=data)
 
 
-def conflict(*issues: WorkflowIssue) -> WorkflowResult:
+def conflict(*issues: WorkflowIssue, data=None) -> WorkflowResult:
     if not issues:
         raise TypeError("a conflict result needs an issue")
-    return WorkflowResult(status="conflict", issues=issues)
+    return WorkflowResult(status="conflict", issues=issues, data=data)
 
 
 def _pointer_part(part) -> str:

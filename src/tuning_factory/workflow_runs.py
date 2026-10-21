@@ -48,7 +48,7 @@ from .desktop_workflows import (
 from .graph_controller import _display, graph_status
 from .graph_planner import ApprovalGrant, GraphPlan
 from .graph_schema import EvaluateNode, TrainNode
-from .graph_store import GraphStore
+from .graph_store import GraphStore, PlanSubmitted
 from .jobs import ACTIVE
 from .projects import LocalId, Sha256
 from .registry import canonical, immutable_write
@@ -354,7 +354,10 @@ def graph_submit(context: WorkflowContext, request: GraphSubmit) -> WorkflowResu
     approval = ApprovalGrant.for_plan(plan)
     store = _ledger(context, create=True)
     try:
-        run = store.submit(plan, request.request_id, approval)
+        run = store.submit(plan, request.request_id, approval, unique_plan=True)
+    except PlanSubmitted as exc:   # one plan is one run, whatever the request ID (Task 11.5, R2 I1)
+        return conflict(issue("plan_submitted", str(exc), "/plan_sha256"),
+                        data={"run_id": exc.run_id, "status": exc.status})
     except ValueError as exc:
         return refusal(exc, path="/request_id")
     _write_receipt(context, run, plan, request)

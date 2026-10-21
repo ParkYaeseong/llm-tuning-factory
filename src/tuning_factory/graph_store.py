@@ -87,6 +87,8 @@ LEDGER_INTEGRITY = ('ledger integrity check failed; no node was failed, and the 
                     'or removes the record')
 TEST_ACKNOWLEDGEMENT = ('acknowledge_tracking is a test hook; attempt evidence is acknowledged only by the tracking '
                         "outbox's receipt")
+# Task 11.5 (R2 I1): ``submit(unique_plan=True)`` refuses a plan that is already a run under another request ID.
+PLAN_SUBMITTED = 'plan already submitted as another run; to run it again, change an input and plan again'
 
 # -- Task 8.2: readiness, dispositions and safe release ---------------------------------------------
 FailureKind = Literal['remote_failed', 'output_invalid', 'refused_before_launch', 'failed_before_submit',
@@ -104,6 +106,15 @@ PARTIAL_REFUSED = 'partial selection is not allowed'
 # 8.2 review M-4: an uncounted settlement already written for the attempt answers these failure kinds.
 SETTLED_AS = {'released_before_contact': frozenset({'failed_before_submit'}),
               'returned_unlaunched': frozenset({'canceled', 'refused_before_launch'})}
+
+
+class PlanSubmitted(ValueError):
+    """``GraphStore.submit(unique_plan=True)``: the plan is already the run ``run_id`` (now ``status``) under another
+    request ID. The text is ``PLAN_SUBMITTED``."""
+
+    def __init__(self, run_id: str, status: str):
+        super().__init__(PLAN_SUBMITTED)
+        self.run_id, self.status = run_id, status
 
 
 class LedgerIntegrityError(ValueError):
@@ -254,6 +265,21 @@ def _ancestors(plan, node_id) -> frozenset:
     return frozenset(found)
 
 
+def _run_of_plan(db, plan_sha256):
+    """The first run (by creation) of the plan with this hash, or None. Rows whose stored plan merely contains the
+    hash are narrowed by reading their plan; an unreadable one that contains it counts as this plan (fail closed:
+    a refused submission spends nothing)."""
+    for row in db.execute('SELECT id,status,plan FROM graph_runs WHERE instr(plan,?)>0 ORDER BY created,id',
+                          (plan_sha256,)):
+        try:
+            same = json.loads(row['plan'])['sha256'] == plan_sha256
+        except (TypeError, KeyError, ValueError):
+            same = True
+        if same:
+            return row
+    return None
+
+
 def _failed_evaluations(plan, node, statuses):
     """The finished-but-unsuccessful evaluation parents of the selection a node compiles (itself or a parent)."""
     nodes = {entry.node.id: entry.node for entry in plan.nodes}
@@ -316,7 +342,12 @@ class GraphStore:
     def state_dir(self) -> Path:
         return self.jobs.path.parent
 
-    def submit(self, plan, request_id, approval):
+    def submit(self, plan, request_id, approval, *, unique_plan=False):
+        """A run of ``plan`` for ``request_id``; the same request ID and plan answer with its existing run.
+
+        ``unique_plan`` (the workflow action, Task 11.5 R2 I1): a plan that is already a run under another request ID,
+        in any status, raises ``PlanSubmitted`` naming that run, checked in this ``BEGIN IMMEDIATE`` transaction so
+        concurrent submitters make one run. Without it the engine keeps its request-ID-only rule."""
         plan = _check_plan(plan)
         if not isinstance(approval, ApprovalGrant):
             raise TypeError('explicit typed approval required')
@@ -331,6 +362,10 @@ class GraphStore:
                     raise ValueError('request ID reused with different plan')
                 run_id = row['id']
             else:
+                if unique_plan:
+                    existing = _run_of_plan(db, plan.sha256)
+                    if existing is not None:
+                        raise PlanSubmitted(existing['id'], existing['status'])
                 run_id = uuid.uuid4().hex
                 plan_json, approval_json = plan.model_dump_json(), approval.model_dump_json()
                 db.execute('INSERT INTO graph_runs VALUES (?,?,?,?,?,?)',
