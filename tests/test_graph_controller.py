@@ -1898,12 +1898,22 @@ def test_an_uncertain_attempt_holds_a_concurrency_slot(tmp_path, monkeypatch):
 
 # -- Task 11.5 re-review: outputs that cannot be saved locally, a cancel in a retry backoff --------------------
 
-@pytest.mark.parametrize('then', ['fixed', 'released'])
-def test_outputs_that_cannot_be_saved_locally_name_the_local_fix(tmp_path, monkeypatch, then):
-    """Re-review M2 (b, c): an accepted COMPLETED result whose freeze keeps failing on this PC (here an antivirus
-    holding the ``.freeze-*`` directory) is named for its local fix, not "could not reach the destination". A result
-    arrived, so nothing is awaited and the desktop offers the release. Fixed, the next reconcile completes it;
-    released, it is a terminal ``output_invalid``."""
+def windows_path_error(winerror):
+    """What CPython raises on Windows for WinError 206 (path too long) or 53/67 (network path or name gone): the
+    error maps to ENOENT, so a FileNotFoundError carrying ``winerror``; built on any OS."""
+    error = FileNotFoundError(2, 'synthetic: the path is too long or its network share is gone')
+    error.winerror = winerror
+    return error
+
+
+@pytest.mark.parametrize('error,then', [('sharing_violation', 'fixed'), ('sharing_violation', 'released'),
+                                        ('path_too_long', 'fixed'), ('network_path_gone', 'fixed')])
+def test_outputs_that_cannot_be_saved_locally_name_the_local_fix(tmp_path, monkeypatch, error, then):
+    """Re-review M2 (b, c): an accepted COMPLETED result whose freeze keeps failing on this PC (an antivirus holding
+    the ``.freeze-*`` directory, a path too long, a network share gone) is named for its local fix, not "could not
+    reach the destination". A result arrived, so nothing is awaited and the desktop offers the release. Fixed, the
+    next reconcile completes it; released, it is a terminal ``output_invalid``. Windows raises a path too long
+    (WinError 206) and a gone network path (53) as FileNotFoundError: still transient (final re-review)."""
     from pathlib import Path
 
     from test_model_artifacts import sharing_violation
@@ -1912,10 +1922,12 @@ def test_outputs_that_cannot_be_saved_locally_name_the_local_fix(tmp_path, monke
     gc = api()
     w = host_world(tmp_path, monkeypatch, lambda r: [train(r, 'a')])
     rename, busy = Path.rename, {'on': True}
+    failure = {'sharing_violation': lambda: sharing_violation(32), 'path_too_long': lambda: windows_path_error(206),
+               'network_path_gone': lambda: windows_path_error(53)}[error]
 
     def held(self, target):
         if busy['on'] and self.name.startswith('.freeze-'):
-            raise sharing_violation(32)
+            raise failure()
         return rename(self, target)
 
     monkeypatch.setattr(Path, 'rename', held)
@@ -1926,7 +1938,7 @@ def test_outputs_that_cannot_be_saved_locally_name_the_local_fix(tmp_path, monke
     controller.tick(owner)   # reconcile collects the same launch again; the freeze fails again
     a = job_of(w, 'a')
     reason = node(w, 'a')['wait_reason']
-    assert reason.startswith(gc.OUTPUTS_NOT_SAVED.split('{')[0]) and 'PermissionError' in reason
+    assert reason.startswith(gc.OUTPUTS_NOT_SAVED.split('{')[0]) and type(failure()).__name__ in reason
     assert reason.startswith(gc.OPERATOR_PREFIXES)
     item = status_of(w, 'a', controller)
     assert (item['uncertain'], item['awaiting_result'], item['needs_operator']) == (True, False, True)

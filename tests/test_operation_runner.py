@@ -1479,3 +1479,26 @@ def test_a_missing_file_after_completion_is_final_not_uncertain(tmp_path, monkey
     assert "FileNotFoundError" in outcome.error and not held_locks(w)
     assert w.runner.failure_kind(w.job_id) == kind
     assert w.calls == ["train.bound.yaml"] and len(w.host.launches) == 1
+
+
+def os_error(kind, winerror=None, filename=None):
+    error = kind(2, "synthetic", filename) if filename else kind(2, "synthetic")
+    if winerror is not None:
+        error.winerror = winerror   # as Windows sets it; portable to Linux
+    return error
+
+
+@pytest.mark.parametrize("error,transient", [
+    (os_error(FileNotFoundError), False), (os_error(NotADirectoryError), False), (os_error(IsADirectoryError), False),
+    (os_error(FileExistsError), False), (os_error(FileNotFoundError, 2), False),
+    (os_error(FileNotFoundError, 206), True), (os_error(FileNotFoundError, 53), True),
+    (os_error(FileNotFoundError, 67), True), (os_error(FileNotFoundError, 3, "C:/" + "d" * 300), True),
+    (os_error(FileNotFoundError, 3, "C:/short"), False), (os_error(PermissionError, 32), True),
+    (OSError(28, "no space left on device"), True)])
+def test_windows_path_errors_raised_as_file_not_found_stay_transient(error, transient):
+    """Final re-review item 1: Windows raises WinError 206 (path too long) and 53/67 (network path or name gone), and
+    WinError 3 (path not found) for a path of MAX_PATH or more, as FileNotFoundError. They are local and fixable
+    (OUTPUTS_NOT_SAVED names the path length), so both the freeze and the collection rule keep them uncertain."""
+    from tuning_factory import execution
+    assert api().local_transient(error) is transient
+    assert execution.transient_error(error) is transient

@@ -42,12 +42,31 @@ COLLECTION_INTERRUPTED = ("remote result collection was interrupted after the ho
 # name): deterministic content errors, never retried, unlike a sharing violation, a full disk, a permission or a busy
 # database, which an operator can fix locally (11.5 re-review M2).
 CONTENT_OS_ERRORS = (FileNotFoundError, NotADirectoryError, IsADirectoryError, FileExistsError)
+# Windows maps WinError 206 (file name too long) and 53/67 (network path or name not found) to ENOENT, so CPython
+# raises FileNotFoundError for them: local and fixable (a shorter state path, the share back), never content. So is
+# WinError 3 (path not found) for a path of MAX_PATH or more (11.5 final re-review).
+TRANSIENT_WINERRORS = frozenset({206, 53, 67})
+MAX_PATH = 260
+
+
+def content_os_error(exc: BaseException) -> bool:
+    """A ``CONTENT_OS_ERRORS`` file error that says the result's files are not as listed; not a Windows path-length or
+    network-path error that only looks like a missing file."""
+    if not isinstance(exc, CONTENT_OS_ERRORS):
+        return False
+    winerror = getattr(exc, "winerror", None)
+    if winerror in TRANSIENT_WINERRORS:
+        return False
+    return not (winerror == 3 and any(len(str(name)) >= MAX_PATH for name in (exc.filename, exc.filename2) if name))
 
 
 def transient_error(exc: BaseException) -> bool:
     """Whether a failure after an accepted result leaves the attempt uncertain (collected and frozen again): any
-    ``Exception`` but a ``ValueError`` (tamper, foreign or invalid content) or a ``CONTENT_OS_ERRORS`` file error."""
-    return isinstance(exc, Exception) and not isinstance(exc, (ValueError, *CONTENT_OS_ERRORS))
+    ``Exception`` but a ``ValueError`` (tamper, foreign or invalid content) or a content file error
+    (``content_os_error``)."""
+    return isinstance(exc, Exception) and not isinstance(exc, ValueError) and not content_os_error(exc)
+
+
 INJECTED_CONNECTION = "v2 operations require an injected SSH connection owned by desktop_runtime.connection()"
 # Control-plane records of a v2 launch directory: never uploaded, never taken from the host by a download.
 V2_CONTROL_RECORDS = frozenset({"result.json", "result.tmp", "remote-attempt.json", "remote-attempt.json.tmp",

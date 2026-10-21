@@ -38,7 +38,7 @@ from typing import Literal
 
 from pydantic import TypeAdapter
 
-from .execution import CONTENT_OS_ERRORS, CachedTransfer, ExecutionUncertain
+from .execution import CachedTransfer, ExecutionUncertain, content_os_error
 from .executor_profiles import ResourceObservation, approval_destination, observation_fits
 from .gpu_servers import SSHServerProfile
 from .graph_planner import (
@@ -81,9 +81,9 @@ OUTPUTS_INTERRUPTED = "the remote result was accepted but its outputs were not f
 def local_transient(exc: BaseException) -> bool:
     """A local failure that says nothing about an accepted result's content (11.5 R1 I-3): an I/O error such as a
     freeze rename an antivirus holds, a full disk or a permission, or a busy ledger. The attempt stays uncertain and
-    is collected and frozen again. A missing or misplaced file (``CONTENT_OS_ERRORS``) is content, and final
-    (11.5 re-review M2)."""
-    return isinstance(exc, (OSError, sqlite3.OperationalError)) and not isinstance(exc, CONTENT_OS_ERRORS)
+    is collected and frozen again. A missing or misplaced file (``execution.content_os_error``) is content, and final
+    (11.5 re-review M2), but not a Windows path too long or network path gone that only looks like one."""
+    return isinstance(exc, (OSError, sqlite3.OperationalError)) and not content_os_error(exc)
 
 
 @dataclass(frozen=True)
