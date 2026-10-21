@@ -1894,3 +1894,53 @@ def test_an_uncertain_attempt_holds_a_concurrency_slot(tmp_path, monkeypatch):
         controller.tick(owner)
     drive(w, controller, owner)
     assert statuses(w) == {'x': 'COMPLETED', 'y': 'COMPLETED'} and w.dispatcher.launches == {'x': 1, 'y': 1}
+
+
+# -- Task 11.5 re-review: outputs that cannot be saved locally, a cancel in a retry backoff --------------------
+
+@pytest.mark.parametrize('then', ['fixed', 'released'])
+def test_outputs_that_cannot_be_saved_locally_name_the_local_fix(tmp_path, monkeypatch, then):
+    """Re-review M2 (b, c): an accepted COMPLETED result whose freeze keeps failing on this PC (here an antivirus
+    holding the ``.freeze-*`` directory) is named for its local fix, not "could not reach the destination". A result
+    arrived, so nothing is awaited and the desktop offers the release. Fixed, the next reconcile completes it;
+    released, it is a terminal ``output_invalid``."""
+    from pathlib import Path
+
+    from test_model_artifacts import sharing_violation
+
+    from tuning_factory import model_artifacts
+    gc = api()
+    w = host_world(tmp_path, monkeypatch, lambda r: [train(r, 'a')])
+    rename, busy = Path.rename, {'on': True}
+
+    def held(self, target):
+        if busy['on'] and self.name.startswith('.freeze-'):
+            raise sharing_violation(32)
+        return rename(self, target)
+
+    monkeypatch.setattr(Path, 'rename', held)
+    monkeypatch.setattr(model_artifacts, 'RENAME_RETRY_SECONDS', 0)
+    controller, owner = start(w, dispatcher=w.runner, provider=w.host_provider)
+    controller.tick(owner)
+    w.pool.run_all()   # the freeze fails: uncertain, the lock kept
+    controller.tick(owner)   # reconcile collects the same launch again; the freeze fails again
+    a = job_of(w, 'a')
+    reason = node(w, 'a')['wait_reason']
+    assert reason.startswith(gc.OUTPUTS_NOT_SAVED.split('{')[0]) and 'PermissionError' in reason
+    assert reason.startswith(gc.OPERATOR_PREFIXES)
+    item = status_of(w, 'a', controller)
+    assert (item['uncertain'], item['awaiting_result'], item['needs_operator']) == (True, False, True)
+    assert w.store.jobs.get(a)['status'] == 'FAILED' and w.store.jobs.gpu_locked('existing_runpod:pod1')
+    if then == 'fixed':
+        busy['on'] = False
+        for _ in range(2):   # ticks well inside the owner TTL, one reconcile interval in all
+            w.clock.advance(gc.ControllerSettings().reconcile_interval_seconds / 2)
+            controller.tick(owner)
+        drive(w, controller, owner)
+        assert statuses(w) == {'a': 'COMPLETED'} and run_row(w)['status'] == 'COMPLETED'
+    else:
+        released = desktop_release(w, 'a', attempts(w, 'a')[0]['attempt_id'])
+        assert released['status'] == 'ok', released
+        drive(w, controller, owner)
+        assert statuses(w) == {'a': 'FAILED'} and w.store.attempt_disposition(a)['disposition'] == 'output_invalid'
+    assert w.engine_calls == ['train.bound.yaml'] and len(w.host.launches) == 1

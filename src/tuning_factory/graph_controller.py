@@ -44,8 +44,9 @@ from .graph_store import (
     LedgerBindingResolver,
     LedgerIntegrityError,
     OwnerLease,
+    accepted_result,
 )
-from .jobs import GRAPH_CANCEL_REFUSED, GRAPH_LAUNCH_REFUSED, NON_HARDWARE
+from .jobs import GRAPH_CANCEL_REFUSED, GRAPH_LAUNCH_REFUSED, NON_HARDWARE, OutputsNotSaved
 from .operations import OperationResources
 from .tracking import CONTROLLER_HTTP_MAX_RETRIES, CONTROLLER_HTTP_TIMEOUT_SECONDS, LazyMLflowTracker
 from .tracking_outbox import LocalEvidenceSink, TrackingOutbox, TrackingPublisher, redact
@@ -77,6 +78,10 @@ AT_CONCURRENCY = "waiting: the run is at its max_concurrent limit"
 THREADS_BUSY = "waiting: every dispatch thread of this controller is busy"
 RETRY_WAIT = "waiting for the retry backoff (attempt {next} of {max})"
 RECONCILE_UNAVAILABLE = "reconcile could not reach the destination: {error}"
+# 11.5 re-review M2: an accepted COMPLETED result whose freeze failed on this PC (jobs.OutputsNotSaved).
+OUTPUTS_NOT_SAVED = ("the result arrived but its outputs could not be saved on this PC; free disk space, check the "
+                     "state folder's permissions, an antivirus scan or the path length; it is retried automatically, "
+                     "or release the lock to give the result up: {error}")
 OUTPUTS_REFUSED = "the completed attempt's outputs could not be recorded; an operator must inspect it: {error}"
 DESTINATION_UNAVAILABLE = "destination unavailable: {error}"
 DISPATCH_FAILED = "dispatch failed: {error}"
@@ -86,7 +91,7 @@ DISPATCHER_STORE_DIFFERS = "the operation dispatcher must use the graph controll
 RETURNED_AFTER_TAKEOVER = "returned unlaunched after takeover: the graph run is not running"
 STOPPING = "returned unlaunched after takeover: the controller is stopping"
 OPERATOR_PREFIXES = (OUTPUTS_REFUSED.split(":")[0], LEDGER_INTEGRITY.split(";")[0], OPERATOR_CONFIRMATION,
-                     RESULT_OVERDUE.split(";")[0])
+                     RESULT_OVERDUE.split(";")[0], OUTPUTS_NOT_SAVED.split(";")[0])
 _REMOTE_PATH = re.compile(r"(?<![\w.:/-])/(?:[\w.-]+/)+[\w.-]*")
 _PROVIDERS = ("existing_runpod:", "ssh_server:")
 
@@ -687,7 +692,9 @@ class GraphController:
         except Exception as exc:
             if isinstance(exc, ValueError) and FINAL_ATTEMPT in str(exc):
                 return True   # defensive (F16): released meanwhile, so settled as final; the next rows apply
-            self._note(lease, row["graph_node_id"], RECONCILE_UNAVAILABLE.format(error=_describe(exc)))
+            reason = (OUTPUTS_NOT_SAVED.format(error=_display(str(exc))) if isinstance(exc, OutputsNotSaved)
+                      else RECONCILE_UNAVAILABLE.format(error=_describe(exc)))
+            self._note(lease, row["graph_node_id"], reason)
             return False
         report.add("reconciled", job_id)
         if outcome is None:
@@ -1167,7 +1174,10 @@ def _node_status(store, plan, entry, node, job, operation, counted, tracking, no
         row = {"id": job["id"], "launch_id": job["launch_id"], "active_attempt_id": job["active_attempt_id"],
                "operation": operation}
         deadline = result_deadline(store, row)
-        awaiting = _has_remote_record(store, row) and (deadline is None or now < deadline)
+        # A result that already arrived (accepted, but its outputs not saved: OUTPUTS_NOT_SAVED) is awaited no
+        # longer, so the operator may release the lock to give it up (11.5 re-review M2).
+        awaiting = (_has_remote_record(store, row) and (deadline is None or now < deadline)
+                    and accepted_result(store.state_dir, job["id"], job["launch_id"], job["active_attempt_id"]) is None)
     wait_reason = (_display(node["wait_reason"]) if node["wait_reason"] and status in UNFINISHED_NODES else None)
     error = node["error"] or (job["error"] if job and job["status"] in ("FAILED", "CANCELED") else None)
     resources = (operation or {}).get("resources") or {}

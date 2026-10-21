@@ -38,7 +38,7 @@ from typing import Literal
 
 from pydantic import TypeAdapter
 
-from .execution import CachedTransfer, ExecutionUncertain
+from .execution import CONTENT_OS_ERRORS, CachedTransfer, ExecutionUncertain
 from .executor_profiles import ResourceObservation, approval_destination, observation_fits
 from .gpu_servers import SSHServerProfile
 from .graph_planner import (
@@ -59,7 +59,7 @@ from .graph_store import (
     NodeOutputs,
     accepted_result,
 )
-from .jobs import ACTIVE, CANCELLATION_REQUESTED, AttemptLease
+from .jobs import ACTIVE, CANCELLATION_REQUESTED, AttemptLease, OutputsNotSaved
 from .manifest import source_hash, verify_manifest
 from .operation_dispatch import MODEL_OP_PARENT, write_benchmark_data
 from .operation_outputs import FOREIGN_RESULT, TRAIN_OUTPUT, evaluation_record, freeze_operation_output
@@ -75,10 +75,15 @@ from .registry import canonical, digest
 from .training import OFT_UNFREEZABLE, CanceledError, LlamaFactoryBackend
 from .worker_protocol import COMMAND, OperationResult, WorkerRequest
 
-# Local failures that say nothing about an accepted result's content (a download, a freeze rename an antivirus holds,
-# a locked ledger): the attempt stays uncertain and is collected again (11.5 R1 I-3).
-TRANSIENT = (OSError, sqlite3.OperationalError)
 OUTPUTS_INTERRUPTED = "the remote result was accepted but its outputs were not frozen; reconcile the same launch"
+
+
+def local_transient(exc: BaseException) -> bool:
+    """A local failure that says nothing about an accepted result's content (11.5 R1 I-3): an I/O error such as a
+    freeze rename an antivirus holds, a full disk or a permission, or a busy ledger. The attempt stays uncertain and
+    is collected and frozen again. A missing or misplaced file (``CONTENT_OS_ERRORS``) is content, and final
+    (11.5 re-review M2)."""
+    return isinstance(exc, (OSError, sqlite3.OperationalError)) and not isinstance(exc, CONTENT_OS_ERRORS)
 
 
 @dataclass(frozen=True)
@@ -194,10 +199,12 @@ class OperationAttemptRunner:
         elif status == "COMPLETED":
             try:
                 outputs, targets = self._outputs(job, manifest, operation, lease.attempt_id, launch, result)
-            except TRANSIENT:
-                raise   # 11.5 R1 I-3: the lock stays held; the next reconcile downloads and freezes again (idempotent)
-            except Exception as exc:   # the remote result exists, so execution stopped: fail, never retrain
-                status, error = "FAILED", f"{type(exc).__name__}: {exc}"
+            except Exception as exc:
+                if local_transient(exc):
+                    # 11.5 R1 I-3: the lock stays held; the next reconcile downloads and freezes again (idempotent).
+                    # The controller names the local fix (11.5 re-review M2).
+                    raise OutputsNotSaved(self.jobs.filtered(f"{type(exc).__name__}: {exc}")) from exc
+                status, error = "FAILED", f"{type(exc).__name__}: {exc}"   # content: the result stays final
         elif error is None:
             error = f"remote operation {status.lower()}"
         if error:
@@ -296,10 +303,10 @@ class OperationAttemptRunner:
             error, uncertain = str(exc), True
         except Exception as exc:
             error = self.jobs.filtered(f"{type(exc).__name__}: {exc}")
-            if isinstance(exc, TRANSIENT) and result is not None and result.status == "COMPLETED":
+            if local_transient(exc) and result is not None and result.status == "COMPLETED":
                 # 11.5 R1 I-3: the paid result is accepted, but a local I/O or database error stopped its freeze.
                 # Keep the lock, so reconcile collects and freezes the same launch again (both idempotent); only a
-                # content error (a ValueError: tampered, refused or invalid output) is final.
+                # content error (a ValueError, or a missing or misplaced file) is final.
                 error, uncertain = f"{OUTPUTS_INTERRUPTED}: {error}", True
         finally:
             stop.set()

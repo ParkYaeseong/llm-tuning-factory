@@ -1443,3 +1443,36 @@ def test_a_cancel_that_lands_during_the_freeze_is_never_lost(tmp_path, monkeypat
     assert w.runner.failure_kind(w.job_id) == "canceled"
     assert w.store.classify_attempt(w.ctl, w.job_id, "canceled") == "canceled" and node_status(w) == "CANCELED"
     assert w.calls == ["train.bound.yaml"] and len(w.host.launches) == 1
+
+
+def drop_from_inventory(directory, name):
+    """A worker whose result lacks one output file (removed with its inventory entry, so the transfer verifies)."""
+    (directory / name).unlink()
+    inventory = json.loads((directory / "artifacts.json").read_bytes())
+    del inventory[name]
+    (directory / "artifacts.json").write_bytes(canonical(inventory))
+
+
+@pytest.mark.parametrize("path,missing,kind", [("launch", "output/adapter_config.json", "output_invalid"),
+                                               ("reconcile", "output/adapter_config.json", "output_invalid"),
+                                               ("launch", "artifacts.json", "failed_before_submit")])
+def test_a_missing_file_after_completion_is_final_not_uncertain(tmp_path, monkeypatch, path, missing, kind):
+    """Re-review M2 (a): FileNotFoundError and its kin after the host finished are deterministic content errors, not
+    transient ones. A missing output file (read by the freeze, from the launch or from reconcile) or a missing
+    inventory (read by the collection) is final at once, as before 11.5, instead of holding the lock forever."""
+    w = world(tmp_path, monkeypatch)
+    if missing == "artifacts.json":
+        w.host.after_worker = lambda directory: (directory / missing).unlink()
+    else:
+        w.host.after_worker = lambda directory: drop_from_inventory(directory, missing)
+    if path == "launch":
+        outcome = run(w)
+    else:
+        w.host.mode = "lose_start_response"
+        assert run(w).uncertain
+        w.host.finish()
+        outcome = w.runner.reconcile(w.job_id, w.executor)
+    assert (outcome.status, outcome.uncertain, outcome.outputs) == ("FAILED", False, None)
+    assert "FileNotFoundError" in outcome.error and not held_locks(w)
+    assert w.runner.failure_kind(w.job_id) == kind
+    assert w.calls == ["train.bound.yaml"] and len(w.host.launches) == 1

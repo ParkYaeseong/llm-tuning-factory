@@ -648,6 +648,9 @@ test("wait reasons cover the controller's texts and every status has a Korean na
     ["dispatch failed: RuntimeError: boom", "error", "보내지 못했습니다"],
     ["settling the attempt failed; retrying next tick: OSError", "error", "정리하지 못했습니다"],
     ["reconcile could not reach the destination: timeout", "error", "확인하지 못했습니다"],
+    ["the result arrived but its outputs could not be saved on this PC; free disk space, check the state folder's "
+      + "permissions, an antivirus scan or the path length; it is retried automatically, or release the lock to give "
+      + "the result up: PermissionError: in use", "operator", "이 PC에 저장하지 못했습니다"],
     // graph_store.readiness and graph_controller._prepare: the most common reasons.
     ["waiting for train-1", "waiting", "앞 단계 ‘train-1’이(가) 끝나기를 기다리는 중입니다"],
     ["waiting for tracking of train-1", "waiting", "앞 단계 ‘train-1’의 MLflow 기록이 저장되기를 기다리는 중입니다"],

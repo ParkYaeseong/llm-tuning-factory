@@ -42,6 +42,9 @@ const REASONS: Rule[] = [
     () => "시간 제한이 지나도 결과가 없습니다. 원격 실행이 멈춘 것을 확인한 뒤 잠금을 해제해야 합니다"],
   [/^operator confirmation required/, "operator", () => "원격 실행이 멈췄는지 운영자 확인이 필요합니다"],
   [/^the completed attempt's outputs could not be recorded/, "operator", () => "완료된 시도의 결과를 기록하지 못했습니다. 운영자가 확인해야 합니다"],
+  // graph_controller.OUTPUTS_NOT_SAVED (11.5): the result arrived, but saving its outputs failed on this PC.
+  [/^the result arrived but its outputs could not be saved on this PC/, "operator",
+    () => "결과는 도착했지만 이 PC에 저장하지 못했습니다. 디스크 여유 공간, 상태 폴더 권한, 백신 검사, 경로 길이를 확인하세요. 자동으로 다시 시도하며, 결과를 포기하려면 잠금을 해제하세요"],
   [/^ledger integrity check failed/, "operator", () => "작업 기록 무결성 검사에 실패했습니다. 운영자가 기록을 복구하거나 지울 때까지 기다립니다"],
   [/^live destination facts differ/, "replan", () => "실행 자원의 실제 정보(GPU 또는 더 높은 가격)가 승인한 계획과 다릅니다. 다시 계획하세요"],
   [/^executor profile changed after approval/, "replan", () => "승인한 뒤 실행 프로필이 바뀌었습니다. 다시 계획하세요"],

@@ -38,6 +38,16 @@ LAUNCH_DIRECTORY_EXISTS = "remote launch directory already exists for this attem
 FOREIGN_RESULT = "remote result belongs to a different attempt"
 COLLECTION_INTERRUPTED = ("remote result collection was interrupted after the host finished; reconcile the same "
                           "launch")
+# After the host finished, these say the result's files are not as listed (a missing or misplaced file, an existing
+# name): deterministic content errors, never retried, unlike a sharing violation, a full disk, a permission or a busy
+# database, which an operator can fix locally (11.5 re-review M2).
+CONTENT_OS_ERRORS = (FileNotFoundError, NotADirectoryError, IsADirectoryError, FileExistsError)
+
+
+def transient_error(exc: BaseException) -> bool:
+    """Whether a failure after an accepted result leaves the attempt uncertain (collected and frozen again): any
+    ``Exception`` but a ``ValueError`` (tamper, foreign or invalid content) or a ``CONTENT_OS_ERRORS`` file error."""
+    return isinstance(exc, Exception) and not isinstance(exc, (ValueError, *CONTENT_OS_ERRORS))
 INJECTED_CONNECTION = "v2 operations require an injected SSH connection owned by desktop_runtime.connection()"
 # Control-plane records of a v2 launch directory: never uploaded, never taken from the host by a download.
 V2_CONTROL_RECORDS = frozenset({"result.json", "result.tmp", "remote-attempt.json", "remote-attempt.json.tmp",
@@ -580,9 +590,9 @@ class SSHExecutor(ExecutionBackend):
                 finished = True
                 try:
                     self._collect_operation(sftp, remote, launch, raw, result)
-                except ValueError:
-                    raise   # content: a tampered, foreign or invalid transfer is final
                 except Exception as exc:
+                    if not transient_error(exc):
+                        raise   # content: a tampered, foreign, invalid or missing transfer is final
                     # The host finished, but its files did not all arrive (a transport or local disk error): the
                     # attempt stays uncertain and reconcile collects the same launch again (11.5 R1 I-3).
                     raise ExecutionUncertain(COLLECTION_INTERRUPTED) from exc

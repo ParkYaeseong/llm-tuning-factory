@@ -28,6 +28,12 @@ TRANSITIONS = {
 }
 
 
+class OutputsNotSaved(RuntimeError):
+    """Reconcile collected an accepted COMPLETED result again, but a local I/O or database error stopped its freeze
+    on this PC (a full disk, a permission, an antivirus holding a file, a path too long, a busy ledger). The attempt
+    keeps its lock and the next reconcile tries again; the controller names the local fix (11.5 re-review M2)."""
+
+
 @dataclass(frozen=True)
 class AttemptLease:
     job_id: str
