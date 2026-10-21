@@ -6434,6 +6434,72 @@ model_artifacts,controller_entry}.py`) and this file.
     - `scripts/check_secrets.py`: 1247 file versions, 0 findings.
     - `git diff --check d462433 HEAD`: clean, with LF only.
 
+## Task 11.5 integration onto PR #4 and the last control-plane fixes, 2026-10-21
+
+**What was on PR #4.**
+- In another session the user merged the branch tip `539b3af` into `codex/rc-planning-fixes` (`d187081`), added
+  `4877791` (correlated selection identities during planning), pushed that to `codex/general-training-workflows` and
+  opened draft PR #4.
+- Hosted CI on `4877791` was green: push run 39562591090, and on the PR runs 39562598427 (CPU verification) and
+  39562598501 (Windows desktop pilot).
+- An installer was built from that tree (sidecar SHA256 `cd8c5bed…`) and installed into
+  `dist\desktop-acceptance-030`. It does not contain the docs, UI/native or control-plane batches; it is not the release
+  candidate.
+
+**Integration (root).**
+- `codex/rc-final` starts at `4877791` and cherry-picks:
+  - the docs batch (7 commits);
+  - the UI/native batch (15);
+  - the control-plane batch (19). These include `ce26a90`, `096be4d`, `22256f7` and `97b35e2`, which its implementer
+    committed just before an API billing error stopped it.
+- The planning batch was already on PR #4.
+- Conflicts:
+  - PROGRESS sections, all kept.
+  - One hunk in `desktop/src/views/graph-runs.ts`: the UI batch's `UNREADABLE_NOTE`/`HIDDEN_CHARACTERS` and the control
+    batch's `RELEASE_REASON`/`NOT_SAVED_*` are both kept. `tsc --noEmit` is clean.
+
+**Review of the four unverified commits: With fixes.**
+- Important: only `os.*` functions set `winerror`.
+  - `open()` (paramiko's download, the freeze copy) raises a path too long or a gone network share as a bare
+    `FileNotFoundError`, so a paid result was still made final.
+  - Fixed test first (`06e6ccc`): on Windows such an error is transient when its path is MAX_PATH or longer, or when
+    its folder's stat fails with WinError 53/67.
+- Two Minors, also fixed test first:
+  - `370fe9d`: a `'` no longer ends the token that the redact window cut goes through.
+  - `9f3c142`: the released state of an unsaved result no longer says that no result arrived.
+
+**Re-review of those three: Ready Yes.** The Minor and nits it found, all fixed test first:
+- `eeb4c59`:
+  - The length rule applies only while Windows enforces MAX_PATH. With long paths enabled, a missing file at 260+
+    characters is content, as are a `\\?\` name and a `FileExistsError`. `RtlAreLongPathsEnabled` is read once; it
+    returns true on this PC.
+  - The judgement never raises inside the runner's handlers.
+- `a14a8d9`: a URL query is stripped to its end even past a `'`.
+- `1522ca1`: the release dialog of an unsaved result says that the result is given up, recorded as `output_invalid`.
+
+**Verification on `1522ca1`** (the code; this entry is a docs-only commit on top):
+
+| Check | Result |
+|---|---|
+| `uv run pytest -q` | 1930 passed, 1 skipped (632 s; the skip is the opt-in real-GPU test) |
+| `uv run ruff check src tests scripts` | All checks passed |
+| `scripts/check_secrets.py` | 1294 file versions, 0 findings |
+| `git diff --check` | clean against `4877791` |
+| `npm run build` | passes |
+| `npx playwright test` | 269 passed (3.7 min, own Vite server, `TUNING_FACTORY_E2E=1`) |
+| `cargo test --locked --offline --release` | 54 passed (Rust is unchanged since the UI batch) |
+| CPU acceptance (`.factory\model-ops-cpu-venv`, `verify_model_ops_cpu.py`) | 29/29, `passed: true` |
+
+- CPU acceptance hashes:
+  - `source_sha256` `f084a32d…c202`, which equals `source_hash()` of this tree;
+  - `lock_sha256` `5883aae6…1437` (unchanged);
+  - receipt SHA256 `38285e3a…ff92`.
+- Not done yet:
+  - the fresh frozen build and `verify_desktop_package.py` on it;
+  - hosted CI on the pushed tip;
+  - the 11.6 installer acceptance.
+- No GPU, paid resource, network data or real credential was used.
+
 ## Windows workbench refinement — 0.2.1
 
 User selected the light Linear/Vercel direction after requesting getdesign.md references and similar open-source
