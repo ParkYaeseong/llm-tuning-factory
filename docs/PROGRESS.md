@@ -6222,6 +6222,135 @@ Actual verification (this worktree, its own `.venv` from `uv sync --extra dev --
 - Not verified: real WebView2 rendering of `<bdi>` and of the release dialog, and two real app windows saving profiles
   at once (Task 11.6 installed-app checks); the dedupe UI against the real backend change.
 
+## Task 11.5 fixes: control plane (R1), 2026-10-21
+
+Branch `codex/rc-control-fixes` in the worktree `D:\llm-tuning-factory-wt114`, on the RC `01c8503`. It fixes R1's
+control-plane findings I-1, I-3, I-4, m1 and m5–m9 and part of m11, test first. Every new test was run against
+the RC source first (the `src` changes stashed): 37 failed for the reported reason (lost cancel, terminal FAILED
+instead of uncertain, the split price refusal, a second dispatch, an unredacted query, an accepted device name, a
+raised cleanup error, an accepted 59 s TTL), and the regression guards passed. With the fixes they pass.
+Changed: `src/tuning_factory/{attempt_runner,execution,gpu_servers,simulated_dispatch,graph_store,graph_controller,
+jobs,runner,auth,desktop,tracking_outbox,model_artifacts,controller_entry}.py`, their tests
+(`tests/test_{operation_runner,simulated_dispatch,graph_controller,graph_store,tracking_https,tracking_outbox,
+model_artifacts,controller_entry}.py`) and this file.
+
+- **I-1, a cancel lost through reconcile: fixed.**
+  - `OperationAttemptRunner.reconcile` and `SimulatedOperationDispatcher.reconcile` map the collected result to
+    CANCELED when the job has `cancel_requested` or the run is CANCELED, as `_launch` does. The flag is re-read
+    after the collection. Nothing is frozen, no child is unblocked and nothing is registered.
+  - `GraphStore._state('CANCELED')` and `JobStore.cancel` also flag a FAILED/CANCELED graph attempt that still
+    holds its lock. A final attempt (lock released) is unchanged, so a retry backoff is not affected.
+  - `SSHExecutor.collect_operation_result(..., cancel=True)` writes the remote `cancel` marker while there is no
+    result. It is best effort: a launch directory that was never created is ignored, and the next reconcile tries
+    again. `_await_result` uses the same `_send_cancel`. `collect_operation_result` has one new keyword-only
+    argument; `SSHExecutor` is its only implementation.
+  - The test fake `ScriptedDispatcher.reconcile` mirrors the runner's new semantics.
+  - Tests:
+    - `test_operation_runner.py`: `test_a_cancel_wins_over_a_late_completion_collected_by_reconcile[run|job]`,
+      `test_reconcile_sends_the_cancel_to_a_worker_that_may_still_run` (the worker then stops before training: 0
+      training calls) and `test_a_job_cancel_leaves_a_final_attempt_unchanged`.
+    - `test_simulated_dispatch.py`: `test_a_cancel_wins_over_a_simulated_result_collected_by_reconcile`, 8 cases
+      (run/job cancel, while running/once uncertain, with or without a published result).
+    - `test_graph_controller.py`: `test_a_cancel_wins_over_a_late_completion_through_reconcile`, 4 cases with the
+      real runner and the fake GPU host (R1's probes: a cancel while `a` runs or once it is FAILED-uncertain, then a
+      lost start response and a late COMPLETED). `a` ends CANCELED and `e` is never compiled or claimed. There is
+      no `model_registration` event and no `node_outputs` row, and `a` trained once and launched once. The run ends
+      CANCELED, or FAILED with `e` BLOCKED after a job-level cancel. `host_world` is factored out of
+      `test_end_to_end_with_the_real_attempt_runner`.
+    - `test_graph_store.py`: `test_a_cancel_flags_an_uncertain_attempt_that_keeps_its_lock[run|job]`.
+- **I-3, a transient failure after COMPLETED was terminal: fixed.**
+  - `SSHExecutor.run_operation` raises `ExecutionUncertain` for a non-`ValueError` collection error after the
+    result was accepted. `finished` is unchanged.
+  - `OperationAttemptRunner._launch` keeps the lock (uncertain) for an `OSError` or `sqlite3.OperationalError`
+    after an accepted COMPLETED result. `reconcile` re-raises those errors from the freeze, so the controller notes
+    them and the next reconcile downloads and freezes the same launch again. Both steps are idempotent:
+    hash-matched files are skipped and the freeze is content-addressed.
+  - Content errors (`ValueError`: tamper, foreign or invalid output) stay terminal.
+  - Tests: `test_a_transient_download_failure_after_completion_stays_uncertain` (one `sftp.get` OSError, then
+    COMPLETED with 1 launch and 1 training call), `test_a_lasting_sharing_violation_while_freezing_stays_uncertain`
+    (WinError 32 eleven times: 10 tries in `_launch`, then the reconcile freeze succeeds on its second try; one
+    artifact) and `test_a_content_error_after_completion_stays_terminal` (`output_invalid`).
+- **I-4, the split price check: fixed.** `SSHExecutor` and `SSHServerFacts` gain
+  `validate_budget(gpu_count, gpu_type, total_hourly_cost_usd)`. The runner passes the pinned total, which
+  `observation_fits` also compares at claim. The v1 `validate_config` computes the same per-GPU product as before
+  and calls it, so legacy behaviour is unchanged. `attempt_runner._PinnedResources` is gone.
+  - Tests: `test_a_pinned_total_is_compared_with_the_live_total[0.21-3|0.11-5]` (one training call, COMPLETED) and
+    `test_a_live_pod_above_the_pinned_total_or_another_gpu_is_still_refused[price|count|type]` (the price is
+    `nextafter(0.21, 1)`).
+- **m1: fixed.** `claim_ready` and the controller's `_queued` count `GraphStore.concurrent_attempts`: active
+  attempts plus the run's finished attempts that still hold a lock. Tests:
+  `test_an_uncertain_attempt_holds_a_concurrency_slot` (R1's probe: no second dispatch, the other destination is
+  not even opened, then both complete) and `test_an_uncertain_attempt_counts_toward_max_concurrent`.
+- **m5: fixed.** `auth.credentials_configured` counts `MLFLOW_TRACKING_PASSWORD`, which MLflow sends with the
+  username. A username alone is not a credential.
+  - `current_auth_mode` keeps bearer/OIDC only, so the D11 tracking hash and the controller's scope are unchanged.
+    The controller already pops Basic credentials.
+  - `DesktopService` with `auth_mode: none` now also drops inherited Basic credentials, so a desktop without
+    authentication on a local HTTP server keeps working.
+  - Tests: `test_http_with_basic_credentials_is_refused[both|password]`, `test_a_username_alone_is_not_a_credential`
+    and `test_basic_credentials_never_reach_a_none_mode_controller`.
+- **m6: fixed.** `tracking_outbox.redact` strips URL query strings, keeping the scheme, host and path. It also
+  redacts quoted `access_token`/`refresh_token`/`id_token`/`client_secret`/`token`/`password` members (JSON or
+  repr). Test: `test_redact_strips_url_queries_and_json_tokens`, with Azure SAS, GCS signed URL and JSON shapes
+  whose fakes are built at runtime.
+- **m7: fixed.** `JobStore.reset_for_resume` refuses a graph-owned job (`GRAPH_RESUME_REFUSED`). So does
+  `Factory.resume`, before it reads the v1 manifest. `claim_ready` (and the controller's queue) claim only a
+  READY node's job.
+  - Test: `test_a_graph_job_is_never_requeued_outside_the_controller`.
+  - `test_claim_reserves_budget_atomically_and_refuses_over_budget` requeued a graph job with `reset_for_resume`.
+    It now pins the refusal and requeues by SQL, so the max_attempts rule is still tested.
+- **m8: fixed.** `freeze`'s cleanup uses `shutil.rmtree(..., ignore_errors=True)`. Test:
+  `test_a_valid_freeze_survives_a_failing_cleanup_of_its_temporary_directory`.
+- **m9: fixed.** `model_artifacts.WINDOWS_DEVICE_NAME` is the one rule for artifact paths and downloads
+  (`execution._DEVICE_NAME` is the same object). It uses the stricter list: COM0–9 and LPT0–9 with the
+  superscript digits, CONIN$/CONOUT$, and spaces before an extension (`NUL .txt`). Tests:
+  `test_the_stricter_windows_device_names_cannot_be_model_paths` (8 names) and
+  `test_names_that_only_resemble_device_names_stay_valid` (5).
+- **m11, part: fixed.** `StartSettings.tracking_claim_ttl_seconds` is at least `CONTROLLER_HTTP_TIMEOUT_SECONDS`
+  (60 s). This is harmless: production uses 600 s, the broker never sends settings and the CLI sets only
+  `tick_seconds`. Test: `test_the_tracking_claim_ttl_covers_one_bounded_create`.
+- Recorded with a reason, no code change:
+  - **m4.** The store's and controller's `max_estimated_cost_usd * (1 + 1e-9)` ceiling is deliberate defence
+    against float summation order. Reservations can exceed the approved total by at most 1e-9 relative (a
+    millionth of a cent on a $10 plan). The planner's plain float sum stays the strict bound.
+  - **m10.** Counting a failure that provably happened before `remote-attempt.json` was written is a design choice
+    (D4). Only the store's own D9 settlement (`release_uncontacted`/`settle_stale_launch`, after the token
+    rotation) releases an attempt uncounted. A caught failure inside `_launch` before contact (for example
+    unreadable dataset bytes) is the attempt's own deterministic failure and stays counted and terminal, never a
+    silent retry.
+  - **m11, MergeNode weights.** The weights must sum to exactly 1 in decimal, so three equal thirds cannot be
+    written; use for example 0.33/0.33/0.34. The weights are part of the plan hash and of the merge receipt's
+    normalized weights; a tolerance would change that contract and the planning schema (the planning batch's
+    area).
+  - **m11, RunPod/SSH exclusivity keys.** A RunPod profile and an SSH profile of the same physical host get
+    different keys (6A: provider labels do not prove distinct hardware). They still never run at once: the D3
+    cross-provider quarantine in `JobStore._resource_blocked` blocks every claim while another provider's lock is
+    held. The difference only affects D1's load ranking and status. The docs batch documents it.
+- Contracts other batches may see: `collect_operation_result` has a keyword-only `cancel` argument;
+  `validate_budget` is new on `SSHExecutor` and `SSHServerFacts`; `GraphStore.concurrent_attempts` is new;
+  `GRAPH_RESUME_REFUSED` is new in `jobs`. `GraphStore.submit`, `workflow_runs`, `graph_planner`, the eligibility
+  checks, `workflow_planning`, `hf_targets` and `tests/test_cli_graph.py` are untouched.
+- Verification (this worktree, Windows, Python 3.12, `uv sync --extra dev --extra tracking --locked`):
+  - The new and changed tests on the RC source: 37 failed, 14 passed. With the fixes: 51 passed.
+  - The 17 affected test files before committing: 773 passed (742 s).
+  - Each of the six fix commits on its own `git archive` tree: `ruff check src tests` passed, `compileall` passed,
+    and the commit's own tests passed (19, 5, 6, 4 and 6; the sixth commit is the tested HEAD).
+  - Full `uv run pytest -q` at the last fix commit, run 1 (beside three other agents' suites): 1803 passed,
+    1 skipped, 1 failed (762 s). The failure was
+    `test_acceptance_workflows.py::test_the_mock_diamond_survives_a_controller_restart_and_honours_cancel[restart]`:
+    the second `serve` exited 1 after "stale controller lease" warnings, consistent with its 6 s owner lease
+    expiring under load. The test then passed 3 times alone (all 3 cases each time) and once in the CI-variable
+    run below.
+  - Full `uv run pytest -q`, run 2, with this section in place: 1804 passed, 1 skipped (651 s). The skip is the
+    opt-in real-GPU test.
+  - `uv run ruff check src tests`: All checks passed.
+  - `uv run python scripts/check_secrets.py`: 1173 file versions, 0 findings.
+  - `git diff --check 01c8503 HEAD`: clean. All 21 changed files are `i/lf w/lf`, and the diff has 0 CR and 0
+    bidi/invisible characters.
+  - `GITHUB_ACTIONS=true CI=true uv run pytest tests/test_graph_controller.py tests/test_acceptance_workflows.py
+    tests/test_controller_entry.py`: 138 passed (235 s).
+  - Not run: the CPU numerics acceptance (root runs it at the RC), and every GPU or network step.
+
 ## Windows workbench refinement — 0.2.1
 
 User selected the light Linear/Vercel direction after requesting getdesign.md references and similar open-source
