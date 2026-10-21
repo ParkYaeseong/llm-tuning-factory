@@ -80,9 +80,11 @@ _SAFE_PART = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*")
 
 # Every pattern below is linear (possessive quantifiers, no backtracking over a long run), and they see at most
 # REDACT_WINDOW characters (11.5 re-review M4: the first URL-query pattern backtracked quadratically on text without
-# whitespace and held the GIL the lease heartbeat needs). The window is far beyond any stored or shown limit, so a
-# value cut at its end never reaches the output.
+# whitespace and held the GIL the lease heartbeat needs). The token the cut goes through is replaced by
+# ``[truncated]`` before any pattern runs: an earlier substitution can shrink the text until the cut's tail falls
+# within the limit, and a partial value may no longer match (a URL-userinfo password needs its ``@``).
 REDACT_WINDOW = 65536
+_LAST_TOKEN = re.compile(r"[^\s'\"<>]*+")   # matched on the reversed window: the token the cut went through
 _BEARER = re.compile(r"(?i)\b(bearer|basic)\s++[^\s,;'\"]++")
 _SECRET_PAIR = re.compile(r"(?i)\b(client_secret|access_token|token|password)=[^\s&;,'\"]++")
 # A token or secret as a JSON (or Python repr) member: ``"access_token": "..."`` (also when cut off unterminated).
@@ -123,7 +125,10 @@ def redact(text, limit=500) -> str:
         value = os.environ.get(name)
         if value and len(value) >= 6:
             text = text.replace(value, "[redacted]")
-    text = text[:max(REDACT_WINDOW, 4 * limit)]
+    window = max(REDACT_WINDOW, 4 * limit)
+    if len(text) > window:
+        cut = text[:window]
+        text = cut[:window - len(_LAST_TOKEN.match(cut[::-1]).group(0))] + "[truncated]"
     text = _BEARER.sub(r"\1 [redacted]", text)
     text = _SECRET_PAIR.sub(r"\1=[redacted]", text)
     text = _QUOTED_SECRET.sub(r"\1\2[redacted]\2", text)
