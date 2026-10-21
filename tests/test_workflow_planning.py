@@ -1518,3 +1518,38 @@ def test_model_root_snapshot_caps_an_undeclared_metadata_body(tmp_path, monkeypa
     assert 4 * MIB < hub.pulled <= 5 * MIB
     assert files(wp.root_snapshots_dir(state)) == []
 
+
+# -- Task 11.5 (R5 I2): a recipe's input kind against the bound dataset's kind, through the channel ----------------
+
+def kind_dataset(state, tmp_path, kind):
+    """A registered dataset of another kind than the SFT instruction recipe takes."""
+    rows = {"preference": [{"instruction": f"선호 {i}", "chosen": f"좋은 답 {i}", "rejected": f"나쁜 답 {i}"}
+                           for i in range(4)],
+            "text": [{"text": f"사전학습 문서 {i}"} for i in range(4)]}[kind]
+    path = tmp_path / f"{kind}.json"
+    path.write_bytes(canonical(rows))
+    record = Registry(state / "registry").register_dataset(f"{kind}-data", "1", path, export_allowed=True, kind=kind)
+    return {"dataset_id": f"{kind}-data", "version": "1", "sha256": record["sha256"]}
+
+
+@pytest.mark.parametrize("kind", ["preference", "text"])
+def test_an_instruction_recipe_bound_to_other_data_is_refused_before_any_run(tmp_path, monkeypatch, kind):
+    """``graph_planner._definition_issues``' kind check (``train_contract``) reaches the user through
+    ``graph_validate`` and ``graph_plan`` (simulation and real), on the train node, before anything is stored."""
+    planning()
+    state = tmp_path / "state"
+    found = real_scenario(state, tmp_path, monkeypatch)
+    recipe = desk.call(state, "recipe_get", {"recipe_id": "sft-lora"})
+    assert recipe["status"] == "ok" and recipe["data"]["recipe"]["training_stage"] == "sft", recipe
+    assert recipe["data"]["recipe"]["input_kind"] == "instruction"
+    dataset = kind_dataset(state, tmp_path, kind)
+    project_id, _ = make_project(state, [train("train", found.recipe, from_root(found.root), ("pod-a",))],
+                                 [binding("train", "train", dataset)])
+    message = "training dataset kind differs from recipe input kind"
+    for result in (run(state, "graph_validate", {"project_id": project_id}),
+                   run(state, "graph_plan", plan_request(project_id, estimates=()), profiles=[found.profile]),
+                   run(state, "graph_plan", plan_request(project_id, simulation=False, estimates=()),
+                       settings=TOKEN_SETTINGS, profiles=[found.profile], clock=NOW + 60)):
+        issue = desk.only_issue(result, "invalid", "train_contract", "/graph/nodes/0")
+        assert issue["node_id"] == "train" and issue["message"] == message, result
+    assert not (state / "jobs.db").exists() and files(state / "workflows" / "plans") == []
