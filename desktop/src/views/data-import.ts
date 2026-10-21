@@ -7,7 +7,7 @@ import "./data-import.css";
 import { imports, pickFile } from "../api";
 import { issueList, issuesAt, localize, rowIssues } from "../issues";
 import { bindingIdFor } from "../project-store";
-import { button, errorText, escapeHtml, icon, statusPill } from "../workbench";
+import { button, errorText, escapeHtml, icon, isolate, statusPill } from "../workbench";
 import type { View, ViewContext } from "../view-types";
 import type { BindingRole, DatasetBinding, DatasetRef, FieldPath, ImportMapping, ImportPreview, ImportSource, InputKind,
   SplitCommitted, SplitPlan, SplitPreview, WorkflowIssue, WorkflowResult } from "../workflow-types";
@@ -143,7 +143,10 @@ function here(ctx: ViewContext) {
   const page = ctx.page, arg = ctx.arg;
   return { still: () => ctx.page === page && ctx.arg === arg };
 }
-function size(bytes: number) {
+/** A count or size from the backend as text: only a finite number is shown (a malformed answer shows "—", never markup). */
+const count = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? String(value) : "—";
+function size(bytes: unknown) {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes)) return "—";
   if (bytes < 1024) return `${bytes} B`;
   return bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
@@ -153,7 +156,7 @@ function cell(value: unknown) {
 }
 /** A source name (path, column) isolated from the surrounding text's direction: `<bdi>` in markup; first-strong
  * isolate marks in `<option>` text, which cannot hold markup. */
-const isolated = (name: string) => `<bdi>${escapeHtml(name)}</bdi>`;
+const isolated = isolate;
 const isolatedText = (name: string) => `\u2068${name}\u2069`;
 const flagsText = (flags: { synthetic: boolean; export_allowed: boolean }) =>
   `${flags.synthetic ? "합성 데이터" : "사용자 데이터"} · GPU 전송 ${flags.export_allowed ? "허용" : "미허용"}`;
@@ -279,7 +282,7 @@ function sampleTable(noun: string, unit: string, allColumns: [string, string][],
 function projectBanner(ctx: ViewContext, projectId: string) {
   const project = ctx.store.draft(projectId);
   const name = project?.saved?.project.name || project?.spec.name;
-  return `<div class="wf-banner import-project"><div>${name ? `프로젝트 <b>‘${escapeHtml(name)}’</b>` : "선택한 프로젝트"}에 연결할 데이터를 가져옵니다. 등록이나 분할을 마친 뒤 마지막 단계에서 연결하세요.</div>${button("프로젝트로 돌아가기", `nav:project:${projectId}`, "quiet")}</div>`;
+  return `<div class="wf-banner import-project"><div>${name ? `프로젝트 <b>‘${isolate(name)}’</b>` : "선택한 프로젝트"}에 연결할 데이터를 가져옵니다. 등록이나 분할을 마친 뒤 마지막 단계에서 연결하세요.</div>${button("프로젝트로 돌아가기", `nav:project:${projectId}`, "quiet")}</div>`;
 }
 
 function sourceCard(ctx: ViewContext) {
@@ -343,7 +346,7 @@ function previewStatusHtml() {
 function previewCard() {
   const preview = draft.preview;
   const shown = preview && !discovered() ? preview : null;
-  const facts = shown ? `<p class="import-facts">행 ${shown.row_count}개${shown.canonical_sha256 ? ` · 변환 결과 SHA256 <span class="mono">${short(shown.canonical_sha256)}</span> · ${size(shown.canonical_size ?? 0)}` : ""}</p>` : "";
+  const facts = shown ? `<p class="import-facts">행 ${count(shown.row_count)}개${shown.canonical_sha256 ? ` · 변환 결과 SHA256 <span class="mono">${short(shown.canonical_sha256)}</span> · ${size(shown.canonical_size ?? 0)}` : ""}</p>` : "";
   const fields = [...CANONICAL_FIELDS[draft.previewSent?.kind ?? draft.kind].required, ...CANONICAL_FIELDS[draft.previewSent?.kind ?? draft.kind].optional];
   const rows = shown ? shown.samples.slice(0, SAMPLE_LIMIT) : [];
   const keys = [...new Set([...fields.filter(name => rows.some(sample => name in sample)), ...rows.flatMap(sample => Object.keys(sample))])];
@@ -384,7 +387,7 @@ function splitStateHtml() {
   const canCommit = Boolean(split.preview) && fresh && !committedNow && !unavailable;
   const preview = split.preview;
   const result = preview ? `${fresh ? "" : `<div class="import-status">${statusPill("warn", "다시 미리보기 필요")}<span class="import-stale">${SPLIT_STALE}</span></div>`}
-    <p class="import-counts">${ROLES.map(role => `${ROLE_LABEL[role]} ${preview.counts[role] ?? 0}`).join(" · ")}</p>
+    <p class="import-counts">${ROLES.map(role => `${ROLE_LABEL[role]} ${count(preview.counts[role] ?? 0)}`).join(" · ")}</p>
     <ul class="import-outputs">${ROLES.filter(role => preview.outputs[role]).map(role => `<li>${ROLE_LABEL[role]} · ${ref(preview.outputs[role]!)}</li>`).join("")}</ul>`
     : `<p class="muted">분할 미리보기에서 역할별 행 수를 확인한 뒤 등록합니다.</p>`;
   return `${result}<div class="actions">${button("분할 등록", "wf:data-import:split-commit", "primary", !canCommit)}${committedNow ? '<span class="muted">이 분할은 등록했습니다.</span>' : ""}</div>`;

@@ -4,8 +4,8 @@
 // maximum duration and concurrent GPUs, every destination, every dataset, the MLflow destination and the steps that
 // wait on a shared single destination. Every dynamic text is escaped (plan data is untrusted).
 import { KIND_LABELS, type NodeKind } from "../graph-model";
-import { escapeHtml, openDialog, statusPill } from "../workbench";
-import type { PlanSummary, PublicProfile, Sha256 } from "../workflow-types";
+import { escapeHtml, isolate, openDialog, statusPill } from "../workbench";
+import type { PlanSummary, PublicProfile } from "../workflow-types";
 
 export interface ApprovalChoice { approveExecution: boolean; approveDataTransfer: boolean }
 export const EXECUTION_APPROVAL = "위 실행 자원에서 학습·평가·병합을 실행하고, 최대 추정 비용까지 GPU 요금이 발생하는 것을 승인합니다.";
@@ -89,7 +89,7 @@ export function approvalBodyHtml(summary: PlanSummary, profiles: PublicProfile[]
   const waitingSteps = nodes.filter(node => waiting.has(node.node_id));
   const attempts = summary.retry_policy?.max_attempts;
   return `<div class="plan-approval">
-    <p class="plan-approval-head">${statusPill(summary.simulation ? "neutral" : "warn", summary.simulation ? "모의 실행" : "실제 실행")} <b>${escapeHtml(projectName)}</b></p>
+    <p class="plan-approval-head">${statusPill(summary.simulation ? "neutral" : "warn", summary.simulation ? "모의 실행" : "실제 실행")} <b>${isolate(projectName)}</b></p>
     <p>${summary.simulation ? SIMULATION_NOTE : REAL_NOTE}</p>
     <dl class="plan-totals">
       <div data-plan-total="cost"><dt>최대 추정 비용</dt><dd>${escapeHtml(usd(summary.max_estimated_cost_usd))}<small>${COST_NOTE}</small></dd></div>
@@ -105,7 +105,7 @@ export function approvalBodyHtml(summary: PlanSummary, profiles: PublicProfile[]
     <h3>데이터</h3>
     ${data ? `<div class="plan-table-wrap"><table class="plan-table"><thead><tr><th scope="col">데이터 ID</th><th scope="col">버전</th><th scope="col">SHA256</th><th scope="col">종류</th><th scope="col">PC 밖 전송</th></tr></thead><tbody>${data}</tbody></table></div>` : '<p class="muted">쓰는 데이터가 없습니다.</p>'}
     <h3>MLflow 기록</h3><p data-plan-total="tracking">${trackingHtml(summary)}</p>
-    ${waitingSteps.length ? `<h3>같은 실행 위치를 기다리는 단계</h3><ul class="plan-waiting">${waitingSteps.map(node => `<li>${escapeHtml(node.label || node.node_id)} · ${WAITING_TEXT}</li>`).join("")}</ul>` : ""}
+    ${waitingSteps.length ? `<h3>같은 실행 위치를 기다리는 단계</h3><ul class="plan-waiting">${waitingSteps.map(node => `<li>${isolate(node.label || node.node_id)} · ${WAITING_TEXT}</li>`).join("")}</ul>` : ""}
   </div>`;
 }
 

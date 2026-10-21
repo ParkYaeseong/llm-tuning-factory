@@ -12,7 +12,7 @@ import { issueList, localize, planSection } from "../issues";
 import { PLAN_DROPPED, type PlanningInputs, type ProjectDraft, type ProjectStore } from "../project-store";
 import type { ViewContext } from "../view-types";
 import type { InspectionSummary } from "../views/executor-profiles";
-import { button, errorText, escapeHtml, focusKey, restoreFocus, statusPill } from "../workbench";
+import { button, errorText, escapeHtml, focusKey, isolate, restoreFocus, statusPill } from "../workbench";
 import type { ControllerView, PlanningEstimate, PlanRequest, PlanSummary, PublicProfile, RecipeSummary, Sha256, WorkflowIssue,
   WorkflowResult } from "../workflow-types";
 import { COST_NOTE, durationText, kindLabel, openApproval, profileName, profileText, usd, WAITING_TEXT } from "./plan-dialog";
@@ -475,7 +475,7 @@ function issuesWithSteps(issues: WorkflowIssue[], summary: PlanSummary): string 
   const label = (nodeId: string | null | undefined) => summary.nodes.find(node => node.node_id === nodeId)?.label || nodeId || "";
   return `<ul class="issue-list" aria-label="실행 등록 결과">${issues.map(issue => {
     const { text, original } = localize(issue);
-    const step = issue.node_id ? `<b>${escapeHtml(label(issue.node_id))}</b> · ` : "";
+    const step = issue.node_id ? `<b>${isolate(label(issue.node_id))}</b> · ` : "";
     return `<li data-code="${escapeHtml(issue.code)}"><span>${step}${escapeHtml(text)}</span>${original ? `<details><summary>원문 보기</summary><span class="issue-original">${escapeHtml(original)}</span></details>` : ""}</li>`;
   }).join("")}</ul>`;
 }
@@ -490,7 +490,7 @@ function summaryHtml(draft: ProjectDraft, view: PlanView): string {
   const refused = submitFeedback.get(draft.projectId);
   const steps = (Array.isArray(summary.nodes) ? summary.nodes : []).map(node => {
     const places = (node.allowed ?? []).map(resource => profileText(resource.profile_id, view.profiles));
-    return `<li data-plan-step="${escapeHtml(node.node_id)}"><b>${escapeHtml(node.label || node.node_id)}</b> · ${escapeHtml(kindLabel(node.kind))} · ${places.length ? escapeHtml(places.join(", ")) : "GPU를 쓰지 않음"} · 최대 ${escapeHtml(usd(node.max_estimated_cost_usd))}${waiting.has(node.node_id) ? ` <span class="plan-wait">${WAITING_TEXT}</span>` : ""}</li>`;
+    return `<li data-plan-step="${escapeHtml(node.node_id)}"><b>${isolate(node.label || node.node_id)}</b> · ${escapeHtml(kindLabel(node.kind))} · ${places.length ? escapeHtml(places.join(", ")) : "GPU를 쓰지 않음"} · 최대 ${escapeHtml(usd(node.max_estimated_cost_usd))}${waiting.has(node.node_id) ? ` <span class="plan-wait">${WAITING_TEXT}</span>` : ""}</li>`;
   }).join("");
   return `<section class="plan-summary" aria-labelledby="plan-summary-title"><div class="plan-summary-head"><h4 id="plan-summary-title" tabindex="-1">${summary.simulation ? "모의 실행 계획" : "실제 실행 계획"}</h4>
       ${statusPill(summary.simulation ? "neutral" : "warn", summary.simulation ? "GPU·데이터 전송 없음" : "승인 필요 · 실행·데이터 전송")}</div>

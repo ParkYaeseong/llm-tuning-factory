@@ -886,3 +886,23 @@ test("a card whose recipe cannot be read blocks planning with its reason", async
   await expect(panel(page).locator('tr[data-plan-node="train-1"]')).toContainText("primary");
   await expect(page.locator("img")).toHaveCount(0);
 });
+
+// -- 11.5 R3 M2: user names inside sentences --
+test("step and project names in the plan and its dialog are isolated from the text around them", async ({ page }) => {
+  const rlo = String.fromCharCode(0x202E);
+  const label = `학습 ${rlo}A1`;
+  await openWorkbench(page, options());
+  await installPlanFake(page, { plans: [ok(summary([planNode("train-1", "train", label, [resource("pod-a")])]))] });
+  const { projectId } = await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label })]) });
+  const current = await bridge(page, "project_get", { project_id: projectId });
+  const name = `계획 프로젝트 ${rlo}B2`;
+  expect((await bridge(page, "project_save", { spec: { ...current.data.project, name }, expected_revision: current.data.revision_sha256 })).status).toBe("ok");
+  await openGraph(page);
+  await plan(page);
+  await expect(panel(page).locator('li[data-plan-step="train-1"] bdi')).toHaveText(label);
+  await approveButton(page).click();
+  const dialog = page.getByRole("dialog", { name: "모의 실행 등록" });
+  await expect(dialog.locator(".plan-approval-head bdi")).toHaveText(name);
+  await dialog.getByRole("button", { name: "돌아가기", exact: true }).click();
+  expect(await calls(page, { action: "graph_submit" })).toEqual([]);
+});

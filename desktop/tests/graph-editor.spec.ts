@@ -632,3 +632,27 @@ test("adding steps stops at 256 connections", async ({ page }) => {
   await expect(toolbar.getByRole("button", { name: "나란히 추가", exact: true })).toBeDisabled();
   await expect(toolbar.getByRole("button", { name: "새 학습 단계", exact: true })).toBeEnabled();
 });
+
+// -- 11.5 R3 M2 --
+test("names in toolbar notes are isolated and recipes that share a name differ in the card's choices", async ({ page }) => {
+  const rlo = String.fromCharCode(0x202E);
+  const label = `학습 ${rlo}A1`;
+  await openWorkbench(page, options());
+  const twin = recipeSpec("twin-sft", "기본 SFT", "lora");                 // another recipe with the same name
+  await seed(page, { recipes: [LORA, twin], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label }),
+    trainNode("train-2", revisions["lora-sft"], { label: "학습 2" })]) });
+  await openGraph(page);
+  await cardButton(page, "train-1").click();
+  const choices = nodeForm(page).getByLabel("레시피").locator("option");
+  await expect(choices.filter({ hasText: "lora-sft" })).toHaveCount(1);
+  await expect(choices.filter({ hasText: "twin-sft" })).toHaveCount(1);
+  await page.locator("#graph-toolbar").getByRole("button", { name: "단계 삭제", exact: true }).click();
+  const note = page.locator(".graph-toolbar-note");
+  await expect(note.locator("bdi")).toHaveText(label);
+  await expect(note).toContainText("단계와 이 단계로 들어오던 연결을 지웠습니다");
+  await cardButton(page, "train-2").click();
+  await page.getByRole("button", { name: "나란히 추가", exact: true }).click();
+  await expect(note.locator("bdi")).toHaveCount(1);
+  await expect(note).toContainText("단계를 추가했습니다");
+  await expect(page.locator("img")).toHaveCount(0);
+});

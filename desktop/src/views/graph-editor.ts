@@ -21,7 +21,7 @@ import { issueList, issuesAt, localize, nodeIssues } from "../issues";
 import { createQueue } from "../poller";
 import type { ProjectDraft } from "../project-store";
 import type { View, ViewContext } from "../view-types";
-import { button, errorText, escapeHtml, focusKey, openDialog, restoreFocus, statusPill } from "../workbench";
+import { button, errorText, escapeHtml, focusKey, isolate, openDialog, restoreFocus, statusPill } from "../workbench";
 import { sessionInspections } from "./executor-profiles";
 import type { BenchmarkRevision, HFRootRef, PublicProfile, RecipeRevision, RecipeSummary, Sha256, WorkflowIssue,
   WorkflowResult } from "../workflow-types";
@@ -47,6 +47,7 @@ const TODO_NAMES: Record<string, string> = { [REASONS.label]: "이름", [REASONS
 // -- module state (the project drafts themselves live in ctx.store) --
 const selection = new Map<string, string>();             // project → selected card
 let addMenu = false;                                     // the "다음 단계 추가" kind choice is open
+/** The toolbar's last note, as escaped markup (a card name in it is isolated with `<bdi>`). */
 let toolbarNote: string | null = null;
 let benchmarkFor: { projectId: string; nodeId: string } | null = null;
 let benchmarkDraft: BenchmarkDraft | null = null;
@@ -86,8 +87,9 @@ const quiet = (html: string) => html.replace(/<summary>/g, '<summary tabindex="-
 const summaryOf = (revision: RecipeRevision): RecipeSummary => ({ recipe_id: revision.recipe.recipe_id, version: revision.recipe.version,
   name: revision.recipe.name, description: revision.recipe.description, training_stage: revision.recipe.training_stage,
   training_method: revision.recipe.training_method, input_kind: revision.recipe.input_kind, revision_sha256: revision.revision_sha256 });
+/** A recipe choice: its name, then its ID and version (two recipes may share a name), stage and method. */
 const recipeText = (recipe: RecipeSummary) =>
-  `${recipe.name} · v${recipe.version} · ${String(recipe.training_stage).toUpperCase()} · ${METHOD_LABELS[recipe.training_method] ?? recipe.training_method}`;
+  `${recipe.name} · ${recipe.recipe_id} v${recipe.version} · ${String(recipe.training_stage).toUpperCase()} · ${METHOD_LABELS[recipe.training_method] ?? recipe.training_method}`;
 const isRootInput = (value: unknown): value is { policy: { base: HFRootRef; adapter: null }; initialization: string } =>
   isObject(value) && isObject(value.policy) && isObject(value.policy.base) && typeof value.policy.base.repo_id === "string" && value.policy.adapter == null;
 
@@ -259,7 +261,7 @@ function toolbarHtml(ctx: ViewContext, view: Shown): string {
     <button type="button" data-action="wf:graph:add-parallel"${off(!selected || linked)}>나란히 추가</button>
     <button type="button" data-action="wf:graph:add-root"${off(full)}>새 학습 단계</button>
     <button type="button" data-action="wf:graph:remove"${off(!selected)}>단계 삭제</button></div>${menu}${note}
-    <p class="muted graph-toolbar-note" role="status">${toolbarNote ? escapeHtml(toolbarNote) : ""}</p>`;
+    <p class="muted graph-toolbar-note" role="status">${toolbarNote ?? ""}</p>`;
 }
 
 function previewHtml(view: Shown): string {
@@ -310,7 +312,7 @@ function blockedHtml(view: Shown, nodeId: string, port: InputPort, onlyEvaluatio
     && (!onlyEvaluations || findNode(view.graph, option.value.node_id)?.kind === "evaluate"));
   if (!blocked.length) return "";
   return `<div class="graph-blocked"><p class="graph-blocked-title">연결할 수 없는 단계</p><ul>${blocked.map(option =>
-    `<li>${escapeHtml(labelOf(findNode(view.graph, option.value.node_id)))} · ${escapeHtml(option.reason)}</li>`).join("")}</ul></div>`;
+    `<li>${isolate(labelOf(findNode(view.graph, option.value.node_id)))} · ${escapeHtml(option.reason)}</li>`).join("")}</ul></div>`;
 }
 const refValue = (value: unknown) => isRef(value) ? `node:${value.node_id}` : value === undefined || value === null ? "" : "keep";
 
@@ -407,7 +409,7 @@ function selectFields(view: Shown, node: Obj, at: (field: string) => WorkflowIss
     const id = option.value.node_id;
     const reason = option.reason ?? (edgesFull && !chosen.has(id) ? REASONS.edgeLimit : undefined);
     const off = Boolean(reason) && !chosen.has(id);
-    return `<label class="check"><input type="checkbox" id="node-evaluation-${index}" data-focus-key="evaluation:${escapeHtml(id)}" data-node-evaluation="${escapeHtml(id)}"${chosen.has(id) ? " checked" : ""}${off ? " disabled" : ""}>${escapeHtml(labelOf(findNode(view.graph, id)))}${reason ? ` <small>${escapeHtml(reason)}</small>` : ""}</label>`;
+    return `<label class="check"><input type="checkbox" id="node-evaluation-${index}" data-focus-key="evaluation:${escapeHtml(id)}" data-node-evaluation="${escapeHtml(id)}"${chosen.has(id) ? " checked" : ""}${off ? " disabled" : ""}>${isolate(labelOf(findNode(view.graph, id)))}${reason ? ` <small>${escapeHtml(reason)}</small>` : ""}</label>`;
   }).join("");
   const selection: Obj = isObject(node.selection) ? node.selection : {};
   const kinds = selectionEvaluators(view.graph, node as NodeJson, view.dctx);
@@ -701,11 +703,11 @@ function addAndFocus(ctx: ViewContext, projectId: string, build: (graph: GraphJs
   if (!draft) return;
   let created: { graph: GraphJson; id: string };
   try { created = build(graphOf(draft), draftContext(draft)); }
-  catch (error) { toolbarNote = errorText(error); ctx.render(); return; }
+  catch (error) { toolbarNote = escapeHtml(errorText(error)); ctx.render(); return; }
   ctx.store.edit(projectId, spec => { spec.graph = graphToJson(created.graph); });
   selection.set(projectId, created.id);
   addMenu = false;
-  toolbarNote = `‘${labelOf(findNode(created.graph, created.id))}’ 단계를 추가했습니다. 저장해야 반영됩니다.`;
+  toolbarNote = `‘${isolate(labelOf(findNode(created.graph, created.id)))}’ 단계를 추가했습니다. 저장해야 반영됩니다.`;
   ctx.render();
   focusLabel();
 }
@@ -742,7 +744,7 @@ function removeCard(ctx: ViewContext) {
   if (next) selection.set(projectId, next); else selection.delete(projectId);
   if (benchmarkFor?.nodeId === id) benchmarkFor = null;
   addMenu = false;
-  toolbarNote = `‘${label}’ 단계와 이 단계로 들어오던 연결을 지웠습니다. 저장하기 전에는 저장된 그래프가 바뀌지 않습니다.`;
+  toolbarNote = `‘${isolate(label)}’ 단계와 이 단계로 들어오던 연결을 지웠습니다. 저장하기 전에는 저장된 그래프가 바뀌지 않습니다.`;
   ctx.render();
   // The last card gone: the empty graph has no toolbar, only its starting shapes.
   if (next) restoreFocus(document, `card:${next}`); else document.querySelector<HTMLButtonElement>(".graph-starters button")?.focus();

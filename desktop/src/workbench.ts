@@ -1,6 +1,14 @@
 type Obj = Record<string, any>;
 export const escapeHtml = (v: unknown) => String(v ?? "").replace(/[&<>"']/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
+/** A user-provided name inside a sentence, escaped and isolated from the text around it (`<bdi>`: a right-to-left
+ * override or a right-to-left name cannot reorder the rest of the sentence). */
+export const isolate = (name: unknown) => `<bdi>${escapeHtml(name)}</bdi>`;
+/** Unicode format characters (category Cf: zero-width spaces and joiners, bidi controls, soft hyphens, BOM), which
+ * render as nothing or reorder text. */
+const FORMAT_CHARACTERS = /\p{Cf}/gu;
+/** A name as it can be typed: NFC, trimmed, without format characters (a typed confirmation compares this on both sides). */
+export const typedForm = (name: string) => name.replace(FORMAT_CHARACTERS, "").normalize("NFC").trim();
 const paths: Record<string, string> = {
   overview: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
   training: '<path d="M9 3h6m-5 0v6L4 19a1.5 1.5 0 0 0 1.3 2h13.4A1.5 1.5 0 0 0 20 19L14 9V3M7 14h10"/>',

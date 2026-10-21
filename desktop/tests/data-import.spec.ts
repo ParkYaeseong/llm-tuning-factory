@@ -826,3 +826,35 @@ test("a changed preview is reported once and names keep their direction", async 
   await expect(page.locator("#import-preview-state")).toContainText(changed);
   await expect(registerButton(page)).toBeDisabled();
 });
+
+// -- 11.5 R3 M1 and M2 --
+test("counts from a malformed answer are never inserted as markup", async ({ page }) => {
+  await openWorkbench(page, { workflow: { dataset_import_source: sourceOk,
+    dataset_import_preview: [discovery(), mappedPreview("2".repeat(64), { row_count: HOSTILE, canonical_size: HOSTILE })],
+    dataset_import_register: registered(),
+    dataset_split_preview: ok({ plan_sha256: PLAN, counts: { train: HOSTILE, validation: 1, test: 1 }, outputs: splitOutputs() }) } });
+  await readyToRegister(page);
+  await expect(page.locator(".import-facts")).toContainText("행 —");
+  await expect(page.locator("img")).toHaveCount(0);
+  await register(page);
+  const split = page.locator("#import-split");
+  await split.getByRole("button", { name: "분할 미리보기", exact: true }).click();
+  await idle(page);
+  await expect(split.locator(".import-counts")).toHaveText("학습 — · 검증 1 · 시험 1");
+  await expect(page.locator("img")).toHaveCount(0);
+});
+
+test("the project name in the import banner is isolated from the sentence around it", async ({ page }) => {
+  const name = `${String.fromCharCode(0x202E)}서열 요약`;           // a right-to-left override inside a user-chosen name
+  await openWorkbench(page, { definitions: true });
+  await page.evaluate(name => (window as any).__TAURI_INTERNALS__.invoke("workflow_action",
+    { action: "project_create", data: { request_id: "req-bidi", name, purpose: "", task_type: "" } }), name);
+  await page.locator('nav [data-action="nav:projects"]').click();
+  await idle(page);
+  await page.locator(".project-list tbody tr").getByRole("button", { name: /열기/ }).click();
+  await idle(page);
+  await page.locator("#project-form").getByRole("button", { name: "CSV·JSON 가져오기", exact: true }).click();
+  await expect(heading(page)).toHaveText("데이터 가져오기");
+  await expect(page.locator("#data-import-page .wf-banner bdi")).toHaveText(name);
+  await expect(page.locator("#data-import-page .wf-banner")).toContainText("에 연결할 데이터를 가져옵니다");
+});
