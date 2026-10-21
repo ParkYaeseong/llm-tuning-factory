@@ -341,8 +341,9 @@ test("a blank project reaches a dry-run plan through the screens without example
         gpu_count: 1, total_hourly_cost_usd: 1.5, cost_source: "estimate" }] }] };
   const projectId = await blankProjectToGraph(page, {
     graph_submit: ok({ run_id: runId, status: "RUNNING", simulation: true, plan_sha256: H("f"), controller: absent }),
-    graph_runs_list: ok({ runs: [{ run_id: runId, status: "RUNNING", simulation: true, plan_sha256: H("f"), created: 1792540800,
-      nodes_by_status: { PENDING: 1 } }], controller: absent }),
+    // The approval first looks for a run of the same plan (none yet); the runs page then lists the new one.
+    graph_runs_list: [ok({ runs: [], controller: absent }), ok({ runs: [{ run_id: runId, status: "RUNNING", simulation: true, plan_sha256: H("f"),
+      created: 1792540800, nodes_by_status: { PENDING: 1 } }], controller: absent })],
     graph_run_get: ok({ run, controller: absent, plan: null, tracking_failures: [] }),
   }, DRY_PLAN);
   // 5. An estimate for the dry run, chosen on the card, saved with the graph.
@@ -385,5 +386,5 @@ test("a blank project reaches a dry-run plan through the screens without example
   await expect(page.locator(`#app [data-tour="graph-runs"] tr[data-run-id="${runId}"]`)).toHaveCount(1);
   await expect(page.locator("#run-detail")).toContainText("학습 1");
   expect(await calls(page, { command: "controller_start" })).toEqual([]);
-  await expectFlow(page, [...FLOW, "graph_plan", "graph_submit", "graph_runs_list"]);
+  await expectFlow(page, [...FLOW, "graph_plan", "graph_runs_list", "graph_submit"]);
 });

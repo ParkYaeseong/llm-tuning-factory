@@ -42,14 +42,16 @@ export const costSource = (source: string) => COST_SOURCES[source] ?? source;
 export const gpuText = (gpuType: unknown, gpuCount: unknown) => `${String(gpuType ?? "")} ×${String(gpuCount ?? "")}`;
 /** A destination's name: the native profile's name, "계획용 추정" for an estimate, else the ID. */
 export function profileName(profileId: string, profiles: readonly PublicProfile[]): string {
-  const native = profiles.find(profile => profile.profile_id === profileId);
-  if (native) return native.fields?.name || profileId;
-  return profileId.startsWith("estimate-") ? "계획용 추정" : profileId;
+  const id = String(profileId ?? "");                     // plan data is untrusted: never a method call on a non-string
+  const native = profiles.find(profile => profile.profile_id === id);
+  if (native) return String(native.fields?.name || id);
+  return id.startsWith("estimate-") ? "계획용 추정" : id;
 }
 /** "A100 Pod (pod-a)", or the ID alone when it is its own name. */
 export function profileText(profileId: string, profiles: readonly PublicProfile[]): string {
-  const name = profileName(profileId, profiles);
-  return name === profileId ? profileId : `${name} (${profileId})`;
+  const id = String(profileId ?? "");
+  const name = profileName(id, profiles);
+  return name === id ? id : `${name} (${id})`;
 }
 
 /** Each destination of the plan once, with the steps allowed on it (in plan order). */

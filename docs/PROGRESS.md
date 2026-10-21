@@ -5102,6 +5102,68 @@ Still unverified, for Task 11 (installed app):
 - screen readers (Narrator, NVDA): accessible names are checked only as Playwright computes them;
 - the 16-step tour in WebView2 (Task 10 §5 item 7) and the rest of Task 10 §5.
 
+## Task 10.6 review fixes: stale projects reload, no second run of a plan, 2026-10-21
+
+Commit `fix: reload the latest project on stale plans and stop duplicate runs after restart`, in the worktree
+`D:\llm-tuning-factory-wt102` on `7321c1b`. It follows the independent review of `7ba0341`/`c10d9f4`/`248aa37`
+("Ready with fixes"; approval integrity held on every path). Changed: `desktop/src/components/{plan-panel,plan-dialog}.ts`,
+`desktop/src/views/graph-editor.ts`, `desktop/src/workbench.ts` (`swallowRepeat`), `desktop/tests/{graph-plan,graph-editor}.spec.ts`
+(new tests; the plan fake also answers `recipe_get` by revision and the default runs list is empty),
+`desktop/tests/workflow-regression.spec.ts` (see the deviation) and this file.
+
+- I1: a project saved elsewhere is no longer a dead end.
+  - A submit's `plan_stale` at `/project`, or an inputs save's (or plan's) `revision_conflict`, marks the saved
+    revision stale.
+  - While it is, "계획 확인" and "다시 계획" are blocked with "최신 버전을 불러오세요". The banner (or, without one,
+    the action row) offers the page's own "최신 버전 불러오기" (confirm, `store.reloadLatest`), which takes the focus.
+  - After the reload, "다시 계획" plans the latest revision.
+- M1: before the approval opens for a plan without a receipt in this session, `graph_runs_list` is read.
+  - A run with the same `plan_sha256` (registered before a restart, or by another window) replaces the approve button
+    with "이 계획으로 등록한 실행이 있습니다 · 실행 보기" (focused). Nothing is submitted.
+  - A list that cannot be read (bridge error, refusal, `not_available`, malformed) opens no approval and says why.
+  - Entries carry `plan_sha256` (`workflow_runs._run_summary`). An unreadable entry (`{run_id, error}`) cannot be
+    matched and is passed over.
+- M2: `isSummary` checks every string the panel and the dialog read, including each allowed resource's profile,
+  resource, GPU and cost source, and each dataset's ID, version and hash. `profileName`/`profileText` coerce with
+  `String()`. A malformed answer is refused with "엔진 응답 형식이 올바르지 않습니다." and the page stays.
+- The in-flight basis:
+  - a plan answered after a profile or settings change, or after its planning inputs changed (M4), is dropped;
+  - the notice then says "계획을 만드는 동안 …", not "계획을 만들었습니다" (M5);
+  - a refusal after the dialog because another task is running says so.
+- `swallowRepeat` ignores events inside an open dialog. The closed one is removed, so such a dialog is a new one, and
+  its confirm at the same spot within 400 ms is no longer eaten.
+- M3: re-entering compares stored inputs with the session's only on the saved graph's non-select cards, so a limit kept
+  for a removed card no longer drops a held plan.
+- M6: at 256 connections, "다음 단계 추가" and "나란히 추가" are disabled; "새 학습 단계" (unconnected) stays.
+- M7: a train card whose recipe revision this page could not read blocks planning. The blocker reads "레시피 정보를
+  확인할 수 없어 실행 환경(primary·ppo)을 정할 수 없습니다: …" and the runtime column shows "확인 불가": a PPO
+  recipe is never planned on "primary" by guess.
+
+Deviation: `workflow-regression.spec.ts` (10.8) scripted `graph_runs_list` to hold the run before it was submitted and
+pinned `graph_runs_list` after `graph_submit` in the first-call order. M1 must read the list before the approval, so its
+mock now answers no runs first and the run second, and the pinned order is `graph_plan`, `graph_runs_list`,
+`graph_submit`. Nothing else in that test changed.
+
+Actual verification:
+- RED first: the 9 new tests failed on their assertions.
+  - "다시 계획" was still offered after `plan_stale` at `/project`.
+  - "계획 확인" stayed enabled after the inputs conflict.
+  - The approval opened for a plan whose run exists.
+  - No malformed-answer error appeared (the page threw `profileId.startsWith is not a function`).
+  - The in-flight notice said "계획을 만들었습니다".
+  - The new dialog's same-spot confirm was swallowed under a paused clock.
+  - A re-entry dropped the held plan.
+  - Planning was enabled with an unreadable recipe.
+  - The toolbar's add buttons were enabled at 256 connections.
+- The regression test failed with the old code once its mock answered no runs first.
+- Mutants were killed: the in-flight guard (the 10.6 survivor) and stale marking on an inputs conflict.
+- Playwright ran against this worktree's own Vite (scratch config under `%TEMP%`, port 1481,
+  `reuseExistingServer: false`). `npx playwright test` **246 passed** (237 + 9 new), including the bidirectional-control
+  scan.
+- `npm run build` passes.
+- `pytest -q` **1716 passed, 1 skipped**; Ruff passes; `check_secrets.py` 0 findings; the protected-path diff is clean;
+  every changed file is CR-free.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

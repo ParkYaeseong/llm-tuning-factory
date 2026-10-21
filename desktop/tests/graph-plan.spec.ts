@@ -99,6 +99,7 @@ async function installPlanFake(page: Page, options: { stored?: object | null; pl
     const sorted = (value: any): any => Array.isArray(value) ? value.map(sorted) : value && typeof value === "object"
       ? Object.fromEntries(Object.keys(value).sort().map(key => [key, sorted(value[key])])) : value;
     const projects: Record<string, any> = {};
+    const recipes: Record<string, any> = {};
     const records: Record<string, any> = {};
     let position = 0;
     w.__storeInputs = (projectId: string, record: unknown) => { records[projectId] = record; };
@@ -111,6 +112,11 @@ async function installPlanFake(page: Page, options: { stored?: object | null; pl
       // `sortKeys`: projects come back as the backend stores them (projects._json_object: sorted keys).
       if (sortKeys && ["project_create", "project_save", "project_get"].includes(action) && answer?.status === "ok") answer.data.project = sorted(answer.data.project);
       if ((action === "project_create" || action === "project_save") && answer?.status === "ok") projects[answer.data.project.project_id] = answer.data;
+      // 9.8's recipe_get by revision hash alone (the definitions fake needs the recipe ID), from the revisions saved.
+      if (action === "recipe_save" && answer?.status === "ok") recipes[answer.data.revision_sha256] = answer.data;
+      if (action === "recipe_get" && typeof data.revision_sha256 === "string" && !data.recipe_id)
+        return recipes[data.revision_sha256] ? result("ok", structuredClone(recipes[data.revision_sha256]))
+          : result("invalid", null, [{ code: "unknown_definition", path: "/revision_sha256", message: "unknown definition revision" }]);
       if (action === "planning_inputs_get" || action === "planning_inputs_save") {
         const project = projects[data.project_id];
         if (!project) return result("invalid", null, [{ code: "unknown_definition", path: "/project_id", message: "unknown definition" }]);
@@ -167,9 +173,12 @@ async function plan(page: Page) {
   await planButton(page).click();
   await idle(page);
 }
+/** No run exists yet unless a test says otherwise (the approval first looks for a run of the same plan). */
+const NO_RUNS = ok({ runs: [], controller: { owner_id: null, state: "absent", heartbeat_age_seconds: null } });
 const options = (extra: BridgeOptions = {}): BridgeOptions => ({ definitions: true, profiles: PROFILES, ...extra,
   catalog: { datasets: CATALOG_DATASETS, ...(extra.catalog ?? {}) },
-  workflow: { model_roots_list: ok({ roots: [ROOT_ENTRY] }), benchmarks_list: ok({ benchmarks: [] }), graph_validate: VALID, ...(extra.workflow ?? {}) } });
+  workflow: { model_roots_list: ok({ roots: [ROOT_ENTRY] }), benchmarks_list: ok({ benchmarks: [] }), graph_validate: VALID, graph_runs_list: NO_RUNS,
+    ...(extra.workflow ?? {}) } });
 
 test("a dry run is the default plan and needs no transfer approval", async ({ page }) => {
   await openWorkbench(page, options({ workflow: { graph_submit: submitted(true) } }));
@@ -469,9 +478,10 @@ test("after submit the run opens and starting the controller stays explicit", as
   const run = { run_id: RUN, status: "RUNNING", simulation: true, plan_sha256: H("f"), approved_cost_usd: 7.56, reserved_cost_usd: 0,
     budget_exhausted: false, unpriced_attempts: 0, created: 1792540800,
     tracking: { events: {}, graph: "not_started", action: null }, nodes: [node] };
+  // The list before the approval has no run of this plan; the runs page then lists the new one.
   await openWorkbench(page, options({ workflow: { graph_submit: submitted(true, "absent"),
-    graph_runs_list: ok({ runs: [{ run_id: RUN, status: "RUNNING", simulation: true, plan_sha256: H("f"), created: 1792540800, nodes_by_status: { PENDING: 1 } }],
-      controller: controllerView("absent") }),
+    graph_runs_list: [NO_RUNS, ok({ runs: [{ run_id: RUN, status: "RUNNING", simulation: true, plan_sha256: H("f"), created: 1792540800, nodes_by_status: { PENDING: 1 } }],
+      controller: controllerView("absent") })],
     graph_run_get: ok({ run, controller: controllerView("absent"), plan: null, tracking_failures: [] }),
     controller_status: ok({ controller: controllerView("absent"), current: null, broker: null, stop_requested: false,
       restart_required: { profiles: [], tracking: false }, runs: { active: 1 } }) } }));
@@ -697,4 +707,181 @@ test("edits that leave the saved graph as it is keep the plan, with the backend'
   await expect(dropped(page)).toContainText("프로젝트 초안이 바뀌었습니다");
   await nodeForm(page).getByLabel("기준값 (선택)").fill("0.5");
   await expect(page.locator("#graph-head")).not.toContainText("저장 안 된 변경");
+});
+
+// -- 10.6 review fixes --
+test("a plan made stale by another save of the project offers the latest version, then plans it", async ({ page }) => {
+  await openWorkbench(page, options({ workflow: { graph_submit: conflict([issue("plan_stale", PLAN_STALE, "/project")]) } }));
+  await installPlanFake(page, { plans: [ONE_STEP] });
+  const { projectId } = await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label: "기준 학습" })]) });
+  await openGraph(page);
+  await plan(page);
+  const planned = await currentRevision(page, projectId);
+  // Another window saves the project; the submit of the plan is then stale at /project.
+  const current = await bridge(page, "project_get", { project_id: projectId });
+  expect((await bridge(page, "project_save", { spec: { ...current.data.project, purpose: "다른 창" }, expected_revision: planned })).status).toBe("ok");
+  await approveButton(page).click();
+  await page.getByRole("dialog", { name: "모의 실행 등록" }).getByRole("button", { name: "모의 실행 등록", exact: true }).click();
+  await idle(page);
+  await expect(dropped(page)).toContainText("프로젝트");
+  // Planning the same (old) revision again cannot help: the latest version is offered instead.
+  await expect(dropped(page).getByRole("button", { name: "다시 계획", exact: true })).toHaveCount(0);
+  await expect(planButton(page)).toBeDisabled();
+  await expect(panel(page).locator(".plan-blockers")).toContainText("최신 버전을 불러오세요");
+  const reload = dropped(page).getByRole("button", { name: "최신 버전 불러오기", exact: true });
+  await expect(reload).toBeFocused();
+  await reload.click();
+  await page.getByRole("dialog", { name: "최신 버전 불러오기" }).getByRole("button", { name: "불러오기", exact: true }).click();
+  await idle(page);
+  await expect(planButton(page)).toBeEnabled();
+  await dropped(page).getByRole("button", { name: "다시 계획", exact: true }).click();
+  await idle(page);
+  const requests = await dataOf(page, "graph_plan");
+  expect(requests.map(request => request.project_revision)).toEqual([planned, await currentRevision(page, projectId)]);
+  await expect(approveButton(page)).toBeEnabled();
+});
+
+test("planning inputs refused for a project saved elsewhere offer the latest version", async ({ page }) => {
+  await openWorkbench(page, options());
+  await installPlanFake(page, { plans: [ONE_STEP] });
+  const { projectId } = await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label: "기준 학습" })]) });
+  await openGraph(page);
+  await limit(page, "train-1").fill("90");
+  const current = await bridge(page, "project_get", { project_id: projectId });
+  await bridge(page, "project_save", { spec: { ...current.data.project, purpose: "다른 창" }, expected_revision: current.data.revision_sha256 });
+  await plan(page);
+  expect(await calls(page, { action: "graph_plan" })).toEqual([]);
+  await expect(panel(page).locator("#plan-actions")).toContainText("최신 프로젝트를 불러온 뒤 다시 저장하세요");
+  await expect(planButton(page)).toBeDisabled();
+  await panel(page).locator("#plan-actions").getByRole("button", { name: "최신 버전 불러오기", exact: true }).click();
+  await page.getByRole("dialog", { name: "최신 버전 불러오기" }).getByRole("button", { name: "불러오기", exact: true }).click();
+  await idle(page);
+  await expect(limit(page, "train-1")).toHaveValue("90");
+  await plan(page);
+  const latest = await currentRevision(page, projectId);
+  expect((await dataOf(page, "planning_inputs_save")).at(-1)).toMatchObject({ project_revision: latest, node_time_limits: [{ node_id: "train-1", timeout_minutes: 90 }] });
+  expect((await dataOf(page, "graph_plan")).map(request => request.project_revision)).toEqual([latest]);
+  await expect(approveButton(page)).toBeEnabled();
+});
+
+test("a plan that already has a run is never approved again, also after a restart", async ({ page }) => {
+  const existing = ok({ runs: [{ run_id: "b".repeat(32), status: "RUNNING", simulation: true, plan_sha256: H("f"), created: 1792540800,
+    nodes_by_status: { PENDING: 1 } }, { run_id: "c".repeat(32), error: "unreadable" }], controller: controllerView("absent") });
+  await openWorkbench(page, options({ workflow: { graph_runs_list: [{ reject: "실행 기록을 읽을 수 없습니다." }, existing], graph_submit: submitted(true) } }));
+  await installPlanFake(page, { plans: [ONE_STEP] });
+  await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label: "기준 학습" })]) });
+  await openGraph(page);
+  await plan(page);
+  // The runs cannot be read: no approval opens (a run of this plan might exist).
+  await approveButton(page).click();
+  await idle(page);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(page.locator(".notice.error")).toContainText("기존 실행을 확인하지 못해");
+  await expect(page.locator(".notice.error")).toContainText("실행 기록을 읽을 수 없습니다.");
+  // A run of this plan exists (registered before a restart, whose request ID is gone): it is shown instead.
+  await approveButton(page).click();
+  await idle(page);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  const result = panel(page).locator(".plan-summary");
+  await expect(result).toContainText("이 계획으로 등록한 실행이 있습니다");
+  await expect(approveButton(page)).toHaveCount(0);
+  const open = result.getByRole("button", { name: "실행 보기", exact: true });
+  await expect(open).toBeFocused();
+  expect(await calls(page, { action: "graph_submit" })).toEqual([]);
+  expect(await calls(page, { action: "graph_runs_list" })).toHaveLength(2);
+  await open.click();
+  await expect(heading(page)).toHaveText("그래프 실행");
+  expect(await calls(page, { action: "graph_submit" })).toEqual([]);
+});
+
+test("a malformed plan answer is refused without breaking the page", async ({ page }) => {
+  const broken = ok(summary([planNode("train-1", "train", "기준 학습", [{ ...resource("pod-a"), profile_id: 5 }])]));
+  await openWorkbench(page, options());
+  await installPlanFake(page, { plans: [broken, ONE_STEP] });
+  await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label: "기준 학습" })]) });
+  await openGraph(page);
+  await plan(page);
+  await expect(page.locator(".notice.error")).toContainText("엔진 응답 형식이 올바르지 않습니다.");
+  await expect(approveButton(page)).toHaveCount(0);
+  await plan(page);
+  await expect(approveButton(page)).toBeEnabled();
+});
+
+test("a settings save while the plan is being made drops that plan", async ({ page }) => {
+  await openWorkbench(page, options({ holds: ["graph_plan"] }));
+  await installPlanFake(page, { plans: [ONE_STEP] });
+  await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label: "기준 학습" })]) });
+  await openGraph(page);
+  await planButton(page).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__held("graph_plan"))).toBe(1);
+  // Meanwhile the connection settings are saved (the busy-disabled button re-enabled by script).
+  await page.locator('nav [data-action="nav:connections"]').click();
+  await page.evaluate(() => { document.querySelector<HTMLButtonElement>('#settings-form button[type="submit"]')!.disabled = false; });
+  await page.getByRole("button", { name: "연결 정보 저장", exact: true }).click();
+  await expect.poll(async () => (await calls(page, { command: "settings_save" })).length).toBe(1);
+  await page.evaluate(() => (window as any).__release("graph_plan"));
+  await idle(page);
+  await expect(page.locator(".notice:not(.busy):not(.error)")).toContainText("계획을 만드는 동안");
+  await expect(page.locator(".notice:not(.busy):not(.error)")).not.toContainText("계획을 만들었습니다");
+  await openGraph(page);
+  await expect(dropped(page)).toContainText("계획을 만드는 동안");
+  await expect(approveButton(page)).toHaveCount(0);
+});
+
+test("a confirm right after another dialog closed at the same spot is not swallowed", async ({ page }) => {
+  const refused = invalid([issue("export_not_allowed", EXPORT_NOT_ALLOWED, "/plan_sha256", { node_id: "train-1" })]);
+  await openWorkbench(page, options({ clock: true, workflow: { graph_submit: [refused, submitted(true)] } }));
+  await installPlanFake(page, { plans: [ONE_STEP] });
+  await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label: "기준 학습" })]) });
+  await openGraph(page);
+  await plan(page);
+  // The clock stands still from here: every later click is "within 400 ms" of the first dialog's close.
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000));
+  const dialog = page.getByRole("dialog", { name: "모의 실행 등록" });
+  await approveButton(page).click();
+  await dialog.getByRole("button", { name: "모의 실행 등록", exact: true }).click();
+  await idle(page);
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(panel(page).locator(".plan-summary")).toContainText(EXPORT_NOT_ALLOWED);
+  // The new dialog's confirm sits where the closed one's was: a click inside it is meant for it.
+  await approveButton(page).click();
+  await dialog.getByRole("button", { name: "모의 실행 등록", exact: true }).click();
+  await expect(heading(page)).toHaveText("그래프 실행");
+  expect(await calls(page, { action: "graph_submit" })).toHaveLength(2);
+});
+
+test("re-entering with the stored inputs of the saved graph keeps a held plan", async ({ page }) => {
+  await openWorkbench(page, options());
+  await installPlanFake(page, { plans: [ONE_STEP] });
+  await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label: "기준 학습" }),
+    evalNode("eval-1", "train-1", { label: "평가" })]) });
+  await openGraph(page);
+  await limit(page, "eval-1").fill("90");
+  await plan(page);
+  // eval-1 goes: the saved graph no longer has it, and the next plan saves the inputs without it.
+  await cardButton(page, "eval-1").click();
+  await page.locator("#graph-toolbar").getByRole("button", { name: "단계 삭제", exact: true }).click();
+  await page.locator("#graph-head").getByRole("button", { name: "저장", exact: true }).click();
+  await idle(page);
+  await plan(page);
+  expect((await dataOf(page, "planning_inputs_save")).at(-1).node_time_limits).toEqual([]);
+  await expect(approveButton(page)).toBeEnabled();
+  await page.locator('nav [data-action="nav:projects"]').click();
+  await openGraph(page);
+  await expect(approveButton(page)).toBeEnabled();
+  await expect(dropped(page)).toHaveCount(0);
+});
+
+test("a card whose recipe cannot be read blocks planning with its reason", async ({ page }) => {
+  await openWorkbench(page, options());
+  await installPlanFake(page, { plans: [ONE_STEP] });
+  await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label: "기준 학습" }),
+    trainNode("train-2", H("9"), { label: `${HOSTILE} 레시피` })]) });
+  await openGraph(page);
+  await expect(planButton(page)).toBeDisabled();
+  await expect(panel(page).locator(".plan-blockers")).toContainText("실행 환경(primary·ppo)");
+  await expect(panel(page).locator(".plan-blockers")).toContainText(`${HOSTILE} 레시피`);
+  await expect(panel(page).locator('tr[data-plan-node="train-2"]')).toContainText("확인 불가");
+  await expect(panel(page).locator('tr[data-plan-node="train-1"]')).toContainText("primary");
+  await expect(page.locator("img")).toHaveCount(0);
 });

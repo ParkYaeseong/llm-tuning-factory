@@ -43,6 +43,10 @@ const MISMATCH = "엔진이 요청과 다른 프로젝트·버전·실행 종류
 const PLAN_REFUSED = "계획을 만들 수 없습니다. 아래 확인할 점을 고친 뒤 다시 계획하세요.";
 const INPUTS_REFUSED = "계획 입력을 저장하지 못해 계획하지 않았습니다. 아래 확인할 점을 보세요.";
 const DROPPED_PREFIX = "변경되어 다시 계획해야 합니다: ";
+const PROJECT_STALE = "다른 곳에서 이 프로젝트를 저장했습니다 · 최신 버전을 불러오세요. 지금 버전으로 다시 계획해도 등록할 수 없습니다.";
+const RECIPE_UNKNOWN = "레시피 정보를 확인할 수 없어 실행 환경(primary·ppo)을 정할 수 없습니다";
+const RUNS_UNREAD = "기존 실행을 확인하지 못해 승인하지 않았습니다. 같은 계획이 이미 등록되어 있을 수 있으니 다시 시도하세요.";
+const RUN_EXISTS = "이 계획으로 등록한 실행이 있습니다";
 /** Fixed texts of non-blocking warnings shown at their profile; the backend text stays under "원문 보기". */
 const WARNING_TEXTS: Record<string, string> = {
   observation_revision_differs: "자원 확인 후 프로필이 바뀌었습니다 · 모의 계획은 확인 당시 자원으로 계산했습니다",
@@ -52,7 +56,10 @@ const WARNING_TEXTS: Record<string, string> = {
 interface Feedback { revision: Sha256; issues: WorkflowIssue[]; warnings: WorkflowIssue[]; estimates: string[]; nodes: string[] }
 const feedback = new Map<string, Feedback>();            // project → the last plan (or refused inputs save) answer
 const submitFeedback = new Map<string, { plan: Sha256; issues: WorkflowIssue[] }>();
-const submittedRuns = new Map<Sha256, string>();         // plan hash → the run registered from this app
+const submittedRuns = new Map<Sha256, string>();         // plan hash → its run (registered here, or found in the run list)
+/** Project → the saved revision another window replaced (a submit's `plan_stale` at /project, an inputs save's
+ * `revision_conflict`): planning it again cannot be registered, so the latest version is offered instead. */
+const staleRevision = new Map<string, Sha256>();
 const storedInputs = new Map<string, StoredPlanningInputs | null>();   // project → as last read or saved
 const pendingApply = new Map<string, StoredPlanningInputs | null>();   // project → a read not yet applied to its draft
 const changedInputs = new Set<string>();                 // projects whose inputs this session changed since then
@@ -93,6 +100,18 @@ export function runtimeOf(node: NodeJson, recipes: ReadonlyMap<Sha256, RecipeSum
   const revision = (node as Obj).recipe_revision;
   return node.kind === "train" && typeof revision === "string" && recipes.get(revision)?.training_stage === "ppo" ? "ppo" : "primary";
 }
+/** A train card that names a recipe revision this page could not read: its runtime (PPO or not) is unknown. */
+const recipeUnknown = (node: NodeJson, recipes: ReadonlyMap<Sha256, RecipeSummary>) => {
+  const revision = (node as Obj).recipe_revision;
+  return node.kind === "train" && typeof revision === "string" && !recipes.has(revision);
+};
+/** Whether another window saved the project over the revision this draft holds (known from a refusal). */
+const projectStale = (draft: ProjectDraft) => Boolean(draft.saved) && staleRevision.get(draft.projectId) === draft.saved!.revision_sha256;
+const markStale = (draft: ProjectDraft, issues: WorkflowIssue[]) => {
+  const stale = issues.some(issue => (issue.code === "plan_stale" && issue.path === "/project")
+    || (issue.code === "revision_conflict" && planSection(issue).section === "project"));
+  if (stale && draft.saved) staleRevision.set(draft.projectId, draft.saved.revision_sha256);
+};
 
 /**
  * The graph_plan request of a saved draft: `node_resources` for every non-select node of `graph` (the saved graph:
@@ -121,10 +140,15 @@ function badLimits(draft: ProjectDraft): string[] {
  * backend decides everything else (a stale resource check is shown as a hint, not a blocker: a check stored by an
  * earlier session may still be fresh).
  */
-export function planBlockers(draft: ProjectDraft, settings: Readonly<Record<string, unknown>>): string[] {
+export function planBlockers(draft: ProjectDraft, settings: Readonly<Record<string, unknown>>,
+    recipes?: ReadonlyMap<Sha256, RecipeSummary>): string[] {
   const out: string[] = [];
   if (!draft.saved || draft.dirty) out.push(NOT_SAVED);
   else if (!planned(savedGraph(draft)).length) out.push(NO_STEPS);
+  if (projectStale(draft)) out.push(PROJECT_STALE);
+  // A PPO recipe the page could not read would be planned on the wrong runtime: never guessed.
+  const unknown = recipes && draft.saved ? planned(savedGraph(draft)).filter(node => recipeUnknown(node, recipes)).map(labelText) : [];
+  if (unknown.length) out.push(`${RECIPE_UNKNOWN}: ${unknown.join(", ")}`);
   const bad = badLimits(draft);
   if (bad.length) out.push(`${BAD_LIMIT}: ${bad.join(", ")}`);
   if (!draft.planning.simulation && !String(settings.MLFLOW_TRACKING_URI ?? "").trim()) out.push(NO_MLFLOW);
@@ -194,7 +218,10 @@ export function applyPlanningInputs(store: ProjectStore, projectId: string): voi
   const next: PlanningInputs = { simulation: record.simulation, estimates: record.estimates.map(estimate => ({ ...estimate })),
     nodeResources: Object.fromEntries(record.node_time_limits.filter(item => known.has(item.node_id) && item.timeout_minutes >= 1 && item.timeout_minutes <= MAX_MINUTES)
       .map(item => [item.node_id, { timeout_seconds: item.timeout_minutes * 60, runtime_profile: "primary" as const }])) };
-  if (inputsKey(draft.planning) === inputsKey(next)) return;
+  // Compared on the saved graph's cards only: a limit kept for a removed card is no difference (and never planned).
+  const current: PlanningInputs = { ...draft.planning,
+    nodeResources: Object.fromEntries(Object.entries(draft.planning.nodeResources).filter(([id]) => known.has(id))) };
+  if (inputsKey(current) === inputsKey(next)) return;
   const replace = (inputs: PlanningInputs) => { inputs.simulation = next.simulation; inputs.nodeResources = next.nodeResources; inputs.estimates = next.estimates; };
   if (draft.plan) store.setPlanning(projectId, replace); else replace(draft.planning);
   for (const key of [...limitText.keys()]) if (key.startsWith(`${projectId}\u0000`)) limitText.delete(key);
@@ -223,6 +250,7 @@ async function persistInputs(projectId: string, draft: ProjectDraft, graph: Grap
     inputsNote.set(projectId, `계획 입력을 이 PC에 저장하지 못했습니다 (${NOT_AVAILABLE}) · 이번 계획은 화면의 값으로 만듭니다.`);
     return true;
   }
+  markStale(draft, result.issues);                           // a revision_conflict: the project was saved elsewhere
   // A time limit's issue goes to its card's row; an estimate's to its row (same order as the body).
   const issues = result.issues.map(issue => {
     const match = /^\/node_time_limits\/(\d+)/.exec(issue.path);
@@ -332,7 +360,7 @@ function limitsHtml(draft: ProjectDraft, view: PlanView): string {
     const label = labelText(node);
     return `<tr data-plan-node="${escapeHtml(node.id)}"><th scope="row"><span>${escapeHtml(label)}</span><small>${escapeHtml(kindLabel(node.kind))} · ${escapeHtml(node.id)}</small></th>
       <td><input type="number" min="1" max="${MAX_MINUTES}" step="1" inputmode="numeric" data-plan-limit="${escapeHtml(node.id)}" data-focus-key="plan-limit:${escapeHtml(node.id)}" aria-label="${escapeHtml(label)} 최대 실행 시간 (분)" value="${escapeHtml(value)}"${invalid ? ' aria-invalid="true"' : ""}>${issueBlock(issues)}</td>
-      <td class="mono">${runtimeOf(node, view.recipes)}</td></tr>`;
+      <td class="mono">${recipeUnknown(node, view.recipes) ? '<span class="plan-unknown" title="레시피 정보를 확인할 수 없습니다">확인 불가</span>' : runtimeOf(node, view.recipes)}</td></tr>`;
   }).join("");
   const selects = graph.nodes.length - nodes.length;
   return `<table class="plan-limits"><caption>단계별 최대 실행 시간 · 기본 ${DEFAULT_MINUTES}분, 1–${MAX_MINUTES}분</caption>
@@ -419,17 +447,22 @@ function otherChecksHtml(draft: ProjectDraft): string {
 }
 
 function actionsHtml(draft: ProjectDraft, view: PlanView, busy: boolean): string {
-  const blockers = planBlockers(draft, view.settings);
+  const blockers = planBlockers(draft, view.settings, view.recipes);
   const found = current(draft);
   const general = found ? [...inSection(found.issues, "project"), ...inSection(found.issues, "other"), ...inSection(found.issues, "approval")] : [];
   const held = Boolean(draft.plan && view.usable);
   const note = inputsNote.get(draft.projectId)
     ?? (changedInputs.has(draft.projectId) ? "바뀐 계획 입력은 ‘계획 확인’ 때 이 PC에 저장합니다." : storedInputs.get(draft.projectId) ? "계획 입력을 이 PC에 저장해 두었습니다." : "계획 입력은 ‘계획 확인’ 때 이 PC에 저장합니다.");
+  // The latest version is offered here when no plan banner offers it (an inputs save refused for a changed project).
+  const reload = projectStale(draft) && !droppedReason(draft, view) ? reloadButton(busy) : "";
   return `<div class="plan-blockers" role="status">${blockers.length ? `<ul>${blockers.map(reason => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>` : ""}</div>
     ${general.length ? issueList(general, { heading: "계획 확인 결과" }) : ""}
-    <div class="actions"><button type="button"${held ? "" : ' class="primary"'} data-action="wf:graph:plan-run" data-focus-key="plan-run"${busy || blockers.length ? " disabled" : ""}>계획 확인</button></div>
+    <div class="actions">${reload}<button type="button"${held || reload ? "" : ' class="primary"'} data-action="wf:graph:plan-run" data-focus-key="plan-run"${busy || blockers.length ? " disabled" : ""}>계획 확인</button></div>
     <p class="muted plan-note">${escapeHtml(note)}</p>`;
 }
+/** The graph page's own "최신 버전 불러오기" (it confirms, then replaces the clean draft with the latest revision). */
+const reloadButton = (busy: boolean) =>
+  `<button type="button" class="primary" data-action="wf:graph:reload" data-focus-key="plan-reload"${busy ? " disabled" : ""}>최신 버전 불러오기</button>`;
 
 function droppedReason(draft: ProjectDraft, view: PlanView): string | null {
   if (draft.plan && view.usable) return null;
@@ -469,7 +502,8 @@ function summaryHtml(draft: ProjectDraft, view: PlanView): string {
     <ul class="plan-steps">${steps}</ul>
     ${warnings ? `<p class="plan-hint">계획 경고 ${warnings}건 · 실행을 막지 않습니다. 실행 자원과 카드에 표시했습니다.</p>` : ""}
     ${refused?.plan === summary.plan_sha256 ? issuesWithSteps(refused.issues, summary) : ""}
-    ${submitted ? `<p class="plan-submitted">이 계획으로 실행을 등록했습니다 · 실행 <span class="mono">${escapeHtml(submitted.slice(0, 12))}</span></p><div class="actions">${button("실행 보기", `nav:runs:${submitted}`)}</div>`
+    ${submitted ? `<p class="plan-submitted">${RUN_EXISTS} · 실행 <span class="mono">${escapeHtml(submitted.slice(0, 12))}</span> · 같은 계획은 다시 등록하지 않습니다.</p>
+        <div class="actions"><button type="button" data-action="${escapeHtml(`nav:runs:${submitted}`)}" data-focus-key="plan-run-open">실행 보기</button></div>`
       : `<div class="actions"><button type="button" class="primary" data-action="wf:graph:plan-approve" data-focus-key="plan-approve">계획 승인·실행…</button></div>
         <p class="muted">${summary.simulation ? "대화상자에서 내용을 확인한 뒤 모의 실행으로 등록합니다." : "대화상자에서 실행과 데이터 전송을 각각 승인해야 등록합니다."} 등록한 뒤에도 컨트롤러는 자동으로 시작하지 않습니다.</p>`}</section>`;
 }
@@ -478,9 +512,12 @@ function resultHtml(draft: ProjectDraft, view: PlanView, busy: boolean): string 
   if (draft.plan && view.usable) return summaryHtml(draft, view);
   const reason = droppedReason(draft, view);
   if (!reason) return "";
-  const blocked = busy || planBlockers(draft, view.settings).length > 0;
+  const blocked = busy || planBlockers(draft, view.settings, view.recipes).length > 0;
+  // Saved elsewhere since: planning this revision again could never be registered, so the latest version comes first.
+  const action = projectStale(draft) ? reloadButton(busy)
+    : `<button type="button" data-action="wf:graph:plan-run" data-focus-key="plan-rerun"${blocked ? " disabled" : ""}>다시 계획</button>`;
   return `<div class="wf-banner warn plan-dropped" role="status"><div><p>${escapeHtml(DROPPED_PREFIX + reason)}</p><small>승인하지 않은 계획은 실행되지 않습니다. 초안은 그대로 남아 있습니다.</small></div>
-    <div class="actions"><button type="button" data-action="wf:graph:plan-run" data-focus-key="plan-rerun"${blocked ? " disabled" : ""}>다시 계획</button></div></div>`;
+    <div class="actions">${action}</div></div>`;
 }
 
 /** The panel's inside (what the editor patches when the draft changes). */
@@ -588,11 +625,18 @@ export async function planAction(ctx: ViewContext, projectId: string, verb: stri
 }
 
 const HEX64 = /^[0-9a-f]{64}$/;
+const isText = (value: unknown) => typeof value === "string";
+const isOptionalText = (value: unknown) => value === undefined || value === null || typeof value === "string";
+/** The summary the panel and the dialog render: every string they read is a string (a malformed answer is refused
+ * as a whole, never half-rendered). */
 function isSummary(value: unknown): value is PlanSummary {
-  return isObject(value) && typeof value.plan_sha256 === "string" && HEX64.test(value.plan_sha256) && typeof value.simulation === "boolean"
-    && typeof value.project_id === "string" && typeof value.project_revision === "string" && Array.isArray(value.nodes)
-    && value.nodes.every(node => isObject(node) && typeof node.node_id === "string" && Array.isArray(node.allowed))
-    && Array.isArray(value.datasets) && typeof value.max_estimated_cost_usd === "number";
+  return isObject(value) && isText(value.plan_sha256) && HEX64.test(value.plan_sha256) && typeof value.simulation === "boolean"
+    && isText(value.project_id) && isText(value.project_revision) && Array.isArray(value.nodes)
+    && value.nodes.every(node => isObject(node) && isText(node.node_id) && isText(node.kind) && isOptionalText(node.label)
+      && Array.isArray(node.allowed) && node.allowed.every((resource: unknown) => isObject(resource) && isText(resource.profile_id)
+        && isText(resource.resource_id) && isText(resource.gpu_type) && isText(resource.cost_source)))
+    && Array.isArray(value.datasets) && value.datasets.every(item => isObject(item) && isText(item.dataset_id) && isText(item.version) && isText(item.sha256))
+    && typeof value.max_estimated_cost_usd === "number";
 }
 
 /**
@@ -603,12 +647,14 @@ function isSummary(value: unknown): value is PlanSummary {
  */
 export async function runPlan(ctx: ViewContext, projectId: string, env: PlanEnv): Promise<void> {
   const draft = ctx.store.draft(projectId);
-  if (!draft?.saved || ctx.busy || planBlockers(draft, ctx.settings).length) return;
+  if (!draft?.saved || ctx.busy || planBlockers(draft, ctx.settings, env.recipes).length) return;
   const graph = savedGraph(draft);
   const request = planRequest(draft, graph, env.recipes);
   const recipeRevisions = [...new Set(graph.nodes.flatMap(node => node.kind === "train" && typeof (node as Obj).recipe_revision === "string"
     ? [(node as Obj).recipe_revision as string] : []))];
+  // The basis besides the store's: the generations and the planning inputs the request was built from.
   const since = ctx.store.generations();
+  const inputsAt = inputsKey(draft.planning);
   const still = stillOn(ctx);
   const outcome = { held: false };
   await ctx.task(request.simulation ? "모의 실행 계획 확인 중" : "실제 실행 계획 확인 중", async () => {
@@ -625,12 +671,17 @@ export async function runPlan(ctx: ViewContext, projectId: string, env: PlanEnv)
       if (data.project_id !== projectId || data.project_revision !== request.project_revision || data.simulation !== request.simulation)
         throw new Error(MISMATCH);
       ctx.store.holdPlan(projectId, data, recipeRevisions, since);
-      if (ctx.store.planUsable(projectId)) outcome.held = true;
-      else ctx.store.dropPlan(projectId, CHANGED_WHILE_PLANNING);
       feedback.set(projectId, { ...base, issues: [], warnings });
-      ctx.notify(`${data.simulation ? "모의" : "실제"} 실행 계획을 만들었습니다. 내용을 확인한 뒤 ‘계획 승인·실행…’을 누르세요.`);
+      if (ctx.store.planUsable(projectId) && inputsKey(draft.planning) === inputsAt) {
+        outcome.held = true;
+        ctx.notify(`${data.simulation ? "모의" : "실제"} 실행 계획을 만들었습니다. 내용을 확인한 뒤 ‘계획 승인·실행…’을 누르세요.`);
+      } else {
+        ctx.store.dropPlan(projectId, CHANGED_WHILE_PLANNING);
+        ctx.notify(CHANGED_WHILE_PLANNING);
+      }
       return;
     }
+    markStale(draft, result.issues);
     feedback.set(projectId, { ...base, issues: result.issues, warnings });
     ctx.notify(PLAN_REFUSED);
   });
@@ -666,10 +717,36 @@ export async function approveAndSubmit(ctx: ViewContext, projectId: string, env:
   const draft = ctx.store.draft(projectId);
   const held = draft?.plan;
   if (!draft?.saved || !held || ctx.busy || !ctx.store.planUsable(projectId) || submittedRuns.has(held.summary.plan_sha256)) return;
+  const hash = held.summary.plan_sha256;
+  const still = stillOn(ctx);
+  // The backend dedupes only by request ID, which lives for this session: a run of the same plan made before a restart
+  // (or by another window) is looked up first, so a lost response never leads to a second run. No list, no approval.
+  const found: { run?: string; read?: boolean } = {};
+  await ctx.task("이 계획의 기존 실행 확인 중", async () => {
+    let result: WorkflowResult<unknown>;
+    try { result = await env.queue.run(() => runs.list()); }
+    catch (error) { throw new Error(`${RUNS_UNREAD} (${errorText(error)})`); }
+    const data: unknown = result.data;
+    if (result.status !== "ok" || !isObject(data) || !Array.isArray(data.runs))
+      throw new Error(`${RUNS_UNREAD} (${result.status === "ok" ? MALFORMED : notAvailable(result) ? NOT_AVAILABLE : describe(result.issues)})`);
+    found.read = true;
+    const match = data.runs.find(entry => isObject(entry) && entry.plan_sha256 === hash && typeof entry.run_id === "string" && entry.run_id);
+    if (isObject(match)) {
+      submittedRuns.set(hash, String(match.run_id));
+      found.run = String(match.run_id);
+      ctx.notify(`${RUN_EXISTS}. 같은 계획을 다시 등록하지 않습니다.`);
+    }
+  });
+  if (found.run) { focusIfLost(still, "plan-run-open"); return; }
+  if (!found.read || !still()) return;
+  // The task's render replaced the button; the dialog opens from it again.
+  if (!document.activeElement || document.activeElement === document.body) restoreFocus(document, "plan-approve");
+  if (ctx.store.draft(projectId)?.plan !== held || !ctx.store.planUsable(projectId) || ctx.busy) return;
   const choice = await openApproval(held.summary, [...env.profiles], planWaiting(held.summary, savedGraph(draft)), draft.spec.name);
   if (!choice) return;
   // The approval covers the plan the dialog showed, only while its basis still holds.
-  if (ctx.store.draft(projectId)?.plan !== held || !ctx.store.planUsable(projectId) || ctx.busy) {
+  if (ctx.busy) { ctx.fail("다른 작업이 진행 중이어서 등록하지 않았습니다. 작업이 끝난 뒤 다시 승인하세요."); return; }
+  if (ctx.store.draft(projectId)?.plan !== held || !ctx.store.planUsable(projectId)) {
     ctx.fail("계획이 바뀌어 등록하지 않았습니다. 다시 계획하세요.");
     return;
   }
@@ -677,7 +754,6 @@ export async function approveAndSubmit(ctx: ViewContext, projectId: string, env:
   if (!simulation && !(choice.approveExecution && choice.approveDataTransfer)) return;
   const request = { plan_sha256: held.summary.plan_sha256, request_id: held.requestId,
     approve_execution: !simulation && choice.approveExecution, approve_data_transfer: !simulation && choice.approveDataTransfer };
-  const still = stillOn(ctx);
   const outcome: { run?: { id: string; controller: ControllerView | null }; stale?: boolean } = {};
   await ctx.task(simulation ? "모의 실행 등록 중" : "실행 등록 중", async () => {
     submitFeedback.delete(projectId);
@@ -691,15 +767,17 @@ export async function approveAndSubmit(ctx: ViewContext, projectId: string, env:
     }
     const stale = result.status === "conflict" ? result.issues.filter(issue => issue.code === "plan_stale") : [];
     if (stale.length) {
+      markStale(draft, stale);                             // /project: another window saved; the latest version first
       ctx.store.dropPlan(projectId, staleReason(stale, env.profiles));
       outcome.stale = true;
-      ctx.notify("계획 이후 바뀐 것이 있어 실행을 등록하지 않았습니다. 초안은 그대로입니다. ‘다시 계획’을 누르세요.");
+      ctx.notify(projectStale(draft) ? "계획 이후 다른 곳에서 프로젝트를 저장해 실행을 등록하지 않았습니다. 초안은 그대로입니다. ‘최신 버전 불러오기’를 누르세요."
+        : "계획 이후 바뀐 것이 있어 실행을 등록하지 않았습니다. 초안은 그대로입니다. ‘다시 계획’을 누르세요.");
       return;
     }
     submitFeedback.set(projectId, { plan: held.summary.plan_sha256, issues: result.issues });
     ctx.notify("실행을 등록하지 못했습니다. 계획 아래의 확인할 점을 보세요.");
   });
-  if (outcome.stale) { focusIfLost(still, "plan-rerun"); return; }
+  if (outcome.stale) { focusIfLost(still, projectStale(draft) ? "plan-reload" : "plan-rerun"); return; }
   const run = outcome.run;
   if (!run) return;
   const message = registeredText(run.controller);

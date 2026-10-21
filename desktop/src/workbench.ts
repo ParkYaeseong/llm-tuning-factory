@@ -95,7 +95,8 @@ export const errorText = (error: unknown) => error instanceof Error ? error.mess
 
 /** After a dialog closes on a click, its repetition within 400 ms is swallowed so it never activates what was underneath:
  * for a pointer close, a pointer click at the same spot (8 px for a mouse, 24 px for touch and pen); for a keyboard close
- * (`detail` 0), a keyboard activation of the control the focus was returned to — other keyboard activations pass. */
+ * (`detail` 0), a keyboard activation of the control the focus was returned to — other keyboard activations pass.
+ * A click inside a dialog opened since (the closed one is removed from the page) is meant for that dialog and passes. */
 function swallowRepeat(origin: MouseEvent, returnedTo: Element | null) {
   const until = performance.now() + 400;
   const types = ["mousedown", "click", "dblclick"];
@@ -105,6 +106,7 @@ function swallowRepeat(origin: MouseEvent, returnedTo: Element | null) {
   const swallow = (event: Event) => {
     const mouse = event as MouseEvent;
     if (performance.now() > until) { stop(); return; }
+    if (event.target instanceof Element && event.target.closest("dialog[open]")) return;
     const repeat = keyboard
       ? mouse.detail === 0 && returnedTo !== null && event.target instanceof Node && returnedTo.contains(event.target)
       : mouse.detail !== 0 && Math.abs(mouse.clientX - origin.clientX) <= radius && Math.abs(mouse.clientY - origin.clientY) <= radius;

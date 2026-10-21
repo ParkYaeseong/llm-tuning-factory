@@ -246,15 +246,17 @@ function toolbarHtml(ctx: ViewContext, view: Shown): string {
   const { graph, selected, dctx } = view;
   if (!graph.nodes.length) return "";
   const full = graph.nodes.length >= MAX_NODES;
+  // A serial or parallel card connects to the graph: at 256 connections only an unconnected new train card fits.
+  const linked = full || graphEdgeCount(graph) >= MAX_EDGES;
   const off = (flag: boolean) => flag ? " disabled" : "";
-  const menu = addMenu && selected && !full ? `<div id="graph-add-kinds" class="graph-kinds" role="group" aria-label="추가할 단계 종류">
+  const menu = addMenu && selected && !linked ? `<div id="graph-add-kinds" class="graph-kinds" role="group" aria-label="추가할 단계 종류">
       ${serialKinds(graph, selected, dctx).map(choice => `<span class="graph-kind"><button type="button" data-action="wf:graph:add:${choice.kind}"${off(!choice.allowed)}>${escapeHtml(choice.label)}</button>${choice.reason ? `<small>${escapeHtml(choice.reason)}</small>` : ""}</span>`).join("")}
       <button type="button" class="quiet" data-action="wf:graph:add-menu-close">닫기</button></div>` : "";
   const note = (full ? `<p class="graph-limit">${REASONS.limit} · 단계를 삭제한 뒤 추가하세요.</p>`
     : !selected ? '<p class="muted">카드를 고르면 그 카드 다음 단계나 나란히 놓을 카드를 추가할 수 있습니다.</p>' : "")
     + (graphEdgeCount(graph) >= MAX_EDGES ? `<p class="graph-limit">${REASONS.edgeLimit} · 연결을 지운 뒤 추가하세요.</p>` : "");
-  return `<div class="graph-toolbar"><button type="button" data-action="wf:graph:add-menu" aria-expanded="${Boolean(menu)}" aria-controls="graph-add-kinds"${off(!selected || full)}>다음 단계 추가</button>
-    <button type="button" data-action="wf:graph:add-parallel"${off(!selected || full)}>나란히 추가</button>
+  return `<div class="graph-toolbar"><button type="button" data-action="wf:graph:add-menu" aria-expanded="${Boolean(menu)}" aria-controls="graph-add-kinds"${off(!selected || linked)}>다음 단계 추가</button>
+    <button type="button" data-action="wf:graph:add-parallel"${off(!selected || linked)}>나란히 추가</button>
     <button type="button" data-action="wf:graph:add-root"${off(full)}>새 학습 단계</button>
     <button type="button" data-action="wf:graph:remove"${off(!selected)}>단계 삭제</button></div>${menu}${note}
     <p class="muted graph-toolbar-note" role="status">${toolbarNote ? escapeHtml(toolbarNote) : ""}</p>`;

@@ -615,3 +615,20 @@ test("a threshold waits for the selection metric", async ({ page }) => {
   await nodeForm(page).getByLabel("선택 지표").selectOption("exact_match");
   await expect(nodeForm(page).getByLabel("기준값 (선택)")).toBeEnabled();
 });
+
+test("adding steps stops at 256 connections", async ({ page }) => {
+  await openWorkbench(page, options());
+  const evals = () => Array.from({ length: 16 }, (_, index) => evalNode(`eval-${index + 1}`, "train-1",
+    { label: `평가 ${index + 1}`, benchmark_revision: TEXT_BENCHMARK.revision_sha256 }));
+  const select = (index: number, count: number) => ({ id: `select-${index}`, kind: "select", label: `선택 ${index}`,
+    evaluations: Array.from({ length: count }, (_, item) => ref(`eval-${item + 1}`, "evaluation")) });
+  // 16 evaluation inputs + 14 × 16 + 15 selections + 1 dependency = 256 connections.
+  await seed(page, { recipes: [LORA], graph: revisions => ({ ...graphOf([trainNode("train-1", revisions["lora-sft"]), ...evals(),
+    ...Array.from({ length: 14 }, (_, index) => select(index + 1, 16)), select(15, 15)]), depends_on: [{ node_id: "select-1", depends_on: "train-1" }] }) });
+  await openGraph(page);
+  await cardButton(page, "train-1").click();
+  const toolbar = page.locator("#graph-toolbar");
+  await expect(toolbar.getByRole("button", { name: "다음 단계 추가", exact: true })).toBeDisabled();
+  await expect(toolbar.getByRole("button", { name: "나란히 추가", exact: true })).toBeDisabled();
+  await expect(toolbar.getByRole("button", { name: "새 학습 단계", exact: true })).toBeEnabled();
+});
