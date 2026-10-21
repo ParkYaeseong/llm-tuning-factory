@@ -323,6 +323,8 @@ test("a result that arrived but could not be saved offers its release, then show
   await expect(nodeRow(page, "train-s")).toContainText("이 PC에 저장하지 못했습니다");
   const released = operatorItem(page, "train-r");
   await expect(released).toContainText("잠금이 이미 해제되었습니다");
+  await expect(released).toContainText("도착한 결과는 저장하지 않고");
+  await expect(released).not.toContainText("결과가 없으면");
   await expect(released).toContainText("컨트롤러를 시작");
   await expect(released).not.toContainText("데스크톱에서 해결할 수 없습니다");
   await expect(released.getByRole("button")).toHaveCount(0);

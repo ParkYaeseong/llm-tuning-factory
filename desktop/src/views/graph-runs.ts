@@ -31,7 +31,8 @@ const RELEASE_RISK = "원격 서버나 Pod에서 이 실행이 아직 돌고 있
 const RELEASE_EFFECT = "해제하면 컨트롤러가 다음 확인 때 이 시도를 정리합니다. 결과가 없으면 이 단계는 실패로(취소를 요청한 실행의 시도는 취소로 기록) 기록되고 다시 실행하지 않습니다. 결과가 필요하면 다시 계획해 새로 실행하세요.";
 const RELEASE_CHECK = "RunPod 콘솔이나 서버의 프로세스 목록에서 아래 작업·시도의 실행이 멈춘 것을 직접 확인한 뒤에만 해제하세요.";
 const RELEASED = "잠금이 이미 해제되었습니다 · 컨트롤러가 다음 확인 때 이 시도를 정리합니다. 결과가 없으면 실패로(취소를 요청한 실행이면 취소로) 기록하고 다시 실행하지 않습니다.";
-const RELEASED_START = "컨트롤러가 동작 중이 아니어서 아직 정리되지 않습니다. 위에서 컨트롤러를 시작하세요.";
+const RELEASED_NOT_SAVED = "잠금이 이미 해제되었습니다 · 컨트롤러가 다음 확인 때 이 시도를 정리합니다. 도착한 결과는 저장하지 않고 출력 무효(output_invalid)로 기록하며 다시 실행하지 않습니다.";
+const RELEASED_START ="컨트롤러가 동작 중이 아니어서 아직 정리되지 않습니다. 위에서 컨트롤러를 시작하세요.";
 const RELEASE_STALE = "실행 상태가 바뀌었습니다. 이 시도는 더 이상 해제할 대상이 아닙니다. 대화 상자를 닫고 다시 확인하세요.";
 const PRE_OUTBOX = "기록 대기열이 생기기 전에 끝난 실행이라 MLflow 기록 상태가 없습니다.";
 /** An unreadable run needs an operator's repair; it is not read again on its own (11.5 R3 M4). */
@@ -291,8 +292,10 @@ function operatorItem(run: GraphRun, node: GraphRunNode, controller: ControllerV
       <p>결과 대기 · ${escapeHtml(until)} 다시 실행하지 않습니다. 같은 실행의 결과가 늦게 도착할 수 있어 실행 자원 잠금을 그대로 둡니다.</p></article>`;
   }
   const reason = reasonHtml(run, node, "operator");
-  if (!node.uncertain && RELEASE_REASON.test(node.wait_reason ?? ""))
-    return `<article ${attrs}>${head(statusPill("neutral", "잠금 해제됨"))}<p>${escapeHtml(RELEASED)}</p>${controller?.state === "running" ? "" : `<p>${escapeHtml(RELEASED_START)}</p>`}</article>`;
+  if (!node.uncertain && RELEASE_REASON.test(node.wait_reason ?? "")) {
+    const released = NOT_SAVED_REASON.test(node.wait_reason ?? "") ? RELEASED_NOT_SAVED : RELEASED;
+    return `<article ${attrs}>${head(statusPill("neutral", "잠금 해제됨"))}<p>${escapeHtml(released)}</p>${controller?.state === "running" ? "" : `<p>${escapeHtml(RELEASED_START)}</p>`}</article>`;
+  }
   const cli = `<details class="run-cli-details" data-open-key="cli:${escapeHtml(node.node_id)}"><summary data-focus-key="cli:${escapeHtml(node.node_id)}">명령줄로 해제하기(대안)</summary><p class="muted">${CLI_NOTE}</p><pre class="run-cli">${operatorInstruction(run.run_id, node)}</pre></details>`;
   if (releasable(node)) {
     const body = NOT_SAVED_REASON.test(node.wait_reason ?? "") ? NOT_SAVED_RELEASE : UNKNOWN_STOP_RELEASE;
