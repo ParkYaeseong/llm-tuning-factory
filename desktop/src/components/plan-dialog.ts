@@ -17,13 +17,8 @@ const REAL_NOTE = "실제 실행 · 승인하면 컨트롤러가 아래 실행 �
 const COST_SOURCES: Record<string, string> = { runpod_api: "RunPod API", estimate: "계획용 추정", operator: "직접 입력한 서버 요금" };
 const AUTH_MODES: Record<string, string> = { oidc: "OIDC", token: "토큰", none: "인증 없음" };
 
-/** 9.8 adds each node's recipe and data references to the summary (workflow-types.ts stays as it is for this sub-task). */
-export interface PlanNodeReferences {
-  recipe?: { recipe_id: string | null; version: string | null; name: string | null; training_stage: string | null;
-    training_method: string | null; revision_sha256: Sha256 } | null;
-  datasets?: { binding_id: string | null; benchmark_revision: Sha256 | null; dataset_id: string; version: string; sha256: Sha256 }[];
-}
-export type PlanNode = PlanSummary["nodes"][number] & PlanNodeReferences;
+/** One plan node with 9.8's recipe and data references (workflow-types.ts). */
+export type PlanNode = PlanSummary["nodes"][number];
 
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
 /** "$1.89": two to four decimals. */

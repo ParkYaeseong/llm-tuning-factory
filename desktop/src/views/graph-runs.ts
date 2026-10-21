@@ -16,8 +16,6 @@ import { EVALUATION_STATUS, EVENT_STATUS, localizeRunText, localizeWaitReason, N
 import type { ControllerView, GraphRun, GraphRunNode, RunDetail, RunListEntry, TrackingFailure, UnreadableRun, WorkflowIssue,
   WorkflowResult } from "../workflow-types";
 
-/** 9.8 adds `job_id` to every node (workflow-types.ts stays as it is for this sub-task). */
-type RunNode = GraphRunNode & { job_id?: string | null };
 type Obj = Record<string, any>;
 type Pill = "neutral" | "good" | "warn" | "bad";
 
@@ -118,7 +116,7 @@ export function preOutbox(run: GraphRun): boolean {
 
 /** The CLI alternative of the desktop release (escaped text): find the job, then release its attempt. */
 export function operatorInstruction(runId: string, node: GraphRunNode): string {
-  const job = (node as RunNode).job_id || "<JOB_ID>";
+  const job = node.job_id || "<JOB_ID>";
   const attempt = node.attempt_id || "<ATTEMPT_ID>";
   return escapeHtml([
     `1. 원격 서버나 Pod에서 이 단계의 실행(작업 ${job}, 시도 ${attempt})이 멈춘 것을 직접 확인합니다.`,
@@ -172,7 +170,7 @@ export function selectionText(run: GraphRun, node: GraphRunNode, graph: { nodes?
 
 /** The desktop release applies only to an uncertain attempt that needs the operator and no late result can settle
  * (9.8: `needs_operator && uncertain && !awaiting_result`), with the IDs the backend checks. */
-const releasable = (node: RunNode) => node.needs_operator && node.uncertain && !node.awaiting_result && Boolean(node.job_id) && Boolean(node.attempt_id);
+const releasable = (node: GraphRunNode) => node.needs_operator && node.uncertain && !node.awaiting_result && Boolean(node.job_id) && Boolean(node.attempt_id);
 
 // -- rendering --
 function listInner(): string {
@@ -219,7 +217,7 @@ function reasonHtml(run: GraphRun, node: GraphRunNode, scope: "table" | "operato
   return `<div class="run-reason ${localized.kind}" data-reason="${localized.kind}"><span>${escapeHtml(localized.text)}</span>${original}</div>`;
 }
 
-function progressHtml(run: GraphRun, node: RunNode): string {
+function progressHtml(run: GraphRun, node: GraphRunNode): string {
   const parts: string[] = [];
   if (node.awaiting_result) parts.push(statusPill("neutral", "결과 대기"));
   else if (node.needs_operator) parts.push(statusPill("warn", "운영자 확인 필요"));
@@ -259,7 +257,7 @@ function outputHtml(run: GraphRun, node: GraphRunNode): string {
 }
 
 function nodeRows(run: GraphRun): string {
-  return (run.nodes as RunNode[]).map(node => {
+  return run.nodes.map(node => {
     const attempts = `${number(node.counted_attempts)}/${number(node.max_attempts)}`
       + (node.attempts !== node.counted_attempts ? `<small>전체 시도 ${escapeHtml(number(node.attempts))}회</small>` : "");
     const destination = node.destination_profile_id || node.resource_id
@@ -272,7 +270,7 @@ function nodeRows(run: GraphRun): string {
   }).join("");
 }
 
-function operatorItem(run: GraphRun, node: RunNode, controller: ControllerView | null): string {
+function operatorItem(run: GraphRun, node: GraphRunNode, controller: ControllerView | null): string {
   const head = (pill: string) => `<div class="run-operator-head"><b>${escapeHtml(nameOf(node))}</b>${pill}</div>`;
   const attrs = `class="run-operator-item" data-operator-node="${escapeHtml(node.node_id)}"`;
   if (node.awaiting_result) {
@@ -296,7 +294,7 @@ function operatorItem(run: GraphRun, node: RunNode, controller: ControllerView |
 }
 
 function operatorSection(run: GraphRun, controller: ControllerView | null): string {
-  const nodes = (run.nodes as RunNode[]).filter(node => node.awaiting_result || node.needs_operator);
+  const nodes = run.nodes.filter(node => node.awaiting_result || node.needs_operator);
   if (!nodes.length) return "";
   return `<section class="run-operator" aria-labelledby="run-operator-title"><h4 id="run-operator-title">확인이 필요한 단계</h4>${nodes.map(node => operatorItem(run, node, controller)).join("")}</section>`;
 }
@@ -516,7 +514,7 @@ const normalized = (text: string) => text.trim().normalize("NFC");
  * the dialog showed; the backend refuses anything but that node's current attempt in that state. */
 async function releaseNode(ctx: ViewContext, nodeId: string) {
   const run = shownRun();
-  const node = run?.nodes.find(item => item.node_id === nodeId) as RunNode | undefined;
+  const node = run?.nodes.find(item => item.node_id === nodeId);
   if (!run || !node || !releasable(node) || document.querySelector("dialog[open]")) return;
   const expected = normalized(nameOf(node));
   const request = { run_id: run.run_id, node_id: node.node_id, job_id: node.job_id!, attempt_id: node.attempt_id! };
@@ -545,7 +543,7 @@ async function releaseNode(ctx: ViewContext, nodeId: string) {
     check?.addEventListener("change", gate);
     gate();
     releaseWatch = () => {
-      const now = shownRun()?.nodes.find(item => item.node_id === request.node_id) as RunNode | undefined;
+      const now = shownRun()?.nodes.find(item => item.node_id === request.node_id);
       if (stale || (now && releasable(now) && now.job_id === request.job_id && now.attempt_id === request.attempt_id)) return;
       stale = true;
       if (note) note.textContent = RELEASE_STALE;

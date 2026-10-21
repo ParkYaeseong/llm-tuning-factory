@@ -110,11 +110,21 @@ export interface PlanResource {
   total_hourly_cost_usd: number; cost_source: string;          // "runpod_api" | "estimate" | SSH cost source
 }
 /** `graph_plan`/`graph_plan_get` `ok` data. A blocked `graph_plan` answers `invalid` with data `{warnings}` or null. */
+/** A plan node's pinned recipe revision and its public identity (9.8 `_node_references`; null fields when the
+ * revision's spec is not in the plan). Train nodes only. */
+export interface PlanNodeRecipe {
+  recipe_id: string | null; version: string | null; name: string | null; training_stage: string | null;
+  training_method: string | null; revision_sha256: Sha256;
+}
+/** The data a plan node uses: a train node's bound dataset (`binding_id`) or an evaluate node's benchmark dataset
+ * (`benchmark_revision`). */
+export interface PlanNodeDataset extends DatasetRef { binding_id: string | null; benchmark_revision: Sha256 | null }
 export interface PlanSummary extends WithWarnings {
   plan_sha256: Sha256; simulation: boolean; project_id: string; project_revision: Sha256;
   max_estimated_cost_usd: number; max_duration_seconds: number; max_concurrent_gpu_count: number;
   retry_policy: { max_attempts: number; backoff_seconds: number };
-  nodes: { node_id: string; kind: string; label: string; max_estimated_cost_usd: number; max_duration_seconds: number; allowed: PlanResource[] }[];
+  nodes: { node_id: string; kind: string; label: string; max_estimated_cost_usd: number; max_duration_seconds: number; allowed: PlanResource[];
+    recipe: PlanNodeRecipe | null; datasets: PlanNodeDataset[] }[];
   datasets: (DatasetRef & { synthetic: boolean; export_allowed: boolean })[];
   tracking: { profile_id: string; public_settings_sha256: Sha256; settings: Record<string, string> | null } | null;
 }
@@ -133,7 +143,7 @@ export interface ControllerStatus {
 export interface ControllerStopResult { requested: boolean; owner_id?: string; reason?: "not_running" }
 export type TrackingStatus = "not_started" | "pending" | "retrying" | "saved" | "uncertain" | "failed";
 export interface GraphRunNode {
-  node_id: string; label: string; kind: string;
+  node_id: string; label: string; kind: string; job_id: string | null;     // job_id: 9.8, the node's current job
   status: "PENDING" | "READY" | "RUNNING" | "COMPLETED" | "FAILED" | "BLOCKED" | "CANCELED";
   job_status: string | null; attempt_id: string | null; attempts: number; counted_attempts: number; max_attempts: number;
   resource_id: string | null; destination_profile_id: string | null; uncertain: boolean; awaiting_result: boolean;
