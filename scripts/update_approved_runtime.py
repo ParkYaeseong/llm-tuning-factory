@@ -1,7 +1,6 @@
 """Apply a reviewed dependency lock only to the session's isolated worker venv."""
 import json
 import os
-import shlex
 import time
 from pathlib import Path
 

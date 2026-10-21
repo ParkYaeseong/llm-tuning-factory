@@ -48,3 +48,11 @@ def test_the_desktop_package_is_rebuilt_when_bundled_inputs_change():
     paths = triggers["pull_request"]["paths"]
     assert {"examples/**", "configs/ai/**", "scripts/seed_acceptance_root.py"} <= set(paths)
     assert len(paths) == len(set(paths))
+
+
+def test_both_workflows_lint_the_release_scripts():
+    """R4 M9: the verifier, the seed script and the build script are release machinery, so ruff checks scripts/."""
+    for name in ("ci.yml", "windows-desktop.yml"):
+        jobs = yaml.safe_load(read(f".github/workflows/{name}"))["jobs"]
+        runs = [step.get("run", "") for job in jobs.values() for step in job["steps"]]
+        assert [run for run in runs if "ruff" in run] == ["uv run ruff check src tests scripts"], (name, runs)
