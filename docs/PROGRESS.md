@@ -5457,6 +5457,132 @@ Not verified or still open:
 - The frozen engine (PyInstaller onefile: `sys._MEIPASS` lock, EOF through the real bootloader, the child pid) and
   `wheel`: Task 11.6, after root builds the sidecar.
 
+## Task 11.2 cross-task acceptance tests and the synthetic seeded root, 2026-10-21
+
+Three commits from worktree `codex/task-11.2`, written on `d0415c0` and rebased onto `0f84972` (11.3, 11.4):
+- `5ecfd45 test: seed a synthetic offline root for acceptance plans`, pushed early for 11.3b;
+- `fix: refuse merges of adapters from different base roots at planning`;
+- `test: accept blank projects, the mock diamond and the headless lifecycle through the production wiring`.
+
+Changed:
+- new `scripts/seed_acceptance_root.py`, `tests/test_seed_acceptance_root.py` and `tests/test_acceptance_workflows.py`;
+- `tests/test_graph_readiness.py`: a `synthetic=` keyword on `build`, and its `registered` helper;
+- `src/tuning_factory/graph_planner.py` and `tests/test_graph_planner.py`, for the fix root approved;
+- this file.
+
+No desktop, Rust, lock or package file changed.
+
+Seed script (D15). `python scripts/seed_acceptance_root.py --state-dir <state>` prints one JSON line:
+`{"modules": 14, "root": {...}}`.
+- The root is `factory-acceptance/tiny-qwen2` at `8342efb8b4c672c4d36d25d557acbcb8e0b0f6be`, the SHA-1 of
+  `factory-acceptance/tiny-qwen2@1`. Its config is `65797530…07ef` and its tokenizer `9f73ebc3…3f1b`.
+- It writes, through the public functions:
+  - the plan's CONFIG and the WordLevel tokenizer of `test_model_inputs`, as canonical bytes;
+  - the root index, with the `ModelProfile` that `ModelHub.inspect` (the legacy `model_inspect` path) builds, answered
+    from the local bytes by an in-process `MockTransport`;
+  - the evidence for 14 linear modules, from a synthetic `model.safetensors` header through `header_tensors` and
+    `target_evidence`.
+- It downloads nothing and writes no weight file.
+- It's idempotent: a rerun rewrites no byte. Other content in the snapshot or the index exits 1; argparse errors exit 2.
+- `seed(state)` and `write_root(state, repo_id, revision, config)` are importable.
+- The profile's `max_length` is the config's `max_position_embeddings` (64), so every recipe planned on this root
+  needs `hyperparameters.cutoff_len: 64`. The default 1024 gets `plan_refused` "cutoff_len exceeds reviewed model
+  limit 64". CONFIG is kept exactly as the plan wrote it.
+
+Product fix (root-approved, a separate commit). A4's "two different roots" case planned `ok`: `graph_plan` accepted a
+merge of adapters trained on two HF roots. Only the merge's compile (`check_merge_descriptors`) refused it, so a real
+plan would have trained every branch on paid GPUs first.
+- `_MergeLineage` resolves each merge input's effective base and adapter targets the way compilation does:
+  - a new adapter's base is its policy base;
+  - a continuation keeps its parent's base;
+  - a merge keeps its inputs' common base;
+  - a selection offers each candidate's base;
+  - an artifact adapter has its descriptor's base;
+  - a full-model or materialized parent is unknown statically, so compile stays authoritative there.
+- `_definition_issues` reports `merge_bases_differ` (the `check_merge_descriptors` text) on the merge node, so
+  `graph_validate` shows it after a save.
+- `plan_graph`'s static routes also refuse a difference that only the artifact snapshots or the bases' module evidence
+  reveal. Example: `lora_target: all` that expands to more than `q_proj,v_proj`.
+- The UI does not refuse such a connection locally. `graph-model.ts` `connectionReason` refuses only materialize and
+  non-plain-adapter sources for a merge, and `upstreamRoot`/`sameRoot` serve the module-structure hint and the root
+  pickers. The validate-after-save issue now names the card.
+
+Acceptance cases (D13, D14). They run through `desktop_workflows.dispatch_action`/`handle`,
+`controller_entry.build_controller`, `serve` on a thread, the `SimulatedOperationDispatcher` and the local tracking
+sink. A module-wide socket guard is on, and a real MLflow client is never constructed.
+- A1, UTF-8 and CP949: a blank project and a new-purpose CSV.
+  - CP949 read as UTF-8 is `invalid_source`, and the Korean cells round-trip.
+  - The flow is synthetic data that is never exported, split 80/10/10, an SFT LoRA, the seeded root, a text benchmark,
+    validate, then a simulation plan.
+  - The same request gives the same `plan_sha256` and the same bytes; `graph_plan_get` returns it, and a later
+    project edit never rewrites it.
+  - No run and no `jobs.db`; no `legacy_origin`; no catalog template named; no bundled example opened.
+- A2, two destinations and one: the mock diamond completes.
+  - `select` is `no_winner` and each GPU node has one attempt.
+  - The claims are two `simulation:` keys, or one key that the second branch waited for.
+  - `graph_run_get` never showed a node on another destination than its pinned one.
+- A3, restart, cancel and cancel-at-join, through `serve`.
+  - Spies that call through time the stop and the cancels.
+  - Restart: the first serve drains the claimed branch, and a new owner finishes. One attempt and one
+    `<launch_id>.result.json` per node.
+  - Cancel at the first branch's launch gate: that attempt never launches, and nothing launches after the cancel.
+  - Cancel while the selection is claimed: the select is CANCELED with no receipt.
+  - `controller_stop`, then `serve` returns 0.
+- A4: the codes observed today.
+  - Five models give `invalid_value` at `/graph/nodes/5/models`.
+  - Weights [0.5, 0.6] and a duplicated model give `invalid_value` under `/graph/nodes/<i>`. The path ends in the union
+    tag `/merge` (passed to 11.1); the tests check only the prefix.
+  - A full-method parent gets `plan_refused` from `graph_plan` only; validate passes it.
+  - An evaluation output gives `typed_port`; two roots give `merge_bases_differ`.
+  - No run is created.
+  - A simulated merge plans, then the run is FAILED: the merge node fails with "merge requires real completed
+    artifacts", its children are BLOCKED, and only the two simulated adapters are frozen (F14, pinned).
+- A5:
+  - (a) The diamond's candidates are all excluded with reason `simulation`, and only local receipts exist under
+    `state/tracking/<run_id>/`.
+  - (b) A real run over synthetic data (`build(synthetic=True)`) uses the real `OperationAttemptRunner`, the fake GPU
+    host and the fake MLflow client. Selection is `no_winner` (`synthetic`). There's no `model_registration` event and
+    no `create_model_version`, and `registration_status` is `none`.
+- A6: the headless lifecycle through the channel.
+  - `controller_status` shows `running` with this owner's `current.json`.
+  - A second `serve` returns 3 and writes nothing.
+  - A simulated run completes, `controller_stop` gives `{requested: true}` and `serve` returns 0.
+  - Afterwards status is `absent`, and `current.json` has `stopped_at` and `code: stopped`.
+
+Actual verification:
+- RED first:
+  - the seed tests failed with "scripts/seed_acceptance_root.py (Task 11.2) is missing";
+  - 5 of the 10 new planner cases failed: no `merge_bases_differ` for the four two-root lineages, and DID NOT RAISE
+    for different targets. The same-root and run-time-base cases passed before the fix.
+- The 11 acceptance cases passed at once. Eight mutations, loaded by a scratch pytest plugin under `%TEMP%` (no `src`
+  edit), each fail at least one:
+  - `select_best` keeps simulation candidates: A5;
+  - registration enqueued for synthetic artifacts: A5;
+  - the claimed join completes despite a cancel: A3 cancel-at-join;
+  - `begin_launch` without the cancel gate: A3 cancel;
+  - the merge weight check removed: A4;
+  - `graph_plan` not content-addressed: A1 and 10 more;
+  - the seed writing a fingerprint other than its files: seed test 1 and 9 more;
+  - the new merge-base check removed: A4.
+- The new tests ran three times: 14, 14 and 14 passed (32-35 s each).
+- `test_graph_readiness`, `test_graph_controller`, `test_controller_entry`, `test_workflow_runs`, `test_workflow_planning`,
+  `test_simulated_dispatch`, `test_hf_targets` and `test_graph_planner`: 436 passed.
+- Full suite:
+  - after the seed: 1720 passed, 1 failed, 1 skipped. The failure is the flake below.
+  - after the fix: 1730 passed, 1 skipped.
+  - final, with all three commits: **1741 passed, 1 skipped** (1718 + 3 seed + 9 planner + 11 acceptance).
+- `ruff check src tests scripts/seed_acceptance_root.py` passes, and `scripts/check_secrets.py` reports 0 findings.
+- CPU acceptance (`scripts/` and `src/` changed): 29/29 twice. The last receipt is source `82fc8570…7352`, receipt
+  SHA256 `f49e4a72…a0c5`, with no GPU, no download and no institution data.
+
+Not verified or still open:
+- Flake (11.1 owns the test): `test_controller_entry::test_a_drain_fenced_by_a_successor_is_not_a_clean_stop` timed
+  out once under full-suite load ("the first tick"). It passed 6 of 6 alone.
+  - Likely cause: `acquire_owner` writes `acquired == heartbeat == now`. This PC's `time.time()` resolves to 15.625 ms
+    (`GetSystemTimeAsFileTime`), so a first renew in the same clock tick never makes `heartbeat > acquired` before the
+    60 s tick.
+- The frozen sidecar (11.3) and the installed app (11.6) layers of D14 are not covered here.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0

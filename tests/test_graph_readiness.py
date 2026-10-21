@@ -43,7 +43,7 @@ from tuning_factory.graph_planner import (
 )
 from tuning_factory.graph_schema import GraphSpec
 from tuning_factory.model_artifacts import ModelArtifactRef, ModelInput, ModelLoadRef
-from tuning_factory.projects import DatasetBinding, ProjectSpec
+from tuning_factory.projects import DatasetBinding, DatasetRef, ProjectSpec
 from tuning_factory.recipes import RecipeSpec
 from tuning_factory.registry import canonical
 
@@ -114,11 +114,22 @@ def diamond(r, profiles=('p1', 'p2')):
             merge('d', ('b', 'c'), profiles)]
 
 
+def registered(registry, tmp_path, name, rows, *, synthetic=False):
+    """``test_operation_runner.register`` (exportable), or the same rows registered as synthetic."""
+    if not synthetic:
+        return register(registry, tmp_path, name, rows, True)
+    path = tmp_path / f'{name}.json'
+    path.write_bytes(canonical(rows))
+    record = registry.register_dataset(name, '1', path, export_allowed=True, synthetic=True)
+    return DatasetRef(dataset_id=name, version='1', sha256=record['sha256'])
+
+
 def build(tmp_path, nodes, *, destinations=None, simulation=False, max_attempts=1, backoff=0, max_concurrent=1,
-          resolver=True, clock=None):
+          resolver=True, clock=None, synthetic=False):
     """A submitted plan over frozen base/adapter artifacts in the GraphStore's own store, with a run lease.
 
     Nothing is prepared: the caller drives readiness. The trusted ledger resolver is installed by default.
+    ``synthetic`` registers both datasets as synthetic (still exportable): Task 11.2 A5's real run.
     """
     gs = api()
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -128,8 +139,8 @@ def build(tmp_path, nodes, *, destinations=None, simulation=False, max_attempts=
     base = models.freeze(*inputs.full_model(tmp_path, 'base'))
     first = models.freeze(*inputs.peft_adapter(tmp_path, 'first', base=base, parents=(base,)))
     second = models.freeze(*inputs.peft_adapter(tmp_path, 'second', rank=3, alpha=9, base=base, parents=(base,)))
-    data = register(registry, tmp_path, 'data', TRAIN_ROWS, True)
-    held = register(registry, tmp_path, 'held', HELD_ROWS, True)
+    data = registered(registry, tmp_path, 'data', TRAIN_ROWS, synthetic=synthetic)
+    held = registered(registry, tmp_path, 'held', HELD_ROWS, synthetic=synthetic)
     recipe = revision(RecipeSpec(recipe_id='r', name='recipe',
                                  hyperparameters={'lora_rank': 2, 'lora_target': 'q_proj,v_proj'}))
     benchmark = BenchmarkSpec(dataset=held, evaluator_kind='classification', evaluator_version='1',
