@@ -61,6 +61,16 @@ def graphs(bench):
         "duplicate_through_selection": ([a, ev("ea", "a"), select("s", ("ea",)),
                                          merge("m", [output("s"), output("a")], PROFILES)],
                                         "m", "merge requires distinct actual artifacts"),
+        "repeated_selected_evaluation": ([a, b, ev("ea", "a"), ev("eb", "b"), select("s", ("ea", "eb")),
+                                          ev("es", "s"), select("last", ("es", "es"))],
+                                         "last", "selection candidates must be distinct models"),
+        "same_selected_model_twice": ([a, b, ev("ea", "a"), ev("eb", "b"), select("s", ("ea", "eb")),
+                                      ev("es", "s"), ev("es2", "s"), select("last", ("es", "es2"))],
+                                     "last", "selection candidates must be distinct models"),
+        "selected_model_alias": ([a, b, ev("ea", "a"), ev("eb", "b"), select("s", ("ea", "eb")),
+                                  ev("es", "s"), select("t", ("es",)),
+                                  merge("last", [output("s"), output("t")], PROFILES)],
+                                 "last", "merge requires distinct actual artifacts"),
         "nested_rank": ([lora(bench, "a", r128), lora(bench, "b", r128), lora(bench, "d", r8),
                          merge("ab", [output("a"), output("b")], PROFILES),
                          merge("m", [output("ab"), output("d")], PROFILES)],
@@ -78,7 +88,9 @@ def graphs(bench):
 
 
 @pytest.mark.parametrize("name", ["full_parent", "materialized_parent", "duplicate_through_selection", "nested_rank",
-                                  "same_model_twice", "two_merged_candidates", "only_a_merged_candidate"])
+                                  "same_model_twice", "two_merged_candidates", "only_a_merged_candidate",
+                                  "repeated_selected_evaluation", "same_selected_model_twice",
+                                  "selected_model_alias"])
 def test_a_node_refusal_of_the_planner_names_its_node(tmp_path, name):
     bench = workbench(tmp_path / "state", tmp_path)
     nodes, node_id, message = graphs(bench)[name]
@@ -93,3 +105,14 @@ def test_a_refusal_of_the_whole_plan_names_no_node(tmp_path):
     found = plan_issue(bench, [lora(bench, "a")], max_total_cost_usd=0.01)
     assert found == {"code": "plan_refused", "path": "", "node_id": None, "row_number": None,
                      "message": "whole graph including retries exceeds maximum total cost"}, found
+
+
+def test_a_conditional_selection_merge_still_plans_through_the_workflow(tmp_path):
+    bench = workbench(tmp_path / "state", tmp_path)
+    nodes = [lora(bench, "a"), lora(bench, "b"), evaluate("ea", output("a"), bench.benchmark, PROFILES),
+             evaluate("eb", output("b"), bench.benchmark, PROFILES), select("s", ("ea", "eb")),
+             merge("last", [output("s"), output("a")], PROFILES)]
+    save_graph(bench, nodes)
+    planned = action(bench.state, "graph_plan", plan_request(bench.project["project_id"], nodes,
+                                                            [estimate("estimate-a")]))
+    assert planned["status"] == "ok", planned

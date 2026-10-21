@@ -1300,3 +1300,38 @@ def test_selection_shapes_that_can_never_resolve_are_refused_at_planning(tmp_pat
             plan()
     else:
         assert plan().nodes[-1].node.id == "s"
+
+
+@pytest.mark.parametrize("case", ["repeated_evaluation", "evaluated_twice", "selection_alias", "nested_alias"])
+def test_correlated_selected_models_are_refused_at_planning(tmp_path, case):
+    """A selected winner and its forwarding aliases remain one model even with two possible winners."""
+    from tuning_factory.graph_planner import NodeRefusal
+    m = merge_fixture(tmp_path)
+    benchmark = benchmarked(m, tmp_path)
+    head = [lora("a", m.default, m.root), lora("b", m.default, m.root), evaluated("ea", "a", benchmark),
+            evaluated("eb", "b", benchmark), chosen("s", ("ea", "eb")), evaluated("es", "s", benchmark)]
+    tail = {
+        "repeated_evaluation": [chosen("last", ("es", "es"))],
+        "evaluated_twice": [evaluated("es2", "s", benchmark), chosen("last", ("es", "es2"))],
+        "selection_alias": [chosen("t", ("es",)), merged_of("last", ("s", "t"))],
+        "nested_alias": [chosen("t", ("es",)), evaluated("et", "t", benchmark), chosen("u", ("et",)),
+                         merged_of("last", ("s", "u"))],
+    }[case]
+    message = ("selection candidates must be distinct models" if case in {"repeated_evaluation", "evaluated_twice"}
+               else "merge requires distinct actual artifacts")
+    with pytest.raises(NodeRefusal, match=f"^{message}$") as refused:
+        planned_or_refused(m, [*head, *tail])[2]()
+    assert refused.value.node_id == "last"
+
+
+@pytest.mark.parametrize("case", ["conditional_merge", "independent_selections"])
+def test_independent_selected_model_choices_still_plan(tmp_path, case):
+    """Possible winners may overlap when the inputs do not share a selected model's identity."""
+    m = merge_fixture(tmp_path)
+    benchmark = benchmarked(m, tmp_path)
+    head = [lora("a", m.default, m.root), lora("b", m.default, m.root), evaluated("ea", "a", benchmark),
+            evaluated("eb", "b", benchmark), chosen("s", ("ea", "eb"))]
+    tail = {"conditional_merge": [merged_of("last", ("s", "a"))],
+            "independent_selections": [evaluated("ea2", "a", benchmark), evaluated("eb2", "b", benchmark),
+                                       chosen("t", ("ea2", "eb2")), merged_of("last", ("s", "t"))]}[case]
+    assert planned_or_refused(m, [*head, *tail])[2]().nodes[-1].node.id == "last"

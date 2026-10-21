@@ -508,10 +508,30 @@ def _sources(value, nodes, active=frozenset()) -> frozenset:
     return frozenset({("node", node.id)})
 
 
-def _distinct_choice_possible(options) -> bool:
-    """Whether one model can be chosen from each option set with all of them distinct (a bipartite matching);
-    unresolvable (empty) sets are left out."""
-    options = [tuple(sorted(item)) for item in options if item]
+def _model_identity(value, nodes, active=frozenset()):
+    """A symbolic model identity, preserved through selections that only forward one identity. A multi-candidate
+    selection has its own identity: every use shares its winner, even when that winner is not yet known."""
+    if isinstance(value, ModelArtifactRef):
+        return ("artifact", *_artifact_key(value))
+    node = nodes.get(value.node_id) if isinstance(value, NodeOutputRef) else None
+    if node is None or node.id in active:
+        return None
+    if isinstance(node, SelectNode):
+        identities = {_model_identity(nodes[ref.node_id].model, nodes, active | {node.id})
+                      for ref in node.evaluations if isinstance(nodes.get(ref.node_id), EvaluateNode)}
+        if len(identities) == 1:
+            return next(iter(identities))
+    return ("node", node.id)
+
+
+def _distinct_choice_possible(values, nodes) -> bool:
+    """Refuse shared symbolic identities before matching possible actual models independently. Unresolvable
+    identities and source sets are left out; independent choices may still have overlapping possible models."""
+    identities = [_model_identity(value, nodes) for value in values]
+    known = [identity for identity in identities if identity is not None]
+    if len(set(known)) != len(known):
+        return False
+    options = [tuple(sorted(item)) for value in values if (item := _sources(value, nodes))]
     owner = {}
 
     def assign(index, seen):
@@ -703,7 +723,7 @@ def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: Execu
                     raise ValueError("held-out test evaluation cannot influence selection")
             # Shapes that can never resolve (Task 11.5, R1 m3): select_best refuses duplicate candidates, and
             # resolve_local_selection takes one merged candidate beside the originals it falls back to.
-            if not _distinct_choice_possible([_sources(item.model, nodes) for item in evaluation_nodes]):
+            if not _distinct_choice_possible([item.model for item in evaluation_nodes], nodes):
                 raise NodeRefusal("selection candidates must be distinct models", node.id)
             merged = sum(isinstance(item.model, NodeOutputRef) and isinstance(nodes[item.model.node_id], MergeNode)
                          for item in evaluation_nodes)
@@ -816,7 +836,7 @@ def _static_routes(node, nodes, recipes, artifacts, resources, evidence=()):
                 # A materialized (full) model, or a selection none of whose candidates is a plain adapter (Task 11.5).
                 raise ValueError("merge requires plain causal LoRA/QLoRA parents")
         # What compile would refuse, carried through nested merges and selections (Task 11.5, R1 m2).
-        if not _distinct_choice_possible([_sources(value, nodes) for value in node.models]):
+        if not _distinct_choice_possible(node.models, nodes):
             raise ValueError("merge requires distinct actual artifacts")
         if sum(_rank_floor(value, nodes, recipes, artifacts) for value in node.models) > 256:
             raise ValueError("merged rank exceeds 256")

@@ -6266,3 +6266,24 @@ no Pod was created/changed, no paid GPU ran, and no operating service was reconf
 
 No known failing CPU checks at handoff. Preserve state/ and network volumes before any retention/cleanup decisions.
 Implementation commits are in the local Git repository; nothing was pushed remotely.
+
+## Codex finalization in the Claude worktree — 2026-10-21
+
+Continued from `D:\llm-tuning-factory-wt115`, branch `codex/rc-planning-fixes`. Merged the companion hosted-CI
+help-format test correction `539b3af` without rewriting the existing work (`d187081`). Fresh Python 3.12.12
+locked sync and Ruff pass. The history/index secret scan checked 1,266 versions with zero findings.
+
+Fresh worktree browser verification: **254 Playwright tests passed** (3.0 minutes); TypeScript/Vite production
+build passed. Pre-fix CPU numerical acceptance passed **29/29** using the existing hash-locked CPU environment;
+it will be rerun after the final source correction. No model was downloaded or GPU used.
+
+The independent final fix review found one remaining planning issue: repeated uses of the same multi-candidate
+selection, including a single-candidate selection alias, were treated as independent possible models. Runtime
+duplicate guards still refuse them, but only after upstream work. A narrow test-first planner correction and
+workflow-channel regressions passed: **230 tests** in 278.53s. Seven intended RED failures were observed before the fix; independent conditional choices remain accepted. LF-only normalization followed the covering run; Ruff and diff checks passed. Scoped re-review remains pending. Initial full-suite runs were deliberately interrupted before
+source changes; they are not reported as passing. Fresh full-suite and frozen/installed acceptance remain pending.
+
+The PC has a registered 0.3.0 acceptance install; no app/controller was running at preflight and the factory's
+Credential Manager service had zero entry-name matches. Existing application data must be preserved. No actual
+BOP/SSH/RunPod/MLflow/HF live check, paid resource, dataset transfer, installation, merge to master or release
+publication has been performed in this finalization session.
