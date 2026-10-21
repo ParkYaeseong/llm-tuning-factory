@@ -1502,3 +1502,31 @@ def test_windows_path_errors_raised_as_file_not_found_stay_transient(error, tran
     from tuning_factory import execution
     assert api().local_transient(error) is transient
     assert execution.transient_error(error) is transient
+
+
+@pytest.mark.parametrize("filename,parent_winerror,windows,transient", [
+    ("C:/" + "d" * 300, None, True, True),      # open() of a path of MAX_PATH or more
+    ("C:/share/f", 53, True, True),             # open() under a network share that is gone
+    ("C:/share/f", 67, True, True),
+    ("C:/state/f", None, True, False),          # the folder is there: the file itself is missing (content)
+    ("C:/state/f", 3, True, False),             # the folder is missing on this PC (content)
+    (None, None, True, False),                  # no path to judge
+    ("C:/" + "d" * 300, None, False, False)])   # not Windows: a missing file stays content
+def test_windows_open_errors_without_a_winerror_are_judged_by_their_path(monkeypatch, filename, parent_winerror,
+                                                                          windows, transient):
+    """Last re-review item 1: only ``os.*`` functions set ``winerror``. ``open()`` (paramiko's download, the freeze
+    copy) raises a path too long or a gone network share as a bare FileNotFoundError, so on Windows the path decides:
+    MAX_PATH or more, or a parent folder whose stat fails with WinError 53/67, is local and fixable."""
+    from tuning_factory import execution
+
+    def stat(path):
+        if parent_winerror is not None:
+            raise os_error(FileNotFoundError, parent_winerror, path)
+        return None
+
+    monkeypatch.setattr(execution, "WINDOWS", windows)
+    monkeypatch.setattr(execution, "_stat", stat)
+    error = os_error(FileNotFoundError, filename=filename)
+    assert getattr(error, "winerror", None) is None
+    assert api().local_transient(error) is transient
+    assert execution.transient_error(error) is transient

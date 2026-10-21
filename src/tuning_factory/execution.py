@@ -44,9 +44,29 @@ COLLECTION_INTERRUPTED = ("remote result collection was interrupted after the ho
 CONTENT_OS_ERRORS = (FileNotFoundError, NotADirectoryError, IsADirectoryError, FileExistsError)
 # Windows maps WinError 206 (file name too long) and 53/67 (network path or name not found) to ENOENT, so CPython
 # raises FileNotFoundError for them: local and fixable (a shorter state path, the share back), never content. So is
-# WinError 3 (path not found) for a path of MAX_PATH or more (11.5 final re-review).
+# WinError 3 (path not found) for a path of MAX_PATH or more (11.5 final re-review). Only ``os.*`` functions set
+# ``winerror``: ``open()`` (paramiko's download, the freeze copy) raises the same failures as a bare FileNotFoundError,
+# so on Windows its path decides (``_windows_path_unreachable``).
 TRANSIENT_WINERRORS = frozenset({206, 53, 67})
 MAX_PATH = 260
+WINDOWS = os.name == "nt"
+_stat = os.stat
+
+
+def _windows_path_unreachable(exc: OSError) -> bool:
+    """A bare FileNotFoundError from ``open()`` on Windows whose path is MAX_PATH or longer, or whose folder cannot be
+    reached (its stat fails with WinError 53/67: the network share is gone)."""
+    names = [os.path.abspath(os.fsdecode(name)) for name in (exc.filename, exc.filename2)
+             if isinstance(name, (str, bytes, os.PathLike))]
+    if any(len(name) >= MAX_PATH for name in names):
+        return True
+    for name in names:
+        try:
+            _stat(os.path.dirname(name))
+        except OSError as error:
+            if getattr(error, "winerror", None) in TRANSIENT_WINERRORS:
+                return True
+    return False
 
 
 def content_os_error(exc: BaseException) -> bool:
@@ -57,7 +77,9 @@ def content_os_error(exc: BaseException) -> bool:
     winerror = getattr(exc, "winerror", None)
     if winerror in TRANSIENT_WINERRORS:
         return False
-    return not (winerror == 3 and any(len(str(name)) >= MAX_PATH for name in (exc.filename, exc.filename2) if name))
+    if winerror == 3 and any(len(str(name)) >= MAX_PATH for name in (exc.filename, exc.filename2) if name):
+        return False
+    return not (winerror is None and WINDOWS and _windows_path_unreachable(exc))
 
 
 def transient_error(exc: BaseException) -> bool:
