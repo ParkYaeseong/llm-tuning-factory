@@ -69,6 +69,8 @@ from .runtime_profiles import engine_profile
 from .training import OFT_UNFREEZABLE, PPO_CONTINUATION, check_generation_benchmark, requires_frozen_reference
 
 RUNPOD_PRICE_REQUIRED = "RunPod resource facts require a positive live hourly price"
+# check_merge_descriptors' refusal; planning reports it as ``merge_bases_differ`` when the lineage shows it.
+MERGE_INPUTS_DIFFER = "merge input effective bases/tokenizers/targets differ"
 
 
 class DatasetSnapshot(StrictModel):
@@ -376,7 +378,110 @@ def _definition_issues(project, graph, recipes, datasets):
                         raise ValueError(PPO_CONTINUATION)
             except (KeyError, ValueError) as exc:
                 issues.append(Issue(code="parent_transition", message=str(exc), node_id=node.id))
+    lineage = _MergeLineage(nodes, by_recipe)
+    for node in graph.nodes:
+        if isinstance(node, MergeNode) and lineage.inputs_differ(node):
+            issues.append(Issue(code="merge_bases_differ", message=MERGE_INPUTS_DIFFER, node_id=node.id))
     return issues
+
+
+class _MergeLineage:
+    """The effective base and adapter targets each merge input can resolve to, from the graph alone (and, when
+    planning, the artifact snapshots and the bases' module evidence), as compilation will resolve them:
+
+    - a new LoRA/QLoRA adapter's effective base is its policy base (an HF root or a model artifact); its targets are
+      ``lora_target`` (``all`` expands over the base's module evidence, LLaMA-Factory's rule as the simulated worker
+      and ``check_continuation_targets`` expand it; unknown without evidence);
+    - a continuation keeps its parent adapter's base and targets; a merge keeps its inputs' common ones; a selection
+      offers each candidate's; an artifact adapter has its descriptor's;
+    - a full-model or materialized parent's output is a run-time artifact, so an adapter trained on it has an unknown
+      base; so do a missing artifact snapshot, an unresolvable recipe and a cycle (reported elsewhere). There the
+      check stays silent and compilation (``check_merge_descriptors``) stays authoritative.
+
+    A candidate is ``(base key, sorted targets or None)``; ``None`` instead of a set of candidates means unknown."""
+
+    def __init__(self, nodes, recipes, artifacts=None, evidence=()):
+        self.nodes, self.recipes, self.artifacts = nodes, recipes, artifacts
+        self.evidence = {item.base.model_dump_json(): item for item in evidence}
+        self.cache: dict[str, frozenset | None] = {}
+
+    def _targets(self, recipe, base) -> tuple[str, ...] | None:
+        lora_target = recipe.hyperparameters.lora_target
+        if lora_target != "all":
+            return tuple(sorted(lora_target.split(",")))
+        evidence = self.evidence.get(base.model_dump_json())
+        return None if evidence is None else tuple(sorted({item.name.rsplit(".", 1)[-1] for item in evidence.modules}))
+
+    def _artifact(self, ref):
+        snapshot = self.artifacts.get(_artifact_key(ref)) if self.artifacts is not None else None
+        return snapshot.descriptor if snapshot is not None else None
+
+    def candidates(self, value, active=frozenset()) -> frozenset | None:
+        if isinstance(value, ModelArtifactRef):
+            descriptor = self._artifact(value)
+            if descriptor is None or descriptor.adapter is None:
+                return None
+            return frozenset({(descriptor.effective_base.model_dump_json(),
+                               tuple(sorted(descriptor.adapter.target_modules)))})
+        if not isinstance(value, NodeOutputRef):
+            return None
+        node_id = value.node_id
+        if node_id in self.cache:
+            return self.cache[node_id]
+        node = self.nodes.get(node_id)
+        if node is None or node_id in active:
+            return None
+        try:
+            result = self._node(node, active | {node_id})
+        except (KeyError, ValueError):
+            result = None
+        self.cache[node_id] = result
+        return result
+
+    def _node(self, node, active) -> frozenset | None:
+        if isinstance(node, TrainNode):
+            recipe = _recipe(node, self.recipes)
+            if recipe.training_method not in {"lora", "qlora"}:
+                return None
+            source = node.model_input
+            if isinstance(source, NodeOutputRef):
+                return self.candidates(source, active)   # a continuation keeps its parent's base and targets
+            policy = source.policy
+            if policy.adapter is not None and source.initialization == "continue_adapter":
+                descriptor = self._artifact(policy.adapter)
+                targets = (tuple(sorted(descriptor.adapter.target_modules)) if descriptor and descriptor.adapter
+                           else None)
+            else:
+                targets = self._targets(recipe, policy.base)
+            return frozenset({(policy.base.model_dump_json(), targets)})
+        if isinstance(node, MergeNode):
+            inputs = [self.candidates(value, active) for value in node.models]
+            shared = _shared_candidates(inputs) if all(inputs) else None
+            return shared or None   # an empty set is this merge's own refusal, never reported again downstream
+        if isinstance(node, SelectNode):
+            offered = [self.candidates(self.nodes[ref.node_id].model, active) for ref in node.evaluations
+                       if isinstance(self.nodes.get(ref.node_id), EvaluateNode)]
+            return frozenset().union(*offered) if offered and all(offered) else None
+        return None
+
+    def inputs_differ(self, node: MergeNode) -> bool:
+        """True only when every input's candidates are known and no single base and target set fits them all."""
+        inputs = [self.candidates(value) for value in node.models]
+        return all(inputs) and not _shared_candidates(inputs)
+
+
+def _shared_candidates(inputs) -> frozenset:
+    """The candidates every input can share: a common base, and targets no two known values contradict (an input
+    whose targets are unknown fits any)."""
+    shared = set()
+    for base in frozenset.intersection(*(frozenset(item for item, _ in options) for options in inputs)):
+        targets = [frozenset(value for item, value in options if item == base) for options in inputs]
+        known = [values for values in targets if None not in values]
+        if not known:
+            shared.add((base, None))
+        else:
+            shared.update((base, value) for value in frozenset.intersection(*known))
+    return frozenset(shared)
 
 
 def _project_root():
@@ -504,7 +609,7 @@ def plan_graph(project_revision: Revision[ProjectSpec], execution_choices: Execu
                 benchmark = benchmarks[evaluation.benchmark_revision].spec
                 if roles.get(_dataset_key(benchmark.dataset)) != "validation":
                     raise ValueError("held-out test evaluation cannot influence selection")
-        _static_routes(node, nodes, recipes, artifacts, allowed)
+        _static_routes(node, nodes, recipes, artifacts, allowed, choices.base_targets)
         attempts = graph.retry_policy.max_attempts
         planned.append(NodePlan(node=node, inputs=tuple(InputContract(source=ref, required_port=port)
             for ref, port in node_refs(node)), permitted_model_roots=permitted_roots, allowed_resources=tuple(allowed),
@@ -535,7 +640,7 @@ def _check_plan(plan):
     return checked
 
 
-def _static_routes(node, nodes, recipes, artifacts, resources):
+def _static_routes(node, nodes, recipes, artifacts, resources, evidence=()):
     """Reject known impossible routes; unknown actual tensor contracts stay conditional."""
     if isinstance(node, SelectNode):
         return
@@ -593,6 +698,8 @@ def _static_routes(node, nodes, recipes, artifacts, resources):
     if isinstance(node, MergeNode):
         if all(isinstance(value, ModelArtifactRef) for value in node.models):
             _merge_descriptors(node.models, tuple(artifacts[_artifact_key(ref)].descriptor for ref in node.models))
+        elif _MergeLineage(nodes, recipes, artifacts, evidence).inputs_differ(node):
+            raise ValueError(MERGE_INPUTS_DIFFER)   # artifact adapters or module evidence show it at planning
         ranks = []
         for value in node.models:
             if isinstance(value, NodeOutputRef) and isinstance(nodes[value.node_id], TrainNode):
@@ -957,7 +1064,7 @@ def check_merge_descriptors(refs, descriptors, *, require_real=True):
                 item.adapter.fan_in_fan_out) != (
                 first.effective_base, first.config_sha256, first.tokenizer_fingerprint, first.adapter.target_modules,
                 first.adapter.fan_in_fan_out):
-            raise ValueError("merge input effective bases/tokenizers/targets differ")
+            raise ValueError(MERGE_INPUTS_DIFFER)
         def dimensions(descriptor):
             result = {}
             for tensor in descriptor.tensors:

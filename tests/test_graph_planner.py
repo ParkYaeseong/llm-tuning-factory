@@ -893,3 +893,127 @@ def test_planning_refuses_a_zero_or_nonfinite_runpod_price(tmp_path, simulation)
     profile = settings().profile(server, profile_id=choices.executors[0].profile_id, revision="1")
     plan = plan_graph(project, choices.model_copy(update={"executors": (profile,)}), (server,), simulation=simulation)
     assert plan.max_estimated_cost_usd == 0
+
+
+# -- Task 11.2 follow-up: merges of adapters whose effective bases differ are refused at planning -------------
+
+MERGE_INPUTS_DIFFER = "merge input effective bases/tokenizers/targets differ"   # check_merge_descriptors' text
+
+
+def merge_fixture(tmp_path):
+    """The fixture plus a second HF root with its context and a ``q_proj,v_proj`` recipe beside the default
+    (``lora_target: all``) one."""
+    from types import SimpleNamespace
+
+    from tuning_factory.graph_planner import ModelContext
+    registry, project, choices, facts = fixture(tmp_path)
+    other = HFRootRef(repo_id="Qwen/Qwen2.5-1.5B-Instruct", revision="d" * 40, config_sha256="e" * 64,
+                      tokenizer_fingerprint="f" * 64)
+    targeted = RecipeSpec(recipe_id="targeted", name="targeted", hyperparameters={"lora_target": "q_proj,v_proj"})
+    targeted = Revision(spec=targeted, revision_sha256=digest(canonical(targeted.model_dump(mode="json"))))
+    choices = choices.model_copy(update={"recipes": (*choices.recipes, targeted),
+                                         "models": (*choices.models, ModelContext(root=other))})
+    return SimpleNamespace(registry=registry, project=project, choices=choices, facts=facts,
+                           root=choices.models[0].root, other=other, default=choices.recipes[0].revision_sha256,
+                           targeted=targeted.revision_sha256)
+
+
+def lora(node_id, recipe, source):
+    """A LoRA training: a new adapter on an HF root, or a continuation of ``source``'s output (a node ID)."""
+    model_input = ({"node_id": source, "output_name": "model"} if isinstance(source, str) else
+                   ModelInput(policy=ModelLoadRef(base=source), initialization="new_adapter").model_dump(mode="json"))
+    return {"kind": "train", "id": node_id, "label": node_id, "recipe_revision": recipe, "model_input": model_input,
+            "dataset_binding": "data", "executor_profile_ids": ["p"]}
+
+
+def merged(node_id, sources):
+    return {"kind": "merge", "id": node_id, "label": "Merge", "weights": [0.5, 0.5], "executor_profile_ids": ["p"],
+            "models": [{"node_id": source, "output_name": "model"} for source in sources]}
+
+
+def merge_case(m, nodes, evidence=()):
+    project = revise(m.project, {"nodes": nodes, "retry_policy": {"max_attempts": 1}})
+    choices = m.choices.model_copy(update={"base_targets": tuple(evidence), "node_resources": tuple(
+        NodeResources(node_id=node["id"], timeout_seconds=600) for node in nodes)})
+    return project, choices
+
+
+def merge_issues(m, project, choices):
+    from tuning_factory.graph_schema import validate_graph
+    return [(issue.code, issue.message, issue.node_id)
+            for issue in validate_graph(project.spec, choices.recipes, m.registry)]
+
+
+def root_evidence(root, *leaves):
+    from tuning_factory.graph_planner import ModelTargetEvidence, TargetModuleEvidence
+    return ModelTargetEvidence(base=root, modules=tuple(
+        TargetModuleEvidence(name=f"model.layers.0.self_attn.{leaf}", input_dimension=2, output_dimension=2)
+        for leaf in leaves))
+
+
+@pytest.mark.parametrize("case", ["direct", "continuation", "nested_merge", "continued_merge"])
+def test_merges_of_adapters_from_different_base_roots_are_refused_at_validation_and_planning(tmp_path, case):
+    """A real plan would otherwise train both branches on paid GPUs and only then fail at the merge's compile
+    (``check_merge_descriptors``). The bases are resolved through the lineage: continuations keep their parent's
+    base, a merge keeps its inputs' common base."""
+    m = merge_fixture(tmp_path)
+    a, b, x = lora("a", m.default, m.root), lora("b", m.default, m.root), lora("x", m.default, m.other)
+    nodes = {
+        "direct": [a, x, merged("m", ("a", "x"))],
+        "continuation": [a, x, lora("c", m.default, "a"), merged("m", ("c", "x"))],
+        "nested_merge": [a, b, x, merged("ab", ("a", "b")), merged("m", ("ab", "x"))],
+        "continued_merge": [a, b, x, merged("ab", ("a", "b")), lora("c", m.default, "ab"), merged("m", ("x", "c"))],
+    }[case]
+    project, choices = merge_case(m, nodes)
+    # Reported on the merge node only (the inner same-root merge is fine), before any plan exists.
+    assert merge_issues(m, project, choices) == [("merge_bases_differ", MERGE_INPUTS_DIFFER, "m")]
+    with pytest.raises(ValueError, match=f"^merge_bases_differ: {MERGE_INPUTS_DIFFER}$"):
+        plan_graph(project, choices, (m.facts,))
+
+
+@pytest.mark.parametrize("case", ["siblings", "continuation", "nested_merge"])
+def test_merges_of_adapters_on_one_base_root_still_plan(tmp_path, case):
+    m = merge_fixture(tmp_path)
+    a, b = lora("a", m.default, m.root), lora("b", m.default, m.root)
+    nodes = {
+        "siblings": [a, b, merged("m", ("a", "b"))],
+        "continuation": [a, b, lora("c", m.default, "a"), merged("m", ("c", "b"))],
+        "nested_merge": [a, b, lora("d", m.default, m.root), merged("ab", ("a", "b")), merged("m", ("ab", "d"))],
+    }[case]
+    project, choices = merge_case(m, nodes, (root_evidence(m.root, "q_proj", "k_proj", "v_proj"),))
+    assert merge_issues(m, project, choices) == []
+    plan = plan_graph(project, choices, (m.facts,))
+    assert {entry.node.id for entry in plan.nodes} == {node["id"] for node in nodes}
+
+
+def test_a_merge_whose_base_is_only_known_at_run_time_still_plans(tmp_path):
+    """A new adapter trained on a materialized model has a run-time artifact as its base: compile stays
+    authoritative (``check_merge_descriptors``), as before this check."""
+    m = merge_fixture(tmp_path)
+    nodes = [lora("a", m.default, m.root), lora("x", m.default, m.other),
+             {"kind": "materialize", "id": "full", "label": "Materialize", "executor_profile_ids": ["p"],
+              "model": {"node_id": "a", "output_name": "model"}},
+             lora("y", m.default, "full"), merged("m", ("y", "x"))]
+    project, choices = merge_case(m, nodes)
+    assert merge_issues(m, project, choices) == []
+    assert plan_graph(project, choices, (m.facts,)).nodes[-1].node.id == "m"
+
+
+def test_merges_of_adapters_with_different_targets_on_one_root_are_refused_when_the_evidence_shows_it(tmp_path):
+    """``lora_target: all`` expands over the root's module evidence (LLaMA-Factory's rule, as the simulated worker
+    and ``check_continuation_targets`` expand it); ``q_proj,v_proj`` is explicit. Without evidence the expansion is
+    unknown and compile stays authoritative; evidence of exactly q_proj and v_proj makes the two the same."""
+    m = merge_fixture(tmp_path)
+    nodes = [lora("a", m.default, m.root), lora("t", m.targeted, m.root), merged("m", ("a", "t"))]
+    project, choices = merge_case(m, nodes, (root_evidence(m.root, "q_proj", "k_proj", "v_proj"),))
+    assert merge_issues(m, project, choices) == []   # validation has no module evidence
+    with pytest.raises(ValueError, match=f"^{MERGE_INPUTS_DIFFER}$"):
+        plan_graph(project, choices, (m.facts,))
+    for evidence in ((), (root_evidence(m.root, "q_proj", "v_proj"),)):
+        project, choices = merge_case(m, nodes, evidence)
+        assert plan_graph(project, choices, (m.facts,)).nodes[-1].node.id == "m"
+    # A continuation of the targeted adapter keeps its targets: merged with a same-target sibling, it plans.
+    nodes = [lora("t", m.targeted, m.root), lora("u", m.targeted, m.root), lora("c", m.targeted, "t"),
+             merged("m", ("c", "u"))]
+    project, choices = merge_case(m, nodes, (root_evidence(m.root, "q_proj", "k_proj", "v_proj"),))
+    assert plan_graph(project, choices, (m.facts,)).nodes[-1].node.id == "m"
