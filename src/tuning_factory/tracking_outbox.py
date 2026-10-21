@@ -78,12 +78,41 @@ SECRET_VARIABLES = ("MLFLOW_TRACKING_TOKEN", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLO
 _SAFE_PART = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*")
 
 
-# A URL's query (11.5 R1 m6): signed storage URLs carry their credential there (Azure SAS ``sig=``, GCS
-# ``X-Goog-Signature``/``X-Goog-Credential``, S3 ``X-Amz-Signature``). The scheme, host and path stay readable.
-_URL_QUERY = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s?#'\"<>]*)\?[^\s#'\"<>]*")
-# A token or secret as a JSON (or Python repr) member: ``"access_token": "..."``.
+# Every pattern below is linear (possessive quantifiers, no backtracking over a long run), and they see at most
+# REDACT_WINDOW characters (11.5 re-review M4: the first URL-query pattern backtracked quadratically on text without
+# whitespace and held the GIL the lease heartbeat needs). The window is far beyond any stored or shown limit, so a
+# value cut at its end never reaches the output.
+REDACT_WINDOW = 65536
+_BEARER = re.compile(r"(?i)\b(bearer|basic)\s++[^\s,;'\"]++")
+_SECRET_PAIR = re.compile(r"(?i)\b(client_secret|access_token|token|password)=[^\s&;,'\"]++")
+# A token or secret as a JSON (or Python repr) member: ``"access_token": "..."`` (also when cut off unterminated).
 _QUOTED_SECRET = re.compile(r"(?i)([\"'](?:access_token|refresh_token|id_token|client_secret|token|password)[\"']"
-                            r"\s*:\s*)([\"'])(?:\\.|(?!\2).)*\2")
+                            r"\s*+:\s*+)([\"'])(?:\\.|(?!\2).)*+(?:\2|$)")
+_USERINFO = re.compile(r"://[^/\s@]++@")
+# A URL's query (11.5 R1 m6): signed storage URLs carry their credential there (Azure SAS ``sig=``, GCS
+# ``X-Goog-Signature``/``X-Goog-Credential``, S3 ``X-Amz-Signature``). The scheme, host and path stay readable. Found
+# per whitespace-delimited token by ``str.find``, so each character is looked at a bounded number of times.
+_TOKEN = re.compile(r"[^\s'\"<>]++")
+
+
+def _strip_queries(match) -> str:
+    token = match.group(0)
+    scheme = token.find("://")
+    if scheme < 0:
+        return token
+    parts, position = [], 0
+    while scheme >= 0:
+        query = token.find("?", scheme + 3)
+        if query < 0:
+            break
+        parts.append(token[position:query] + "?[redacted]")
+        position = token.find("#", query)
+        if position < 0:
+            position = len(token)
+            break
+        scheme = token.find("://", position)
+    parts.append(token[position:])
+    return "".join(parts)
 
 
 def redact(text, limit=500) -> str:
@@ -94,11 +123,12 @@ def redact(text, limit=500) -> str:
         value = os.environ.get(name)
         if value and len(value) >= 6:
             text = text.replace(value, "[redacted]")
-    text = re.sub(r"(?i)\b(bearer|basic)\s+[^\s,;'\"]+", r"\1 [redacted]", text)
-    text = re.sub(r"(?i)\b(client_secret|access_token|token|password)=[^\s&;,'\"]+", r"\1=[redacted]", text)
+    text = text[:max(REDACT_WINDOW, 4 * limit)]
+    text = _BEARER.sub(r"\1 [redacted]", text)
+    text = _SECRET_PAIR.sub(r"\1=[redacted]", text)
     text = _QUOTED_SECRET.sub(r"\1\2[redacted]\2", text)
-    text = re.sub(r"://[^/\s@]+@", "://[redacted]@", text)
-    text = _URL_QUERY.sub(r"\1?[redacted]", text)
+    text = _USERINFO.sub("://[redacted]@", text)
+    text = _TOKEN.sub(_strip_queries, text)
     return text[:limit]
 
 

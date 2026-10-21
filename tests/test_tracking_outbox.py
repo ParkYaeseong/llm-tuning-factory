@@ -1251,3 +1251,30 @@ def test_redact_strips_url_queries_and_json_tokens():
     for text, expected in texts.items():
         redacted = outbox_api.redact(text)
         assert redacted == expected and signature not in redacted and token not in redacted
+
+
+def test_redact_is_bounded_on_long_text_without_whitespace(monkeypatch):
+    """Task 11.5 re-review M4: the URL-query pattern backtracked quadratically on whitespace-free text (280 KB took
+    16 s, holding the GIL the lease heartbeat needs). 1 MB adversarial texts are redacted well under a second, and a
+    secret near the start is still removed."""
+    import time
+    outbox_api = api()
+    secret = 'z' * 12 + '%2F' + 'y' * 12   # built at runtime; never a real credential
+    monkeypatch.setenv('MLFLOW_TRACKING_PASSWORD', 'synthetic-' + 'basic-password')
+    size = 1_000_000
+    texts = [
+        f'GET https://h.example/o?sig={secret}' + 'https://a' * (size // 9),
+        'https://a.b' * (size // 11) + f' https://h.example/o?sig={secret}',
+        f'"access_token": "{secret}' + 'x' * size,
+        f'https://user:{secret}@h.example/' + '://a' * (size // 4),
+        'synthetic-basic-password' + 'a.' * (size // 2),
+        '"token": "' * (size // 10),
+    ]
+    for text in texts:
+        started = time.perf_counter()
+        for limit in (500, 4000):
+            redacted = outbox_api.redact(text, limit)
+            assert secret not in redacted and 'synthetic-basic-password' not in redacted
+            assert len(redacted) <= limit
+        assert time.perf_counter() - started < 0.5, text[:40]
+    assert outbox_api.redact(texts[0]).startswith('GET https://h.example/o?[redacted]')
