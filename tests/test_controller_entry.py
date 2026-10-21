@@ -1449,6 +1449,18 @@ def test_the_git_revision_child_inherits_no_credentials(tmp_path):
     assert len(seen["revision"]) == 40 or seen["revision"] == "uncommitted"
 
 
+def test_the_tracking_claim_ttl_covers_one_bounded_create():
+    """Task 11.5 R1 m11: a tracking claim TTL below the controller's 60 s MLflow request bound could expire during one
+    create; ``StartSettings`` refuses it (production uses 600 s)."""
+    from tuning_factory.tracking import CONTROLLER_HTTP_TIMEOUT_SECONDS
+    ce = entry()
+    fast = {"lease_ttl_seconds": 6.0, "lease_heartbeat_seconds": 1.5}   # three heartbeats are far below either TTL
+    with pytest.raises(ValueError, match="greater than or equal"):
+        ce.StartSettings(tracking_claim_ttl_seconds=float(CONTROLLER_HTTP_TIMEOUT_SECONDS) - 1, **fast)
+    settings = ce.StartSettings(tracking_claim_ttl_seconds=float(CONTROLLER_HTTP_TIMEOUT_SECONDS), **fast)
+    assert settings.controller_settings().tracking_claim_ttl_seconds == CONTROLLER_HTTP_TIMEOUT_SECONDS
+
+
 def test_basic_credentials_never_reach_a_none_mode_controller(monkeypatch):
     """Task 11.5 R1 m5: inherited MLflow Basic credentials now make plain HTTP refused on the v1 paths, but they have no
     auth mode of their own and the controller pops them, so a 'none' controller on a local HTTP server still starts."""

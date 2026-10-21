@@ -67,6 +67,7 @@ from .registry import canonical, digest
 from .tracking import (
     AUTH_MODES,
     AUTHENTICATED_HTTPS,
+    CONTROLLER_HTTP_TIMEOUT_SECONDS,
     DEFAULT_EXPERIMENT,
     public_tracking_settings,
     tracking_settings_sha256,
@@ -167,7 +168,8 @@ class StartSettings(StrictModel):
     lease_ttl_seconds: float = _seconds(60, 2, 600)
     tick_seconds: float = _seconds(5, 0.05, 60)
     lease_heartbeat_seconds: float = _seconds(20, 0.5, 300)
-    tracking_claim_ttl_seconds: float = _seconds(600, 3, 7200)
+    # At least one bounded MLflow create (11.5 R1 m11): a shorter claim could expire during a single request.
+    tracking_claim_ttl_seconds: float = _seconds(600, CONTROLLER_HTTP_TIMEOUT_SECONDS, 7200)
     stale_attempt_seconds: float = _seconds(120, 5, 3600)
 
     @model_validator(mode="after")

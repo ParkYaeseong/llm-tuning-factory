@@ -59,12 +59,18 @@ class ModelArtifactRef(ArtifactModel):
 BaseRef = HFRootRef | ModelArtifactRef
 
 
+# A Windows device name, also with spaces before an extension (``NUL .txt`` opens NUL): artifact paths and remote
+# downloads (``execution``) share this one rule (11.5 R1 m9), with the superscript digits Windows maps to COM/LPT.
+WINDOWS_DEVICE_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[0-9¹²³]|LPT[0-9¹²³])"
+                                 r" *(?:\..*)?", re.IGNORECASE)
+
+
 def _relative(value: str) -> str:
     # Reject Windows drive/ADS names and ambiguous normalization on every platform.
     if (not value or "\\" in value or ":" in value or value.startswith("/")
             or any(part in {"", ".", ".."} or part[-1:] in {" ", "."}
                    or re.search(r'[<>"|?*\x00-\x1f]', part)
-                   or re.fullmatch(r"CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]", part.split(".")[0], re.I)
+                   or WINDOWS_DEVICE_NAME.fullmatch(part)
                    for part in value.split("/"))):
         raise ValueError("invalid relative artifact path")
     return value
@@ -735,8 +741,10 @@ class ModelArtifactStore:
                 verifier.verify(ref)
             return ref
         finally:
+            # Best effort, as freeze_operation_output (11.5 R1 m8): an antivirus holding a leftover ``.freeze-*``
+            # directory never fails a valid freeze, nor replaces the error of a failed one.
             if temporary.exists():
-                shutil.rmtree(temporary)
+                shutil.rmtree(temporary, ignore_errors=True)
 
     def get(self, ref: ModelArtifactRef) -> ModelDescriptor:
         return self.verify(ref)

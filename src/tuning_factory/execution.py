@@ -18,6 +18,7 @@ from pydantic import Field
 from .config import StrictModel
 from .gpu_servers import SSHServerFacts, safe_remote_root, validate_server_binding
 from .manifest import verify_manifest
+from .model_artifacts import WINDOWS_DEVICE_NAME
 from .registry import canonical, digest, file_digest
 from .remote_model_cache import CachedTransfer, ensure_cached, remote_exists  # CachedTransfer is re-exported
 from .worker_protocol import COMMAND, RESULT, START_MARKER, OperationResult, WorkerRequest, is_v2_directory
@@ -48,8 +49,7 @@ REQUIRED_UPLOADS = (COMMAND, "manifest.json", "model-inputs.json")
 # Names Windows cannot hold as written: reserved characters and control codes (``:`` also selects a drive or
 # an alternate data stream), device names, and a trailing dot or space (Win32 strips both, aliasing the name).
 _WINDOWS_UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]|[. ]$')
-_DEVICE_NAME = re.compile(r"(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[0-9¹²³]|LPT[0-9¹²³])"
-                          r"(?:\..*)?", re.IGNORECASE)
+_DEVICE_NAME = WINDOWS_DEVICE_NAME   # one rule with artifact paths (11.5 R1 m9)
 # The shape of an NTFS 8.3 short name (``REMOTE~1.JSO``), which can open an existing long-named file.
 _SHORT_NAME = re.compile(r"~[0-9]")
 

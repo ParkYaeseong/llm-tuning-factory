@@ -698,3 +698,48 @@ def test_freeze_raises_other_rename_errors_and_a_lasting_violation(tmp_path, mon
         assert len(calls) == tries
         assert not [path for path in store.root.iterdir() if path.name.startswith('.freeze-')]
     assert sleeps == [0.05] * 9
+
+
+# The superscript digits Windows also maps to COM/LPT devices, from their code points.
+SUPERSCRIPT_ONE, SUPERSCRIPT_THREE = chr(0xB9), chr(0xB3)
+
+
+@pytest.mark.parametrize('filename', ['COM0', 'LPT0.bin', 'CONIN$', 'conout$.json', 'COM' + SUPERSCRIPT_ONE,
+                                      'nested/LPT' + SUPERSCRIPT_THREE + '.txt', 'NUL .txt', 'aux  .tar.gz'])
+def test_the_stricter_windows_device_names_cannot_be_model_paths(filename):
+    """Task 11.5 R1 m9: artifact paths and remote downloads share one device-name rule, the stricter one."""
+    from tuning_factory import execution
+    module = api()
+    assert execution._DEVICE_NAME is module.WINDOWS_DEVICE_NAME
+    with pytest.raises(ValueError):
+        module.TensorMetadata(file=filename, name='weight', shape=(1,), dtype='F32')
+    assert module.WINDOWS_DEVICE_NAME.fullmatch(filename.rsplit('/', 1)[-1])
+
+
+@pytest.mark.parametrize('filename', ['console.json', 'com10.bin', 'lpt', 'nul_model.safetensors', 'con fig.json'])
+def test_names_that_only_resemble_device_names_stay_valid(filename):
+    module = api()
+    assert module.TensorMetadata(file=filename, name='weight', shape=(1,), dtype='F32').file == filename
+
+
+def test_a_valid_freeze_survives_a_failing_cleanup_of_its_temporary_directory(tmp_path, monkeypatch):
+    """Task 11.5 R1 m8: when the identical entry already exists, the leftover ``.freeze-*`` directory is removed best
+    effort (as ``freeze_operation_output`` does); an antivirus holding it never fails the valid freeze."""
+    import shutil
+    module = api()
+    directory, descriptor = fixture_model(tmp_path)
+    store = module.ModelArtifactStore(tmp_path / 'store')
+    first = store.freeze(directory, descriptor)
+    rmtree, cleanups = shutil.rmtree, []
+
+    def held(path, ignore_errors=False, *args, **kwargs):
+        if Path(path).name.startswith('.freeze-'):
+            cleanups.append(path)
+            if not ignore_errors:
+                raise sharing_violation(32)
+            return None
+        return rmtree(path, ignore_errors, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, 'rmtree', held)
+    assert store.freeze(directory, descriptor) == first   # the rename finds the entry, which verifies
+    assert cleanups and store.verify(first) == descriptor
