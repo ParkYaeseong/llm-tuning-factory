@@ -6239,7 +6239,9 @@ model_artifacts,controller_entry}.py`) and this file.
     CANCELED when the job has `cancel_requested` or the run is CANCELED, as `_launch` does. The flag is re-read
     after the collection. Nothing is frozen, no child is unblocked and nothing is registered.
   - `GraphStore._state('CANCELED')` and `JobStore.cancel` also flag a FAILED/CANCELED graph attempt that still
-    holds its lock. A final attempt (lock released) is unchanged, so a retry backoff is not affected.
+    holds its lock. Since the re-review (M3 below), `JobStore.cancel` also flags one whose node is unfinished (not
+    yet classified, or in a retry backoff), and that node is settled CANCELED instead of retried. The final attempt
+    of a finished node is unchanged.
   - `SSHExecutor.collect_operation_result(..., cancel=True)` writes the remote `cancel` marker while there is no
     result. It is best effort: a launch directory that was never created is ignored, and the next reconcile tries
     again. `_await_result` uses the same `_send_cancel`. `collect_operation_result` has one new keyword-only
@@ -6350,6 +6352,87 @@ model_artifacts,controller_entry}.py`) and this file.
   - `GITHUB_ACTIONS=true CI=true uv run pytest tests/test_graph_controller.py tests/test_acceptance_workflows.py
     tests/test_controller_entry.py`: 138 passed (235 s).
   - Not run: the CPU numerics acceptance (root runs it at the RC), and every GPU or network step.
+- **Re-review follow-ups (root's scoped re-review: ready to integrate, no Critical or Important), test first, as
+  commits on top of `d462433`.** The new tests were run on `d462433` first: 17 failed for the reported
+  reason, and the old `redact` was timed for M4 (below). All pass with the fixes.
+  - **M1, a cancel landing during the freeze: fixed.**
+    - Before, the cancel check ran before the freeze and the result was recorded after it, so such a cancel was
+      lost.
+    - Now `JobStore.transition(..., 'COMPLETED')` and `JobStore.reconcile_result(..., 'COMPLETED')` write CANCELED
+      for a graph attempt whose job or run was canceled, in the same transaction, and return the status written.
+      No window is left.
+    - The runner and the simulated dispatcher use the returned status: no outputs, no cache seed. The early check
+      before the freeze stays and saves a needless freeze. The scripted test fake honours the returned status.
+    - Tests: `test_a_cancel_that_lands_during_the_freeze_is_never_lost` (`_launch` and reconcile × run and job; the
+      cancel fires inside `freeze_operation_output`) and `test_a_cancel_during_the_simulated_freeze_is_never_lost`
+      (run, job).
+  - **M2, the over-broad transient set and the status: fixed.**
+    - (a) `execution.CONTENT_OS_ERRORS` are FileNotFoundError, NotADirectoryError, IsADirectoryError and
+      FileExistsError. After the host finished, they are content errors and final at once, as before 11.5:
+      `output_invalid` from the freeze, `failed_before_submit` from the collection. `attempt_runner.local_transient`
+      (freeze) and `execution.transient_error` (collection) keep the other local errors uncertain. Test:
+      `test_a_missing_file_after_completion_is_final_not_uncertain`, 3 cases: a missing `adapter_config.json` from
+      `_launch` and from reconcile, and a missing `artifacts.json`.
+    - (b) A freeze failure in reconcile raises `jobs.OutputsNotSaved`. The controller then notes the new
+      `graph_controller.OUTPUTS_NOT_SAVED`, which is in `OPERATOR_PREFIXES`, instead of `RECONCILE_UNAVAILABLE`.
+      Its exact text: "the result arrived but its outputs could not be saved on this PC; free disk space, check the
+      state folder's permissions, an antivirus scan or the path length; it is retried automatically, or release
+      the lock to give the result up: {error}".
+    - (c) In `graph_status`, an uncertain attempt with an accepted result for its launch is no longer
+      `awaiting_result`. So `needs_operator` is true and the desktop's `graph_release_lock` gate
+      (`needs_operator && uncertain && !awaiting_result`) offers the release, which gives a terminal
+      `output_invalid`. There is no new status field. Test: `test_outputs_that_cannot_be_saved_locally_name_the_local_fix`:
+      with `fixed`, the next reconcile completes it (1 launch, 1 training call); with `released`, the desktop release
+      gives `output_invalid`.
+    - (d) `desktop/src/wait-reasons.ts` localizes the reason (kind `operator`), and the
+      `desktop/tests/graph-runs.spec.ts` case list has it. No test enforces that every constant is localized; the spec
+      lists cases. `node_modules` is not installed here, so Playwright was not run. Instead a Node 26 script (type
+      stripping) imported `wait-reasons.ts` and checked the localization of the constant's formatted text: kind
+      `operator`, Korean text, original kept. The spec's text equals the constant.
+  - **M3, a job-level cancel during a retry backoff: fixed.** `JobStore.cancel` flags a FAILED/CANCELED graph job
+    while its node is unfinished. `_settle_node` then cancels a node not yet classified, and `settle_canceled_jobs`
+    settles a node in its backoff CANCELED with its subtree BLOCKED.
+    - Test: `test_a_job_cancel_during_a_retry_backoff_is_honoured` (before classification, and in a 300 s backoff;
+      `max_attempts=2`, ticks past the backoff). Result: `a` CANCELED, `b` BLOCKED, 1 launch, run FAILED.
+    - The two I-1 guards that cancelled an unclassified "final" attempt now classify it first.
+  - **M4, `redact` was quadratic: fixed.**
+    - On `d462433`, 20/40/80 KB of `https://a` took 0.11/0.43/1.7 s.
+    - Now the configured secret values are replaced on the whole text first. Then it works on at most
+      `REDACT_WINDOW` = 65536 characters (or 4 × limit). The patterns are possessive, and URL queries are stripped
+      per whitespace-free token with `str.find`.
+    - Test: `test_redact_is_bounded_on_long_text_without_whitespace`: six 1 MB adversarial texts, each under 0.5 s
+      for both limits, with the secrets removed.
+  - **M5: fixed.** `claim_ready`'s `max_concurrent` gate applies to GPU claims only. Test:
+    `test_a_local_selection_is_never_held_back_by_max_concurrent` (the selection completes while the other GPU claim
+    waits).
+  - **Nits: fixed.**
+    - `jobs.GRAPH_RESUME_REFUSED` = "a graph-owned job is never resumed by hand; to run it again, change an input and
+      plan again".
+    - `auth.INSECURE_TRACKING` now names `MLFLOW_TRACKING_USERNAME`/`MLFLOW_TRACKING_PASSWORD` as values to clear.
+  - **Flake hardening.**
+    - The `Served` helper of `tests/test_acceptance_workflows.py` takes settings. Both Served tests pass
+      `SERVED = {**FAST, "lease_ttl_seconds": 60}`; the heartbeat stays 1.5 s (2 × 1.5 ≤ 60 and 3 × 1.5 ≤ 600).
+    - Its failure messages include `current.json`'s `code`.
+    - Neither test relies on lease expiry:
+      - both stop by their stop event or a stop request, and the owner is released on the drain;
+      - the second controller of the headless test is refused with `owner_held` while the first runs.
+  - Commits:
+    - `875837f` fixes M1.
+    - `6290eea` fixes M2.
+    - `6174911` fixes M3.
+    - `e13f310` fixes M4.
+    - `7d30f4e` fixes M5.
+    - `81a58d7` fixes the nits.
+    - `f405e77` is the flake hardening.
+    - Each was checked on its own `git archive` tree: ruff passed, compileall passed, and its own tests passed (23,
+      11, 7, 2, 8 and 5).
+  - Verification:
+    - Full `uv run pytest -q` at `f405e77`: 1819 passed, 1 skipped (452 s; the skip is the opt-in real-GPU test).
+    - `GITHUB_ACTIONS=true CI=true uv run pytest tests/test_graph_controller.py tests/test_acceptance_workflows.py
+      tests/test_controller_entry.py`: 142 passed (164 s).
+    - `uv run ruff check src tests`: All checks passed.
+    - `scripts/check_secrets.py`: 1247 file versions, 0 findings.
+    - `git diff --check d462433 HEAD`: clean, with LF only.
 
 ## Windows workbench refinement — 0.2.1
 
