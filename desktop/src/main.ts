@@ -252,6 +252,9 @@ function compatibilityView() {
     ${(result.warnings || []).map((message: string) => `<p>${esc(message)}</p>`).join("")}
     ${result.model?.verification_scope ? `<p>GPU 검증 이력: ${esc(result.model.verification_scope)}</p>` : ""}<small>필요한 데이터 종류: ${esc(result.dataset_kind || "학습 단계에 따른 데이터")} · 학습 엔진 ${esc(result.engine_version || "확인 필요")} · ${result.resume_supported === false ? "이 조합은 체크포인트 재개를 지원하지 않습니다." : "재개 시 완전한 체크포인트가 필요합니다."}<br>설정 호환성은 실제 GPU 학습 성공이나 모든 모델의 검증을 보장하지 않습니다.</small></section>`;
 }
+/** "저장된 인증값 삭제" (11.5 R2 I2): what main.rs forget_credentials deletes, and what that means for real runs. */
+const FORGET_CONFIRMATION = "Windows 자격 증명 저장소에 저장한 이 앱의 RunPod·MLflow·S3·Hugging Face 인증값과 모든 실행 프로필의 RunPod API 키를 삭제합니다. 진행 중인 작업에는 적용되지 않습니다. 실행 프로필의 키를 다시 저장하기 전에는 그 프로필로 등록한 실제 실행이 다음 컨트롤러 시작부터 진행되지 않습니다.";
+const FORGET_PROFILES_UNKNOWN = "연결 인증값은 삭제했지만 실행 프로필 인증값을 모두 삭제했는지 확인하지 못했습니다.";
 const datasetKinds: [string, string][] = [["instruction", "지시·대화 · SFT"], ["text", "텍스트 · PT"], ["preference", "선호 쌍 · RM/DPO"], ["kto", "선호 라벨 · KTO"], ["prompt", "프롬프트 · PPO"]];
 function dataSize(value: unknown) {
   if (typeof value !== "number") return "—";
@@ -268,7 +271,7 @@ function s3Connections() {
     ${field("S3 Access Key ID", "S3_ACCESS_KEY_ID", s.S3_ACCESS_KEY_ID || "", "password", s.S3_ACCESS_KEY_ID_saved ? "보안 저장됨 · 변경할 때만 입력" : "읽기 권한의 키를 권장합니다.")}
     ${field("S3 Secret Access Key", "S3_SECRET_ACCESS_KEY", s.S3_SECRET_ACCESS_KEY || "", "password", s.S3_SECRET_ACCESS_KEY_saved ? "보안 저장됨" : "Windows 자격 증명 저장소에 보관합니다.")}
     ${field("S3 Session Token", "S3_SESSION_TOKEN", s.S3_SESSION_TOKEN || "", "password", s.S3_SESSION_TOKEN_saved ? "보안 저장됨" : "임시 자격 증명을 사용할 때 입력하세요.")}
-    </div><div class="actions"><button class="primary" type="submit">S3 연결 정보 저장</button></div><p class="muted">저장된 인증값 삭제는 RunPod·MLflow·S3의 인증값을 함께 삭제합니다. 목록 권한이 없어도 데이터 화면에서 정확한 객체 key로 확인할 수 있습니다.</p></section></form>`;
+    </div><div class="actions"><button class="primary" type="submit">S3 연결 정보 저장</button></div><p class="muted">저장된 인증값 삭제는 RunPod·MLflow·S3·Hugging Face 인증값과 모든 실행 프로필의 RunPod API 키를 함께 삭제합니다. 목록 권한이 없어도 데이터 화면에서 정확한 객체 key로 확인할 수 있습니다.</p></section></form>`;
 }
 function s3Datasets() {
   const d = state.s3Draft;
@@ -969,8 +972,12 @@ async function action(name: string) {
         "저장된 연결 정보로 MLflow와 GPU 서버 조회를 확인했습니다. 실제 학습은 아직 확인하지 않았습니다." : "GPU 서버 조회를 확인했습니다. MLflow 주소가 없어 기록 저장소는 확인하지 않았습니다.";
     }
     else if (name === "forget") {
-      if (await approve("저장된 인증값 삭제", "Windows 자격 증명 저장소에 저장한 이 앱의 RunPod·MLflow·S3·Hugging Face 인증값을 삭제합니다. 진행 중인 작업에는 적용되지 않습니다.")) {
-        await invoke("forget_credentials"); state.settings = await invoke("settings_get"); store.markSettingsChanged(); state.settingsDraft = null; state.s3SettingsDraft = null; state.hfDraft = null; state.connectionReport = null; state.notice = "저장된 인증값을 삭제했습니다.";
+      if (await approve("저장된 인증값 삭제", FORGET_CONFIRMATION)) {
+        // main.rs forget_all_credentials: the connection credentials, then (best effort) every executor profile's key.
+        const result = await invoke<Obj | null>("forget_credentials");
+        state.settings = await invoke("settings_get"); store.markSettingsChanged(); state.settingsDraft = null; state.s3SettingsDraft = null; state.hfDraft = null; state.connectionReport = null;
+        if (result?.profile_credentials_forgotten === false) state.error = String(result.profile_warning || FORGET_PROFILES_UNKNOWN);
+        else state.notice = "저장된 인증값을 삭제했습니다.";
       }
     }
     else if (name === "runtime_check" || name === "runtime_prepare") { state.runtimeReport = await api(name, { approved: name === "runtime_prepare", training_stage: state.config?.training_stage || "sft" }); state.notice = `선택한 ${isServer(state.settings) ? "GPU 서버" : "Pod"}에서 앱과 일치하는 학습 환경과 CUDA를 확인했습니다.`; }

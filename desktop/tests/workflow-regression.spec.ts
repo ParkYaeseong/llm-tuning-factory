@@ -388,3 +388,30 @@ test("a blank project reaches a dry-run plan through the screens without example
   expect(await calls(page, { command: "controller_start" })).toEqual([]);
   await expectFlow(page, [...FLOW, "graph_plan", "graph_runs_list", "graph_submit"]);
 });
+
+// -- 11.5 R2 I2: "저장된 인증값 삭제" also deletes every executor profile's RunPod key (main.rs forget_all_credentials) --
+test("forgetting credentials names every profile key and shows a partial failure instead of success", async ({ page }) => {
+  const warning = `연결 인증값은 삭제했지만 실행 프로필 인증값을 모두 삭제했는지 확인하지 못했습니다. (${HOSTILE})`;
+  await openWorkbench(page, { settings: { RUNPOD_API_KEY_saved: true }, native: { forget_credentials: [
+    { profile_credentials_forgotten: true }, { profile_credentials_forgotten: false, profile_warning: warning }] } });
+  await nav(page, "connections");
+  await idle(page);
+  await expect(page.locator("#s3-settings-form")).toContainText("모든 실행 프로필의 RunPod API 키");
+  const forget = page.getByRole("button", { name: "저장된 인증값 삭제", exact: true });
+  await forget.click();
+  const dialog = page.getByRole("dialog");
+  for (const text of ["RunPod·MLflow·S3·Hugging Face", "모든 실행 프로필의 RunPod API 키", "컨트롤러"])
+    await expect(dialog).toContainText(text);
+  await dialog.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await idle(page);
+  await expect(page.locator("#app .notice:not(.busy):not(.error)")).toHaveText("저장된 인증값을 삭제했습니다.");
+  await expect(page.locator("#app .notice.error")).toHaveCount(0);
+  // A profile key that could not be deleted (a corrupt profile file, a locked credential): the native warning, no success.
+  await forget.click();
+  await dialog.getByRole("button", { name: "내용 확인 · 진행", exact: true }).press("Enter");
+  await idle(page);
+  await expect(page.locator("#app .notice.error")).toHaveText(warning);
+  await expect(page.getByText("저장된 인증값을 삭제했습니다.")).toHaveCount(0);
+  expect(await calls(page, { command: "forget_credentials" })).toHaveLength(2);
+  await expect(page.locator("img")).toHaveCount(0);
+});
