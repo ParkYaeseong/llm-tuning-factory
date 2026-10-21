@@ -15,10 +15,13 @@
 4. seeds the remote model cache from the launch's own output (best effort, ``<launch_id>.cache-seed.json``).
 
 ``ExecutionUncertain`` means the remote process may still run: the attempt is FAILED with ``uncertain=True``
-and keeps its lock. ``reconcile`` never launches: it collects the same launch and finishes the attempt, or
-returns None while there is no result. ``outputs_for`` rebuilds identical outputs of a completed attempt from
-local files (freezing is content-addressed, so a rebuild never makes a second artifact). A crash at any step
-therefore resumes (before ``begin_launch``) or reconciles (after it), and never launches twice.
+and keeps its lock. So does a local I/O or database error after an accepted COMPLETED result (11.5 R1 I-3): the
+paid result is collected and frozen again, never discarded. ``reconcile`` never launches: it collects the same
+launch and finishes the attempt (CANCELED after a job or run cancel, as ``_launch``), or returns None while there
+is no result (then a canceled attempt gets the remote cancel marker). ``outputs_for`` rebuilds identical outputs
+of a completed attempt from local files (freezing is content-addressed, so a rebuild never makes a second
+artifact). A crash at any step therefore resumes (before ``begin_launch``) or reconciles (after it), and never
+launches twice.
 
 No MLflow, scheduling, retries or ``record_outputs`` here: those are Task 8's.
 """
@@ -27,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +75,11 @@ from .operations import EvaluateOperation, TrainOperation
 from .registry import canonical, digest
 from .training import OFT_UNFREEZABLE, CanceledError, LlamaFactoryBackend
 from .worker_protocol import COMMAND, OperationResult, WorkerRequest
+
+# Local failures that say nothing about an accepted result's content (a download, a freeze rename an antivirus holds,
+# a locked ledger): the attempt stays uncertain and is collected again (11.5 R1 I-3).
+TRANSIENT = (OSError, sqlite3.OperationalError)
+OUTPUTS_INTERRUPTED = "the remote result was accepted but its outputs were not frozen; reconcile the same launch"
 
 
 @dataclass(frozen=True)
@@ -192,6 +201,8 @@ class OperationAttemptRunner:
         elif status == "COMPLETED":
             try:
                 outputs, targets = self._outputs(job, manifest, operation, lease.attempt_id, launch, result)
+            except TRANSIENT:
+                raise   # 11.5 R1 I-3: the lock stays held; the next reconcile downloads and freezes again (idempotent)
             except Exception as exc:   # the remote result exists, so execution stopped: fail, never retrain
                 status, error = "FAILED", f"{type(exc).__name__}: {exc}"
         elif error is None:
@@ -267,7 +278,7 @@ class OperationAttemptRunner:
         def canceled():
             return bool(self.jobs.get(job_id)["cancel_requested"])
 
-        status, error, uncertain, outputs, targets = "FAILED", None, False, None, ()
+        status, error, uncertain, outputs, targets, result = "FAILED", None, False, None, (), None
         stop = self._heartbeat(lease)
         try:
             self.jobs.materialize_job_evidence(job_id)
@@ -289,6 +300,11 @@ class OperationAttemptRunner:
             error, uncertain = str(exc), True
         except Exception as exc:
             error = self.jobs.filtered(f"{type(exc).__name__}: {exc}")
+            if isinstance(exc, TRANSIENT) and result is not None and result.status == "COMPLETED":
+                # 11.5 R1 I-3: the paid result is accepted, but a local I/O or database error stopped its freeze.
+                # Keep the lock, so reconcile collects and freezes the same launch again (both idempotent); only a
+                # content error (a ValueError: tampered, refused or invalid output) is final.
+                error, uncertain = f"{OUTPUTS_INTERRUPTED}: {error}", True
         finally:
             stop.set()
         # Deliberately outside ``finally``: after a crash nothing below runs, and reconcile repairs the ledger.

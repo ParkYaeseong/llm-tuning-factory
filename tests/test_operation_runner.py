@@ -1306,3 +1306,63 @@ def test_reconcile_sends_the_cancel_to_a_worker_that_may_still_run(tmp_path, mon
     assert (outcome.status, outcome.outputs) == ("CANCELED", None) and not held_locks(w)
     assert w.calls == [] and len(w.host.launches) == 1
     assert json.loads((remote_launch(w) / "result.json").read_bytes())["status"] == "CANCELED"
+
+
+def test_a_transient_download_failure_after_completion_stays_uncertain(tmp_path, monkeypatch):
+    """R1 I-3: one ``sftp.get`` OSError after the host reported COMPLETED made the paid attempt a terminal
+    ``failed_before_submit``. It is uncertain now: the lock is kept and reconcile collects and freezes the same
+    launch, with one launch and one training call."""
+    w = world(tmp_path, monkeypatch)
+    original, failures = w.host.sftp.get, []
+
+    def get(source, target):
+        if f"/jobs/{w.job_id}/" in source and not failures:
+            failures.append(source)
+            raise OSError("synthetic: connection reset during the download")
+        return original(source, target)
+
+    monkeypatch.setattr(w.host.sftp, "get", get)
+    outcome = run(w)
+    assert (outcome.status, outcome.uncertain, outcome.outputs) == ("FAILED", True, None) and failures
+    assert w.store.jobs.get(w.job_id)["status"] == "FAILED" and held_locks(w)
+    assert w.runner.failure_kind(w.job_id) == "uncertain"
+    outcome = w.runner.reconcile(w.job_id, w.executor)
+    assert (outcome.status, outcome.uncertain) == ("COMPLETED", False), outcome.error
+    assert w.calls == ["train.bound.yaml"] and len(w.host.launches) == 1 and not held_locks(w)
+    assert w.store.artifacts.verify(outcome.outputs.model.model).producer_attempt_id == w.lease.attempt_id
+
+
+def test_a_lasting_sharing_violation_while_freezing_stays_uncertain(tmp_path, monkeypatch):
+    """R1 I-3: an antivirus holding the ``.freeze-*`` directory past the bounded rename retry (WinError 32, 11 times)
+    made the accepted COMPLETED result a terminal ``output_invalid``. It is uncertain now, and reconcile re-freezes
+    it (content-addressed: one artifact)."""
+    from test_model_artifacts import sharing_violation
+
+    from tuning_factory import model_artifacts
+    w = world(tmp_path, monkeypatch)
+    before, rename, refused = artifact_entries(w.store), Path.rename, []
+
+    def busy(self, target):
+        if self.name.startswith(".freeze-") and len(refused) < 11:
+            refused.append(self.name)
+            raise sharing_violation(32)
+        return rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", busy)
+    monkeypatch.setattr(model_artifacts, "RENAME_RETRY_SECONDS", 0)
+    outcome = run(w)
+    assert (outcome.status, outcome.uncertain, outcome.outputs) == ("FAILED", True, None)
+    assert len(refused) == model_artifacts.RENAME_TRIES and held_locks(w)
+    assert w.runner.failure_kind(w.job_id) == "uncertain" and artifact_entries(w.store) == before
+    outcome = w.runner.reconcile(w.job_id, w.executor)
+    assert (outcome.status, outcome.uncertain) == ("COMPLETED", False), outcome.error
+    assert len(refused) == 11 and len(artifact_entries(w.store)) == len(before) + 1 and not held_locks(w)
+    assert w.calls == ["train.bound.yaml"] and len(w.host.launches) == 1
+
+
+def test_a_content_error_after_completion_stays_terminal(tmp_path, monkeypatch):
+    """R1 I-3: only transient I/O is uncertain; a refused output (here an engine vocabulary change) stays final."""
+    w = world(tmp_path, monkeypatch, tokenizer=changed_tokenizer("added_token"))
+    outcome = run(w)
+    assert (outcome.status, outcome.uncertain) == ("FAILED", False) and not held_locks(w)
+    assert w.runner.failure_kind(w.job_id) == "output_invalid"

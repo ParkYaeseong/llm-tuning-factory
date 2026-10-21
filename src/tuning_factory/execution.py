@@ -35,6 +35,8 @@ HEX32 = re.compile(r"[0-9a-f]{32}")
 ALREADY_STARTED = "remote launch already started for this attempt; reconcile instead of relaunching"
 LAUNCH_DIRECTORY_EXISTS = "remote launch directory already exists for this attempt; reconcile instead of relaunching"
 FOREIGN_RESULT = "remote result belongs to a different attempt"
+COLLECTION_INTERRUPTED = ("remote result collection was interrupted after the host finished; reconcile the same "
+                          "launch")
 INJECTED_CONNECTION = "v2 operations require an injected SSH connection owned by desktop_runtime.connection()"
 # Control-plane records of a v2 launch directory: never uploaded, never taken from the host by a download.
 V2_CONTROL_RECORDS = frozenset({"result.json", "result.tmp", "remote-attempt.json", "remote-attempt.json.tmp",
@@ -570,7 +572,14 @@ class SSHExecutor(ExecutionBackend):
                 raw = self._await_result(sftp, remote, request.timeout_seconds, canceled)
                 result = self._accept_result(raw, request, kind)
                 finished = True
-                self._collect_operation(sftp, remote, launch, raw, result)
+                try:
+                    self._collect_operation(sftp, remote, launch, raw, result)
+                except ValueError:
+                    raise   # content: a tampered, foreign or invalid transfer is final
+                except Exception as exc:
+                    # The host finished, but its files did not all arrive (a transport or local disk error): the
+                    # attempt stays uncertain and reconcile collects the same launch again (11.5 R1 I-3).
+                    raise ExecutionUncertain(COLLECTION_INTERRUPTED) from exc
                 return result.model_dump(mode="json")
         except BaseException as exc:
             if submitted and not finished:
