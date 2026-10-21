@@ -6190,6 +6190,15 @@ written first and seen failing for the reason named; the existing tests that cha
   the Korean text; `workflow-types.ts` declares `PlanSubmitted`. Tests (mocked): `a submit the backend refuses as
   already registered shows that run and how to plan anew`, `a plan_submitted refusal without its run is shown as the
   backend's reason`. Not run against the backend change, which lands separately.
+- Scoped re-review (root): **fixed**. M1: `forget_profile_secrets` takes the store lock best effort, so a lock file it
+  cannot open or lock (a directory there, a share-none handle) no longer keeps every key; the keys are deleted and
+  `LOCK_FAILED` is the reported problem (`profile_warning`). M2: the duplicated `PlanNodeRecipe`/`PlanNodeDataset`
+  declarations in `workflow-types.ts` (a `git stash pop` while splitting commits re-inserted them; TypeScript merged
+  them silently) are gone. Nit: a store write, under the lock, first removes `executor-profiles.*.tmp` left by a crash
+  (best effort). Tests: `forgetting_profile_keys_does_not_wait_for_a_lock_it_cannot_take`,
+  `a_store_write_removes_temporary_files_a_crash_left_behind`, `the channel's shapes declare each type once`, each
+  failing first. Then `npm run build` passes, `npx playwright test` **266 passed**, `cargo test` **54 passed**,
+  `pytest tests/test_native_contract.py tests/test_repository_text.py` **11 passed**, `git diff --check` clean.
 
 Actual verification (this worktree, its own `.venv` from `uv sync --extra dev --extra tracking --locked`):
 - `npm run build` (tsc + vite) passes.
