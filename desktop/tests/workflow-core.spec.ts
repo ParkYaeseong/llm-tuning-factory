@@ -27,6 +27,15 @@ test("the typed bridge lists exactly the native workflow actions", () => {
   for (const pending of NATIVE_PENDING) expect(rust).not.toContain(pending);
 });
 
+test("the channel's shapes declare each type once", () => {
+  // TypeScript merges a repeated interface silently, so a duplicated declaration (11.5 re-review M2) builds; it is
+  // still two places to keep equal.
+  const source = readFileSync(new URL("../src/workflow-types.ts", import.meta.url), "utf8");
+  const names = [...source.matchAll(/^export (?:interface|type) (\w+)/gm)].map(match => match[1]);
+  expect(names.length).toBeGreaterThan(40);
+  expect(names.filter((name, index) => names.indexOf(name) !== index)).toEqual([]);
+});
+
 test("workflow results are validated before use", () => {
   const malformed: unknown[] = [{}, null, "ok", [], { status: "done", issues: [], data: null }, { status: "ok", data: null },
     { status: "invalid", issues: "x", data: null }, { status: "ok", issues: [] },

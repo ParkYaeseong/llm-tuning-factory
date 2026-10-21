@@ -120,15 +120,6 @@ export interface PlanNodeRecipe {
  * (`benchmark_revision`). */
 export interface PlanNodeDataset extends DatasetRef { binding_id: string | null; benchmark_revision: Sha256 | null }
 /** `graph_plan`/`graph_plan_get` `ok` data. A blocked `graph_plan` answers `invalid` with data `{warnings}` or null. */
-/** A plan node's pinned recipe revision and its public identity (9.8 `_node_references`; null fields when the
- * revision's spec is not in the plan). Train nodes only. */
-export interface PlanNodeRecipe {
-  recipe_id: string | null; version: string | null; name: string | null; training_stage: string | null;
-  training_method: string | null; revision_sha256: Sha256;
-}
-/** The data a plan node uses: a train node's bound dataset (`binding_id`) or an evaluate node's benchmark dataset
- * (`benchmark_revision`). */
-export interface PlanNodeDataset extends DatasetRef { binding_id: string | null; benchmark_revision: Sha256 | null }
 export interface PlanSummary extends WithWarnings {
   plan_sha256: Sha256; simulation: boolean; project_id: string; project_revision: Sha256;
   max_estimated_cost_usd: number; max_duration_seconds: number; max_concurrent_gpu_count: number;
