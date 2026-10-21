@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 from test_seed_acceptance_root import (
+    FAST,
     MAPPING,
     WAIT,
     accepted,
@@ -178,7 +179,8 @@ def wait_run(state, run_id, until=settled, served=None):
             return run
         assert time.monotonic() < deadline, f"the run did not reach the expected state in {WAIT} s: {run}"
         if served is not None:
-            assert served.thread.is_alive(), f"serve returned {served.result} before the run settled: {run}"
+            assert served.thread.is_alive(), (f"serve returned {served.result} (current.json code "
+                                              f"{current_code(state)}) before the run settled: {run}")
         time.sleep(0.05)
 
 
@@ -186,14 +188,28 @@ def current_json(state):
     return json.loads((Path(state) / "controller" / "current.json").read_bytes())
 
 
-class Served:
-    """``controller_entry.serve`` on a thread with the production start (blank tracking, no profiles, the FAST
-    settings), stopped by its stop event or a stop request."""
+def current_code(state):
+    """``current.json``'s ``code`` for a failure message (why a served controller stopped), or why it is missing."""
+    try:
+        return current_json(state).get("code")
+    except (OSError, ValueError) as exc:
+        return f"unreadable: {type(exc).__name__}"
 
-    def __init__(self, state, owner_id):
+
+# Served controllers keep FAST's ticks and heartbeat but a 60 s owner lease (2 x 1.5 s and 3 x 1.5 s stay within
+# their bounds): under a loaded machine a 6 s lease could lapse between heartbeats and stop the controller
+# (owner_lost), which neither Served test exercises; both stop by their stop event or a stop request.
+SERVED = {**FAST, "lease_ttl_seconds": 60}
+
+
+class Served:
+    """``controller_entry.serve`` on a thread with the production start (blank tracking, no profiles, ``settings``:
+    FAST by default), stopped by its stop event or a stop request."""
+
+    def __init__(self, state, owner_id, settings=None):
         from tuning_factory import controller_entry as ce
         self.state, self.owner_id, self.stop, self.result = Path(state), owner_id, threading.Event(), []
-        start = controller_start(state, owner_id)
+        start = controller_start(state, owner_id, settings)
         self.thread = threading.Thread(target=lambda: self.result.append(ce.serve(start, stop_event=self.stop)),
                                        name=f"serve-{owner_id}", daemon=True)
         self.thread.start()
@@ -206,7 +222,7 @@ class Served:
             current = data["current"] or {}
             if data["controller"]["state"] == "running" and current.get("owner_id") == self.owner_id:
                 return data
-            assert self.thread.is_alive(), f"serve returned {self.result}"
+            assert self.thread.is_alive(), f"serve returned {self.result} (current.json code {current_code(self.state)})"
             assert time.monotonic() < deadline, f"{self.owner_id} did not start in {WAIT} s: {data}"
             time.sleep(0.05)
 
@@ -418,7 +434,7 @@ def test_the_mock_diamond_survives_a_controller_restart_and_honours_cancel(tmp_p
     hook = (spy(monkeypatch, GraphStore, "complete_local_selection", at_join) if case == "cancel_at_join"
             else spy(monkeypatch, JobStore, "begin_launch", at_branch_launch))
     with hook as fired:
-        served["first"] = Served(state, "acceptance.3.1")
+        served["first"] = Served(state, "acceptance.3.1", SERVED)
         try:
             assert served["first"].running()["current"]["owner_id"] == "acceptance.3.1"
             if case == "restart":
@@ -427,7 +443,7 @@ def test_the_mock_diamond_survives_a_controller_restart_and_honours_cancel(tmp_p
                 assert halfway["status"] == "RUNNING" and statuses(halfway)["train-a"] == "COMPLETED"
                 assert statuses(halfway)["select"] != "COMPLETED" and statuses(halfway)[seen["node"]] == "COMPLETED"
                 assert accepted(action(state, "controller_status"))["controller"]["state"] == "absent"
-                served["second"] = Served(state, "acceptance.3.2")   # a new owner adopts the same run
+                served["second"] = Served(state, "acceptance.3.2", SERVED)   # a new owner adopts the same run
                 run = wait_run(state, run_id, served=served["second"])
                 assert accepted(action(state, "controller_stop"))["requested"] is True
                 assert served["second"].join() == ce.EXIT_OK
@@ -633,7 +649,7 @@ def test_the_headless_lifecycle_through_the_channel(tmp_path, connects):
                    [estimate("estimate-a")])
     absent = accepted(envelope(state, "controller_status"))
     assert absent["controller"]["state"] == "absent" and absent["current"] is None
-    served = Served(state, "acceptance.6.1")
+    served = Served(state, "acceptance.6.1", SERVED)
     try:
         status = served.running()
         current = status["current"]
