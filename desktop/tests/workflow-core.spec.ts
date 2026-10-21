@@ -396,7 +396,9 @@ test("Playwright's web server runs Vite without HMR or file watching, and npm ru
   expect(serverOptions(true)).toEqual({ port: 1420, strictPort: true, hmr: false, watch: null });
   expect(serverOptions(false)).toEqual({ port: 1420, strictPort: true, watch: { ignored: ["**/src-tauri/**"] } });
   const { default: config } = await import("../playwright.config.ts");
-  expect(config.webServer).toMatchObject({ command: "npm run dev", env: { TUNING_FACTORY_E2E: "1" } });
+  // A server already on 1420 (an `npm run dev` with HMR, maybe of another tree) is never reused: its env would be
+  // ignored, so with strictPort a busy port fails the run loudly instead (11.5 R3 M6).
+  expect(config.webServer).toMatchObject({ command: "npm run dev", env: { TUNING_FACTORY_E2E: "1" }, reuseExistingServer: false });
 });
 
 test("issue codes without an English pattern have Korean texts, and the materialize card has one name", async () => {

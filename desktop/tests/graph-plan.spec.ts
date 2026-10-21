@@ -38,12 +38,12 @@ const DROPPED = "변경되어 다시 계획해야 합니다";
 const WAIT = "대기 후 순차 실행";
 const RERUN_HINT = "다시 실행하려면 입력(최대 실행 시간 등)을 바꾸거나 실행 프로필에서 자원을 다시 확인한 뒤 ‘계획 확인’으로 새 계획을 만드세요.";
 
-const recipeSpec = (recipe_id: string, name: string, training_method: string, training_stage = "sft") => ({ schema_version: 1, recipe_id,
-  version: "1", name, description: "", training_backend: "llamafactory", capability_version: "lf-text-v1", training_stage,
-  training_method, input_kind: "instruction", quantization_bit: 4, hyperparameters: {}, finetuning_options: {}, stage_options: {},
+const recipeSpec = (recipe_id: string, name: string, training_method: string, training_stage = "sft", input_kind = "instruction") => ({
+  schema_version: 1, recipe_id, version: "1", name, description: "", training_backend: "llamafactory", capability_version: "lf-text-v1",
+  training_stage, training_method, input_kind, quantization_bit: 4, hyperparameters: {}, finetuning_options: {}, stage_options: {},
   evaluation_defaults: {} });
 const LORA = recipeSpec("lora-sft", "기본 SFT", "lora");
-const PPO = recipeSpec("ppo-rl", "보상 학습", "lora", "ppo");
+const PPO = recipeSpec("ppo-rl", "보상 학습", "lora", "ppo", "prompt");     // RecipeSave: a PPO recipe takes prompts
 const fromRoot = { policy: { base: ROOT, adapter: null }, initialization: "new_adapter" };
 const ref = (node_id: string, output_name = "model") => ({ node_id, output_name });
 const trainNode = (id: string, recipe_revision: string, extra: object = {}) => ({ id, kind: "train", label: id, recipe_revision,
