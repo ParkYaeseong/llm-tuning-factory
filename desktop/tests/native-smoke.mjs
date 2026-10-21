@@ -2,9 +2,13 @@
 // Offline and safe by default (Task 11 plan 11.3c). Opt-in flags:
 //   FACTORY_SMOKE_LIVE_HF=1  also run the live Hugging Face metadata check (network)
 //   FACTORY_SMOKE_FLOW=1     also run a simulated graph through the background controller; needs the seeded root
-//                            (scripts/seed_acceptance_root.py --state-dir <app state>)
-// It never calls forget_credentials on a state with saved credentials or executor profiles, creates only synthetic
-// profiles (smoke-<suffix>) and deletes them, and stops every controller it started.
+//                            (scripts/seed_acceptance_root.py --state-dir <app state>) and a state without executor
+//                            profiles, saved credentials or an MLflow address
+// It refuses before its first write unless the controller is absent and no graph run is active. It writes into the
+// app's real state (projects, which cannot be deleted, the desktop_smoke dataset and the flow's records). It never
+// calls forget_credentials on a state with saved credentials or executor profiles, starts the real controller only
+// on a state without executor profiles, saved credentials or an MLflow address, creates only synthetic profiles
+// (smoke-<suffix>) and deletes them, and stops every controller it started.
 import { chromium } from "@playwright/test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -92,6 +96,12 @@ try {
   await page.getByRole("heading", { name: "작업 공간", exact: true }).waitFor();
   await page.waitForFunction(() => !document.body.textContent.includes("작업 공간 불러오는 중"));
   await page.getByText(`Windows · 내부 검토 ${version}`, { exact: true }).waitFor();
+  // Before the first write (the desktop_smoke dataset below): the background controller must be absent and no graph
+  // run active, so a refused smoke leaves the state as it found it.
+  const idle = await controllerStatus();
+  if (idle.controller.state !== "absent")
+    throw new Error(`The background controller must be absent before the smoke (state: ${idle.controller.state}); stop it in the app first`);
+  if (idle.runs?.active !== 0) throw new Error(`Active graph runs present (${idle.runs?.active}); use a state without active runs`);
 
   // 2. Legacy one-request actions (unchanged; the Hugging Face block only with FACTORY_SMOKE_LIVE_HF=1).
   const catalog = await page.evaluate(() => window.__TAURI_INTERNALS__.invoke("factory_action", { action: "catalog", data: {} }));
@@ -169,7 +179,7 @@ try {
   await page.locator('nav [data-action="nav:overview"]').click();
   await page.screenshot({ path: "test-results/native-workspace.png", fullPage: true });
 
-  // 4. Workflow channel. The controller must be absent and no graph run active before this smoke starts one.
+  // 4. Workflow channel (the controller was checked absent and no graph run active before the first write).
   const projects = await workflow("projects_list");
   if (!Array.isArray(projects.projects)) throw new Error("projects_list returned no project list");
   const projectName = `스모크 ${suffix}`;
@@ -179,18 +189,23 @@ try {
     throw new Error("The created project is not listed");
   const recipes = await workflow("recipes_list");
   if (!Array.isArray(recipes.recipes)) throw new Error("recipes_list returned no recipe list");
-  const idle = await controllerStatus();
-  if (idle.controller.state !== "absent")
-    throw new Error(`The background controller must be absent before the smoke (state: ${idle.controller.state}); stop it in the app first`);
-  if (idle.runs?.active !== 0) throw new Error(`Active graph runs present (${idle.runs?.active}); use a state without active runs`);
 
   // 5.-7. Only on a state without executor profiles: the profile, the controller and the flow use synthetic data only.
+  //    The real controller (6, 7) gets the saved MLflow settings and could send pending tracking events, so it starts
+  //    only when no credential is saved and no MLflow address is set; network_used: false then holds.
   const synthetic = initialProfiles.length === 0;
+  const offline = synthetic && !savedCredentials && !String(initial.MLFLOW_TRACKING_URI ?? "").trim();
   const skipped = "skipped_existing_profiles";
   const results = { profiles: skipped, controller: skipped, flow: FLOW ? skipped : false };
+  const profileId = `smoke-${suffix}`;
+  const deleteSyntheticProfile = async () => {
+    const deleted = await invoke("executor_profile_delete", { profileId });
+    if (deleted.profile_id !== profileId) throw new Error("Profile delete failed");
+    if ((await invoke("executor_profiles_get")).profiles.length !== 0) throw new Error("A synthetic profile was left");
+    cleanup.splice(0, cleanup.length);   // nothing left to undo: no controller runs and every profile is gone
+  };
   if (synthetic) {
     // 5. Profiles: one synthetic RunPod profile with a synthetic key; two drafts refused before anything is written.
-    const profileId = `smoke-${suffix}`;
     const syntheticKey = "synthetic-" + "runpod-" + "k".repeat(12) + "-" + suffix;
     cleanup.push(async () => { await invoke("executor_profile_delete", { profileId }); });
     const saved = await invoke("executor_profile_save", { profileId, values: {
@@ -214,7 +229,13 @@ try {
     if ((await invoke("executor_profiles_get")).profiles.map(p => p.profile_id).join() !== profileId)
       throw new Error("A refused draft was saved");
     results.profiles = { profile_saved: true, profile_key_masked: true, relative_key_refused: true, pasted_key_refused: true };
-
+    if (!offline) {
+      await deleteSyntheticProfile();
+      results.controller = "skipped_saved_settings";
+      if (FLOW) results.flow = "skipped_saved_settings";
+    }
+  }
+  if (offline) {
     // 6. Controller: the real broker reads the key from Credential Manager in the background; D21 round trips; the
     //    stop dialog's focus while it runs; stop and drain; the synthetic profile is deleted.
     const running = await startController();
@@ -249,10 +270,7 @@ try {
     if (afterEsc.controller.state !== "running" || afterEsc.stop_requested) throw new Error("Esc on the stop dialog changed the controller");
     const stop = await stopStartedController();
     if (stop.requested !== true) throw new Error(`controller_stop did not request a stop: ${JSON.stringify(stop)}`);
-    const deleted = await invoke("executor_profile_delete", { profileId });
-    if (deleted.profile_id !== profileId) throw new Error("Profile delete failed");
-    if ((await invoke("executor_profiles_get")).profiles.length !== 0) throw new Error("A synthetic profile was left");
-    cleanup.splice(0, cleanup.length);   // nothing left to undo: the controller stopped and every profile is gone
+    await deleteSyntheticProfile();   // the controller stopped
     results.controller = { started: true, broker_read_profile_key: true, second_start_refused: true,
       status_roundtrip_ms: samples, status_roundtrip_ms_median: median, stop_dialog_focus: true, stopped: true,
       profile_deleted: true };
