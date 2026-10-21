@@ -442,3 +442,14 @@ test("issue codes without an English pattern have Korean texts, and the material
     expect(text, message).not.toContain("모델 변환");
   }
 });
+
+test("the planner's merge and selection refusals are shown in the editor's terms", () => {
+  // 11.5: graph_plan's `plan_refused` (graph_planner.py) for merge and selection graphs it can prove will fail.
+  for (const [message, korean] of [
+    ["selection candidates must be distinct models", "자동 선택 후보는 서로 다른 모델이어야 합니다(앞 자동 선택을 거쳐도 같은 모델이면 안 됨)."],
+    ["a selection takes at most one merged candidate", "자동 선택에는 병합 모델 평가를 하나까지만 넣을 수 있습니다."],
+    ["a selection needs an original candidate beside its merged one", "병합 모델 평가 옆에 원래 모델 평가가 하나 이상 있어야 합니다."],
+    ["merge requires distinct actual artifacts", "같은 모델을 두 번 병합할 수 없습니다(자동 선택을 거쳐도 같음)."],
+    ["merge requires plain causal LoRA/QLoRA parents", "병합에는 LoRA·QLoRA 어댑터만 넣을 수 있습니다(전체 모델 확정 결과는 안 됨)."],
+  ]) expect(localize(issue("plan_refused", message, "", { node_id: "merge-1" })), message).toEqual({ text: korean, original: message });
+});

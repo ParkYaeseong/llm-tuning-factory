@@ -45,8 +45,8 @@ export function planSection(issue: WorkflowIssue): { section: PlanSection; key?:
 }
 
 const ENCODING = "문자 인코딩이 맞지 않습니다. Windows에서 만든 CSV라면 CP949로 바꿔 다시 미리보세요.";
-/** The graph editor's name of the materialize card (graph-model KIND_LABELS), so the advice names a card the add menu has. */
-const MATERIALIZE = KIND_LABELS.materialize;
+/** The graph editor's card names (graph-model KIND_LABELS), so the advice names cards the add menu has. */
+const MATERIALIZE = KIND_LABELS.materialize, SELECT = KIND_LABELS.select, MERGE = KIND_LABELS.merge;
 /** English domain texts of Tasks 1–8 (exact prefixes or fixed fragments) → Korean. Checked before CODE_TEXTS. */
 const MESSAGE_TEXTS: [RegExp, string][] = [
   [/codec can't decode/, ENCODING],
@@ -78,6 +78,12 @@ const MESSAGE_TEXTS: [RegExp, string][] = [
   [/^source must contain nonempty records/, "원본에 레코드가 없거나 객체가 아닌 레코드가 있습니다."],
   [/^CP949 is supported only for CSV/, "CP949 인코딩은 CSV에서만 쓸 수 있습니다."],
   [/^duplicate dataset binding ID/, "데이터 연결 ID가 중복되었습니다."],
+  // graph_planner's merge and selection refusals (11.5), sent as graph_plan's `plan_refused`, with the node when known.
+  [/^selection candidates must be distinct models/, `${SELECT} 후보는 서로 다른 모델이어야 합니다(앞 ${SELECT}을 거쳐도 같은 모델이면 안 됨).`],
+  [/^a selection takes at most one merged candidate/, `${SELECT}에는 ${MERGE} 모델 평가를 하나까지만 넣을 수 있습니다.`],
+  [/^a selection needs an original candidate beside its merged one/, `${MERGE} 모델 평가 옆에 원래 모델 평가가 하나 이상 있어야 합니다.`],
+  [/^merge requires distinct actual artifacts/, `같은 모델을 두 번 ${MERGE}할 수 없습니다(${SELECT}을 거쳐도 같음).`],
+  [/^merge requires plain causal LoRA\/QLoRA parents/, `${MERGE}에는 LoRA·QLoRA 어댑터만 넣을 수 있습니다(${MATERIALIZE} 결과는 안 됨).`],
 ];
 /** Known codes → Korean, used when the message is English and no message text above matched. */
 const CODE_TEXTS: Record<string, string> = {

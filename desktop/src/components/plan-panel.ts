@@ -179,11 +179,15 @@ export function planWaiting(summary: PlanSummary, graph: GraphJson): Set<string>
 }
 
 /** Plan issues and warnings that belong on the editor's cards and fields (`/graph/...`), for the saved revision they
- * were planned from. */
+ * were planned from. A general refusal that names a node (graph_plan's `plan_refused` of a merge or a selection, 11.5)
+ * goes on that card too; the panel's "계획 확인 결과" keeps it as well. */
 export function planFeedback(draft: ProjectDraft): { issues: WorkflowIssue[]; warnings: WorkflowIssue[] } {
   const found = feedback.get(draft.projectId);
   if (!found || found.revision !== draft.saved?.revision_sha256) return { issues: [], warnings: [] };
-  const onCards = (list: WorkflowIssue[]) => list.filter(issue => planSection(issue).section === "graph");
+  const onCards = (list: WorkflowIssue[]) => list.filter(issue => {
+    const { section } = planSection(issue);
+    return section === "graph" || (section === "other" && Boolean(issue.node_id));
+  });
   return { issues: onCards(found.issues), warnings: onCards(found.warnings) };
 }
 

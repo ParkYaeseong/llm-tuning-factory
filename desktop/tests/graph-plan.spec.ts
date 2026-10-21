@@ -954,3 +954,27 @@ test("a plan_submitted refusal without its run is shown as the backend's reason"
   await expect(result.locator('li[data-code="plan_submitted"]')).toContainText("새 계획");
   await expect(result.locator('li[data-code="plan_submitted"] .issue-original')).toHaveText("plan already submitted");
 });
+
+// -- 11.5: the planner's merge and selection refusals (graph_plan `plan_refused`, with the node when known) --
+test("a merge or selection refusal is shown in Korean in the panel and on its card", async ({ page }) => {
+  const MERGE_DISTINCT = "merge requires distinct actual artifacts";
+  const SELECT_DISTINCT = "selection candidates must be distinct models";
+  const refused = invalid([issue("plan_refused", MERGE_DISTINCT, "", { node_id: "train-2" }), issue("plan_refused", SELECT_DISTINCT)]);
+  await openWorkbench(page, options());
+  await installPlanFake(page, { plans: [refused] });
+  await seed(page, { recipes: [LORA], graph: revisions => graphOf([trainNode("train-1", revisions["lora-sft"], { label: "기준 학습" }),
+    trainNode("train-2", revisions["lora-sft"], { label: "두 번째 학습" })]) });
+  await openGraph(page);
+  await plan(page);
+  const results = panel(page).locator("#plan-actions .issue-list");
+  await expect(results).toContainText("같은 모델을 두 번 병합할 수 없습니다(자동 선택을 거쳐도 같음).");
+  await expect(results).toContainText("자동 선택 후보는 서로 다른 모델이어야 합니다(앞 자동 선택을 거쳐도 같은 모델이면 안 됨).");
+  await results.locator('li[data-code="plan_refused"]').first().getByText("원문 보기").click();
+  await expect(results.locator(".issue-original").first()).toHaveText(MERGE_DISTINCT);
+  // The refusal that names a node marks that card; the other stays in the panel only.
+  await expect(card(page, "train-2")).toHaveClass(/flagged/);
+  await expect(card(page, "train-2")).toContainText("같은 모델을 두 번 병합할 수 없습니다");
+  await expect(card(page, "train-1")).not.toHaveClass(/flagged/);
+  await expect(card(page, "train-1")).not.toContainText("자동 선택 후보는");
+  await expect(approveButton(page)).toHaveCount(0);
+});
