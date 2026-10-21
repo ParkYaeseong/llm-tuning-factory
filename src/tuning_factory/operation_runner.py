@@ -227,9 +227,9 @@ def _derive(operation, verifier: ArtifactVerifier) -> ResolvedModelInputs:
         reference_bit, reward_type = _training_rules(operation, verifier)
     models = tuple(_staged(role, index, ref, verifier) for role, index, ref in _role_refs(operation, verifier))
     roles = {(item.role, item.index): item for item in models}
-    if require_real and any(not verifier.verify(item.artifact).eligible_for_real_use
+    if require_real and any(not verifier.verify(item.artifact).usable_in_real_operations
                             for item in models if item.artifact is not None):
-        raise ValueError("synthetic/simulation artifact is ineligible for real use")
+        raise ValueError("simulation artifact is ineligible for real use")
     for item in models:
         base = roles.get((item.role.replace("_adapter", "_base"), 0))
         if item.storage_kind == "adapter" and base is not None and (

@@ -344,11 +344,16 @@ def test_merge_plan_normalizes_weights_exactly_and_records_scales():
 
 
 @pytest.mark.parametrize("flag", ["synthetic", "simulation"])
-def test_merge_require_real_refuses_synthetic_or_simulation(flag):
+def test_merge_require_real_refuses_simulation_only(flag):
+    """Task 11.5 (R1 I-2, option b): synthetic adapters may be merged for real (their merge stays synthetic, so it is
+    never selected or registered); simulated adapters never."""
     module = api()
     refs, descriptors = two_adapters(**{flag: True})
-    with pytest.raises(ValueError, match="merge requires real completed artifacts"):
-        module.validate_merge_inputs(refs, descriptors, (0.25, 0.75))
+    if flag == "simulation":
+        with pytest.raises(ValueError, match="merge requires real completed artifacts"):
+            module.validate_merge_inputs(refs, descriptors, (0.25, 0.75))
+    else:
+        assert module.validate_merge_inputs(refs, descriptors, (0.25, 0.75)).output_rank == 5
     plan = module.validate_merge_inputs(refs, descriptors, (0.25, 0.75), require_real=False)
     assert plan.output_rank == 5
     # Relaxing the real-only rule must not relax any other conversion rule.
@@ -361,10 +366,11 @@ def test_merge_require_real_refuses_synthetic_or_simulation(flag):
 
 def test_graph_merge_compilation_stays_real_only():
     from tuning_factory.graph_planner import _merge_descriptors
-    refs, descriptors = two_adapters(synthetic=True)
+    refs, descriptors = two_adapters(simulation=True)
     api().validate_merge_inputs(refs, descriptors, (0.25, 0.75), require_real=False)
     with pytest.raises(ValueError, match="merge requires real completed artifacts"):
         _merge_descriptors(refs, descriptors)
+    _merge_descriptors(*two_adapters(synthetic=True))   # Task 11.5: synthetic inputs compile (option b)
 
 
 def test_model_ops_uses_the_public_conversion_rules():

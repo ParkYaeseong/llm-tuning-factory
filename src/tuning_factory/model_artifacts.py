@@ -176,8 +176,18 @@ class ModelDescriptor(ArtifactModel):
 
     @property
     def eligible_for_real_use(self) -> bool:
-        """Provenance eligibility only; this does not establish model quality."""
+        """Whether this artifact may be selected or registered: neither synthetic nor simulated. Provenance
+        eligibility only; this does not establish model quality."""
         return not (self.synthetic or self.simulation)
+
+    @property
+    def usable_in_real_operations(self) -> bool:
+        """Whether a real operation may take this artifact as an input: anything not simulated (Task 11.5, R1 I-2).
+
+        Synthetic artifacts may feed real training, evaluation, merge and materialization, so chains over dummy data
+        can be exercised on real GPUs. Every descendant stays synthetic (``validate_lineage``; outputs and evaluation
+        records inherit the flag), so it is never selected or registered (``eligible_for_real_use``)."""
+        return not self.simulation
 
 
 class ModelLoadRef(ArtifactModel):
@@ -621,9 +631,9 @@ class ArtifactVerifier:
         semantic = effective.semantic_kind if isinstance(effective, ModelDescriptor) else "causal_lm"
         if semantic != kind:
             raise ValueError(f"model input requires semantic kind {kind}")
-        if require_real and any(isinstance(item, ModelDescriptor) and not item.eligible_for_real_use
+        if require_real and any(isinstance(item, ModelDescriptor) and not item.usable_in_real_operations
                                 for item in (base, effective)):
-            raise ValueError("synthetic/simulation artifact is ineligible for real use")
+            raise ValueError("simulation artifact is ineligible for real use")
         return effective
 
     def validate_input(self, model_input: ModelInput, *, require_real: bool = False) -> ModelInput:

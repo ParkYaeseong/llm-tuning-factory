@@ -271,14 +271,20 @@ def test_initialization_requires_explicit_compatible_loader(initialization, adap
 
 @pytest.mark.parametrize('flag', ['synthetic', 'simulation'])
 def test_synthetic_or_simulated_outputs_cannot_be_real_candidates(tmp_path, flag):
+    """Task 11.5 (R1 I-2, option b): neither is eligible for selection or registration; a synthetic artifact may still
+    be the input of a real operation, a simulated one never."""
     module = api()
     directory, descriptor = fixture_model(tmp_path)
     store = module.ModelArtifactStore(tmp_path / 'store')
     ref = store.freeze(directory, updated(descriptor, **{flag: True}))
     assert not store.get(ref).eligible_for_real_use
-    with pytest.raises(ValueError, match='synthetic|simulation'):
-        store.validate_input(module.ModelInput(policy=module.ModelLoadRef(base=ref),
-                                               initialization='full_weights'), require_real=True)
+    assert store.get(ref).usable_in_real_operations is (flag == 'synthetic')
+    model_input = module.ModelInput(policy=module.ModelLoadRef(base=ref), initialization='full_weights')
+    if flag == 'simulation':
+        with pytest.raises(ValueError, match='simulation artifact is ineligible for real use'):
+            store.validate_input(model_input, require_real=True)
+    else:
+        assert store.validate_input(model_input, require_real=True) == model_input
 
 
 def test_frozen_reference_and_reward_bindings_are_verified(tmp_path):

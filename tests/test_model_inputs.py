@@ -1135,10 +1135,15 @@ def test_evaluate_operation_stages_the_evaluated_model_roles(tmp_path, store, sf
     full = EvaluateOperation(model=sft_ref, benchmark=benchmark(), resources=resources(), lineage=lineage())
     resolved_full = module.stage_model_inputs(full, store, tmp_path / "full-attempt")
     assert [(item.role, item.artifact) for item in resolved_full.models] == [("operation_base", sft_ref)]
-    # A real evaluation refuses synthetic models; a tampered model is refused before model-inputs.json exists.
+    # A real evaluation refuses simulated models and accepts synthetic ones (Task 11.5, R1 I-2 option b: their
+    # records are synthetic, so never selected); a tampered model is refused before model-inputs.json exists.
+    directory, simulated = full_model(tmp_path, "simulated")
+    simulated_ref = store.freeze(directory, simulated.model_copy(update={"simulation": True}))
+    with pytest.raises(ValueError, match="simulation artifact is ineligible for real use"):
+        module.stage_model_inputs(full.model_copy(update={"model": simulated_ref}), store, tmp_path / "simulated")
     synthetic_ref, _ = frozen(store, full_model(tmp_path, "synthetic", synthetic=True))
-    with pytest.raises(ValueError, match="synthetic/simulation artifact is ineligible for real use"):
-        module.stage_model_inputs(full.model_copy(update={"model": synthetic_ref}), store, tmp_path / "synthetic")
+    staged = module.stage_model_inputs(full.model_copy(update={"model": synthetic_ref}), store, tmp_path / "synthetic")
+    assert [(item.role, item.artifact) for item in staged.models] == [("operation_base", synthetic_ref)]
     (Path(cache_path(store, adapter_ref)) / "adapter_model.safetensors").write_bytes(b"tampered")
     with pytest.raises(ValueError, match="hash|inventory"):
         module.stage_model_inputs(evaluate, store, tmp_path / "tampered")

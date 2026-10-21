@@ -183,8 +183,9 @@ def test_plan_is_read_only_and_tampered_plan_fails_compilation(tmp_path):
                      VerifiedBindings(registry, ModelArtifactStore(tmp_path / "models"), choices.executors[0]))
 
 
-def evaluation_fixture(tmp_path, role="validation"):
-    from test_model_artifacts import fixture_model
+def evaluation_fixture(tmp_path, role="validation", **flags):
+    """``flags`` (``synthetic``/``simulation``) mark the evaluated artifact's descriptor."""
+    from test_model_artifacts import fixture_model, updated
 
     from tuning_factory.benchmarks import BenchmarkSpec
     from tuning_factory.graph_planner import (
@@ -196,6 +197,7 @@ def evaluation_fixture(tmp_path, role="validation"):
     from tuning_factory.model_artifacts import ModelArtifactStore
     registry, project, choices, facts = fixture(tmp_path)
     directory, descriptor = fixture_model(tmp_path)
+    descriptor = updated(descriptor, **flags) if flags else descriptor
     store = ModelArtifactStore(tmp_path / "models")
     ref = store.freeze(directory, descriptor)
     producer = ProducerEvidence(model=ref, job_id=descriptor.producer_job_id,
@@ -241,6 +243,37 @@ def test_evaluation_cost_sample_order_and_ready_metadata_checks(tmp_path):
     with pytest.raises(ValueError, match="completed"):
         compile_node(plan, "eval", VerifiedBindings(registry, store, choices.executors[0],
             producers=(producer.model_copy(update={"status": "failed"}),)))
+
+
+REAL_TRACKING = {"profile_id": "mlflow", "revision": "1", "public_settings_sha256": "2" * 64}
+
+
+def real_choices(choices):
+    """The execution choices of a real plan: a frozen transport revision and a tracking destination."""
+    from tuning_factory.graph_planner import TrackingDestination
+    return choices.model_copy(update={
+        "executors": tuple(item.model_copy(update={"transport_settings_sha256": "1" * 64}) for item in choices.executors),
+        "tracking_destination": TrackingDestination.model_validate(REAL_TRACKING)})
+
+
+@pytest.mark.parametrize("flag", ["synthetic", "simulation"])
+def test_real_compilation_refuses_only_simulated_input_models(tmp_path, flag):
+    """Task 11.5 (R1 I-2, option b): a synthetic model is a valid input of a real evaluation (its record is synthetic,
+    so it never wins a selection); a simulated model never runs for real. A simulation plan accepts both."""
+    from tuning_factory.graph_planner import TrackingDestination, VerifiedBindings
+    registry, project, choices, facts, store, ref, producer, _ = evaluation_fixture(tmp_path, **{flag: True})
+    choices = real_choices(choices)
+    plan = plan_graph(project, choices, (facts,), simulation=False)
+    bindings = VerifiedBindings(registry, store, choices.executors[0], producers=(producer,),
+                                tracking_destination=TrackingDestination.model_validate(REAL_TRACKING))
+    if flag == "simulation":
+        with pytest.raises(ValueError, match="simulation model is ineligible for real execution"):
+            compile_node(plan, "eval", bindings)
+    else:
+        assert compile_node(plan, "eval", bindings).model == ref
+    simulated = plan_graph(project, choices, (facts,))
+    assert compile_node(simulated, "eval", VerifiedBindings(registry, store, choices.executors[0],
+                                                            producers=(producer,))).model == ref
 
 
 def test_heldout_test_cannot_influence_selection(tmp_path):

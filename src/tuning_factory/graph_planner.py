@@ -849,8 +849,8 @@ def compile_node(plan: GraphPlan, node_id: str, verified_bindings: VerifiedBindi
         if producer is None:
             raise ValueError("completed producer evidence is required")
         _check_producer(ref, descriptor, producer)
-        if not plan.simulation and not descriptor.eligible_for_real_use:
-            raise ValueError("synthetic/simulation model is ineligible for real execution")
+        if not plan.simulation and not descriptor.usable_in_real_operations:
+            raise ValueError("simulation model is ineligible for real execution")
         if resources and producer.runtime_profile != resources.runtime.profile:
             raise ValueError("unsupported primary/legacy PPO artifact route")
         if descriptor.adapter and descriptor.adapter.method == "oft":
@@ -1049,12 +1049,14 @@ def adapter_tensor_shapes(descriptor):
 
 
 def check_merge_descriptors(refs, descriptors, *, require_real=True):
-    """Merge conversion rules; only the real-only rule is relaxable (synthetic CPU acceptance fixtures)."""
+    """Merge conversion rules; only the real-only rule is relaxable (the CPU acceptance's simulation-lineage
+    operations). A real merge refuses simulated inputs; synthetic ones merge into a synthetic output (Task 11.5,
+    R1 I-2)."""
     if len({_artifact_key(ref) for ref in refs}) != len(refs):
         raise ValueError("merge requires distinct actual artifacts")
     for descriptor in descriptors:
         check_materializable(descriptor)
-        if require_real and not descriptor.eligible_for_real_use:
+        if require_real and not descriptor.usable_in_real_operations:
             raise ValueError("merge requires real completed artifacts")
     if sum(item.adapter.rank for item in descriptors) > 256:
         raise ValueError("merged rank exceeds 256")

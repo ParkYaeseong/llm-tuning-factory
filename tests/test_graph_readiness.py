@@ -47,6 +47,8 @@ from tuning_factory.projects import DatasetBinding, DatasetRef, ProjectSpec
 from tuning_factory.recipes import RecipeSpec
 from tuning_factory.registry import canonical
 
+REAL_ROWS = [{'instruction': 'real train question', 'output': 'real train answer'}]   # ``build(real_data=True)``
+
 
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch):
@@ -67,12 +69,12 @@ def api():
 
 # -- graph definitions ---------------------------------------------------------------------------
 
-def train(r, node_id, source=None, profiles=('p1',)):
-    """A LoRA training of the base artifact, or a continuation of ``source``'s adapter output."""
+def train(r, node_id, source=None, profiles=('p1',), binding='data'):
+    """A LoRA training of the base artifact, or a continuation of ``source``'s adapter output, on ``binding``."""
     model_input = ({'node_id': source, 'output_name': 'model'} if source else
                    ModelInput(policy=ModelLoadRef(base=r.base), initialization='new_adapter').model_dump(mode='json'))
     return {'kind': 'train', 'id': node_id, 'label': 'Train', 'recipe_revision': r.recipe.revision_sha256,
-            'model_input': model_input, 'dataset_binding': 'data', 'executor_profile_ids': list(profiles)}
+            'model_input': model_input, 'dataset_binding': binding, 'executor_profile_ids': list(profiles)}
 
 
 def evaluate(r, node_id, model, profiles=('p1',)):
@@ -125,11 +127,12 @@ def registered(registry, tmp_path, name, rows, *, synthetic=False):
 
 
 def build(tmp_path, nodes, *, destinations=None, simulation=False, max_attempts=1, backoff=0, max_concurrent=1,
-          resolver=True, clock=None, synthetic=False):
+          resolver=True, clock=None, synthetic=False, real_data=False):
     """A submitted plan over frozen base/adapter artifacts in the GraphStore's own store, with a run lease.
 
     Nothing is prepared: the caller drives readiness. The trusted ledger resolver is installed by default.
-    ``synthetic`` registers both datasets as synthetic (still exportable): Task 11.2 A5's real run.
+    ``synthetic`` registers both datasets as synthetic (still exportable): Task 11.2 A5's real run. ``real_data`` adds
+    a second train binding ``real`` whose rows are registered as real (not synthetic) and exportable.
     """
     gs = api()
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -141,6 +144,7 @@ def build(tmp_path, nodes, *, destinations=None, simulation=False, max_attempts=
     second = models.freeze(*inputs.peft_adapter(tmp_path, 'second', rank=3, alpha=9, base=base, parents=(base,)))
     data = registered(registry, tmp_path, 'data', TRAIN_ROWS, synthetic=synthetic)
     held = registered(registry, tmp_path, 'held', HELD_ROWS, synthetic=synthetic)
+    real = registered(registry, tmp_path, 'real', REAL_ROWS) if real_data else None
     recipe = revision(RecipeSpec(recipe_id='r', name='recipe',
                                  hyperparameters={'lora_rank': 2, 'lora_target': 'q_proj,v_proj'}))
     benchmark = BenchmarkSpec(dataset=held, evaluator_kind='classification', evaluator_version='1',
@@ -155,13 +159,16 @@ def build(tmp_path, nodes, *, destinations=None, simulation=False, max_attempts=
     refs = SimpleNamespace(base=base, first=first, second=second, recipe=recipe, benchmark=benchmark)
     graph = GraphSpec.model_validate({'nodes': nodes(refs), 'max_concurrent': max_concurrent,
                                       'retry_policy': {'max_attempts': max_attempts, 'backoff_seconds': backoff}})
+    extra = (DatasetBinding(binding_id='real', role='train', dataset=real),) if real else ()
     project = revision(ProjectSpec(project_id='project.1', name='Project', datasets=(
         DatasetBinding(binding_id='data', role='train', dataset=data),
-        DatasetBinding(binding_id='held', role='validation', dataset=held)), graph=graph.model_dump(mode='json')))
+        DatasetBinding(binding_id='held', role='validation', dataset=held), *extra),
+        graph=graph.model_dump(mode='json')))
     producers = tuple(producer(ref, marker) for marker, ref in (('base', base), ('first', first), ('second', second)))
     choices = ExecutionChoices(
         recipes=(recipe,), benchmarks=(BenchmarkRevision(spec=benchmark, revision_sha256=benchmark.fingerprint()),),
-        datasets=(snapshot_dataset(registry, data), snapshot_dataset(registry, held)),
+        datasets=(snapshot_dataset(registry, data), snapshot_dataset(registry, held),
+                  *((snapshot_dataset(registry, real),) if real else ())),
         models=(ModelContext(root=inputs.ROOT, profile=inputs.PROFILE),),
         artifacts=tuple(snapshot_artifact(models, item.model, item) for item in producers),
         executors=tuple(profile for profile, _ in destinations),
