@@ -5370,6 +5370,93 @@ Not verified or still open:
 - 11.3b (the frozen verifier) follows in this worktree. Its §4 step "graph_plan twice with the same plan_sha256" cannot
   hold with a real clock (see above); it compares the stored plan instead.
 
+## Task 11.3b frozen verifier: workflow channel, background controller, argument refusal, 2026-10-21
+
+Commit `test: verify the frozen workflow channel and background controller in the package check` (the §4 message), in
+worktree `D:\llm-tuning-factory-wt113` on `f78ad93` (11.3a, pushed), after 11.2's seed script `5ecfd45`. Changed:
+`scripts/verify_desktop_package.py` and this file. No `src/`, desktop, dependency or `scripts/build_desktop.py` change.
+
+The CLI for 11.6:
+
+```text
+uv run python scripts/verify_desktop_package.py [--bridge PATH] [--check NAME]... [--receipt PATH]
+  --bridge   default dist/factory-bridge.exe; the installed app's factory-bridge.exe; a .py path (the source entry
+             scripts/desktop_entry.py) runs with this interpreter ("bridge_mode": "source")
+  --check    legacy | arguments | workflow | controller | wheel   (repeatable; default: all, in this order)
+  --receipt  also write the printed JSON receipt to PATH (LF)
+11.6 step 4:  uv run python scripts/verify_desktop_package.py --receipt .factory\frozen-040-receipt.json
+11.6 step 10: uv run python scripts/verify_desktop_package.py --bridge "$acc\app\factory-bridge.exe" --check arguments --check workflow --check controller
+```
+
+What it checks:
+- `legacy`: the previous checks, moved into `check_legacy` unchanged, with the same receipt keys. The wheel's
+  `source_and_worker_match` now comes from `check_wheel`.
+- `arguments`: `--bogus` and `--controller extra` must each exit 2 within 60 s, with empty stdout and stderr
+  `unsupported sidecar arguments`. stdin is an open, empty pipe, so an engine that reads it times out.
+- `workflow`: one engine process per request, using the app's envelope on a temporary state.
+  - A blank project ("질의응답 실험 01", task type `qa`, no `legacy_origin`).
+  - A 12-row CP949 CSV; the preview round-trips the Korean cells. Registered `synthetic`, not exportable.
+  - An 80/10/10 split, committed and bound to the project. An SFT LoRA recipe with `cutoff_len` 64.
+  - `seed()` of `scripts/seed_acceptance_root.py` into the same state, from this process. `model_roots_list` through
+    the engine must show the root `snapshot_ready` and `targets_ready`.
+  - A `text` benchmark on the validation split, then train → evaluate. `graph_validate` must pass, then a simulation
+    `graph_plan` with `estimate-local`.
+  - `graph_plan_get` must return the same plan. The stored plan, hash-checked on read, must pin
+    `digest(containers/gpu-requirements.lock)` for every resource; in a frozen engine that lock comes from
+    `sys._MEIPASS/assets`.
+  - No run before submit; then `graph_submit` (simulation) must return `RUNNING`.
+- `controller` (runs `workflow` first when that is not selected):
+  - It starts `--controller` with a `factory-controller/1` line: fast settings, `tracking: {}` and one RunPod profile
+    whose synthetic key is built at runtime. stdin stays open.
+  - The ready line must name the owner and a pid. The submitted run must reach COMPLETED within 180 s.
+  - `controller_status` must show this owner `running`, with the profile in `current.profiles` and not in
+    `skipped_profiles`.
+  - `controller_stop` must return `{requested, owner_id}`. The process must exit 0 within 60 s; `current.json` then has
+    `code: stopped` and `stopped_at`, the status is `absent`, and the ready pid is gone.
+  - A second start, then stdin closed (EOF): exit 0 and the pid gone.
+  - A third start, plus a fourth while it runs: the fourth prints `{"ok": false, "code": "owner_held"}` and exits 3.
+    Then the third is stopped.
+  - The key must appear in no file under the state, in no controller output and in no one-request answer.
+  - Pids are checked with `OpenProcess`/`GetExitCodeProcess`, never `os.kill(pid, 0)`, which terminates a process
+    on Windows.
+- `wheel`: unchanged; without a build it says to run `build_desktop.py`.
+- Receipt: `bridge`, `bridge_mode`, `bridge_sha256`, `checks`, the legacy keys, and these:
+  - `unsupported_args_exit_2`;
+  - `workflow_channel`, `mapped_import_cp949`, `split_committed`, `immutable_plan`, `frozen_lock_path`,
+    `workflow_run_submitted`;
+  - `controller_ready`, `controller_run_completed`, `controller_profile_loaded`, `controller_stop_drained`,
+    `controller_eof_drained`, `owner_held_exit_3`, `onefile_child_exited`, `engine_child_process`,
+    `broker_secret_not_written`;
+  - `source_and_worker_match` (wheel) and `gpu_started: false`.
+
+Deviations from §4 (for root):
+- `--bridge` also accepts the source entry (`.py`), so everything except `wheel` runs before 11.6 builds the sidecar.
+  The 11.4 text in WINDOWS_APP lists the three options and not this source mode.
+- "graph_plan twice with the same plan_sha256" became `graph_plan_get` plus the stored plan. The plan pins
+  the estimate's `observed_at`, so the hash changes with the clock (11.3a above).
+- Extra receipt keys: `bridge`, `bridge_mode`, `checks`, `workflow_run_submitted`, `controller_profile_loaded` and
+  `engine_child_process`. The last is true when the engine pid differs from the started process: the onefile child
+  in a frozen engine, or the venv launcher's child in source mode on Windows.
+
+Actual verification:
+- RED (§4) against `D:\llm-tuning-factory\dist\desktop-acceptance-030\factory-bridge.exe` (0.3.0, run read-only):
+  - `--check arguments` failed: `['--bogus']: still running after 60 s; the engine waits for stdin`;
+  - `--check workflow` failed: `('project_create', {'ok': False, 'error': 'unsupported desktop action'})`.
+  - No bridge process was left. The killed bootloader's `%TEMP%\_MEI287882` was removed.
+- GREEN in source mode: `--bridge scripts/desktop_entry.py --check legacy --check arguments --check workflow --check
+  controller` passed three times in a row on the final file (about 23 s each; the `--receipt` file is one LF line),
+  every key true, `gpu_started: false`, and `source_sha256`
+  `0849b47e…d56c`. `--check controller` alone also passed. No controller process or `factory-package-*` folder was
+  left.
+- `--check wheel` without a build fails with the message above. A missing default bridge exits 2 with `no engine at …`.
+- `ruff check src tests scripts/verify_desktop_package.py scripts/seed_acceptance_root.py` passes; the file is CR-free;
+  `scripts/check_secrets.py` reports 0 findings with the change staged.
+- No test references the verifier.
+
+Not verified or still open:
+- The frozen engine (PyInstaller onefile: `sys._MEIPASS` lock, EOF through the real bootloader, the child pid) and
+  `wheel`: Task 11.6, after root builds the sidecar.
+
 ---
 
 # Current extension acceptance — 2026-10-15, Windows 0.3.0
