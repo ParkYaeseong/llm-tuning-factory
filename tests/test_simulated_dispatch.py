@@ -931,3 +931,26 @@ def test_a_cancel_wins_over_a_simulated_result_collected_by_reconcile(tmp_path, 
     assert d.failure_kind(job_id) == "canceled"
     assert w.store.classify_attempt(w.ctl, job_id, "canceled") == "canceled"
     assert w.store.get_run(w.run_id)["nodes"][0]["status"] == "CANCELED"
+
+
+@pytest.mark.parametrize("scope", ["run", "job"])
+def test_a_cancel_during_the_simulated_freeze_is_never_lost(tmp_path, monkeypatch, scope):
+    """Task 11.5 re-review M1, as the real runner: a cancel landing while the outputs freeze is decided in the
+    transaction that records the result, so the attempt ends CANCELED."""
+    sd = api()
+    w = build(tmp_path, lambda r: [node_train(r, "train")])
+    claimed = claim(w, "train")
+    real = sd.SimulatedOperationDispatcher._outputs
+
+    def outputs(self, job, *args, **kwargs):
+        if scope == "run":
+            w.store.cancel(w.run_id)
+        else:
+            w.store.jobs.cancel(job["id"])
+        return real(self, job, *args, **kwargs)
+
+    monkeypatch.setattr(sd.SimulatedOperationDispatcher, "_outputs", outputs)
+    outcome = dispatcher(w).run_claimed(claimed, None, approval=w.approval)
+    assert (outcome.status, outcome.uncertain, outcome.outputs) == ("CANCELED", False, None)
+    assert w.store.jobs.get(claimed["id"])["status"] == "CANCELED" and not held(w)
+    assert dispatcher(w).failure_kind(claimed["id"]) == "canceled"

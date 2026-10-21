@@ -59,7 +59,7 @@ from .graph_store import (
     NodeOutputs,
     accepted_result,
 )
-from .jobs import ACTIVE, AttemptLease
+from .jobs import ACTIVE, CANCELLATION_REQUESTED, AttemptLease
 from .manifest import source_hash, verify_manifest
 from .operation_dispatch import MODEL_OP_PARENT, write_benchmark_data
 from .operation_outputs import FOREIGN_RESULT, TRAIN_OUTPUT, evaluation_record, freeze_operation_output
@@ -190,7 +190,7 @@ class OperationAttemptRunner:
         if self._cancel_requested(self.jobs.get(job_id)):
             # As _launch (11.5 R1 I-1): a result collected after a cancel is CANCELED, whatever it says, so a late
             # completion never freezes an output, unblocks a child or registers a model.
-            status, error = "CANCELED", "cancellation requested"
+            status, error = "CANCELED", CANCELLATION_REQUESTED
         elif status == "COMPLETED":
             try:
                 outputs, targets = self._outputs(job, manifest, operation, lease.attempt_id, launch, result)
@@ -202,7 +202,10 @@ class OperationAttemptRunner:
             error = f"remote operation {status.lower()}"
         if error:
             self._write_error(job_id, error)
-        self.jobs.reconcile_result(lease, status, error)
+        if self.jobs.reconcile_result(lease, status, error) != status:
+            # A cancel that landed during the freeze, decided in reconcile_result's transaction (11.5 re-review M1).
+            status, error, outputs, targets = "CANCELED", CANCELLATION_REQUESTED, None, ()
+            self._write_error(job_id, error)
         if status == "COMPLETED":
             self._seed_cache(executor, operation, launch, outputs)
         return OperationOutcome(job_id, lease.attempt_id, status, False, outputs, targets, error)
@@ -280,7 +283,7 @@ class OperationAttemptRunner:
             raw = executor.run_operation(self._job_dir(job_id), launch, request, transfers, canceled)
             result = self._accept(raw, request, launch)
             if canceled():
-                raise CanceledError("cancellation requested")
+                raise CanceledError(CANCELLATION_REQUESTED)
             if result.status == "COMPLETED":
                 self.jobs.transition(lease, "EVALUATING")
                 outputs, targets = self._outputs(job, manifest, operation, lease.attempt_id, launch, result)
@@ -305,7 +308,10 @@ class OperationAttemptRunner:
             outputs, targets = None, ()
         if error:
             self._write_error(job_id, error)
-        self.jobs.transition(lease, status, error)
+        if self.jobs.transition(lease, status, error) != status:
+            # A cancel that landed during the freeze, decided in the COMPLETED transaction (11.5 re-review M1).
+            status, error, outputs, targets = "CANCELED", CANCELLATION_REQUESTED, None, ()
+            self._write_error(job_id, error)
         if not uncertain:
             self.jobs.release_gpu(lease, execution_stopped=True)   # a result, or no launch, proves it stopped
         if status == "COMPLETED":

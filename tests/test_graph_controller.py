@@ -252,7 +252,9 @@ class ScriptedDispatcher:
             return outcome(job['id'], lease.attempt_id, 'CANCELED', error='cancellation requested')
         self.jobs.transition(lease, 'EVALUATING')
         outputs, targets = self._produce(job, lease)
-        self.jobs.transition(lease, 'COMPLETED')
+        if self.jobs.transition(lease, 'COMPLETED') == 'CANCELED':   # a cancel during the freeze (re-review M1)
+            self.jobs.release_gpu(lease, execution_stopped=True)
+            return outcome(job['id'], lease.attempt_id, 'CANCELED', error='cancellation requested')
         self._step(node, 'before_release')
         self.jobs.release_gpu(lease, execution_stopped=True)
         if node in self.seed:   # the runner seeds the remote cache after release_gpu (D8)
@@ -299,7 +301,8 @@ class ScriptedDispatcher:
             self.jobs.reconcile_result(lease, status, 'late failure')
             return outcome(job_id, lease.attempt_id, status, error='late failure')
         outputs, targets = self._produce(job, lease)
-        self.jobs.reconcile_result(lease, 'COMPLETED')
+        if self.jobs.reconcile_result(lease, 'COMPLETED') == 'CANCELED':   # a cancel during the freeze (M1)
+            return outcome(job_id, lease.attempt_id, 'CANCELED', error='cancellation requested')
         return outcome(job_id, lease.attempt_id, 'COMPLETED', outputs=outputs, targets=targets)
 
     def outputs_for(self, job_id):

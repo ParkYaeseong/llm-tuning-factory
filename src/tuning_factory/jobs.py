@@ -17,6 +17,7 @@ GRAPH_RESUME_REFUSED = ('a graph-owned job is retried only by its graph controll
                         '(retry or re-run the graph instead)')
 RECEIPT_CHUNK = 500  # Stay far below SQLite's variable limit.
 TERMINAL = {'FAILED', 'CANCELED', 'COMPLETED'}
+CANCELLATION_REQUESTED = 'cancellation requested'   # a graph attempt's result after a job or run cancel
 TRANSITIONS = {
     'PENDING': {'QUEUED', 'CANCELED'}, 'QUEUED': {'PROVISIONING', 'CANCELED'},
     'PROVISIONING': {'RUNNING', 'FAILED', 'CANCELED', 'RETRYING'},
@@ -268,6 +269,9 @@ class JobStore:
         return self.error_filter(str(error))
 
     def transition(self, subject, status, error=None):
+        """Move the job to ``status`` and return the status written. A graph attempt's COMPLETED is written as
+        CANCELED when its job or run was canceled, decided in this transaction (11.5 re-review M1), so a cancel that
+        lands while the outputs freeze is never lost."""
         job_id = subject.job_id if isinstance(subject, AttemptLease) else subject
         error = self.filtered(error)
         with self.connection() as db:
@@ -276,12 +280,25 @@ class JobStore:
             if isinstance(subject, AttemptLease) or (row and (row['active_attempt_id'] or row['attempts'])):
                 self.validate_lease(db, subject)
             if row is not None and row['status'] == status:
-                return
+                return status
+            if status == 'COMPLETED' and row is not None and self._graph_canceled(db, row):
+                status, error = 'CANCELED', CANCELLATION_REQUESTED
             if row is None or status not in TRANSITIONS.get(row['status'], set()):
                 raise ValueError(f'invalid state transition to {status}')
             now = time.time()
             db.execute('UPDATE jobs SET status=?,error=?,updated=? WHERE id=?', (status, error, now, job_id))
             db.execute('INSERT INTO events VALUES (?,?,?,?)', (job_id, status, now, error))
+            return status
+
+    @staticmethod
+    def _graph_canceled(db, row):
+        """Whether a graph job's result must be CANCELED: a job-level cancel, or its run was canceled."""
+        if row['graph_run_id'] is None:
+            return False
+        if row['cancel_requested']:
+            return True
+        run = db.execute('SELECT status FROM graph_runs WHERE id=?', (row['graph_run_id'],)).fetchone()
+        return run is not None and run['status'] == 'CANCELED'
 
     @staticmethod
     def gpu_count(raw):
@@ -571,6 +588,9 @@ class JobStore:
             db.execute('INSERT INTO events VALUES (?,?,?,?)', (job_id, 'QUEUED', time.time(), 'manual resume'))
 
     def reconcile_result(self, lease, status, error=None):
+        """Settle a FAILED attempt that holds its lock from its collected result, release the lock and return the
+        status written: a graph attempt's COMPLETED becomes CANCELED here, in the same transaction, when its job or
+        run was canceled (11.5 re-review M1)."""
         if status not in TERMINAL:
             raise ValueError('invalid reconciled terminal status')
         error = self.filtered(error)
@@ -579,9 +599,12 @@ class JobStore:
             row = self.validate_lease(db, lease)
             if row['status'] != 'FAILED':
                 raise ValueError('only failed jobs may be reconciled')
+            if status == 'COMPLETED' and self._graph_canceled(db, row):
+                status, error = 'CANCELED', CANCELLATION_REQUESTED
             db.execute('UPDATE jobs SET status=?,error=?,updated=? WHERE id=?', (status, error, time.time(), lease.job_id))
             db.execute('INSERT INTO events VALUES (?,?,?,?)', (lease.job_id, status, time.time(), 'remote result reconciled'))
             self._release(db, lease)
+            return status
 
     def materialize_job_evidence(self, job_id):
         from .registry import canonical, immutable_write

@@ -1399,3 +1399,47 @@ def test_a_live_pod_above_the_pinned_total_or_another_gpu_is_still_refused(tmp_p
     outcome = run(w)
     assert (outcome.status, outcome.uncertain) == ("FAILED", False) and message in outcome.error
     assert w.host.commands == [] and w.calls == [] and not held_locks(w)
+
+
+# -- 16. Task 11.5 re-review: a cancel during the freeze, deterministic file errors -------------------------------
+
+def cancel_scope(w, scope):
+    if scope == "run":
+        w.store.cancel(w.run["id"])
+    else:
+        w.store.jobs.cancel(w.job_id)
+
+
+@pytest.mark.parametrize("path", ["launch", "reconcile"])
+@pytest.mark.parametrize("scope", ["run", "job"])
+def test_a_cancel_that_lands_during_the_freeze_is_never_lost(tmp_path, monkeypatch, path, scope):
+    """Re-review M1: the cancel check ran before the freeze and the result was recorded after it, so a cancel landing
+    in between ended COMPLETED. It is decided in the transaction that records the result (``transition`` from
+    ``_launch``, ``reconcile_result`` from reconcile): CANCELED, no output to record, nothing seeded."""
+    from tuning_factory import attempt_runner
+    w = world(tmp_path, monkeypatch)
+    original, fired = attempt_runner.freeze_operation_output, []
+
+    def freeze(*args, **kwargs):
+        if not fired:
+            fired.append(scope)
+            cancel_scope(w, scope)   # the cancel lands while the outputs are being frozen
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(attempt_runner, "freeze_operation_output", freeze)
+    if path == "launch":
+        outcome = run(w)
+    else:
+        w.host.mode = "lose_start_response"
+        assert run(w).uncertain and not fired
+        w.host.finish()
+        outcome = w.runner.reconcile(w.job_id, w.executor)
+    assert fired == [scope]
+    assert (outcome.status, outcome.uncertain, outcome.outputs) == ("CANCELED", False, None)
+    assert w.store.jobs.get(w.job_id)["status"] == "CANCELED" and not held_locks(w)
+    with pytest.raises(ValueError, match="only for a completed attempt"):
+        w.runner.outputs_for(w.job_id)   # so record_outputs can never mark the node COMPLETED
+    assert not (launch_dir(w).parent / (w.claimed["launch_id"] + ".cache-seed.json")).exists()
+    assert w.runner.failure_kind(w.job_id) == "canceled"
+    assert w.store.classify_attempt(w.ctl, w.job_id, "canceled") == "canceled" and node_status(w) == "CANCELED"
+    assert w.calls == ["train.bound.yaml"] and len(w.host.launches) == 1

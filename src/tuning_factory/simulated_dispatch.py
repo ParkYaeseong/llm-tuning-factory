@@ -595,7 +595,9 @@ class SimulatedOperationDispatcher:
             error = f"simulated operation {status.lower()}"
         if error:
             self._write_error(job_id, error)
-        self.jobs.reconcile_result(lease, status, error)
+        if self.jobs.reconcile_result(lease, status, error) != status:   # a cancel during the freeze (re-review M1)
+            status, error, outputs, targets = "CANCELED", "cancellation requested", None, ()
+            self._write_error(job_id, error)
         return OperationOutcome(job_id, lease.attempt_id, status, False, outputs, targets, error)
 
     def failure_kind(self, job_id: str) -> FailureKind | None:
@@ -695,7 +697,9 @@ class SimulatedOperationDispatcher:
             outputs, targets = None, ()
         if error:
             self._write_error(job_id, error)
-        self.jobs.transition(lease, status, error)
+        if self.jobs.transition(lease, status, error) != status:   # a cancel during the freeze (11.5 re-review M1)
+            status, error, outputs, targets = "CANCELED", "cancellation requested", None, ()
+            self._write_error(job_id, error)
         self.jobs.release_gpu(lease, execution_stopped=True)   # simulation is synchronous: it has stopped
         return OperationOutcome(job_id, lease.attempt_id, status, False, outputs, targets, error)
 
