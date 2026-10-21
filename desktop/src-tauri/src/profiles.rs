@@ -253,9 +253,11 @@ fn without_key_content(value: &Value) -> Option<Value> {
 /// renamed over the old one: `std::fs::rename` replaces an existing file atomically on Windows
 /// (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`) and on POSIX, so a reader or a crash sees the old or the new
 /// store, never a partial one. The temporary name is unique per write (process, counter, time), so two writers never
-/// share one; the callers hold `StoreLock`. Credentials stay exclusively in Credential Manager.
+/// share one; the callers hold `StoreLock`, so temporary files a crashed write left behind are removed first.
+/// Credentials stay exclusively in Credential Manager.
 fn write_store(root: &Path, store: &Map<String, Value>) -> Result<(), String> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    remove_stale_temporaries(root);
     let served: Map<String, Value> = served(store).into_iter().map(|(id, fields)| (id, Value::Object(fields))).collect();
     let profiles: Map<String, Value> = store.iter().map(|(id, entry)| (id.clone(), served.get(id).cloned()
         .unwrap_or_else(|| without_key_content(entry).unwrap_or(Value::Null)))).collect();
@@ -270,6 +272,17 @@ fn write_store(root: &Path, store: &Map<String, Value>) -> Result<(), String> {
         return Err(SAVE_FAILED.into());
     }
     Ok(())
+}
+
+/// Removes `executor-profiles.*.tmp` files a crash between a temporary write and its rename left behind (best effort).
+/// Only under `StoreLock`: no other writer can be mid-write then.
+fn remove_stale_temporaries(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("executor-profiles.") && name.ends_with(".tmp") { let _ = fs::remove_file(entry.path()); }
+    }
 }
 
 /// An exclusive lock on `PROFILES_LOCK` for one read-modify-write of the store (11.5 R2 M1): saves and deletes in other
@@ -424,15 +437,17 @@ pub fn delete_profile(root: &Path, vault: &dyn Vault, id: &str) -> Result<(), St
 /// IDs are read leniently (any `profiles` object, whatever the schema version), every entry is tried even after a
 /// failure, and the first problem (an unexpected, unreadable or unparsable file, a failed delete) is returned at the
 /// end. A missing file is nothing to forget (and creates nothing); otherwise the IDs are read under `StoreLock`, so a
-/// save in another window that already stored its key also has its ID in the file.
+/// save in another window that already stored its key also has its ID in the file. The lock is best effort: a lock file
+/// that cannot be opened or locked never keeps a key; it is the first problem reported.
 pub fn forget_profile_secrets(root: &Path, vault: &dyn Vault) -> Result<(), String> {
     let path = root.join(PROFILES_FILE);
     if !path.exists() { return Ok(()); }
-    let _lock = StoreLock::acquire(root)?;
+    let lock = StoreLock::acquire(root);
     let bytes = fs::read(&path).map_err(|_| READ_FAILED)?;
     let parsed: Value = serde_json::from_slice(&bytes).map_err(|_| CORRUPT)?;
     let profiles = parsed.get("profiles").and_then(Value::as_object).ok_or(CORRUPT)?;
-    let mut result = if parsed.get("schema_version") == Some(&json!(1)) { Ok(()) } else { Err(CORRUPT.to_owned()) };
+    let mut result = lock.as_ref().map(|_| ()).map_err(Clone::clone);
+    if parsed.get("schema_version") != Some(&json!(1)) { result = result.and(Err(CORRUPT.to_owned())); }
     for id in profiles.keys().filter(|id| valid_profile_id(id)) {
         for name in PROFILE_SECRETS {
             if let Err(error) = vault.delete(&profile_secret_entry(id, name)) { result = result.and(Err(error)); }
@@ -1126,6 +1141,48 @@ mod tests {
         assert_eq!(key_of(&vault, "a"), None);
         assert_eq!(key_of(&vault, "c"), None);
         assert_eq!(key_of(&vault, "b"), Some(synthetic("b")));
+    }
+
+    #[test]
+    fn forgetting_profile_keys_does_not_wait_for_a_lock_it_cannot_take() {
+        // 11.5 re-review M1: a lock file that cannot be opened (here a directory; antivirus holding it share-none is the
+        // same) must not keep the keys: every key is still deleted, and the lock problem is reported at the end.
+        let root = TempRoot::new("forget-no-lock");
+        let legacy: Vec<(String, String)> = crate::SECRETS.iter().map(|name| (name.to_string(), synthetic(name))).collect();
+        let entries: Vec<(&str, &str)> = legacy.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        let vault = MemoryVault::with(&entries);
+        for id in ["a", "b"] {
+            save_profile(root.path(), &vault, id, &with_key(runpod(id, "pod"), &synthetic(id)), None).unwrap();
+        }
+        fs::remove_file(root.path().join(PROFILES_LOCK)).unwrap();
+        fs::create_dir(root.path().join(PROFILES_LOCK)).unwrap();
+        assert_eq!(forget_profile_secrets(root.path(), &vault), Err(LOCK_FAILED.to_owned()));
+        assert_eq!((key_of(&vault, "a"), key_of(&vault, "b")), (None, None));
+        let vault = MemoryVault::with(&entries);
+        vault.set(&profile_secret_entry("a", "RUNPOD_API_KEY"), &synthetic("a")).unwrap();
+        let outcome = crate::forget_all_credentials(|| Ok(root.path().to_path_buf()), &vault).unwrap();
+        assert_eq!(outcome["profile_credentials_forgotten"], false);
+        assert!(outcome["profile_warning"].as_str().unwrap().contains(LOCK_FAILED), "{outcome}");
+        assert!(vault.names().is_empty(), "left behind: {:?}", vault.names());
+    }
+
+    #[test]
+    fn a_store_write_removes_temporary_files_a_crash_left_behind() {
+        // 11.5 re-review nit: a crash between the temporary write and the rename leaves a unique `.tmp`; the next write,
+        // under the store lock (no other writer can be mid-write), removes such leftovers. Other files stay.
+        let root = TempRoot::new("stale-tmp");
+        let vault = MemoryVault::default();
+        save_profile(root.path(), &vault, "a", &runpod("A", "pod-a"), None).unwrap();
+        for name in ["executor-profiles.4242-0-123.tmp", "executor-profiles.tmp"] {
+            fs::write(root.path().join(name), b"{\"partial\"").unwrap();
+        }
+        for name in ["settings.tmp", "executor-profiles.json.bak", "other.tmp"] { fs::write(root.path().join(name), b"keep").unwrap(); }
+        save_profile(root.path(), &vault, "b", &runpod("B", "pod-b"), None).unwrap();
+        let mut left = temporaries(root.path());
+        left.sort();
+        assert_eq!(left, ["other.tmp", "settings.tmp"]);
+        assert!(root.path().join("executor-profiles.json.bak").exists());
+        assert_eq!(read_profiles(root.path(), &vault, false).unwrap()["profiles"].as_array().unwrap().len(), 2);
     }
 
     #[test]
