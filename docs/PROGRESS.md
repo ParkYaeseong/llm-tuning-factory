@@ -5994,6 +5994,126 @@ Verification (this worktree, Python 3.12, `uv sync --extra dev --extra tracking 
 GPU work still outstanding for this area: the L2b chain on synthetic data (train -> continue -> evaluate -> select ->
 merge -> evaluate) has only run against the fake GPU host; its live run stays as planned in Task 11.
 
+## Task 11.5 fixes: release scripts and docs, 2026-10-21
+
+Worktree `D:\llm-tuning-factory-wt116`, branch `codex/rc-docs-fixes` on RC `01c8503`, from the R4 review (release
+machinery and docs) plus the doc items of R1, R2 and R5 that root assigned. Commits: `b27a22d` (verifier), `72a953a`
+(CI lint), `bd2924a` (native smoke), `131bff1` (docs) and this entry. No `src/`, `desktop/src/` or
+`desktop/src-tauri/` change.
+
+Scripts and CI:
+- R4 M1: **fixed**. `verify_desktop_package.frozen_only(bridge)` now sets `frozen_engine`, `frozen_s3_sdk_loaded`,
+  `frozen_lock_path` and `onefile_child_exited`: true for a frozen bridge, null in source mode. Receipt consumers:
+  `windows-desktop.yml` runs the default (frozen) bridge and parses nothing, and the 11.6 steps read "every key true"
+  from frozen receipts, whose values are unchanged.
+- R4 M11: **fixed**. New `tests/test_verify_desktop_package.py`:
+  - `test_only_a_frozen_bridge_reports_frozen_evidence` runs on every platform.
+  - `test_the_verifier_passes_in_source_mode_offline_and_cleans_up` (`slow`) runs the verifier as a subprocess on
+    `scripts/desktop_entry.py` with `--check legacy/arguments/workflow/controller`. TEMP, TMP, TMPDIR, HOME and
+    USERPROFILE point into `tmp_path`, credential variables are dropped, and a loopback-only `sitecustomize` guard on
+    PYTHONPATH records and refuses any other connect or name lookup in the verifier and every child. It pins the 17
+    passed keys, the four null keys, `source_sha256`, `gpu_started: false`, the receipt file bytes, zero refusals, a
+    guard loaded in at least 10 processes, and an empty TEMP afterwards.
+  - The `slow` marker sits beside `gpu` in `pyproject.toml` and runs by default: `ci.yml`'s `-m "not gpu"` and
+    `windows-desktop.yml`'s plain `pytest` both include it, and `-m "not slow"` deselects it. Off Windows it is
+    skipped, because the verifier accepts the Windows sidecar and no offline Linux environment was available here to
+    run it on ubuntu.
+  - RED: `AttributeError: ... no attribute 'frozen_only'`, and the source receipt had the four keys true.
+- R4 M2 (script): **fixed**. The controller-absent and no-active-runs check now runs before the first write. That
+  write is section 2's `desktop_smoke` dataset, which comes before the `project_create` the report named. A refused
+  smoke now writes nothing.
+- R4 M3: **fixed**. Sections 6 and 7 start the real controller only on a state with no executor profiles, no saved
+  credential and no `MLFLOW_TRACKING_URI`. The broker hands the controller the public URI even under
+  `auth_mode: none`, which `!savedCredentials` alone would miss. Otherwise the synthetic profile is deleted at once,
+  and controller and flow report `skipped_saved_settings`. `node --check` passes; the smoke was not run (11.6).
+- R4 M4: **recorded, no change**. `forget_profile_secrets` deleting the keys of unserved entries (an unknown provider
+  or a non-object value) is what "forget" means. Only the smoke's "no profiles" guard cannot see those entries, which
+  is very rare.
+- R4 M9: **fixed**. `ci.yml` and `windows-desktop.yml` run `uv run ruff check src tests scripts`, the old F401
+  (`shlex`) in `scripts/update_approved_runtime.py` is gone, and the developer commands in README and WINDOWS_APP say
+  the same. No existing test pinned the CI command lines; `test_both_workflows_lint_the_release_scripts` pins them
+  now (RED with the two workflows reverted).
+
+Docs (Korean for users, English for operators):
+- R4 I1: **fixed by rewording**. README, WINDOWS_APP and TRAINING_WORKFLOWS §14 no longer claim installed-app checks
+  in the past tense. Done: automated tests, the 29-check CPU acceptance and the verifier's source mode. Planned: the
+  frozen engine and installed-app checks, as "설치 앱 검사(11.6) … 진행 기록에 기록합니다". Root turns them into past
+  tense from the 11.6 receipt.
+- R4 doc fixes 1–5 and R2 M2: **fixed**.
+  1. CONFIGURATION: an unknown key points at the object that holds it, with "(the unknown key is not shown)".
+  2. CONFIGURATION `graph_submit`: the desktop sends `request_id = plan-<plan_sha256>`.
+  3. TRAINING_WORKFLOWS §6, plus CONFIGURATION and WINDOWS_APP: re-run guidance. Real plans and dry runs on native
+     profiles only give the same hash for the same inputs, so change an input (re-running 자원 확인 is enough). Dry
+     runs that use an estimate give a new plan on every 계획 확인.
+  4. OPERATIONS: `status --job-id JOB_ID` (twice), and the stale "development branch … not in 0.3.0" note on SSH
+     servers.
+  5. WINDOWS_APP: the verifier's `.py` source mode, `bridge_mode` and the null frozen keys.
+- R4 M2 (docs): **fixed**. WINDOWS_APP no longer says the smoke runs in a "별도 테스트 앱". It says the smoke writes to
+  the real app state (projects that cannot be deleted, `desktop_smoke`, and with FLOW a seeded root, datasets, a
+  recipe, a benchmark and a run). FLOW's prerequisites are listed: the seed command, no profiles, saved credentials or
+  MLflow address, the controller absent and no active runs. The seed command uses PowerShell's
+  `"$env:APPDATA\kr.kbiofoundry.tuningfactory\state"`, because a literal `%APPDATA%` does not expand in the
+  PowerShell context of that section.
+- R4 M6: **fixed**. TRAINING_WORKFLOWS §12 and OPERATIONS: `graph-work`'s exit 3 holds only with `--state-dir` at the
+  app state. With the default `./state`, a second controller can dispatch to the same borrowed Pod, because GPU locks
+  live per state.
+- R4 M7: **fixed**. The installer is named `LLM.Tuning.Factory_0.4.0_x64-setup.exe`.
+- R5 M3: **fixed**. TRAINING_WORKFLOWS (§11 and the §12 table), CONFIGURATION and OPERATIONS recommend
+  `--request-id plan-<PLAN_SHA256>`.
+- Documented to root's target for behaviour that other batches implement in parallel (root re-reviews against the
+  final code):
+  - Plan dedupe (`plan_submitted`, also after a cancel; the same request ID stays idempotent; desktop and CLI):
+    TRAINING_WORKFLOWS §6 and §11, CONFIGURATION `graph_submit`, OPERATIONS. The old text disclosing the CLI
+    double-registration hole is gone.
+  - Synthetic lineage: TRAINING_WORKFLOWS registration step, §9 and §11, and CONFIGURATION merge rules plus a new
+    "Synthetic and simulated lineage" paragraph. Merges now say "not simulated; any synthetic input makes the merged
+    output synthetic".
+  - Merge fallback (R5 M4): TRAINING_WORKFLOWS §5 and CONFIGURATION `SelectionSpec`.
+  - One machine, one profile (R1 m11): TRAINING_WORKFLOWS §7, WINDOWS_APP and CONFIGURATION executor profiles.
+    **Deviation from root's wording:** "the app cannot prevent both being used at once" holds only across state
+    directories or PCs. Within one state, the D3 cross-provider quarantine (`jobs.py` `_resource_blocked`,
+    `graph_controller._conflicts`) makes every RunPod attempt and every SSH attempt wait for each other. What differs
+    is the plan, which counts the two profiles separately for 대기 후 순차 실행 and `max_concurrent_gpu_count`. The docs
+    say this.
+  - Task 11 plan L2b: with `synthetic: true`, the chain runs end to end, both selections end `no_winner`, and nothing
+    is registered; registration stays an L3 check with real data.
+- Not in this batch: R4 M5 and doc fix 6 (the release-notes warning, in the git-ignored draft), M8 (PR draft links) and
+  M10 (`tests/test_cli_graph.py`, owned by the CI-fix agent).
+
+Actual verification:
+- `uv run pytest -q`: **1758 passed, 1 skipped** in 945 s, with the code at `bd2924a` and the docs uncommitted, beside
+  other agents' suites. That is 1755 at the RC, plus the two verifier tests and the lint pin. The skip is the opt-in
+  real-GPU test.
+- `uv run pytest tests/test_verify_desktop_package.py`: 2 passed in about 28 s, several times. The earlier RED runs are
+  described above.
+- `uv run ruff check src tests scripts`: All checks passed. `uv lock --check --offline` passes after the
+  `pyproject.toml` marker change.
+- `uv run python scripts/check_secrets.py`: `Checked 1101 staged/historical file versions; 0 findings.`
+- `node --check desktop/tests/native-smoke.mjs` passes. `git diff --check 01c8503..HEAD` is clean, and
+  `git ls-files --eol` shows `i/lf w/lf` for every changed file.
+- `uv run python scripts/verify_desktop_package.py --bridge scripts/desktop_entry.py --check legacy --check arguments
+  --check workflow --check controller --receipt <scratch>`: exit 0 in 31 s.
+  - `bridge_mode: source`, and the 17 check keys are true.
+  - `frozen_engine`, `frozen_s3_sdk_loaded`, `frozen_lock_path` and `onefile_child_exited` are null.
+  - `engine_child_process` is true (the venv launcher), and `gpu_started` is false.
+  - `source_sha256` is `7fd0f911601f4d67ee0cbe7bf73a81e9b447e205aa2796c1dd988281815622dc`.
+  - `source_commit` is `"uncommitted"`. This is not new: `code_revision` runs `git rev-parse` in the verifier's temp
+    workdir.
+  - No `factory-package-*` folder was left. Without `--check`, the same command also runs `wheel`, which fails without
+    a build (`no engine wheel under build/desktop-assets/dist`).
+- Docs: a scratch checker over README, the four guides, the Task 11 plan and the changed scripts and tests found no CR,
+  BOM, control, format, bidi or invisible character, and no backslash-u escape. Every relative link and anchor in the
+  changed docs resolves; the plan's pre-existing `…/blob/v0.4.0/` template links and its quoted escape text are
+  unchanged. A planted probe (CR, U+200B, a broken link and a broken anchor) was reported. The new curly- or
+  single-quoted labels (“자원 확인”, “계획 확인”, ‘최대 동시 GPU’, ‘대기 후 순차 실행’, “실행 보기”) exist in
+  `desktop/src`.
+
+Not verified or still open:
+- The verifier test on ubuntu (skipped there) and on hosted windows-latest; root sees hosted CI.
+- The native smoke against an installed app (11.6).
+- The plan-dedupe, synthetic-lineage and merge-fallback docs describe behaviour from parallel batches; they need root's
+  re-check against the final code.
+
 ## Windows workbench refinement — 0.2.1
 
 User selected the light Linear/Vercel direction after requesting getdesign.md references and similar open-source
