@@ -935,3 +935,71 @@ def test_profile_in_use_skips_simulated_jobs(tmp_path, monkeypatch):
     execute(state, "UPDATE jobs SET manifest=? WHERE id=?", "{", claimed["id"])
     desk.only_issue(run(state, "executor_profile_edit_check", {"profile_id": "pod-a"}), "conflict", "profile_in_use",
                     "/profile_id")
+
+
+def test_a_submit_that_holds_the_ledger_makes_the_second_wait_then_refuse(tmp_path, monkeypatch):
+    """Re-review m3, deterministic: submit ``a`` stops inside its ``BEGIN IMMEDIATE`` with its run inserted and not yet
+    committed; submit ``b`` (its store already open, every check before the transaction done) reaches its own
+    ``BEGIN IMMEDIATE`` only then, and ``a`` commits only after that. So ``b``'s plan check runs after ``a``'s commit,
+    inside ``b``'s transaction, and refuses with ``a``'s run. A check made before the transaction would have seen no
+    run and made a second one. Events order the steps; nothing sleeps or races."""
+    import threading
+    from contextlib import contextmanager
+
+    from tuning_factory.graph_planner import ApprovalGrant
+    from tuning_factory.graph_store import GraphStore, PlanSubmitted
+    from tuning_factory.jobs import JobStore
+    state = tmp_path / "state"
+    found = simulation_world(state, tmp_path, monkeypatch)
+    plan = wpt.planning().stored_plan(state, found.plan_sha256)
+    first_store, second_store = ledger(state), ledger(state)   # opened (migrations done) before either submit
+    a_holds, b_begins = threading.Event(), threading.Event()
+    track, connection = GraphStore._track, JobStore.connection
+
+    def held_track(self, db, events):   # called in submit's transaction, after the run's rows are inserted
+        if threading.current_thread().name == "submit-a":
+            a_holds.set()
+            assert b_begins.wait(60), "submit b never reached its transaction"
+        return track(self, db, events)
+
+    class Announcing:
+        def __init__(self, db):
+            self._db = db
+
+        def __getattr__(self, name):
+            return getattr(self._db, name)
+
+        def execute(self, sql, *args):
+            if sql == "BEGIN IMMEDIATE":
+                b_begins.set()
+            return self._db.execute(sql, *args)
+
+    @contextmanager
+    def announcing_connection(self):
+        with connection(self) as db:
+            yield Announcing(db) if threading.current_thread().name == "submit-b" else db
+
+    monkeypatch.setattr(GraphStore, "_track", held_track)
+    monkeypatch.setattr(JobStore, "connection", announcing_connection)
+    results = {}
+
+    def submit_as(name, store):
+        try:
+            results[name] = store.submit(plan, name, ApprovalGrant.for_plan(plan), unique_plan=True)
+        except Exception as exc:   # reported below
+            results[name] = exc
+
+    first = threading.Thread(target=submit_as, args=("a", first_store), name="submit-a", daemon=True)
+    second = threading.Thread(target=submit_as, args=("b", second_store), name="submit-b", daemon=True)
+    first.start()
+    assert a_holds.wait(60), results
+    second.start()
+    first.join(60)
+    second.join(60)
+    assert not first.is_alive() and not second.is_alive(), results
+    assert isinstance(results["a"], dict), results
+    refused = results["b"]
+    assert isinstance(refused, PlanSubmitted), results
+    assert (refused.run_id, refused.status) == (results["a"]["id"], "RUNNING")
+    assert desk.workflows().classify(str(refused)) == ("conflict", "plan_submitted")
+    assert [(row[0], row[1]) for row in run_rows(state)] == [(results["a"]["id"], "a")]
