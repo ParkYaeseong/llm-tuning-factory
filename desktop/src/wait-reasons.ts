@@ -1,4 +1,5 @@
-// Korean texts for the graph controller's English wait reasons, statuses and tracking texts (D12). Pure: no imports.
+// Korean texts for the graph controller's English wait reasons, statuses and tracking texts (D12). Pure: it imports only
+// the graph editor's kind names (graph-model.ts, itself pure), so every screen names a card kind the same way.
 // The controller's texts carry no codes, so they are matched by their fixed prefixes. The sources of a node's wait
 // reason (checked against 6c8780f): graph_store.readiness ("waiting for <parent>", "waiting for tracking of <parent>")
 // with graph_controller._prepare's tracking suffix; graph_controller.py's constants (62-89) and `_describe(exc)` of a
@@ -6,6 +7,7 @@
 // provider's ValueError text through (executor_profiles.py 122-127, desktop_runtime.py, runtime_profiles.py) and
 // wraps anything else as "destination unavailable: ..." (controller_entry.DESTINATION_TIMEOUT included). A wording
 // change in the backend falls back to the original text (kind `error`), never to a wrong one; the original is kept.
+import { KIND_LABELS } from "./graph-model";
 
 export type ReasonKind = "waiting" | "operator" | "replan" | "budget" | "error";
 export interface LocalizedReason { text: string; original: string; kind: ReasonKind }
@@ -137,7 +139,8 @@ export const TRACKING_KIND: Record<string, string> = {
   attempt_evidence: "시도 결과 파일", model_registration: "모델 등록",
 };
 export const EVENT_STATUS: Record<string, string> = { FAILED: "기록 실패", UNCERTAIN: "기록 확인 필요", PENDING: "기록 대기", ACKNOWLEDGED: "기록됨" };
-export const NODE_KIND: Record<string, string> = { train: "학습", evaluate: "평가", select: "선택", merge: "병합", materialize: "모델 변환" };
+/** The graph editor's kind names (11.5 R3 M3: one name per kind on every screen). */
+export const NODE_KIND: Record<string, string> = { ...KIND_LABELS };
 /** benchmarks.EvaluationRecord.status */
 export const EVALUATION_STATUS: Record<string, string> = {
   pending: "대기", running: "실행 중", completed: "완료", failed: "실패", cancelled: "취소", skipped: "건너뜀", unevaluated: "평가하지 않음",

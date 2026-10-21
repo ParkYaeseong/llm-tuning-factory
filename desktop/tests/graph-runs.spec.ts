@@ -534,8 +534,12 @@ test("an unreadable run and a missing controller are shown without breaking the 
   await idle(page);
   await expect(detailCard(page)).toContainText("읽을 수 없는 실행");
   await expect(detailCard(page).getByRole("button", { name: /일시정지|다시 진행|^취소$/ })).toHaveCount(0);
-  // An answer about another run is never shown as this one: the last state stays with a read error.
+  // An unreadable run is not read again on its own (11.5 R3 M4); "다시 확인" reads it once. An answer about another run
+  // is never shown as this one: the last state stays with a read error.
   await page.clock.runFor(3000);
+  await expect(detailCard(page)).not.toContainText("엔진 응답 형식이 올바르지 않습니다.");
+  await detailCard(page).getByRole("button", { name: "다시 확인", exact: true }).click();
+  await idle(page);
   await expect(detailCard(page)).toContainText("엔진 응답 형식이 올바르지 않습니다.");
   await expect(detailCard(page)).toContainText("읽을 수 없는 실행");
   await expect(detailCard(page).getByRole("button", { name: /일시정지|다시 진행|^취소$/ })).toHaveCount(0);
@@ -756,4 +760,85 @@ test("the release dialog stops when the node changes while it is open", async ({
   await operatorItem(page, "train-b").getByRole("button", { name: "실행 잠금 해제" }).click();
   await expect(page.getByRole("dialog")).toContainText(A_C);
   await expect(page.getByRole("dialog")).not.toContainText("실행 상태가 바뀌었습니다");
+});
+
+// -- 11.5 review fixes (R3 M2, M3, M4) --
+test("a node label with invisible or bidi characters is isolated and can be typed as it is shown", async ({ page }) => {
+  // Built from code points: no source file may hold these characters literally.
+  const [zwsp, rlo, pdf] = [0x200B, 0x202E, 0x202C].map(code => String.fromCharCode(code));
+  const label = `학습${zwsp}B ${rlo}cba${pdf}`;
+  const visible = "학습B cba";
+  const stuck = node("train-b", { label, status: "RUNNING", job_id: J_B, attempt_id: A_B, attempts: 1, counted_attempts: 1,
+    job_status: "FAILED", uncertain: true, needs_operator: true, wait_reason: OPERATOR_CONFIRMATION });
+  await openWorkbench(page, { workflow: { graph_runs_list: listOf(entry(run())), controller_status: controllerStatus("running"),
+    graph_run_get: detail(run({}, [stuck])) } });
+  await openRun(page, RUN);
+  await operatorItem(page, "train-b").getByRole("button", { name: "실행 잠금 해제" }).click();
+  const dialog = page.getByRole("dialog");
+  // An override inside the name cannot reorder the sentence around it.
+  await expect(dialog.locator(".run-release-target bdi")).toHaveText(label);
+  // The name to type is shown without its invisible format characters, and the dialog says so.
+  await expect(dialog.locator(".run-release-label bdi")).toHaveText(visible);
+  await expect(dialog.locator(".run-release-label")).toContainText("보이지 않는 문자");
+  const confirm = dialog.getByRole("button", { name: "잠금 해제", exact: true });
+  await dialog.getByRole("checkbox", { name: STOP_CONFIRMED }).check();
+  const typed = dialog.getByRole("textbox");
+  await typed.fill(visible);
+  await expect(confirm).toBeEnabled();
+  await typed.fill(label);                                               // pasted with the characters: the same name
+  await expect(confirm).toBeEnabled();
+  await typed.fill("학습B abc");                                         // the order an override would show
+  await expect(confirm).toBeDisabled();
+  await dialog.getByRole("button", { name: "돌아가기" }).click();
+  expect(await calls(page, { action: "graph_release_lock" })).toHaveLength(0);
+});
+
+test("the runs page names kinds as the editor does and shows profile names where they are known", async ({ page }) => {
+  const nodes = [node("model-1", { kind: "materialize", label: "확정", resource_id: "runpod:pod-a" }),
+    node("select-1", { kind: "select", label: "고르기", destination_profile_id: null }),
+    node("train-1", { destination_profile_id: "pod-gone" })];
+  await openWorkbench(page, { profiles: [{ profile_id: "pod-a", RUNPOD_API_KEY_saved: true, fields: { provider: "existing_runpod", name: `${HOSTILE} A100` } }],
+    workflow: { graph_runs_list: listOf(entry(run())), controller_status: controllerStatus("running"), graph_run_get: detail(run({}, nodes)) } });
+  await openRuns(page);
+  expect(await calls(page, { command: "executor_profiles_get" })).toHaveLength(0);   // the list has no destinations
+  await listRow(page, RUN).getByRole("button", { name: "열기" }).click();
+  await idle(page);
+  await expect(nodeRow(page, "model-1").locator(".run-node-label small")).toContainText("전체 모델 확정");
+  await expect(nodeRow(page, "select-1").locator(".run-node-label small")).toContainText("자동 선택");
+  const place = nodeRow(page, "model-1").locator(".run-node-destination");
+  await expect(place.locator("b")).toHaveText(`${HOSTILE} A100`);
+  await expect(place).toContainText("pod-a");
+  await expect(place).toContainText("runpod:pod-a");
+  await expect(nodeRow(page, "train-1").locator(".run-node-destination b")).toHaveText("pod-gone");   // not saved here: its ID
+  await expect(nodeRow(page, "select-1").locator(".run-node-destination")).toHaveText("—");
+  expect(await calls(page, { command: "executor_profiles_get" })).toHaveLength(1);
+  await expect(page.locator("img")).toHaveCount(0);
+});
+
+test("an unreadable run is not polled again until it is checked by hand", async ({ page }) => {
+  const unreadable = ok({ run: { run_id: RUN, error: "unreadable graph run: JSONDecodeError: Expecting value" },
+    controller: controllerView("running"), plan: null, tracking_failures: [] });
+  await openWorkbench(page, { clock: true, workflow: { graph_runs_list: listOf(entry(run())), controller_status: controllerStatus("running"),
+    graph_run_get: [unreadable, unreadable, detail(run())] } });
+  await pauseClock(page);
+  await openRun(page, RUN);
+  expect(await gets(page)).toBe(1);
+  await expect(detailCard(page)).toContainText("읽을 수 없는 실행");
+  await expect(detailCard(page)).toContainText("자동으로 다시 확인하지 않습니다");
+  await page.clock.runFor(120_000);                                      // well past the 60 s back-off ceiling
+  expect(await gets(page)).toBe(1);
+  const recheck = detailCard(page).getByRole("button", { name: "다시 확인", exact: true });
+  await recheck.click();
+  await idle(page);
+  expect(await gets(page)).toBe(2);
+  await expect(recheck).toBeFocused();                                   // still unreadable: the button keeps the focus
+  await page.clock.runFor(60_000);
+  expect(await gets(page)).toBe(2);
+  await recheck.click();
+  await idle(page);
+  expect(await gets(page)).toBe(3);
+  await expect(runState(page)).toContainText("실행 중");                 // readable again: followed every 3 s
+  await expect(page.locator("#run-detail-title")).toBeFocused();
+  await page.clock.runFor(3000);
+  await expect.poll(() => gets(page)).toBe(4);
 });

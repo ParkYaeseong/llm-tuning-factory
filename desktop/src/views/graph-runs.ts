@@ -5,12 +5,12 @@
 // dialog that explains the risk and needs the stop confirmation and the typed node label. Every dynamic text (labels,
 // wait reasons, errors, IDs) is escaped: run data is untrusted.
 import "./graph-runs.css";
-import { MALFORMED, projects as projectApi, releaseLock, runs as runApi } from "../api";
+import { executorProfiles, MALFORMED, projects as projectApi, releaseLock, runs as runApi } from "../api";
 import { attachControllerBar, controllerAction, controllerBarHtml, controllerBarState } from "../components/controller-bar";
 import { localize } from "../issues";
 import { createPoller, createQueue, type Poller } from "../poller";
 import type { View, ViewContext } from "../view-types";
-import { button, errorText, escapeHtml, formatDate, openDialog, statusPill } from "../workbench";
+import { button, errorText, escapeHtml, formatDate, isolate, openDialog, statusPill, typedForm } from "../workbench";
 import { EVALUATION_STATUS, EVENT_STATUS, localizeRunText, localizeWaitReason, NODE_KIND, NODE_STATUS, RUN_STATUS, TRACKING_KIND,
   TRACKING_STATUS } from "../wait-reasons";
 import type { ControllerView, GraphRun, GraphRunNode, RunDetail, RunListEntry, TrackingFailure, UnreadableRun, WorkflowIssue,
@@ -34,6 +34,9 @@ const RELEASED = "잠금이 이미 해제되었습니다 · 컨트롤러가 다�
 const RELEASED_START = "컨트롤러가 동작 중이 아니어서 아직 정리되지 않습니다. 위에서 컨트롤러를 시작하세요.";
 const RELEASE_STALE = "실행 상태가 바뀌었습니다. 이 시도는 더 이상 해제할 대상이 아닙니다. 대화 상자를 닫고 다시 확인하세요.";
 const PRE_OUTBOX = "기록 대기열이 생기기 전에 끝난 실행이라 MLflow 기록 상태가 없습니다.";
+/** An unreadable run needs an operator's repair; it is not read again on its own (11.5 R3 M4). */
+const UNREADABLE_NOTE = "운영자가 실행 기록을 복구해야 합니다. 자동으로 다시 확인하지 않습니다. 복구한 뒤 ‘다시 확인’을 누르세요.";
+const HIDDEN_CHARACTERS = "이름의 보이지 않는 문자(폭 없는 공백, 방향 제어 문자 등)는 빼고 표시했습니다. 입력할 때도 빼고 비교합니다.";
 /** The reasons graph_status gives an uncertain attempt (OPERATOR_CONFIRMATION, RESULT_OVERDUE): with `needs_operator`
  * still true but `uncertain` false, the lock was released (by this app, another session or the CLI) and the
  * controller has not settled the node yet (9.8: until its next tick). */
@@ -64,6 +67,9 @@ let attached: Attached | null = null;
 let session = 0;
 /** While the release dialog is open: re-checks the shown node after every detail read (M4). */
 let releaseWatch: (() => void) | null = null;
+/** Profile ID → name, read once per opened run (`executor_profiles_get`, a local read): the "실행 위치" column shows names
+ * as the plan and its dialog do (11.5 R3 M3). Unknown IDs (a profile deleted since) are shown as IDs. */
+let profileNames = new Map<string, string>();
 
 const isRecord = (value: unknown): value is Obj => typeof value === "object" && value !== null && !Array.isArray(value);
 const isUnreadable = (value: unknown): value is UnreadableRun => isRecord(value) && typeof value.error === "string" && !Array.isArray(value.nodes);
@@ -91,8 +97,8 @@ function localizedText(text: string | null, key: string): string {
   if (!localized) return "";
   return `<span>${escapeHtml(localized.text)}</span>${localized.original ? originalDetails(localized.original, key) : ""}`;
 }
-/** How a node is named on this page: its label, or its ID when the label is blank. */
-const nameOf = (node: Pick<GraphRunNode, "label" | "node_id">) => String(node.label ?? "").trim() || node.node_id;
+/** How a node is named on this page: its label, or its ID when the label is blank (or holds only invisible characters). */
+const nameOf = (node: Pick<GraphRunNode, "label" | "node_id">) => typedForm(String(node.label ?? "")) ? String(node.label).trim() : node.node_id;
 const labelsOf = (run: GraphRun) => (nodeId: string) => { const node = run.nodes.find(item => item.node_id === nodeId); return node ? nameOf(node) : null; };
 const keyedButton = (label: string, action: string, key: string, cls = "") =>
   `<button type="button" class="${cls}" data-action="${escapeHtml(action)}" data-focus-key="${escapeHtml(key)}">${escapeHtml(label)}</button>`;
@@ -128,7 +134,7 @@ export function operatorInstruction(runId: string, node: GraphRunNode): string {
 }
 
 /** The merge nodes whose outputs the select node's evaluations evaluate, read structurally from the planned graph
- * (10.7 does not import graph-model.ts); null when the graph or the select node is unknown. */
+ * (not through graph-model.ts's draft model); null when the graph or the select node is unknown. */
 function evaluatedMerges(graph: { nodes?: unknown[] } | null, selectId: string): string[] | null {
   const nodes = Array.isArray(graph?.nodes) ? graph.nodes.filter(isRecord) : null;
   if (!nodes) return null;
@@ -260,8 +266,10 @@ function nodeRows(run: GraphRun): string {
   return run.nodes.map(node => {
     const attempts = `${number(node.counted_attempts)}/${number(node.max_attempts)}`
       + (node.attempts !== node.counted_attempts ? `<small>전체 시도 ${escapeHtml(number(node.attempts))}회</small>` : "");
-    const destination = node.destination_profile_id || node.resource_id
-      ? `${node.destination_profile_id ? `<b>${escapeHtml(node.destination_profile_id)}</b>` : ""}${node.resource_id ? `<small class="mono">${escapeHtml(node.resource_id)}</small>` : ""}` : "—";
+    const profile = node.destination_profile_id;
+    const named = profile ? profileNames.get(profile) : undefined;
+    const destination = profile || node.resource_id
+      ? `${profile ? `<b>${escapeHtml(named ?? profile)}</b>${named !== undefined ? `<small class="mono">${escapeHtml(profile)}</small>` : ""}` : ""}${node.resource_id ? `<small class="mono">${escapeHtml(node.resource_id)}</small>` : ""}` : "—";
     return `<tr data-node-id="${escapeHtml(node.node_id)}"><td class="run-node-label"><b>${escapeHtml(nameOf(node))}</b><small>${escapeHtml(NODE_KIND[node.kind] ?? node.kind)} · <span class="mono">${escapeHtml(node.node_id)}</span></small></td>
       <td class="run-node-status">${statusPill(NODE_PILL[node.status] ?? "neutral", NODE_STATUS[node.status] ?? String(node.status))}</td>
       <td class="run-node-attempts">${attempts}</td><td class="run-node-destination">${destination}</td>
@@ -325,7 +333,8 @@ function detailInner(): string {
   const run = state.data.run;
   if (!isRun(run)) {
     const error = isUnreadable(run) ? run.error : MALFORMED;
-    return `${detailHeading(state.runId)}${readError}<div class="wf-banner bad"><div><p><b>읽을 수 없는 실행</b> · ${escapeHtml(localizeRunText(error)!.text)}</p>${localizeRunText(error)!.original ? originalDetails(error, "detail-error") : ""}</div></div>${back}`;
+    return `${detailHeading(state.runId)}${readError}<div class="wf-banner bad"><div><p><b>읽을 수 없는 실행</b> · ${escapeHtml(localizeRunText(error)!.text)}</p>${localizeRunText(error)!.original ? originalDetails(error, "detail-error") : ""}<p>${UNREADABLE_NOTE}</p></div>
+      <div class="actions">${keyedButton("다시 확인", "wf:runs:recheck", "run-recheck")}</div></div>${back}`;
   }
   const status = `<div class="run-state" role="status">${statusPill(RUN_PILL[run.status] ?? "neutral", RUN_STATUS[run.status] ?? String(run.status))}${statusPill("neutral", run.simulation ? "모의 실행" : "실제 실행")}</div>`;
   const banners: string[] = [];
@@ -403,6 +412,19 @@ async function ensureGraph(token: number, runId: string) {
 
 const shownRun = (): GraphRun | null => isRun(detailState?.data?.run) ? detailState!.data!.run as GraphRun : null;
 const shownSettled = () => { const run = shownRun(); return run !== null && settled(run); };
+/** The shown run's record could not be read (`{run_id, error}`): it waits for an operator, not for the controller. */
+const shownUnreadable = () => detailState?.data != null && !isRun(detailState.data.run);
+
+/** Once per opened run: the native profile names (a local read, never the sidecar). A failure keeps the IDs. */
+async function readProfileNames(token: number) {
+  try {
+    const result = await queue.run(() => executorProfiles());
+    if (token !== session || !Array.isArray(result?.profiles)) return;
+    profileNames = new Map(result.profiles.filter(profile => isRecord(profile) && typeof profile.profile_id === "string"
+      && isRecord(profile.fields) && typeof profile.fields.name === "string" && profile.fields.name.trim() !== "")
+      .map(profile => [profile.profile_id, String(profile.fields.name)]));
+  } catch { /* the column shows profile IDs */ }
+}
 
 /** Shows a steering or release answer `{run, controller}` at once. */
 function applyRun(runId: string, data: { run: GraphRun | UnreadableRun; controller: ControllerView }) {
@@ -443,7 +465,7 @@ function attach(ctx: ViewContext): Attached {
       releaseWatch?.();
       if (outcome === "unavailable") return "stop";
       if (outcome === "failed") throw new Error("graph run not read");
-      return shownSettled() ? "stop" : "continue";
+      return shownSettled() || shownUnreadable() ? "stop" : "continue";
     } }),
     onVisible() { if (document.visibilityState === "visible") { handle.list.poke(); handle.detail.poke(); } },
   };
@@ -452,9 +474,21 @@ function attach(ctx: ViewContext): Attached {
   return handle;
 }
 
+/** "다시 확인" of an unreadable run: one read; a run that became readable is followed again (11.5 R3 M4). */
+async function recheck(ctx: ViewContext) {
+  const runId = detailState?.runId;
+  if (!runId || ctx.arg !== runId) return;
+  await ctx.task("실행 다시 확인 중", async () => {
+    await readDetail(session, runId);
+    await ensureGraph(session, runId);
+  });
+  follow();
+  focusTitle();
+}
+
 /** After a click changed the run: follow it again until it settles (a re-arm or a release can unsettle it). */
 function follow() {
-  if (attached && detailState && !detailState.unavailable && !shownSettled()) attached.detail.start();
+  if (attached && detailState && !detailState.unavailable && !shownSettled() && !shownUnreadable()) attached.detail.start();
 }
 
 function focusTitle() {
@@ -507,8 +541,6 @@ async function rearm(ctx: ViewContext, eventId: string, runId: string) {
   follow();
 }
 
-const normalized = (text: string) => text.trim().normalize("NFC");
-
 /** The desktop operator release (root decision, 9.8): a dialog that explains the risk, shows the CLI alternative and
  * enables its button only while "멈춘 것을 확인했습니다" is ticked and the node label is typed exactly. It sends the IDs
  * the dialog showed; the backend refuses anything but that node's current attempt in that state. */
@@ -516,13 +548,16 @@ async function releaseNode(ctx: ViewContext, nodeId: string) {
   const run = shownRun();
   const node = run?.nodes.find(item => item.node_id === nodeId);
   if (!run || !node || !releasable(node) || document.querySelector("dialog[open]")) return;
-  const expected = normalized(nameOf(node));
+  // The name to type, as it can be typed: invisible format characters (a zero-width space, a bidi override) are left
+  // out of what is shown and of both sides of the comparison (11.5 R3 M2).
+  const expected = typedForm(nameOf(node));
+  const hidden = expected !== nameOf(node).normalize("NFC");
   const request = { run_id: run.run_id, node_id: node.node_id, job_id: node.job_id!, attempt_id: node.attempt_id! };
   const pending = openDialog({ title: "실행 잠금 해제",
-    bodyHtml: `<p class="run-release-target"><b>${escapeHtml(nameOf(node))}</b> · 작업 <span class="mono">${escapeHtml(request.job_id)}</span> · 시도 <span class="mono">${escapeHtml(request.attempt_id)}</span></p>
+    bodyHtml: `<p class="run-release-target"><b>${isolate(nameOf(node))}</b> · 작업 <span class="mono">${escapeHtml(request.job_id)}</span> · 시도 <span class="mono">${escapeHtml(request.attempt_id)}</span></p>
       <p class="run-release-risk">${escapeHtml(RELEASE_RISK)}</p><p>${escapeHtml(RELEASE_EFFECT)}</p><p>${escapeHtml(RELEASE_CHECK)}</p>
       <details class="run-cli-details"><summary>명령줄로 해제하기(대안)</summary><p class="muted">${CLI_NOTE}</p><pre class="run-cli">${operatorInstruction(run.run_id, node)}</pre></details>
-      <label class="field run-release-label"><span>확인을 위해 단계 이름 ‘${escapeHtml(expected)}’을(를) 그대로 입력하세요</span><input id="run-release-label" type="text" autocomplete="off" spellcheck="false"></label>
+      <label class="field run-release-label"><span>확인을 위해 단계 이름 ‘${isolate(expected)}’을(를) 그대로 입력하세요</span><input id="run-release-label" type="text" autocomplete="off" spellcheck="false">${hidden ? `<small>${HIDDEN_CHARACTERS}</small>` : ""}</label>
       <p id="run-release-stale" class="run-release-stale"></p>`,
     checks: [{ id: "stopped", label: STOP_CONFIRMED }],
     actions: [{ id: "back", label: "돌아가기" }, { id: "release", label: "잠금 해제", primary: true, requires: ["stopped"] }] });
@@ -537,7 +572,7 @@ async function releaseNode(ctx: ViewContext, nodeId: string) {
     const note = dialog.querySelector<HTMLElement>("#run-release-stale");
     const gate = () => {
       typed = input.value;
-      if (confirm) confirm.disabled = stale || !(check?.checked && normalized(typed) === expected);
+      if (confirm) confirm.disabled = stale || !expected || !(check?.checked && typedForm(typed) === expected);
     };
     for (const type of ["input", "change", "compositionend"]) input.addEventListener(type, gate);
     check?.addEventListener("change", gate);
@@ -552,7 +587,7 @@ async function releaseNode(ctx: ViewContext, nodeId: string) {
   }
   const answer = await pending;
   releaseWatch = null;
-  if (stale || answer?.action !== "release" || !answer.checked.includes("stopped") || normalized(typed) !== expected) return;
+  if (stale || !expected || answer?.action !== "release" || !answer.checked.includes("stopped") || typedForm(typed) !== expected) return;
   await ctx.task("실행 잠금 해제 중", async () => {
     const result = await queue.run(() => releaseLock({ ...request, confirm_execution_stopped: true }));
     if (result.status === "ok" && isRecord(result.data) && (isRun(result.data.run) || isUnreadable(result.data.run))) {
@@ -588,7 +623,7 @@ export const view: View = {
     // Read-only only (D3): the runs list, the shown run (and its planned graph once) and the controller status.
     await ctx.task(runId ? "그래프 실행 불러오는 중" : "그래프 실행 목록 불러오는 중", async () => {
       await readList(handle.token);
-      if (runId) { await readDetail(handle.token, runId); await ensureGraph(handle.token, runId); }
+      if (runId) { await readDetail(handle.token, runId); await ensureGraph(handle.token, runId); await readProfileNames(handle.token); }
       await handle.bar.refresh();
     });
     if (attached !== handle || ctx.page !== "runs" || ctx.arg !== runId) return;
@@ -604,5 +639,6 @@ export const view: View = {
     else if (verb === "cancel" && runId) await cancelRun(ctx, runId);
     else if (verb === "release" && arg) await releaseNode(ctx, arg);
     else if (verb === "rearm" && arg && runId) await rearm(ctx, arg, runId);
+    else if (verb === "recheck") await recheck(ctx);
   },
 };
