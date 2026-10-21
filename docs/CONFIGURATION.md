@@ -231,22 +231,29 @@ provide `evaluation`, every other kind provides `model`; select nodes take `eval
 |---|---|
 | `train` | `recipe_revision`, `overrides` (whole groups), `model_input` (an HF root with `initialization` `new_adapter`, `continue_adapter` or `full_weights`, or a node output), `dataset_binding` (a `train` binding), `reward_binding` (PPO only), `executor_profile_ids` (at least one) |
 | `evaluate` | `model`, `benchmark_revision`, `executor_profile_ids` |
-| `select` | `evaluations` (at least one), `selection` |
-| `merge` | `models` (2–4, distinct), `weights` (one per model, each > 0, exact sum 1), `executor_profile_ids` |
+| `select` | `evaluations` (at least one), `selection`; `graph_plan` (`plan_refused`, not `graph_validate`) also requires distinct models (also through nested selections), at most one evaluation of a merge node, and at least one other candidate beside it |
+| `merge` | `models` (2–4, distinct, also through selections), `weights` (one per model, each > 0, exact sum 1), `executor_profile_ids` |
 | `materialize` | `model`, `executor_profile_ids` |
 
-Merge rules (`graph_planner.py`): the parents are LoRA or QLoRA train nodes (not rm or ppo) without DoRA, rsLoRA or
-PiSSA; their ranks sum to at most 256; merge and materialize use the primary runtime. The inputs must be completed
-artifacts that are not simulated (any synthetic input makes the merged output synthetic), with the same effective base,
-config, tokenizer, target modules and tensor shapes (`check_merge_descriptors`, `require_real=True`), so a dry run stops
-at a merge node. Continuing, merging or materializing adapters trained on an HF root needs that root's module evidence
-(`base_targets_missing`). The editor requires a `materialize` node between connected train nodes whose training method
-family changes.
+Merge rules (`graph_planner.py`): each merge input must be a plain causal LoRA/QLoRA adapter: such a train node (not rm
+or ppo, no DoRA, rsLoRA or PiSSA), another merge, an existing adapter artifact, or a select node at least one of whose
+candidates is one. A materialize output or full model is refused at planning (`merge requires plain causal LoRA/QLoRA
+parents`). Ranks sum to at most 256: planning counts a nested merge by the sum of its inputs and a select input by its
+smallest candidate, and compile checks the actual ranks. Merge and materialize use the primary runtime. The inputs must
+be completed artifacts that are not simulated (any synthetic input makes the merged output synthetic), with the same
+effective base, config, tokenizer, target modules and tensor shapes (`check_merge_descriptors`, `require_real=True`), so
+a dry run stops at a merge node. Continuing, merging or materializing adapters trained on an HF root needs that root's
+module evidence (`base_targets_missing`). The editor requires a `materialize` node between connected train nodes whose
+training method family changes.
 
 Synthetic and simulated lineage: a result is synthetic when any of its inputs was synthetic data (`synthetic: true`) or
-a synthetic result. Synthetic results may feed later real nodes (continued training, evaluation, merge), and
-everything derived from them stays synthetic: it is never promoted, never chosen by a selection (a selection over
-synthetic candidates only ends `no_winner`) and never registered in MLflow. Simulated results never feed a real run.
+a synthetic result; an evaluation on a synthetic benchmark (its data is synthetic) is synthetic too. Synthetic results
+may feed later real nodes (continued training, evaluation, merge, materialize), and everything derived from them stays
+synthetic: it is never promoted and never registered in MLflow, and a selection never chooses it. A synthetic
+candidate counts as unsuccessful evidence: without `allow_partial`, one synthetic original ends the selection
+`no_winner` (`partial_selection_not_allowed`); with it, only non-synthetic originals can win, and only when at least
+`min_success` of them qualify; a synthetic merged candidate keeps the best original (`merged_not_eligible`).
+Simulated results never feed a real run.
 
 ### Planning inputs and graph plans
 
@@ -271,7 +278,8 @@ times `max_attempts`; the total must not exceed `max_total_cost_usd`. The plan i
 approvals. It re-checks the project revision (every plan) and, for a real plan, each pinned profile's current revision and
 the MLflow destination hash (`plan_stale`). It is idempotent by `request_id`: the same request returns the same run, and
 the same ID with another plan is `request_reused`. A plan runs at most once: submitting a plan that already has a run
-under another request ID is `conflict`/`plan_submitted`, naming the existing run, also after that run was cancelled.
+under another request ID is `conflict`/`plan_submitted` at `/plan_sha256` with `data: {run_id, status}` of the existing
+run, also after that run was cancelled; `plan_stale`, missing approvals and data refusals are answered first.
 This holds for the desktop and the CLI alike. The desktop sends `request_id = plan-<PLAN_SHA256>` (and checks
 `graph_runs_list` for the plan hash before it opens the approval); pass `--request-id plan-<PLAN_SHA256>` to
 `graph-submit` too, so the CLI and the desktop treat each other's submission as the same request. The receipt holds IDs
@@ -303,11 +311,15 @@ root's.
 `SelectionSpec`: `metric`, `direction` (`max` or `min`), `thresholds` (`{metric, direction, value}`), `allow_partial`
 (default false), `min_success` (at least 2, default 2) and `merge_regression_tolerance` (at least 0, default 0). All
 candidates use one benchmark on a `validation` binding; test evaluations never influence a selection. Synthetic and
-simulated candidates, missing or non-finite metrics and failed thresholds are excluded, and the result is `selected`,
+simulated candidates and missing or non-finite metrics are unsuccessful evidence (gated by `allow_partial` and
+`min_success`, see the lineage rules above), failed thresholds are ordinary exclusions, and the result is `selected`,
 `waiting` or `no_winner`. After a merge, the best original is kept when the merged model regresses by more than the
-tolerance. Without `allow_partial`, a failed merge or a failed evaluation of the merged model stops the final selection,
-which then waits for the operator; with `allow_partial` the best original is selected. Text-agreement metrics are not
-semantic quality scores, and `json_validity` is a format metric.
+tolerance, or when the merged evaluation is not eligible (`merged_not_eligible`; its exclusion stays in `excluded`).
+Without `allow_partial`, a failed merge or merged evaluation blocks the final selection (`BLOCKED`, "partial
+selection is not allowed"), and nothing is selected even when the originals were evaluated. With `allow_partial`, the
+best original is selected when at least `min_success` originals succeeded; otherwise the result is `no_winner` with
+`insufficient_partial_success`. In both cases the run still ends `FAILED`, because a node failed. Text-agreement
+metrics are not semantic quality scores, and `json_validity` is a format metric.
 
 ## Executor profiles
 

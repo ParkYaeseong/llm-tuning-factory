@@ -6110,6 +6110,11 @@ Actual verification:
 - Re-review Minors (docs, `git log` for the SHA): the checkbox label ‘일부 평가만 성공해도 선택’, L2b shows no selection
   outcome with synthetic data, the smoke leftovers name the seed command and the LIVE_HF model, one placeholder `plan-<PLAN_SHA256>`;
   `test_repository_text` passes, `check_secrets.py` checks 1182 file versions with 0 findings.
+- Planning re-review (docs, checked against `codex/rc-planning-fixes`: `benchmarks.select_best`/`finalize_with_merge`,
+  `graph_store._readiness`, `graph_planner` refusals, `test_merge_fallback`, `test_synthetic_chains`): a failed merge or
+  merged evaluation without `allow_partial` blocks the selection and fails the run (not "waits for the operator"), an
+  ineligible merged evaluation keeps the original, the synthetic selection rules, the planning refusals for select and
+  merge inputs, materialize in the synthetic list, and the `plan_submitted` shape; secret scan 1214 versions (all branches; it grows as they commit), 0 findings.
 
 Not verified or still open:
 - The verifier test on ubuntu (skipped there) and on hosted windows-latest; root sees hosted CI.
