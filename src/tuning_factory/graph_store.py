@@ -784,7 +784,7 @@ class GraphStore:
                           (run_id,)).fetchone()[0]
 
     def concurrent_attempts(self, run_id) -> int:
-        """``claim_ready``'s count against ``max_concurrent``: active attempts and lock-holding finished ones."""
+        """``claim_ready``'s count against ``max_concurrent`` (GPU claims): active and lock-holding finished attempts."""
         with self.jobs.connection() as db:
             return self._concurrent(db, run_id)
 
@@ -818,7 +818,8 @@ class GraphStore:
             if run['status'] != 'RUNNING':
                 return None
             plan = GraphPlan.model_validate_json(run['plan'])
-            if self._concurrent(db, run['id']) >= plan.graph.max_concurrent:
+            # GPU claims only (11.5 re-review M5): a local selection uses no GPU and is never held back.
+            if resource_facts is not None and self._concurrent(db, run['id']) >= plan.graph.max_concurrent:
                 return None
             reserved = self._reserved(db, run['id'])
             ceiling = plan.max_estimated_cost_usd * (1 + 1e-9)   # defence in depth against float summation order

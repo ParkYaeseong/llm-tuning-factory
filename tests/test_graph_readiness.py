@@ -1009,3 +1009,26 @@ def test_failure_kind_and_classification_honour_an_existing_settlement(tmp_path)
     assert store.classify_attempt(w.ctl, returned['id'], 'canceled') == 'returned_unlaunched'
     assert [row['disposition'] for row in table(w, 'attempt_dispositions')] == ['released_before_contact',
                                                                                'returned_unlaunched']
+
+
+def test_a_local_selection_is_never_held_back_by_max_concurrent(tmp_path):
+    """Task 11.5 re-review M5: counting a lock-holding (uncertain) attempt toward max_concurrent (R1 m1) applies to
+    GPU claims only. A local selection uses no GPU, so it is still claimed and completed; another GPU claim waits."""
+    w = build(tmp_path, lambda r: [evaluate(r, 'e1', r.base, ('p1',)), evaluate(r, 'x', r.first, ('p2',)),
+                                   evaluate(r, 'y', r.second, ('p1',)), select('s', ('e1',))],
+              destinations=pods('pod1', 'pod2'), max_concurrent=1)
+    prepare(w, 'e1', 'x', 'y')
+    complete(w, 'e1', evaluation_output)
+    held = claim(w, 'x')
+    jobs = w.store.jobs
+    jobs.begin_launch(held['lease'])
+    jobs.transition(held['lease'], 'RUNNING')
+    jobs.transition(held['lease'], 'FAILED', 'remote execution uncertain; reconcile the same launch')   # lock kept
+    assert w.store.concurrent_attempts(w.run_id) == 1
+    y = w.store.jobs.get(node_row(w, 'y')['job_id'])['manifest']['operation']['resources']['facts']
+    assert w.store.claim_ready(TypeAdapter(ResourceObservation).validate_python(y), w.ctl) is None
+    prepare(w, 's')
+    claimed = w.store.claim_ready(None, w.ctl)
+    assert claimed is not None and claimed['graph_node_id'] == 's'
+    w.store.complete_local_selection(w.ctl, claimed)
+    assert statuses(w)['s'] == 'COMPLETED' and statuses(w)['y'] == 'READY'
