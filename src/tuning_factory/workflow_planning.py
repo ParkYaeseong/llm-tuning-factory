@@ -858,7 +858,7 @@ class _BoundedHub(ModelHub):
     chunk more refuses) instead of a whole body read before the check."""
 
     def get(self, url, optional=False, **kwargs):
-        from .hf_targets import _open, _read
+        from .hf_targets import ENCODED_RESPONSE, _identity, _open, _read
         if kwargs:
             raise TypeError("the snapshot client reads plain metadata URLs only")
         try:
@@ -869,6 +869,7 @@ class _BoundedHub(ModelHub):
                 if response.status_code != 200:
                     raise ValueError(f"Hugging Face metadata request failed (HTTP {response.status_code}); "
                                      "check model access")
+                _identity(response, _Refused("snapshot_failed", ENCODED_RESPONSE))   # the cap counts wire bytes
                 body = _read(response, METADATA_LIMIT, ValueError(METADATA_TOO_LARGE))
             finally:
                 response.close()
@@ -881,8 +882,11 @@ def _hub(token: str | None, *, transport: httpx.BaseTransport | None = None) -> 
     """The Hugging Face client; an Authorization header only when ``HF_TOKEN`` was scoped to this request.
 
     Redirects are followed by ``hf_targets._open``, never by httpx: its ``next_request`` drops the header on
-    redirects to another origin (the CDN), and the request hook refuses a hop to plain HTTP."""
-    headers = {"Authorization": "Bearer " + token} if token else {}
+    redirects to another origin (the CDN), and the request hook refuses a hop to plain HTTP. Responses are never
+    content-decoded (``identity``; an encoded answer is refused), so every cap counts the bytes received."""
+    headers = {"Accept-Encoding": "identity"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
     return _BoundedHub(client=httpx.Client(timeout=20, follow_redirects=False, headers=headers, transport=transport,
                                            event_hooks={"request": [https_only]}))
 
@@ -917,7 +921,7 @@ def _selected_files(info) -> tuple[str, ...]:
 def _download(hub: ModelHub, url: str, target: Path, budget: int) -> int:
     """One file into ``target`` within the per-file and remaining total caps; the byte count. Read through
     ``hf_targets._open`` and ``_read`` (Task 11.5, R2 M3): redirect bodies stay unread and the body is capped."""
-    from .hf_targets import _open, _read
+    from .hf_targets import ENCODED_RESPONSE, _identity, _open, _read
     limit = min(MAX_ROOT_FILE_BYTES, budget)
     too_large = _Refused("size_limit", ROOT_FILE_TOO_LARGE)
     try:
@@ -926,6 +930,7 @@ def _download(hub: ModelHub, url: str, target: Path, budget: int) -> int:
             if response.status_code != 200:
                 raise ValueError(f"Hugging Face file request failed (HTTP {response.status_code}); "
                                  "check model access")
+            _identity(response, _Refused("snapshot_failed", ENCODED_RESPONSE))
             declared = response.headers.get("content-length", "").strip()
             if declared.isdigit() and int(declared) > limit:
                 raise too_large

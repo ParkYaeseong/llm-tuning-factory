@@ -1553,3 +1553,36 @@ def test_an_instruction_recipe_bound_to_other_data_is_refused_before_any_run(tmp
         issue = desk.only_issue(result, "invalid", "train_contract", "/graph/nodes/0")
         assert issue["node_id"] == "train" and issue["message"] == message, result
     assert not (state / "jobs.db").exists() and files(state / "workflows" / "plans") == []
+
+
+class EncodedHub(FakeHub):
+    """Answers ``encoded`` (the revision info or one tokenizer file) gzip-encoded, whatever the request asked."""
+
+    def __init__(self, encoded, **options):
+        super().__init__(**options)
+        self.encoded = encoded
+
+    def respond(self, request):
+        import gzip
+        response = super().respond(request)
+        path = unquote(request.url.path)
+        wanted = (path == f"/api/models/{self.repo}/revision/{self.commit}" if self.encoded == "info"
+                  else path.endswith("/resolve/" + self.commit + "/tokenizer.json"))
+        if not wanted or response.status_code != 200:
+            return response
+        return httpx.Response(200, content=gzip.compress(response.read()), headers={"Content-Encoding": "gzip"})
+
+
+@pytest.mark.parametrize("encoded", ["info", "file"])
+def test_model_root_snapshot_asks_for_identity_and_refuses_an_encoded_answer(tmp_path, monkeypatch, encoded):
+    """Re-review m2: the caps count the bytes on the wire, so the snapshot client sends ``Accept-Encoding: identity``
+    and refuses a compressed answer unread (``hf_targets._identity``), metadata and files alike."""
+    wp = planning()
+    from tuning_factory import hf_targets as ht
+    state = tmp_path / "state"
+    hub = EncodedHub(encoded).install(monkeypatch)
+    result = run(state, "model_root_snapshot", {"repo_id": REPO, "revision": COMMIT, "download_approved": True})
+    issue = desk.only_issue(result, "invalid", "snapshot_failed", "/repo_id")
+    assert issue["message"] == ht.ENCODED_RESPONSE
+    assert hub.requests and all(item.headers.get("accept-encoding") == "identity" for item in hub.requests)
+    assert files(wp.root_snapshots_dir(state)) == []
