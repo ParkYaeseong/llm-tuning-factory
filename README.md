@@ -40,9 +40,10 @@ S3 버킷·파일 조회와 버전/해시를 고정한 PC 가져오기(파일당
 
 **검증 구분:** 위 H100 결과는 0.2.3의 SFT 시험입니다. 0.3.0의 학습 조합은 CPU/UI 검사,
 PPO 전용 실제 패키지 import, 로컬 S3 서명·전송 계약을 검증했으며 실제 GPU/클라우드 S3 시험은 남아 있습니다.
-0.4.0의 프로젝트·그래프 기능은 별도 해시 고정 환경의 CPU 병합·확정 검산, 가짜 RunPod·SSH·MLflow 연결을 쓴 자동 시험,
-개발 PC 한 대에서의 설치 파일 검사로 확인합니다. 실제 Hugging Face 헤더 조회, 실제 RunPod·BOP GPU 학습(직렬·병렬·병합과
-재평가 포함), 실제 MLflow 서버 기록은 각각 별도 승인을 받아 시험하며 아직 하지 않았습니다.
+0.4.0의 프로젝트·그래프 기능은 별도 해시 고정 환경의 CPU 병합·확정 검산과 가짜 RunPod·SSH·MLflow 연결을 쓴 자동 시험으로
+확인했습니다. 개발 PC 한 대에서의 설치 앱 검사(11.6)는 결과를 진행 상태에 기록합니다. 실제 Hugging Face 헤더 조회,
+실제 RunPod·BOP GPU 학습(직렬·병렬·병합과 재평가 포함), 실제 MLflow 서버 기록은 각각 별도 승인을 받아 시험하며 아직 하지
+않았습니다.
 정확한 결과와 남은 시험은 [진행 상태](docs/PROGRESS.md)에 구분합니다.
 PPO·OFT 등의 upstream 재개/평가 제한은 이유와 함께 차단합니다.
 멀티모달·임의 모델/플러그인·대량 스트리밍·다중 PC 스케줄링·서빙·코드 서명은 이번 범위에 포함하지 않습니다.
@@ -154,7 +155,7 @@ git pull --ff-only
 uv sync --python 3.12 --extra tracking --locked
 ```
 
-개발자는 `--extra dev`도 설치하고 `uv run pytest -q`, `uv run ruff check src tests`,
+개발자는 `--extra dev`도 설치하고 `uv run pytest -q`, `uv run ruff check src tests scripts`,
 `uv run python scripts/check_secrets.py`를 실행합니다. GPU 실험은 별도 승인이 필요합니다.
 
 ## 문서

@@ -153,7 +153,9 @@ Changing a destination setting invalidates earlier previews, plans and approvals
 The general-purpose workflow (user guide: [TRAINING_WORKFLOWS.md](TRAINING_WORKFLOWS.md)) keeps its definitions in the
 state directory: `%APPDATA%\kr.kbiofoundry.tuningfactory\state` for the desktop app, `--state-dir` (default `state`) for
 the CLI. Every hash below is the SHA-256 of canonical JSON (sorted keys, no whitespace, UTF-8, no NaN; `registry.canonical`).
-Requests are strict: unknown keys are refused, and issues point at the offending field (RFC 6901) without echoing values.
+Requests are strict: unknown keys are refused. Issues carry an RFC 6901 pointer and never echo values: an invalid value
+points at its field, and an unknown key (`extra_field`) points at the object that holds it, with the note "(the unknown
+key is not shown)", so a mistyped or secret-looking key name never appears in the issue.
 The desktop sends each request through one channel (`desktop_workflows.py`: envelope, action table, issue codes).
 
 | Path under the state directory | Content | Owner |
@@ -234,11 +236,17 @@ provide `evaluation`, every other kind provides `model`; select nodes take `eval
 | `materialize` | `model`, `executor_profile_ids` |
 
 Merge rules (`graph_planner.py`): the parents are LoRA or QLoRA train nodes (not rm or ppo) without DoRA, rsLoRA or
-PiSSA; their ranks sum to at most 256; merge and materialize use the primary runtime. The inputs must be real completed
-artifacts, neither synthetic nor simulated, with the same effective base, config, tokenizer, target modules and tensor
-shapes (`check_merge_descriptors`, `require_real=True`), so a dry run stops at a merge node. Continuing, merging or
-materializing adapters trained on an HF root needs that root's module evidence (`base_targets_missing`). The editor
-requires a `materialize` node between connected train nodes whose training method family changes.
+PiSSA; their ranks sum to at most 256; merge and materialize use the primary runtime. The inputs must be completed
+artifacts that are not simulated (any synthetic input makes the merged output synthetic), with the same effective base,
+config, tokenizer, target modules and tensor shapes (`check_merge_descriptors`, `require_real=True`), so a dry run stops
+at a merge node. Continuing, merging or materializing adapters trained on an HF root needs that root's module evidence
+(`base_targets_missing`). The editor requires a `materialize` node between connected train nodes whose training method
+family changes.
+
+Synthetic and simulated lineage: a result is synthetic when any of its inputs was synthetic data (`synthetic: true`) or
+a synthetic result. Synthetic results may feed later real nodes (continued training, evaluation, merge), and
+everything derived from them stays synthetic: it is never promoted, never chosen by a selection (a selection over
+synthetic candidates only ends `no_winner`) and never registered in MLflow. Simulated results never feed a real run.
 
 ### Planning inputs and graph plans
 
@@ -261,10 +269,18 @@ times `max_attempts`; the total must not exceed `max_total_cost_usd`. The plan i
 
 `graph_submit` takes `plan_sha256`, `request_id`, `approve_execution` and `approve_data_transfer`; a real plan needs both
 approvals. It re-checks the project revision (every plan) and, for a real plan, each pinned profile's current revision and
-the MLflow destination hash (`plan_stale`). It is idempotent by `request_id` only: the same request returns the same run,
-and the same ID with another plan is `request_reused`. A new request ID for the same plan creates another run; the desktop
-prevents that by checking `graph_runs_list` for the plan hash first. The receipt holds IDs and approval flags only.
-Submission never starts the controller.
+the MLflow destination hash (`plan_stale`). It is idempotent by `request_id`: the same request returns the same run, and
+the same ID with another plan is `request_reused`. A plan runs at most once: submitting a plan that already has a run
+under another request ID is `conflict`/`plan_submitted`, naming the existing run, also after that run was cancelled.
+This holds for the desktop and the CLI alike. The desktop sends `request_id = plan-<plan_sha256>` (and checks
+`graph_runs_list` for the plan hash before it opens the approval); pass `--request-id plan-<PLAN_SHA256>` to
+`graph-submit` too, so the CLI and the desktop treat each other's submission as the same request. The receipt holds IDs
+and approval flags only. Submission never starts the controller.
+
+To run a graph again, plan again so that the plan hash changes. Real plans, and dry runs whose nodes use native profiles
+only, take their resource facts from the stored observations, so the same inputs give the same `plan_sha256` and the
+desktop shows the existing run: change an input (a new `executor_profile_inspect` of a used profile is enough). A dry run
+with an estimate pins `observed_at = now` for it, so every `graph_plan` gives a new plan.
 
 ### Benchmarks and selection
 
@@ -289,7 +305,9 @@ root's.
 candidates use one benchmark on a `validation` binding; test evaluations never influence a selection. Synthetic and
 simulated candidates, missing or non-finite metrics and failed thresholds are excluded, and the result is `selected`,
 `waiting` or `no_winner`. After a merge, the best original is kept when the merged model regresses by more than the
-tolerance. Text-agreement metrics are not semantic quality scores, and `json_validity` is a format metric.
+tolerance. Without `allow_partial`, a failed merge or a failed evaluation of the merged model stops the final selection,
+which then waits for the operator; with `allow_partial` the best original is selected. Text-agreement metrics are not
+semantic quality scores, and `json_validity` is a format metric.
 
 ## Executor profiles
 
@@ -321,6 +339,13 @@ closed when the engine cannot check).
 `observations/<profile key>.json`. A real plan accepts an observation only while its profile revision,
 `sha256(canonical({schema: "executor-profile/1", profile_id, fields}))`, equals the current one and it is at most an hour
 old (`pin_observation`, `observation_fresh`).
+
+Destinations are told apart by their exclusivity key: `existing_runpod:<pod_id>` for a RunPod profile and
+`ssh_server:<server_id>` (the hashed `/etc/machine-id`) for an SSH profile, where SSH profiles that share a server ID or a
+GPU UUID count as one server. A RunPod profile and an SSH profile that point at the same physical host therefore count as
+different destinations: the plan's waits and `max_concurrent_gpu_count` treat them separately. Within one state
+directory the cross-provider quarantine still makes every RunPod attempt and every SSH attempt wait for each other, but
+another state directory or PC is not protected. Register one physical machine under one profile only.
 
 ### CLI profiles file and credential files
 

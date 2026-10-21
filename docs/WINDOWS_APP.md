@@ -29,7 +29,7 @@ GPU 비용도 없습니다. **Esc** 또는 **그만하기**로 언제든 끝낼 
 아래는 기존 **단일 학습** 화면(연결 설정 → 학습 설정 → 실행 관리)의 순서입니다. 학습 그래프는
 [학습 프로젝트·그래프 안내](TRAINING_WORKFLOWS.md)를 따르며, RunPod Pod와 GPU 서버를 **실행 프로필**로 따로 등록합니다.
 
-1. 제공받은 LLM Tuning Factory_0.4.0_x64-setup.exe를 설치합니다. 이전 버전에서 업데이트한다면 먼저 아래
+1. 제공받은 `LLM.Tuning.Factory_0.4.0_x64-setup.exe`(배포 페이지의 설치 파일)를 설치합니다. 이전 버전에서 업데이트한다면 먼저 아래
    ‘업데이트·제거’를 확인하세요.
 2. **연결 설정**에서 RunPod API 키, 배정받은 Pod ID, SSH 개인키 파일과 서버 지문을 입력합니다.
    SSH 지문은 관리자가 신뢰할 수 있는 경로로 확인해 전달해야 합니다. 접속 시 관측한 값을 자동 승인하지 않습니다.
@@ -137,7 +137,8 @@ GPU·Pod, 승인은 들어가지 않습니다. 저장할 때마다 새 버전이
 그래프 화면 아래 “계획과 승인”에서 계획을 만듭니다. 기본은 “모의 실행 계획 · 기본”으로 GPU를 쓰지 않고 데이터를 보내지 않습니다.
 “실제 실행 계획”은 1시간 이내에 자원을 확인한 실행 프로필과 MLflow 서버 주소가 필요합니다. 실제 실행의 승인 창에서는
 ‘실행 승인’과 ‘데이터 전송 승인’을 각각 체크해야 등록됩니다. 최대 추정 비용은 재시도를 포함한 추정치이며 제공자의 청구 상한이
-아닙니다. 같은 계획은 다시 등록하지 않으며, 등록해도 컨트롤러는 자동으로 시작하지 않습니다.
+아닙니다. 같은 계획은 다시 등록하지 않으며, 등록해도 컨트롤러는 자동으로 시작하지 않습니다. 다시 실행하려면 입력을 바꿔 새 계획을
+만듭니다(실행 프로필의 “자원 확인”을 다시 해도 됩니다).
 
 ## 실행 프로필과 백그라운드 컨트롤러
 
@@ -145,6 +146,8 @@ GPU·Pod, 승인은 들어가지 않습니다. 저장할 때마다 새 버전이
   SSH 개인키는 이 PC의 전체 경로(예: `C:\Users\이름\.ssh\id_ed25519`)로 입력합니다. RunPod API 키는 프로필마다 Windows 자격 증명
   저장소에 보관합니다. GPU 서버는 “GPU 목록 확인”으로 GPU를 고르고, “자원 확인”으로 GPU와 요금을 기록합니다(읽기 전용).
 - 연결 설정의 “저장된 인증값 삭제”는 모든 실행 프로필의 RunPod API 키도 함께 지웁니다.
+- 실제 장비 하나는 실행 프로필 하나로만 등록합니다. 같은 장비를 RunPod 프로필과 GPU 서버 프로필로 함께 등록하면 서로 다른 실행
+  대상으로 계산하므로, 다른 상태 폴더나 다른 PC에서 함께 쓰면 동시 사용을 막지 못합니다.
 - 컨트롤러 막대(실행 프로필·그래프 실행 화면)의 “컨트롤러 시작”으로 백그라운드 컨트롤러를 켭니다. 앱은 자동으로 켜지 않습니다.
   앱 창을 닫아도 계속 돌며, 다시 열면 “동작 중”으로 보입니다. PC가 절전·종료되면 멈추므로 “연결 끊김”이 보이면 다시 시작합니다.
 - “컨트롤러 정지”는 진행 중인 단계가 끝날 때까지 기다린 뒤 멈추므로 학습 중이면 몇 시간이 걸릴 수 있습니다. 상태가 “정지”가 되면
@@ -269,8 +272,8 @@ loss를 제외하며 최대 200개 지점을 표시합니다. 기록이 없으�
   것은 허용하지만 다른 서버나 설정으로 바꾸면 과거 작업을 이어받지 않습니다. 비용은 입력값 기준이며 실제 사용량 관측이나
   서버의 다른 사용자 작업은 확인하지 않습니다.
 - 실제 SSH/BOP 서버·GPU·MLflow 서버·Hugging Face 머리글 조회 시험은 하지 않았습니다. 서버 기능은 가짜 SSH 응답으로 시험했습니다.
-  설치본(WebView2 화면, Windows 자격 증명 저장소, 백그라운드 컨트롤러)은 개발 PC 한 대에서 GPU·네트워크 데이터 없이 검사하며
-  결과는 [진행 기록](PROGRESS.md)에 있습니다. 깨끗한 두 번째 PC와 코드 서명은 검증하지 않았습니다.
+  설치본(WebView2 화면, Windows 자격 증명 저장소, 백그라운드 컨트롤러) 검사(11.6)는 개발 PC 한 대에서 GPU·네트워크 데이터 없이 하며
+  결과는 [진행 기록](PROGRESS.md)에 기록합니다. 깨끗한 두 번째 PC와 코드 서명은 검증하지 않았습니다.
 - 백그라운드 컨트롤러의 알려진 한계(0.4.0):
   - 실행 자원에 연결한 뒤 원격 작업이 멈추는 경우를 감시하는 장치가 없습니다. “동작 중”인데 오래 진행이 없으면 컨트롤러를 다시 시작하세요.
   - 절전 뒤 다른 컨트롤러가 소유권을 넘겨받으면 이전 컨트롤러 프로세스는 진행 중이던 요청이 돌아올 때까지 남아 있다가 끝납니다.
@@ -318,7 +321,7 @@ JOB_ID는 실행 관리 표의 업무 AI 이름 아래에 표시됩니다. ATTEM
 
     uv sync --extra dev --extra tracking --locked
     uv run pytest
-    uv run ruff check src tests
+    uv run ruff check src tests scripts
     uv run python scripts/build_desktop.py
     cd desktop
     npm ci
@@ -333,13 +336,32 @@ UI 테스트는 가짜 연결을 사용하며 실제 서버·GPU 성공을 증�
 설치 파일에 들어갈 학습 엔진(`dist/factory-bridge.exe`)은 `uv run python scripts/verify_desktop_package.py`로 검사합니다.
 옵션은 다음과 같습니다.
 - `--bridge PATH`: 검사할 엔진. 기본은 `dist/factory-bridge.exe`이며 설치한 앱 폴더의 `factory-bridge.exe`도 검사할 수 있습니다.
+  `.py` 경로(`scripts/desktop_entry.py`)를 주면 빌드 없이 소스 상태의 엔진을 이 Python으로 실행하는 소스 모드가 되며, `wheel`을 뺀
+  검사를 할 수 있습니다.
 - `--check NAME`: `legacy`, `arguments`, `workflow`, `controller`, `wheel` 중 하나. 여러 번 줄 수 있으며 주지 않으면 모두 이 순서로 검사합니다.
 - `--receipt PATH`: 출력한 JSON 결과를 파일로도 저장합니다.
 
-tests/native-smoke.mjs는 loopback WebView2 debugging을 켠 별도 테스트 앱에서만 수동 실행합니다. 테스트 앱은 PowerShell에서
+결과의 `bridge_mode`는 빌드한 엔진이면 `frozen`, 소스 모드면 `source`입니다. 소스 모드에서는 빌드한 엔진만 보여 줄 수 있는 항목
+(`frozen_engine`, `frozen_s3_sdk_loaded`, `frozen_lock_path`, `onefile_child_exited`)이 `null`이므로 설치 파일의 검사를 대신하지
+않습니다. 소스 모드 검사는 자동 시험(`tests/test_verify_desktop_package.py`, Windows에서만)에도 들어 있습니다.
+
+tests/native-smoke.mjs는 loopback WebView2 debugging을 켜고 실행한 앱에서만 수동 실행합니다. 앱은 PowerShell에서
 `$env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=9223"`를 설정한 뒤 실행하며, 스크립트는 `127.0.0.1:9223`에 붙습니다.
-기본 실행은 네트워크를 쓰지 않습니다. `FACTORY_SMOKE_LIVE_HF=1`이면 Hugging Face 메타데이터 조회를 함께 검사하고(네트워크 사용),
-`FACTORY_SMOKE_FLOW=1`이면 합성 기반 모델을 넣어 둔 앱 상태에서 모의 그래프 실행을 끝까지 따라갑니다. 저장된 인증값이나 실행 프로필이
-있는 상태에서는 인증값 삭제 검사를 건너뜁니다.
+**스크립트는 이 PC의 실제 앱 상태에 씁니다.** 앱 데이터 폴더와 Windows 자격 증명 저장소 항목은 앱 식별자
+(`kr.kbiofoundry.tuningfactory`)를 따르므로, 디버깅 포트를 켜고 실행한 앱도 평소와 같은 상태를 씁니다.
+실행할 때마다 프로젝트(지울 수 없음)와 `desktop_smoke` 데이터가 남고, `FACTORY_SMOKE_FLOW=1`이면 합성 기반 모델, 데이터 버전,
+레시피, 평가 기준과 모의 그래프 실행도 남습니다. 백그라운드 컨트롤러가 돌고 있거나 진행 중인 그래프 실행이 있으면 아무것도
+쓰기 전에 멈춥니다.
+
+기본 실행은 네트워크를 쓰지 않습니다. `FACTORY_SMOKE_LIVE_HF=1`이면 Hugging Face 메타데이터 조회를 함께 검사합니다(네트워크 사용).
+저장된 인증값이나 실행 프로필이 있는 상태에서는 인증값 삭제 검사를 건너뜁니다. 실행 프로필, 저장된 인증값, MLflow 주소 중 하나라도
+있으면 실제 컨트롤러를 시작하는 검사(프로필로 컨트롤러 시작·정지, 모의 그래프 실행)도 건너뜁니다.
+
+`FACTORY_SMOKE_FLOW=1`이면 모의 그래프 실행을 백그라운드 컨트롤러로 끝까지 따라갑니다. 필요한 조건은 다음과 같습니다.
+- 합성 기반 모델을 앱 상태에 먼저 넣어 둡니다(소스 저장소에서 실행).
+  `uv run python scripts/seed_acceptance_root.py --state-dir "$env:APPDATA\kr.kbiofoundry.tuningfactory\state"`
+- 실행 프로필이 없고, 저장된 인증값과 MLflow 주소도 없어야 합니다.
+- 백그라운드 컨트롤러가 꺼져 있고 진행 중인 그래프 실행이 없어야 합니다.
+
 일반 배포 앱은 디버깅 포트를 열지 않습니다. 실제 MLflow 읽기와 정지된 Pod 조회는
 scripts/verify_desktop_readonly.py --connection-file ...로 별도 검증할 수 있으며 키를 출력하지 않습니다.

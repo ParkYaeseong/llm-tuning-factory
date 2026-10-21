@@ -31,6 +31,11 @@ and different Pods; increase both max_concurrent and max_gpus deliberately. A Po
 - File formats, the CLI profiles file, credential files and the controller environment: [CONFIGURATION.md](CONFIGURATION.md).
 - An uncertain graph attempt is released with the same `release-lock JOB_ID ATTEMPT_ID --confirm-execution-stopped` as a
   single job, only after confirming on the Pod or server that the attempt stopped; `status --job-id JOB_ID` shows the job.
+- Point every graph command that shares borrowed resources with the app at the app's state with `--state-dir`. GPU locks
+  live per state directory: `graph-work` refuses to start beside the app's controller (exit 3) only with that state; with
+  the default `./state` it starts a second controller that can dispatch to the same borrowed Pod or server.
+- Submit with `graph-submit PLAN_SHA256 --request-id plan-PLAN_SHA256`, the request ID the desktop uses. A plan runs at
+  most once: another request ID for an already submitted plan is refused (`plan_submitted`, naming the existing run).
 
 ## MLflow
 
@@ -151,9 +156,9 @@ Do not use an unrelated SSH host even if you control its key; the live provider 
 ## Existing Linux GPU server over SSH
 
 For an institution server (for example a BOP-style Linux host) the app connects with SSH and runs the same training
-worker directly on the server, in the same way as the existing Pod path. This part describes the development branch.
-It was tested only with fake SSH responses; no real SSH server or GPU was used and it is not in the released 0.3.0
-installer. Nothing below is authorization to connect, transfer data or spend: each step needs the owner's approval.
+worker directly on the server, in the same way as the existing Pod path. It ships in the Windows 0.4.0 installer (the
+0.3.0 installer did not have it). It was tested only with fake SSH responses; no real SSH server or GPU was used.
+Nothing below is authorization to connect, transfer data or spend: each step needs the owner's approval.
 
 ### What the app never does
 
@@ -258,12 +263,12 @@ succeed, release the lock with the CLI against the desktop state folder. `releas
 CANCELED or COMPLETED and ATTEMPT_ID is the job's current attempt:
 
 ```powershell
-uv run factory --state-dir "$env:APPDATA\kr.kbiofoundry.tuningfactory\state" status JOB_ID
+uv run factory --state-dir "$env:APPDATA\kr.kbiofoundry.tuningfactory\state" status --job-id JOB_ID
 uv run factory --state-dir "$env:APPDATA\kr.kbiofoundry.tuningfactory\state" release-lock JOB_ID ATTEMPT_ID --confirm-execution-stopped
 ```
 
 JOB_ID is shown under the task name in the desktop jobs table. The ATTEMPT_ID is not shown there; read the `active_attempt_id`
-field in the `status JOB_ID` output. The state folder is the app data folder (`kr.kbiofoundry.tuningfactory`) plus `state`.
+field in the `status --job-id JOB_ID` output. The state folder is the app data folder (`kr.kbiofoundry.tuningfactory`) plus `state`.
 
 ## Managed paid Pod
 
