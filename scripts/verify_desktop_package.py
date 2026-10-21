@@ -3,7 +3,9 @@
 usage: verify_desktop_package.py [--bridge PATH] [--check NAME]... [--receipt PATH]
   --bridge   the engine to check: default dist/factory-bridge.exe; also the installed app's factory-bridge.exe.
              A .py path (scripts/desktop_entry.py) runs the source entry with this interpreter ("source" mode), so
-             every check except wheel can run before a build; the receipt then says bridge_mode "source".
+             every check except wheel can run before a build; the receipt then says bridge_mode "source" and the
+             evidence only a frozen engine gives (frozen_engine, frozen_s3_sdk_loaded, frozen_lock_path,
+             onefile_child_exited) is null.
   --check    legacy | arguments | workflow | controller | wheel   (repeatable; default: all, in this order).
              controller needs the run that workflow submits, so it runs workflow first when that is not selected.
   --receipt  also write the printed JSON receipt to PATH (e.g. .factory/frozen-040-receipt.json)
@@ -58,6 +60,12 @@ class Bridge:
                              capture_output=True, timeout=timeout, cwd=cwd)
         self.outputs.append(run.stdout + run.stderr)
         return json.loads(run.stdout)
+
+
+def frozen_only(bridge: Bridge) -> bool | None:
+    """Evidence only a frozen executable gives (its bundled engine, S3 data and GPU lock, the onefile bootloader):
+    true once checked on a frozen bridge, null in source mode, where nothing frozen ran."""
+    return None if bridge.source else True
 
 
 # -- legacy one-request actions (unchanged checks) -------------------------------------------------
@@ -125,8 +133,8 @@ def check_legacy(bridge: Bridge, workdir: Path) -> dict:
     registered = request("dataset", {"dataset_id": "tutorial_sample", "version": "1", "path": tutorial["path"],
                                      "synthetic": True})
     assert registered["export_allowed"] is False and registered["synthetic"] is True and registered["rows"] == 8
-    return {"frozen_engine": True, "offline_dry_run": True, "locked_dependencies": True, "all_stage_plans": True,
-            "frozen_s3_sdk_loaded": True, "tutorial_sample_persisted": True,
+    return {"frozen_engine": frozen_only(bridge), "offline_dry_run": True, "locked_dependencies": True,
+            "all_stage_plans": True, "frozen_s3_sdk_loaded": frozen_only(bridge), "tutorial_sample_persisted": True,
             "source_commit": plan["manifest"]["code_commit"], "source_sha256": source_hash()}
 
 
@@ -248,7 +256,7 @@ def check_workflow(bridge: Bridge, workdir: Path) -> tuple[dict, dict]:
     submitted = call("graph_submit", {"plan_sha256": sha, "request_id": "verify-submit"})
     assert submitted["simulation"] is True and submitted["status"] == "RUNNING", submitted
     return ({"workflow_channel": True, "mapped_import_cp949": True, "split_committed": True, "immutable_plan": True,
-             "frozen_lock_path": True, "workflow_run_submitted": True},
+             "frozen_lock_path": frozen_only(bridge), "workflow_run_submitted": True},
             {"state": state, "run_id": submitted["run_id"], "call": call})
 
 
@@ -412,9 +420,10 @@ def check_controller(bridge: Bridge, workdir: Path, flow: dict) -> dict:
     assert not any(key in text for text in bridge.outputs), "the key reached a one-request answer"
     return {"controller_ready": True, "controller_run_completed": True, "controller_profile_loaded": True,
             "controller_stop_drained": True, "controller_eof_drained": True, "owner_held_exit_3": True,
-            # The engine ran as a child of the started process (the onefile bootloader; in source mode on Windows,
-            # the venv launcher), so stop and EOF were checked through that parent.
-            "onefile_child_exited": True, "engine_child_process": all(parent != child for parent, child in pids),
+            # Frozen: the engine ran as a child of the onefile bootloader, so stop and EOF were checked through that
+            # parent. Source mode has no bootloader (on Windows the venv launcher is the parent instead).
+            "onefile_child_exited": frozen_only(bridge),
+            "engine_child_process": all(parent != child for parent, child in pids),
             "broker_secret_not_written": True}
 
 

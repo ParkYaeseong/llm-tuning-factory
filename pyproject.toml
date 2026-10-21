@@ -21,7 +21,8 @@ packages = ["src/tuning_factory"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["gpu: requires explicitly authorized real GPU infrastructure"]
+markers = ["gpu: requires explicitly authorized real GPU infrastructure",
+           "slow: takes tens of seconds; runs by default (deselect with -m 'not slow')"]
 
 [tool.ruff]
 line-length = 110
