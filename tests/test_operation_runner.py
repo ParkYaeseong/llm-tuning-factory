@@ -1282,9 +1282,12 @@ def test_a_cancel_wins_over_a_late_completion_collected_by_reconcile(tmp_path, m
 
 
 def test_a_job_cancel_leaves_a_final_attempt_unchanged(tmp_path, monkeypatch):
-    """R1 I-1: ``JobStore.cancel`` flags a FAILED attempt only while it holds its lock; a final one is untouched."""
+    """R1 I-1, re-review M3: ``JobStore.cancel`` flags a FAILED attempt while it holds its lock or while its node is
+    unfinished (not yet classified, or in a retry backoff); the final attempt of a finished node is untouched."""
     w = world(tmp_path, monkeypatch, fail="engine exited with status 1")
     assert run(w).status == "FAILED" and not held_locks(w)
+    assert w.store.classify_attempt(w.ctl, w.job_id, "remote_failed") == "remote_failed"
+    assert node_status(w) == "FAILED"   # max_attempts=1: no retry, the node is finished
     w.store.jobs.cancel(w.job_id)
     job = w.store.jobs.get(w.job_id)
     assert (job["status"], job["cancel_requested"]) == ("FAILED", 0)

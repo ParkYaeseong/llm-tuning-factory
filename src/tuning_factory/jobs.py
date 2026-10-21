@@ -533,15 +533,19 @@ class JobStore:
 
     def cancel(self, job_id):
         """Request a cancel: an active attempt is flagged, an unclaimed job is canceled at once. A finished graph
-        attempt that still holds its lock (uncertain, or a crash before its release) is flagged too, so the late
-        result its reconcile collects is CANCELED (11.5 R1 I-1); a final attempt is left unchanged."""
+        attempt is flagged too while it still holds its lock (uncertain, or a crash before its release: the late
+        result its reconcile collects is CANCELED, 11.5 R1 I-1) or while its node is unfinished (a remote failure
+        not yet classified, or in its retry backoff: the controller settles the node CANCELED instead of retrying,
+        11.5 re-review M3). A final attempt of a finished node is left unchanged."""
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT status,graph_run_id FROM jobs WHERE id=?', (job_id,)).fetchone()
             if row is None:
                 raise ValueError('unknown job')
             if row['status'] in ACTIVE or (row['graph_run_id'] is not None and row['status'] in {'FAILED', 'CANCELED'}
-                                           and self._holds_any_lock(db, job_id)):
+                                           and (self._holds_any_lock(db, job_id) or db.execute(
+                                               "SELECT 1 FROM nodes WHERE run_id=? AND job_id=? AND status IN "
+                                               "('READY','RUNNING')", (row['graph_run_id'], job_id)).fetchone())):
                 db.execute('UPDATE jobs SET cancel_requested=1 WHERE id=?', (job_id,))
             elif row['status'] in {'PENDING', 'QUEUED', 'RETRYING'}:
                 db.execute("UPDATE jobs SET status='CANCELED',updated=? WHERE id=?", (time.time(), job_id))

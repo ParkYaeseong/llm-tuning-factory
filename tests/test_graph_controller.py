@@ -1944,3 +1944,30 @@ def test_outputs_that_cannot_be_saved_locally_name_the_local_fix(tmp_path, monke
         drive(w, controller, owner)
         assert statuses(w) == {'a': 'FAILED'} and w.store.attempt_disposition(a)['disposition'] == 'output_invalid'
     assert w.engine_calls == ['train.bound.yaml'] and len(w.host.launches) == 1
+
+
+@pytest.mark.parametrize('when', ['before_classification', 'in_backoff'])
+def test_a_job_cancel_during_a_retry_backoff_is_honoured(tmp_path, monkeypatch, when):
+    """Re-review M3: ``factory cancel <job>`` of a remotely failed attempt (FAILED, lock released) did nothing, so
+    the retry relaunched it after the backoff. The cancel is flagged while the node is unfinished, and the node is
+    settled CANCELED with its subtree BLOCKED: before classification by ``_settle_node``, in the backoff by
+    ``settle_canceled_jobs``."""
+    w = world(tmp_path, monkeypatch, chain, max_attempts=2, backoff=300)
+    w.dispatcher.script['a'] = ['fail_remote']
+    controller, owner = start(w)
+    controller.tick(owner)
+    w.pool.run_all()   # a remote failure: FAILED, its lock released
+    a = job_of(w, 'a')
+    if when == 'in_backoff':
+        controller.tick(owner)
+        assert node(w, 'a')['status'] == 'RUNNING' and node(w, 'a')['retry_not_before'] is not None
+    w.store.jobs.cancel(a)
+    assert w.store.jobs.get(a)['cancel_requested'] == 1
+    for _ in range(12):   # well past the backoff, ticking inside the owner TTL
+        w.clock.advance(30)
+        controller.tick(owner)
+    drive(w, controller, owner)
+    assert statuses(w) == {'a': 'CANCELED', 'b': 'BLOCKED'} and run_row(w)['status'] == 'FAILED'
+    assert w.dispatcher.launches == {'a': 1} and len(attempts(w, 'a')) == 1
+    assert w.store.attempt_disposition(a)['disposition'] == 'remote_failed'
+    assert node(w, 'a')['retry_not_before'] is None

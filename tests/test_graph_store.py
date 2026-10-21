@@ -1095,7 +1095,9 @@ def test_a_cancel_flags_an_uncertain_attempt_that_keeps_its_lock(tmp_path, scope
     held, final = (store.claim_ready(facts, ctl) for facts in w.facts)
     uncertain(store, held)
     uncertain(store, final)
-    store.jobs.release_gpu(final['lease'], execution_stopped=True)   # its result arrived: final
+    store.jobs.release_gpu(final['lease'], execution_stopped=True)   # released by the operator: final
+    assert store.classify_attempt(ctl, final['id'], 'failed_before_submit') == 'failed_before_submit'
+    assert node_status(store, run, 'train.2') == 'FAILED'   # a finished node (re-review M3 flags unfinished ones)
     if scope == 'run':
         store.cancel(run)
     else:

@@ -1359,16 +1359,20 @@ class GraphStore:
 
     def settle_canceled_jobs(self, controller_lease) -> tuple[str, ...]:
         """Nodes whose job was canceled while it had no attempt (``JobStore.cancel`` of a QUEUED job: freshly
-        prepared, requeued for a retry, or returned unlaunched) become CANCELED, and their subtree is BLOCKED unless
-        the run itself is canceled (8.2 review I-2). Returns those node IDs. ``finalize_run`` and the gated
-        ``prepare_ready`` apply it too."""
+        prepared, requeued for a retry, or returned unlaunched), or while its finished attempt waited out a retry
+        backoff (a flagged FAILED job without a lock; 11.5 re-review M3), become CANCELED, and their subtree is
+        BLOCKED unless the run itself is canceled (8.2 review I-2). Returns those node IDs. ``finalize_run`` and the
+        gated ``prepare_ready`` apply it too."""
         with self.jobs.connection() as db:
             db.execute('BEGIN IMMEDIATE')
             return self._settle_canceled(db, self._controller(db, controller_lease))
 
     def _settle_canceled(self, db, run):
-        rows = db.execute("SELECT n.node_id FROM nodes n JOIN jobs j ON n.job_id=j.id WHERE n.run_id=? "
-                          "AND n.status IN ('READY','RUNNING') AND j.status='CANCELED' AND j.active_attempt_id IS NULL "
+        rows = db.execute("SELECT n.node_id FROM nodes n JOIN jobs j ON n.job_id=j.id WHERE n.run_id=? AND ("
+                          "(n.status IN ('READY','RUNNING') AND j.status='CANCELED' AND j.active_attempt_id IS NULL) "
+                          "OR (n.status='RUNNING' AND n.retry_not_before IS NOT NULL AND j.status='FAILED' "
+                          "AND j.cancel_requested=1 AND j.id NOT IN (SELECT job_id FROM gpu_locks) "
+                          "AND j.id NOT IN (SELECT job_id FROM resource_leases))) "
                           "ORDER BY n.node_id", (run['id'],)).fetchall()
         plan = GraphPlan.model_validate_json(run['plan']) if rows else None
         for row in rows:
