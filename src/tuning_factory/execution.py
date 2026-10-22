@@ -79,8 +79,10 @@ def _windows_path_unreachable(exc: OSError) -> bool:
     be reached (its stat fails with WinError 53/67: the network share is gone). Never raises: it runs inside the
     runner's exception handlers."""
     try:
-        names = [os.path.abspath(os.fsdecode(name)) for name in (exc.filename, exc.filename2)
+        names = [os.fsdecode(name) for name in (exc.filename, exc.filename2)
                  if isinstance(name, (str, bytes, os.PathLike))]
+        # A ``\\?\`` name is already absolute (Windows keeps it as it is; elsewhere abspath would prefix it).
+        names = [name if name.startswith("\\\\?\\") else os.path.abspath(name) for name in names]
     except (ValueError, TypeError):
         return False
     if any(_too_long(name) for name in names):
