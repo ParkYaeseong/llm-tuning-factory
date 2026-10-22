@@ -1,9 +1,12 @@
-# General-purpose workflows — implementation in progress, 2026-10-19
+# General-purpose workflows — Windows 0.4.0 accepted on one PC, 2026-10-22
 
 User approved the [design](superpowers/specs/2026-10-17-general-training-workflows-design.md) and
 [implementation plan](superpowers/plans/2026-10-17-general-training-workflows.md), including task implementers
-and independent reviews. Work continues on codex/general-training-workflows; the released Windows 0.3.0
-installer remains unchanged until new acceptance.
+and independent reviews. Tasks 1–11 are implemented and reviewed on codex/general-training-workflows. The Windows
+0.4.0 installer, built from `b4e359a`, passed the installed-app acceptance on the development PC; its receipt is
+[`acceptance/2026-10-22-desktop-040.json`](acceptance/2026-10-22-desktop-040.json), and the "Task 11.6" entry below lists
+what it did not verify. Real GPU, Hugging Face and MLflow checks (L1–L3) are still pending and each needs the user's
+authorization.
 
 Reviewed foundations (Tasks 1–4): blank projects and immutable reusable recipes; mapped CSV/JSON/JSONL import
 with original/canonical provenance and input-OR-group component splits; immutable effective-model artifacts;
