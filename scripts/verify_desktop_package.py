@@ -56,8 +56,9 @@ class Bridge:
         return [sys.executable, str(self.path), *args] if self.source else [str(self.path), *args]
 
     def request(self, envelope: dict, cwd: Path, timeout: float = REQUEST_TIMEOUT) -> dict:
-        run = subprocess.run(self.command(), input=json.dumps(envelope), text=True, encoding="utf-8",
-                             capture_output=True, timeout=timeout, cwd=cwd)
+        # Raw UTF-8, as the native bridge writes it (serde_json): ASCII escapes hid a cp949 stdin that garbled Hangul.
+        run = subprocess.run(self.command(), input=json.dumps(envelope, ensure_ascii=False), text=True,
+                             encoding="utf-8", capture_output=True, timeout=timeout, cwd=cwd)
         self.outputs.append(run.stdout + run.stderr)
         return json.loads(run.stdout)
 
@@ -305,7 +306,7 @@ class Controller:
                         threading.Thread(target=self._read_stderr, daemon=True)]
         for reader in self.readers:
             reader.start()
-        self.process.stdin.write(json.dumps(line).encode("utf-8") + b"\n")
+        self.process.stdin.write(json.dumps(line, ensure_ascii=False).encode("utf-8") + b"\n")   # as the broker
         self.process.stdin.flush()
 
     def _read_stdout(self):

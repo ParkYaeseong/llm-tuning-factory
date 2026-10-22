@@ -566,11 +566,18 @@ class DesktopService:
         return {"runs": result, "next_page_token": getattr(runs, "token", None)}
 
 
+def _request_line() -> str:
+    """The request line as UTF-8. The native bridge writes raw UTF-8 JSON, while a text stdin on Korean Windows
+    decodes with the cp949 code page and garbles Hangul (11.6). A stdin without a byte buffer is read as text."""
+    buffer = getattr(sys.stdin, "buffer", None)
+    return buffer.readline().decode("utf-8") if buffer is not None else sys.stdin.readline()
+
+
 def main():
     # One request per process: authentication environment is never shared across profiles.
     response = None
     try:
-        request = json.loads(sys.stdin.readline())
+        request = json.loads(_request_line())
         if not isinstance(request, dict):
             raise ValueError("invalid request")
         with contextlib.redirect_stdout(sys.stderr):

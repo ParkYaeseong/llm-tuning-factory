@@ -1035,6 +1035,25 @@ def test_workflow_channel_imports_no_heavy_or_keyring_modules(tmp_path):
     assert json.loads(heavy) == []
 
 
+def test_a_raw_utf8_request_keeps_its_hangul_under_a_korean_code_page(tmp_path):
+    """11.6 acceptance of the installed app: the native bridge writes raw UTF-8 JSON (serde_json), but on Korean
+    Windows the sidecar's text stdin decoded it with the cp949 code page, so a Hangul project name was refused
+    ("unable to parse raw data as a unicode string"). The request line is read as UTF-8 bytes. PYTHONIOENCODING=cp949
+    reproduces that code page on any OS."""
+    name = "질의응답 실험 01"
+    request = {"channel": "workflow", "root": str(tmp_path / "state"), "settings": {}, "action": "project_create",
+               "data": {"request_id": "utf8-a1", "name": name}}
+    raw = json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n"
+    assert not raw.isascii()
+    environment = {**os.environ, "PYTHONIOENCODING": "cp949", "PYTHONUTF8": "0"}
+    process = subprocess.run([sys.executable, "-c", "from tuning_factory import desktop; desktop.main()"],
+                             input=raw, capture_output=True, timeout=120, cwd=tmp_path, env=environment)
+    assert process.returncode == 0, process.stderr
+    answer = json.loads(process.stdout)
+    assert answer["ok"] is True and answer["result"]["status"] == "ok", answer
+    assert answer["result"]["data"]["project"]["name"] == name
+
+
 # Task 9.2, parent RED: a blank project reaches a dry plan with mapped data and no bundled example.
 def test_blank_project_to_mapped_data_recipe_and_dry_plan_without_examples(tmp_path, monkeypatch):
     import builtins
