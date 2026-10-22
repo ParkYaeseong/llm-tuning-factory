@@ -43,3 +43,25 @@ def test_reconcile_does_not_release_still_running_worker(tmp_path):
     factory.work(executor=Disconnected(), gpu="retained")
     assert factory.reconcile(job["id"], StillRunning())["status"] == "FAILED"
     assert factory.store.gpu_locked("retained")
+
+
+def test_reconcile_rejects_receipt_from_another_launch(tmp_path):
+    import pytest
+
+    class Disconnected(LocalExecutor):
+        def run(self, *args, **kwargs):
+            raise ExecutionUncertain('detached')
+
+    class Collector:
+        def collect_result(self, directory):
+            pytest.fail('wrong launch must be rejected before remote collection')
+
+    factory = Factory(tmp_path)
+    factory.registry.register_dataset('dummy', '1', 'examples/dummy.json')
+    job = factory.submit(load_config('configs/ai/paper_extraction.yaml'))
+    factory.work(executor=Disconnected(), gpu='retained')
+    receipt = factory.directory(job['id']) / 'remote-attempt.json'
+    receipt.write_text(json.dumps({'remote_path': '/workspace/factory/' + job['id'] + '/' + '0' * 32}))
+    with pytest.raises(ValueError, match='launch'):
+        factory.reconcile(job['id'], Collector())
+    assert factory.store.gpu_locked('retained')

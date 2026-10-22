@@ -1,0 +1,82 @@
+{
+  "date": "2026-10-15",
+  "app_version": "0.3.0",
+  "installer_file": "LLM.Tuning.Factory_0.3.0_x64-setup.exe",
+  "installer_bytes": 47043962,
+  "installer_sha256": "b7be610ed6c10ec98b89f3b8a3fb2459435306d1d67283354707a94fd3f4e49b",
+  "frozen_python_source_commit": "36e479d0b5b4192b1552352b786474f2d91db07d",
+  "source_sha256": "b8cbf0d8c8eb4ff5aedd1fcfa854b512dd186dc44153ee4c3d7b0c6669ec8595",
+  "bridge_sha256": "a500c777d75b936952bf403f4b2efb11b8143cbe803d5b4175bb9561846140e6",
+  "frozen_acceptance": {
+    "all_six_stage_plans": true,
+    "worker_sources_match": true,
+    "both_locks_match": true,
+    "frozen_s3_sdk_loaded": true,
+    "dry_run_only": true
+  },
+  "python": {
+    "passed": 214,
+    "skipped": 1,
+    "skip": "opt-in real GPU test"
+  },
+  "ui": {
+    "passed": 23,
+    "typescript_vite": "passed"
+  },
+  "native_rust": {
+    "passed": 4
+  },
+  "native_smoke": {
+    "native_ui": true,
+    "bundled_catalog": 3,
+    "dataset_registered_locally": true,
+    "dry_run": true,
+    "worker_lock_present": true,
+    "native_vault_masked": true,
+    "native_s3_vault_masked": true,
+    "training_stage_catalog": 6,
+    "ppo_guard": true,
+    "modern_hf_model_registered": "Qwen/Qwen3.5-0.8B",
+    "modern_hf_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "native_hf_vault_masked": true,
+    "native_dataset_preview": true,
+    "command_navigation": true,
+    "gpu_started": false,
+    "dataset_transferred": false
+  },
+  "public_model_metadata": {
+    "model_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+    "tokenizer_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+    "template": "qwen",
+    "architecture": "qwen2",
+    "max_length": 32768,
+    "recommended_precision": "bfloat16",
+    "hidden_layers": 24,
+    "metadata_verified": true
+  },
+  "modern_config_cpu": {
+    "transformers": "5.6.0",
+    "model_configurations": {
+      "Qwen/Qwen3.5-0.8B": {
+        "model_type": "qwen3_5",
+        "configuration_class": "Qwen3_5Config"
+      },
+      "Qwen/Qwen3.6-27B": {
+        "model_type": "qwen3_5",
+        "configuration_class": "Qwen3_5Config"
+      }
+    },
+    "gemma4_configuration_registered": true,
+    "model_weights_downloaded": false,
+    "gpu_training": false
+  },
+  "paid_resources_started": false,
+  "real_s3_account_accessed": false,
+  "institution_data_transferred": false,
+  "outstanding": [
+    "Actual GPU execution of new stage/method combinations",
+    "Real AWS/NCP/MinIO account checks",
+    "Clean second-PC installation and code signing",
+    "Multimodal, unlimited streaming, multi-PC scheduling"
+  ]
+}

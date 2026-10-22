@@ -4,14 +4,27 @@
 LLaMA-Factory 학습 엔진과 RunPod 실행기를 분리하고, 데이터·명세서·산출물을 해시로 추적합니다.
 기존 KBF 프로젝트의 ShareGPT 데이터 규격·Keycloak 인증 방식·순수 추출 평가 함수를 재사용합니다.
 
-**운영 방식:** 각자 PC에 설치하여 작업을 관리하고, 학습은 각자 배정받은 RunPod GPU에서 실행합니다.
+**운영 방식:** 각자 PC에 설치하여 작업을 관리하고, 학습은 각자 배정받은 RunPod Pod 또는
+SSH로 접속하는 기관 GPU 서버에서 실행합니다.
 실행 기록과 업로드한 산출물은 공용 MLflow에 모읍니다. 별도 NCP 관리 서버는 필요하지 않습니다.
-Windows 앱은 **0.2.3 내부 검토 버전**입니다.
+Windows 앱은 **0.4.0 내부 검토 버전**입니다.
 
-[Windows 설치 파일 다운로드](https://github.com/ParkYaeseong/llm-tuning-factory/releases/tag/v0.2.3) ·
-[Windows 사용 안내](docs/WINDOWS_APP.md) · [실제 GPU 검증 결과](docs/GPU_ACCEPTANCE_2026-10-15.md)
+[Windows 설치 파일 다운로드](https://github.com/ParkYaeseong/llm-tuning-factory/releases/tag/v0.4.0) ·
+[Windows 사용 안내](docs/WINDOWS_APP.md) · [학습 프로젝트·그래프 안내](docs/TRAINING_WORKFLOWS.md) ·
+[실제 GPU 검증 결과](docs/GPU_ACCEPTANCE_2026-10-15.md)
 
-연결 설정·로컬 데이터 미리보기·업무별 학습 설정·실행 관리·MLflow 기록 비교를 제공합니다.
+**0.4.0 범용 학습 흐름:** 목적과 데이터를 직접 정한 프로젝트에서 여러 학습을 직렬·병렬로 묶어 자동 실행합니다.
+
+1. **프로젝트** — 이름과 목적을 자유롭게 정한 빈 프로젝트를 만듭니다. 예제가 필요하지 않습니다.
+2. **데이터 가져오기** — CSV·JSON·JSONL의 열을 학습 항목에 연결해 바뀌지 않는 데이터 버전으로 등록하고 학습·검증·시험으로 나눕니다.
+3. **레시피** — 학습 단계·방식·옵션을 이름 붙여 저장하고 여러 그래프에서 다시 씁니다.
+4. **학습 그래프** — 학습·평가·자동 선택·병합·전체 모델 확정 카드를 직렬·병렬로 연결합니다.
+5. **계획·승인 → 그래프 실행** — 기본은 모의 실행입니다. 실제 실행은 실행 승인과 데이터 전송 승인을 따로 받은 뒤
+   창을 닫아도 계속 도는 백그라운드 컨트롤러가 진행합니다.
+
+자세한 순서와 주의점은 [학습 프로젝트·그래프 안내](docs/TRAINING_WORKFLOWS.md)에 있습니다.
+
+기존의 연결 설정·로컬 데이터 미리보기·업무별 학습 설정·실행 관리·MLflow 기록 비교도 그대로 제공합니다.
 Windows 앱은 Python을 포함하며 키는 연결 화면에서 입력하고 Windows 자격 증명 저장소에 보관합니다.
 기존 Python CLI도 계속 사용할 수 있습니다. 아래 소스 설치 안내는 CLI/개발자용입니다.
 
@@ -19,9 +32,36 @@ Windows 앱은 Python을 포함하며 키는 연결 화면에서 입력하고 Wi
 취소·체크포인트 재개·연결 중단 복구, 산출물 전체 회수와 공용 MLflow 왕복 해시를 확인했습니다.
 더미 결과는 업무 AI 품질을 의미하지 않습니다.
 
-**지원 범위:** 정해진 모델 목록의 SFT LoRA/QLoRA와 로컬 JSON/JSONL 데이터입니다.
-LLaMA-Factory 전체 모델·학습 방식의 자동 호환 설정과 S3 데이터 직접 연결은 아직 없습니다.
-다른 모델의 실제 GPU 검증·대량 스트리밍·다중 PC 스케줄링·새 PC 설치 검증·코드 서명도 남아 있습니다.
+**학습 방식(0.3.0부터):** PT·SFT·RM·PPO·DPO·KTO, Full·Freeze·LoRA·QLoRA·OFT와 단계별 옵션을 제공합니다.
+기본 모델 15개와 Hugging Face 검색·모델 ID 추가를 제공하고, 구조별 호환 조건과 고정 revision을 관리합니다.
+Qwen3.5/3.6·Gemma4 등은 지원 구조를 검사해 추가하며, GPU 검증 여부와 실행 제한을 따로 표시합니다.
+S3 버킷·파일 조회와 버전/해시를 고정한 PC 가져오기(파일당 32 MiB)를 지원합니다.
+[학습 방식·S3 사용 안내](docs/TRAINING_AND_STORAGE.md)를 확인하세요.
+
+**검증 구분:** 위 H100 결과는 0.2.3의 SFT 시험입니다. 0.3.0의 학습 조합은 CPU/UI 검사,
+PPO 전용 실제 패키지 import, 로컬 S3 서명·전송 계약을 검증했으며 실제 GPU/클라우드 S3 시험은 남아 있습니다.
+0.4.0의 프로젝트·그래프 기능은 별도 해시 고정 환경의 CPU 병합·확정 검산과 가짜 RunPod·SSH·MLflow 연결을 쓴 자동 시험으로
+확인했고, 개발 PC 한 대에서 설치 파일과 설치한 앱(0.3.0에서의 업데이트, 빈 프로젝트에서 모의 실행까지, 백그라운드 컨트롤러,
+튜토리얼)도 검사했습니다. 한글 입력기 조합과 실행 중인 컨트롤러가 있을 때의 대화형 설치는 확인하지 않았습니다. 실제 Hugging Face 헤더 조회,
+실제 RunPod·BOP GPU 학습(직렬·병렬·병합과 재평가 포함), 실제 MLflow 서버 기록은 각각 별도 승인을 받아 시험하며 아직 하지
+않았습니다.
+정확한 결과와 남은 시험은 [진행 상태](docs/PROGRESS.md)에 구분합니다.
+PPO·OFT 등의 upstream 재개/평가 제한은 이유와 함께 차단합니다.
+멀티모달·임의 모델/플러그인·대량 스트리밍·다중 PC 스케줄링·서빙·코드 서명은 이번 범위에 포함하지 않습니다.
+
+**GPU 서버:** RunPod 외에 BOP 같은 기관의 Linux/NVIDIA GPU 서버에 SSH 키 인증과 관리자가 전달한
+SHA256 지문으로 직접 접속해 학습할 수 있습니다(단일 학습 화면은 작업당 GPU 1개). 서버의 작업 폴더 아래에만 전용 환경을 만들며 서버를 켜거나 끄지 않습니다.
+설정 절차는 [Windows 사용 안내](docs/WINDOWS_APP.md), CLI 절차와 요구 조건은 [운영 안내](docs/OPERATIONS.md)를 확인하세요.
+학습 그래프에서는 서버를 실행 프로필로 등록합니다([학습 프로젝트·그래프 안내](docs/TRAINING_WORKFLOWS.md)).
+실제 서버·GPU 시험은 아직 하지 않았습니다.
+
+**MLflow 인증 없음:** 로컬(`127.0.0.1`)·내부망 MLflow 서버는 앱에서 “인증 없음”을 선택하거나
+CLI `.env`의 토큰과 OIDC 세 항목을 비워 연결합니다. 서버에 접근할 수 있는 누구나 기록을 볼 수 있으므로
+신뢰할 수 있는 망에서만 사용하세요. 토큰·OIDC 인증값을 쓰면 CLI와 앱 모두 HTTPS 주소만 허용합니다. 자세한 내용은 [운영 안내](docs/OPERATIONS.md)와 [Windows 사용 안내](docs/WINDOWS_APP.md)에 있습니다.
+
+처음 사용하는 Windows 앱 사용자는 작업 공간의 “튜토리얼 시작”으로 합성 예제만 쓰는 16단계·약 7분 실습을 해 볼 수 있습니다
+(연결 정보 불필요, GPU·전송 없음). 11~15단계는 프로젝트·실행 프로필·데이터 가져오기·학습 그래프·그래프 실행 화면을
+설명만 하며 아무것도 만들지 않습니다. [Windows 사용 안내](docs/WINDOWS_APP.md)를 확인하세요.
 
 ## 처음 설치하기
 
@@ -39,6 +79,7 @@ macOS/Linux에서는 마지막 명령 대신 `cp .env.example .env`를 사용합
 로컬 `.env`를 열어 본인 RunPod API 키, 관리자가 별도로 전달한 MLflow 인증 정보,
 기록을 구분할 `FACTORY_OPERATOR`를 입력합니다. 서버 주소는 예시에 들어 있습니다.
 OIDC 대신 발급받은 토큰을 쓰면 OIDC 세 항목을 비우고 `MLFLOW_TRACKING_TOKEN`을 채웁니다.
+인증 없는 로컬·내부 서버는 토큰과 OIDC 세 항목을 모두 비웁니다.
 
 ```powershell
 uv run factory doctor
@@ -80,7 +121,7 @@ uv run factory evaluate examples/evaluation.json --kind classification
 ## 실제 학습과 공유 시 주의점
 
 실제 학습은 [운영 안내](docs/OPERATIONS.md)의 GPU 런타임 준비와 데이터 전송 승인이 필요합니다.
-로컬 설치만으로 RunPod에 학습 환경이 설치되거나 GPU가 자동 시작되지는 않습니다.
+로컬 설치만으로 RunPod나 GPU 서버에 학습 환경이 설치되거나 GPU가 자동 시작되지는 않습니다.
 PC를 켜 두고 실행해야 작업 관리와 결과 회수가 이어집니다.
 
 각 PC의 `state/`에는 별도의 작업 목록·데이터 사본·GPU 잠금이 저장됩니다.
@@ -99,7 +140,15 @@ GPU 이미지 자체의 빌드와 학습 어댑터 Model Registry 등록은 이�
 
 ## 업데이트와 개발 검증
 
-작업이 실행 중이지 않을 때 업데이트합니다. 기존 작업은 실행 당시 소스 해시를 사용하므로
+**Windows 앱 업데이트·제거.** 새 설치 파일을 실행하거나 앱을 제거하기 전에 앱의 컨트롤러 막대에서 **컨트롤러 정지** →
+**정지 요청**을 누르고, 상태가 ‘정지’로 바뀐 뒤 앱 창을 닫습니다. 백그라운드 컨트롤러는 창을 닫아도 계속 돌며 앱과 학습 엔진 파일을 열어 두므로
+설치 프로그램이 파일을 바꿀 수 없습니다. 진행 중인 단계가 끝나야 정지되므로 몇 시간이 걸릴 수 있습니다.
+0.3.0의 연결 설정과 저장한 인증값은 0.4.0에서 그대로 씁니다. 0.4.0으로 한 번 연 작업 DB는 0.3.0에서 다시 쓸 수 없으므로
+이전 버전으로 되돌리지 마세요. 제거 창의 ‘애플리케이션 데이터 삭제하기’를 선택하면 프로젝트·데이터 버전·실행 기록이
+모두 지워지므로 의도한 경우에만 선택합니다. 설치 파일은 코드 서명하지 않았으므로 Windows SmartScreen 경고가 나오면
+배포 페이지의 SHA256을 확인한 뒤 ‘추가 정보’ → ‘실행’을 누릅니다. 자세한 절차는 [Windows 사용 안내](docs/WINDOWS_APP.md)에 있습니다.
+
+**CLI 업데이트.** 작업이 실행 중이지 않을 때 업데이트합니다. 기존 작업은 실행 당시 소스 해시를 사용하므로
 업데이트 이후 재시도 시 해당 작업과 일치하는 GPU 패키지·명세를 확인해야 합니다.
 
 ```powershell
@@ -107,7 +156,7 @@ git pull --ff-only
 uv sync --python 3.12 --extra tracking --locked
 ```
 
-개발자는 `--extra dev`도 설치하고 `uv run pytest -q`, `uv run ruff check src tests`,
+개발자는 `--extra dev`도 설치하고 `uv run pytest -q`, `uv run ruff check src tests scripts`,
 `uv run python scripts/check_secrets.py`를 실행합니다. GPU 실험은 별도 승인이 필요합니다.
 
 ## 문서
@@ -116,6 +165,8 @@ uv sync --python 3.12 --extra tracking --locked
 - [구현 계획](docs/IMPLEMENTATION_PLAN.md)
 - [아키텍처와 상태 관리](docs/ARCHITECTURE.md)
 - [설정·데이터·평가 규격](docs/CONFIGURATION.md)
+- [Windows 앱 사용 안내](docs/WINDOWS_APP.md)
+- [학습 프로젝트·학습 그래프 안내](docs/TRAINING_WORKFLOWS.md)
 - [실제 RunPod·MLflow 설치 및 운영](docs/OPERATIONS.md)
 - [테스트·진행 상태·미완료 항목](docs/PROGRESS.md)
 

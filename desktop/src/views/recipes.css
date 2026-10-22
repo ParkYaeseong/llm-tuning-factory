@@ -1,0 +1,21 @@
+/* Recipes (10.2): the list, the example card and the editor that reuses the training form's option cards. */
+.recipes-top{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(260px,1fr);gap:20px;align-items:start}
+.recipe-list td small{display:block;color:#8a919d;font-size:10px;margin-top:3px;overflow-wrap:anywhere}
+.recipe-list tr.current td{background:#f6f7fd}
+.recipe-row-actions{white-space:nowrap;text-align:right}
+.recipe-example .actions{margin-top:16px}
+.recipe-fieldset{border:0;margin:0;padding:0;min-width:0}
+.recipe-editor h4{font-size:12px;font-weight:600;color:#3d434e;margin:26px 0 14px}
+.recipe-editor .card{border:0;border-top:1px solid var(--line);border-radius:0;padding:22px 0 0;margin:24px 0 0}
+.recipe-editor .card h3{font-size:12px;margin:0 0 14px}
+.recipe-field{min-width:0}
+.recipe-field .issue-list{margin:6px 0 0}
+.recipe-editor textarea{resize:vertical;min-height:58px;line-height:1.6}
+.recipe-editor textarea:focus-visible{outline:2px solid #7d8ddd;outline-offset:3px}
+.recipe-editor textarea:hover{border-color:#cbd0db}
+.recipe-editor h3:focus{outline:none}
+.recipe-editor h3:focus-visible{outline:2px solid #7d8ddd;outline-offset:3px}
+.recipe-banner small{display:block;font-size:10px;color:inherit;opacity:.8}
+.recipe-summary{margin:0 0 14px}
+.recipe-editor>.recipe-note{margin:26px 0 0}
+@media(max-width:1150px){.recipes-top{grid-template-columns:minmax(0,1fr)}}

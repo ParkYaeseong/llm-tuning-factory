@@ -1,0 +1,65 @@
+/* Graph runs (10.7). The view modules are bundled eagerly, so every rule here is scoped to the runs page's classes. */
+.runs-layout{display:grid;gap:0;align-items:start}
+.run-list tr.current td{background:#f6f7fd}
+.run-list td small{display:block;color:#8a919d;font-size:10px;margin-top:3px;overflow-wrap:anywhere}
+.run-list .run-counts{max-width:260px;overflow-wrap:anywhere}
+.run-row-actions{text-align:right;white-space:nowrap}
+.run-read-error p{margin:0;color:inherit;font-size:11px}
+.run-read-error small{display:block;color:inherit;opacity:.85;font-size:10px;overflow-wrap:anywhere;white-space:pre-wrap}
+.run-head{display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:12px 18px;margin-bottom:18px}
+.run-head h3{margin:0 0 8px}
+.run-detail h3:focus{outline:none}
+.run-detail h3:focus-visible{outline:2px solid #7d8ddd;outline-offset:3px}
+.run-head .actions{margin:0}
+.run-state{display:flex;flex-wrap:wrap;gap:8px}
+.run-back{margin-top:16px}
+.run-detail .wf-banner p{margin:0;color:inherit;font-size:11px;line-height:1.7;overflow-wrap:anywhere}
+.run-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px 20px;margin:0 0 22px;font-size:11px}
+.run-meta dt{color:#858c98;margin-bottom:4px}
+.run-meta dd{margin:0;color:#4b5361;overflow-wrap:anywhere}
+.run-graph-action{margin-top:6px;color:#7c5a1f;font-size:10px;line-height:1.6}
+.run-original{margin:4px 0 0}
+.run-original summary{font-size:10px}
+.run-original[open]>summary{margin-bottom:4px}
+.run-original .mono{display:block;color:#7d8592;overflow-wrap:anywhere;white-space:pre-wrap}
+.run-nodes td{vertical-align:top;padding:13px 12px}
+.run-nodes td small{font-size:10px;margin-top:4px;overflow-wrap:anywhere}
+.run-node-label{min-width:140px;max-width:220px;overflow-wrap:anywhere}
+.run-node-destination{max-width:170px;overflow-wrap:anywhere}
+.run-node-progress{min-width:220px;max-width:320px}
+.run-node-progress .status-pill{margin-bottom:6px;white-space:normal}
+.run-node-output{min-width:160px;max-width:280px;overflow-wrap:anywhere}
+.run-reason{font-size:11px;line-height:1.6;color:#5d6573}
+.run-reason.operator,.run-reason.replan,.run-reason.budget{color:#7c5a1f}
+.run-reason.error{color:#a25f54}
+.run-node-error{margin:6px 0 0;font-size:11px;line-height:1.6;color:#a25f54;overflow-wrap:anywhere}
+.run-node-action{margin-top:6px;font-size:10px;line-height:1.6;color:#7c5a1f}
+.run-metrics{list-style:none;margin:6px 0 0;padding:0;display:grid;gap:2px}
+.run-metric-note{display:block;color:#8a919e}
+.run-selection{margin:6px 0 0;font-size:11px;line-height:1.6;color:#414a59}
+.run-operator{border:1px solid #f0e4c8;background:#fffbf3;border-radius:8px;padding:14px 18px;margin:0 0 22px}
+.run-operator h4,.run-tracking h4{margin:0 0 10px;font-size:12px;font-weight:600}
+.run-operator-item+.run-operator-item{border-top:1px solid #f1e8d4;margin-top:12px;padding-top:12px}
+.run-operator-head{display:flex;align-items:center;flex-wrap:wrap;gap:10px}
+.run-operator-head b{font-weight:550;color:#414a59;overflow-wrap:anywhere}
+.run-operator-item p{margin:6px 0 0;font-size:11px;line-height:1.7;color:#5f6775}
+.run-operator-item .run-reason{margin-top:6px}
+.run-operator-item .actions{margin-top:10px}
+.run-cli-details{margin-top:10px}
+.run-cli{margin:8px 0 0;font-size:10px;max-height:none;white-space:pre-wrap;overflow-wrap:anywhere}
+.run-tracking{margin-top:24px}
+.run-tracking-list{list-style:none;margin:0;padding:0;display:grid;gap:12px}
+.run-tracking-failure{border:1px solid var(--line);border-radius:6px;padding:12px 14px}
+.run-tracking-head{display:flex;align-items:center;flex-wrap:wrap;gap:10px;font-size:11px}
+.run-tracking-head b{font-weight:550;color:#414a59}
+.run-tracking-failure .wf-banner{margin:10px 0 0;padding:10px 12px;font-size:11px}
+.run-tracking-failure .actions{margin-top:10px}
+.run-rearm-warning{margin-bottom:12px}
+.run-release-target{overflow-wrap:anywhere}
+.run-release-risk{color:#7c5a1f}
+.run-release-label{margin-top:14px}
+.run-release-label>span{overflow-wrap:anywhere}
+.run-graph-note{margin-top:6px;color:#858c98;font-size:10px;line-height:1.6}
+.run-release-stale{color:#a25f54}
+.run-release-stale:empty{display:none}
+.run-tracking-error{margin:8px 0 0;font-size:11px;line-height:1.6;overflow-wrap:anywhere}

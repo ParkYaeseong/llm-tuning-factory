@@ -14,8 +14,9 @@ def test_idempotency_and_transition(tmp_path):
     with pytest.raises(ValueError):
         store.transition(first["id"], "COMPLETED")
     store.transition(first["id"], "QUEUED")
-    assert store.claim("gpu1", max_concurrent=1)["id"] == first["id"]
-    store.transition(first["id"], "RUNNING")
+    claimed = store.claim("gpu1", max_concurrent=1)
+    assert claimed["id"] == first["id"]
+    store.transition(claimed["lease"], "RUNNING")
     store.cancel(first["id"])
     assert store.get(first["id"])["cancel_requested"]
 
@@ -37,14 +38,14 @@ def test_recovery_does_not_release_unknown_remote_execution(tmp_path):
     store = JobStore(tmp_path / "jobs.db")
     job = store.submit({"sha256": "abc"}, "x")
     store.transition(job["id"], "QUEUED")
-    store.claim("pod1", 1)
-    store.transition(job["id"], "RUNNING")
-    store.recover(stale_after_seconds=0)
+    claimed = store.claim("pod1", 1)
+    store.transition(claimed["lease"], "RUNNING")
+    store.recover(stale_after_seconds=-1)   # strictly older than now: two Windows clock reads can be equal
     recovered = store.get(job["id"])
     assert recovered["status"] == "FAILED"
     assert "reconcile" in recovered["error"]
     assert store.gpu_locked("pod1")
-    store.release_gpu(job["id"])
+    store.release_gpu(claimed["lease"], execution_stopped=True)
     assert not store.gpu_locked("pod1")
 
 
@@ -56,3 +57,17 @@ def test_gpu_budget_separate_from_concurrent_job_count(tmp_path):
         store.transition(job["id"], "QUEUED")
     assert store.claim("pod-a", max_concurrent=4, max_gpus=2)
     assert store.claim("pod-b", max_concurrent=4, max_gpus=2) is None
+
+
+def test_retired_lease_rejected_before_resumed_job_is_claimed(tmp_path):
+    store = JobStore(tmp_path / 'jobs.db')
+    job = store.submit({'sha256': 'one'}, 'one')
+    store.transition(job['id'], 'QUEUED')
+    first = store.claim('mock-cpu')
+    store.transition(first['lease'], 'FAILED')
+    store.release_gpu(first['lease'], execution_stopped=True)
+    store.reset_for_resume(job['id'])
+    for status in ('QUEUED', 'CANCELED'):
+        with pytest.raises(ValueError, match='lease'):
+            store.transition(first['lease'], status)
+        assert store.get(job['id'])['status'] == 'QUEUED'

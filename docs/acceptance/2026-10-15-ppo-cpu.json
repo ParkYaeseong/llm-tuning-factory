@@ -1,0 +1,46 @@
+{
+  "api_compatible": true,
+  "configuration_keywords": [
+    "accelerator_kwargs",
+    "batch_size",
+    "gradient_accumulation_steps",
+    "learning_rate",
+    "log_with",
+    "max_grad_norm",
+    "mini_batch_size",
+    "model_name",
+    "optimize_device_cache",
+    "ppo_epochs",
+    "project_kwargs",
+    "seed",
+    "target",
+    "use_score_norm",
+    "use_score_scaling",
+    "whiten_rewards"
+  ],
+  "trainer_keywords": [
+    "config",
+    "data_collator",
+    "dataset",
+    "lr_scheduler",
+    "model",
+    "optimizer",
+    "ref_model",
+    "tokenizer"
+  ],
+  "versions": {
+    "llamafactory": "0.9.3",
+    "trl": "0.9.6",
+    "transformers": "4.52.4",
+    "peft": "0.15.2",
+    "accelerate": "1.7.0",
+    "datasets": "3.6.0",
+    "huggingface-hub": "0.33.5",
+    "torch": "2.7.1+cpu",
+    "bitsandbytes": "0.48.1"
+  },
+  "config_constructed": true,
+  "model_downloaded": false,
+  "gpu_training_performed": false,
+  "verification_scope": "offline CPU import, call-signature compatibility, PPOConfig construction"
+}

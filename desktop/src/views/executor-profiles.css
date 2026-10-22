@@ -1,0 +1,40 @@
+/* Executor profiles (10.4) and the controller bar (components/controller-bar.ts, also shown by 10.7's runs page; the
+   view modules are bundled eagerly, so these rules are loaded on every page). */
+.controller-bar{border:1px solid var(--line);border-radius:8px;background:#fff;padding:18px 22px;margin-bottom:20px}
+.controller-head{display:flex;align-items:center;flex-wrap:wrap;gap:12px 18px}
+.controller-head h3{margin:0;font-size:13px}
+.controller-state{display:flex;align-items:center;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--muted);min-width:0}
+.controller-state .status-pill{white-space:normal}
+.controller-head .actions{margin:0 0 0 auto}
+.controller-notes{display:grid;gap:10px;margin-top:14px}
+.controller-notes .wf-banner{margin:0;padding:11px 14px;font-size:11px}
+.controller-notes .wf-banner p{margin:0;color:inherit;font-size:11px;line-height:1.7;overflow-wrap:anywhere}
+.controller-notes .wf-banner small{display:block;color:inherit;opacity:.85;font-size:10px;line-height:1.7;overflow-wrap:anywhere}
+.controller-foot{margin:12px 0 0;font-size:10px;line-height:1.7}
+.profiles-layout{display:grid;gap:0;align-items:start}
+.profile-list td small{display:block;color:#8a919d;font-size:10px;margin-top:3px;overflow-wrap:anywhere}
+.profile-list tr.current td{background:#f6f7fd}
+.profile-location{overflow-wrap:anywhere;max-width:240px}
+.profile-check{min-width:200px}
+.profile-check b{display:block;font-weight:550;color:#414a59;margin-top:3px}
+.profile-when{font-size:10px;color:#69707e}
+.profile-row-actions{white-space:nowrap;text-align:right}
+.profile-row-actions button+button{margin-left:6px}
+.profile-affected{margin:0 0 16px}
+.profile-observations-note{margin:14px 0 0}
+.profile-fieldset{border:0;margin:0;padding:0;min-width:0}
+.profile-form input:disabled,.profile-form select:disabled{background:#f6f7f9;color:#8a909b}
+.profile-form h3:focus{outline:none}
+.profile-form h3:focus-visible{outline:2px solid #7d8ddd;outline-offset:3px}
+.profile-form .check{margin:22px 0 0}
+.profile-gpus{border:1px solid var(--line);border-radius:6px;padding:12px 16px 14px;margin:24px 0 0;min-width:0}
+.profile-gpus legend{font-size:11px;font-weight:550;color:#555d6b;padding:0 6px}
+.profile-gpus>p{margin:4px 0 8px}
+.profile-gpus .actions{margin-top:12px}
+.profile-gpu-list{display:grid;gap:2px}
+.profile-gpus .profile-gpu{margin:7px 0;align-items:flex-start}
+.profile-gpu input{margin-top:2px}
+.profile-gpu b{font-weight:550;color:#414a59}
+.profile-gpu .mono{color:#8a919e;overflow-wrap:anywhere}
+.profile-gpu small{display:block;font-size:10px;margin-top:2px}
+.card.profile-form>p.profile-note{margin:22px 0 0}

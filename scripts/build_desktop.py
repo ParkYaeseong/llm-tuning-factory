@@ -1,4 +1,4 @@
-"""Build a self-contained Windows sidecar. No credentials, state or data are bundled."""
+"""Build a self-contained Windows sidecar. Only the fictional synthetic tutorial sample (examples/tutorial_sample.json) is bundled; no credentials, user state or user data are."""
 import importlib.metadata
 import shutil
 import subprocess
@@ -14,11 +14,13 @@ def run(*args):
 def main():
     assets = ROOT / "build/desktop-assets"
     assets.mkdir(parents=True, exist_ok=True)
-    for name in ("pyproject.toml", "uv.lock", "containers/gpu-requirements.lock"):
+    for name in ("pyproject.toml", "uv.lock", "containers/gpu-requirements.lock", "containers/gpu-ppo-requirements.lock"):
         target = assets / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / name, target)
     shutil.copytree(ROOT / "configs/ai", assets / "configs/ai", dirs_exist_ok=True)
+    (assets / "examples").mkdir(exist_ok=True)
+    shutil.copyfile(ROOT / "examples/tutorial_sample.json", assets / "examples/tutorial_sample.json")
     wheel_dir = assets / "dist"
     wheel_dir.mkdir(exist_ok=True)
     for old in wheel_dir.glob("*.whl"):
@@ -37,6 +39,8 @@ def main():
         "--add-data", str(assets) + ";assets",
         "--add-data", str(ROOT / "src/tuning_factory") + ";tuning_factory",
         "--collect-submodules", "tuning_factory", "--collect-all", "mlflow",
+        "--collect-all", "boto3", "--collect-submodules", "botocore",
+        "--additional-hooks-dir", str(ROOT / "scripts/pyinstaller-hooks"),
         *metadata, str(ROOT / "scripts/desktop_entry.py"))
     target = ROOT / "desktop/src-tauri/binaries/factory-bridge-x86_64-pc-windows-msvc.exe"
     target.parent.mkdir(parents=True, exist_ok=True)

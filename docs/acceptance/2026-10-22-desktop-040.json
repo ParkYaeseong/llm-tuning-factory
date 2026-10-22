@@ -1,0 +1,241 @@
+{
+  "date": "2026-10-22",
+  "app_version": "0.4.0",
+  "installer_file": "LLM.Tuning.Factory_0.4.0_x64-setup.exe",
+  "installer_bytes": 48200394,
+  "installer_sha256": "ac6f2e2573c25bb9110843bcf48015134a35113f4fb853cf25113dcf8d607c02",
+  "frozen_source_commit": "b4e359abbf15504233cbc363224d17940d6d76f5",
+  "source_sha256": "2d8b667c86c16847d3fc29d29c0e65a0d6b572d59f9802b3bffbcf3a2ef5a375",
+  "bridge_sha256": "98f996f9fa200bd1ffed134a760ed2440e1c55f899a991ec53a4204ec5325023",
+  "frozen_acceptance": {
+    "frozen_engine": true,
+    "offline_dry_run": true,
+    "locked_dependencies": true,
+    "all_stage_plans": true,
+    "frozen_s3_sdk_loaded": true,
+    "tutorial_sample_persisted": true,
+    "unsupported_args_exit_2": true,
+    "workflow_channel": true,
+    "mapped_import_cp949": true,
+    "split_committed": true,
+    "immutable_plan": true,
+    "frozen_lock_path": true,
+    "workflow_run_submitted": true,
+    "controller_ready": true,
+    "controller_run_completed": true,
+    "controller_profile_loaded": true,
+    "controller_stop_drained": true,
+    "controller_eof_drained": true,
+    "owner_held_exit_3": true,
+    "onefile_child_exited": true,
+    "engine_child_process": true,
+    "broker_secret_not_written": true,
+    "source_and_worker_match": true,
+    "gpu_started": false
+  },
+  "installed_sidecar_acceptance": {
+    "unsupported_args_exit_2": true,
+    "workflow_channel": true,
+    "mapped_import_cp949": true,
+    "split_committed": true,
+    "immutable_plan": true,
+    "frozen_lock_path": true,
+    "workflow_run_submitted": true,
+    "controller_ready": true,
+    "controller_run_completed": true,
+    "controller_profile_loaded": true,
+    "controller_stop_drained": true,
+    "controller_eof_drained": true,
+    "owner_held_exit_3": true,
+    "onefile_child_exited": true,
+    "engine_child_process": true,
+    "broker_secret_not_written": true,
+    "gpu_started": false
+  },
+  "cpu_acceptance": {
+    "passed": true,
+    "checks_passed": 29,
+    "checks_total": 29,
+    "receipt_sha256": "b9431a3b9ccfc8fb1ee1ee6cb6f663034c159c76af3e20b331d3ae98270b724c",
+    "source_sha256": "2d8b667c86c16847d3fc29d29c0e65a0d6b572d59f9802b3bffbcf3a2ef5a375",
+    "lock_sha256": "5883aae629da2fd83aa4bf78c291593e6e14ebda7d2dd20e465d435984a91437",
+    "source_matches_frozen": true
+  },
+  "python": {
+    "passed": 1931,
+    "skipped": 1,
+    "skip": "opt-in real GPU test",
+    "at": "b4e359abbf15504233cbc363224d17940d6d76f5"
+  },
+  "ui": {
+    "playwright_passed": 269,
+    "npm_build": "passed",
+    "note": "desktop/ is unchanged between 1522ca1 and the RC"
+  },
+  "native_rust": {
+    "passed": 54,
+    "note": "Rust is unchanged since the 11.5 UI/native batch"
+  },
+  "hosted_ci": {
+    "commit": "b4e359abbf15504233cbc363224d17940d6d76f5",
+    "cpu_verification_push": "39703288416 success",
+    "cpu_verification_pr": "39703295195 success",
+    "windows_desktop_pilot_pr": "39703295204 success"
+  },
+  "upgrade_from_030": {
+    "installer_030_sha256_matches_f3": true,
+    "silent_install_030_then_040": true,
+    "uninstall_key_display_version": "0.4.0",
+    "installed_bridge_equals_build": true,
+    "main_binary_bundle_marker_bytes": 3,
+    "footer_040": true,
+    "public_settings_kept": true,
+    "saved_key_flag_kept": true,
+    "connections_show_runpod": true,
+    "deviation": "No synthetic key was saved in 0.3.0 and forget_credentials was not called: the user's real legacy RunPod key stays in Credential Manager (user decision 2026-10-21). 0.3.0 settings_save writes a secret only when present and non-empty, so only public settings were saved."
+  },
+  "native_smoke": {
+    "native_ui": true,
+    "app_version": "0.4.0",
+    "bundled_catalog": 3,
+    "dataset_registered_locally": true,
+    "dry_run": true,
+    "worker_lock_present": true,
+    "native_vault_masked": "skipped_existing_credentials",
+    "native_s3_vault_masked": "skipped_existing_credentials",
+    "training_stage_catalog": 6,
+    "ppo_guard": true,
+    "live_hf": false,
+    "modern_hf_model_registered": null,
+    "modern_hf_revision": null,
+    "native_hf_vault_masked": "skipped_existing_credentials",
+    "native_dataset_preview": true,
+    "command_navigation": true,
+    "workflow_channel": true,
+    "workflow_project_created": true,
+    "controller_absent_before": true,
+    "executor_profiles": {
+      "profile_saved": true,
+      "profile_key_masked": true,
+      "relative_key_refused": true,
+      "pasted_key_refused": true
+    },
+    "background_controller": "skipped_saved_settings",
+    "status_roundtrip_ms_median": null,
+    "flow": false,
+    "workflow_pages": [
+      "projects",
+      "profiles",
+      "runs",
+      "overview"
+    ],
+    "gpu_started": false,
+    "dataset_transferred": false,
+    "network_used": false
+  },
+  "native_smoke_flow": {
+    "background_controller": {
+      "started": true,
+      "broker_read_profile_key": true,
+      "second_start_refused": true,
+      "status_roundtrip_ms": [
+        6982,
+        7063,
+        7164,
+        6944,
+        7080
+      ],
+      "status_roundtrip_ms_median": 7063,
+      "stop_dialog_focus": true,
+      "stopped": true,
+      "profile_deleted": true
+    },
+    "flow": {
+      "run_id": "d2c658e388134f74a46d57e8ac195f4b",
+      "plan_sha256": "1d3f539d619f1bdad3146e4d2b0a5b017103aad88f15d0dd5f91d8112e673788",
+      "run_completed": true,
+      "simulation": true,
+      "controller_stopped": true
+    },
+    "network_used": false,
+    "gpu_started": false,
+    "deviation": "Run from an acceptance copy of native-smoke.mjs whose offline guard ignores only RUNPOD_API_KEY_saved (the broker never hands the legacy key to the controller, broker.rs:507); forget_credentials stays guarded. The MLflow address was blank."
+  },
+  "d21_status_roundtrip_ms": {
+    "median_under_load": 7063,
+    "under_load_samples": [
+      6982,
+      7063,
+      7164,
+      6944,
+      7080
+    ],
+    "median_idle": 3483,
+    "idle_samples": [
+      3554,
+      3441,
+      3483,
+      3438,
+      3528,
+      3538,
+      3358
+    ],
+    "decision": "Above 3 s idle. No base interval change in 0.4.0: D10 already waits max(base, 2 x last call) with one call in flight, so polls are >= 7 s apart. Follow-up: cut the one-file sidecar start time."
+  },
+  "installer_controller": {
+    "stopped_path_reinstall_exit_0": true,
+    "stopped_path_sidecar_unchanged": true,
+    "running_idle_interactive_path": "not observed (needs a person at the installer prompt)",
+    "silent_uninstall": "exit 0; files and uninstall key removed; app data kept; Credential Manager unchanged",
+    "acceptance_install_left_for_11_8": true
+  },
+  "job_object": {
+    "launcher_shell_in_job": false,
+    "app_in_job": false,
+    "started_from": "Start-Process (not Explorer)",
+    "controller_survived_window_close_60s": true,
+    "broker_killed_eof_drain_seconds": 1,
+    "drained_state": "absent, current.code stopped, stopped_at set"
+  },
+  "webview2_checklist": {
+    "M1_blank_project_korean": "pass",
+    "M2_data_import_ui": "not run in the UI (native file picker); CP949 mapped import passed in the frozen and installed verifier",
+    "M3_single_train_simulated_run": "pass through the workflow channel and controller (flow smoke); UI follow on 그래프 실행 shows it completed",
+    "M4_mock_diamond_two_and_one_destinations": "not run in the installed UI; covered by acceptance test A2 (production wiring)",
+    "M5_executor_profiles": "partial pass: save, mask, delete, relative path and pasted key refused; profile-in-use refusal not applicable offline",
+    "M6_controller_bar": "pass: start, window closed and reopened state, second start refused, stop dialog explains the drain, 정지 after it; restart banner not checked",
+    "M7_legacy_isolation": "pass",
+    "M8_escaping": "pass (rendered as text, 0 injected img elements; screenshot m8-escaping.png)",
+    "M9_tutorial": "pass: 16 steps, all anchors found with the practice done, closed at the end; the invoke hook recorded no calls, so 'no mutating call' rests on tutorial.spec.ts",
+    "M10_dialogs_focus": "partial pass: stop dialog heading focus, Esc closes, focus returns (smoke); card-list keyboard not checked",
+    "M11_ime_and_hidden_polling": "not verified (needs a person: Microsoft IME composition, minimize sampling)",
+    "M12_cli_ctrl_c": "not run (optional)"
+  },
+  "defects_found_and_fixed": [
+    "b4e359a: the one-request sidecar read stdin in the cp949 code page, so the installed app refused Hangul in workflow requests (project names). Found by the native smoke; the verifier now sends raw UTF-8 like the bridge."
+  ],
+  "nsis_toolchain": "Tauri's NSIS 3.11 bundle copied from the existing local Tauri cache (the Codex app's virtualized LocalAppData, downloaded by Tauri on 2026-10-14) after the GitHub download stalled",
+  "appdata_restore": {
+    "files_checked": 302,
+    "mismatches": 0,
+    "extra_files": 0,
+    "credential_entries_before": 1,
+    "credential_entries_after": 1
+  },
+  "gpu_started": false,
+  "paid_resources_started": false,
+  "network_used_by_app": false,
+  "institution_data_transferred": false,
+  "real_credentials_used": false,
+  "outstanding": [
+    "L1 live Hugging Face header and range checks",
+    "L2 real RunPod/BOP GPU execution (L2a, L2b)",
+    "L3 real MLflow server",
+    "Installer against a running idle controller (interactive prompt)",
+    "Microsoft IME composition and hidden-window polling in WebView2; Narrator",
+    "Clean second PC, code signing",
+    "Redirected AppData",
+    "Sidecar start time above D21's 3 s (follow-up)",
+    "Legacy single-job paths read some JSON with the locale code page (ASCII content today; follow-up)"
+  ]
+}

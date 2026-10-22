@@ -1,4 +1,5 @@
 """One common pipeline for all AIs. Durable evidence stays on the control plane."""
+import contextlib
 import json
 import threading
 import time
@@ -7,9 +8,9 @@ from pathlib import Path
 from .config import AIConfig
 from .evaluation import CommonEvaluator
 from .execution import CapacityUnavailable, ExecutionUncertain, LocalExecutor, Policy
-from .jobs import JobStore
+from .jobs import GRAPH_RESUME_REFUSED, JobStore
 from .manifest import resolve, source_hash, verify_manifest
-from .registry import Registry, canonical, digest, immutable_write
+from .registry import Registry, canonical, file_digest, immutable_write
 from .training import CanceledError, LlamaFactoryBackend, MockTrainingBackend
 
 
@@ -26,20 +27,30 @@ class Factory:
         self.store.get(job_id)
         return self.root / "jobs" / job_id
 
-    def submit(self, config, request_key=None, priority=0, simulation=True):
+    def submit(self, config, request_key=None, priority=0, simulation=True, *, server_receipt=None):
         manifest = resolve(config, self.registry, simulation=simulation)
         self.policy.check(config, manifest["dataset"])
-        job = self.store.submit(manifest, request_key or manifest["sha256"], priority)
-        directory = self.directory(job["id"])
-        immutable_write(directory / "manifest.json", canonical(manifest))
+        if server_receipt is not None:
+            from .gpu_servers import ServerApprovalReceipt
+            server_receipt = ServerApprovalReceipt.model_validate(server_receipt.model_dump()
+                if hasattr(server_receipt, "model_dump") else server_receipt)
+            server_receipt.validate_destination(manifest["sha256"], server_receipt.profile.transport, server_receipt.facts)
+            server_receipt.facts.validate_config(config)
+        job = self.store.submit(manifest, request_key or manifest["sha256"], priority, server_receipt=server_receipt)
+        self.store.materialize_job_evidence(job["id"])
         if job["status"] == "PENDING":
             self.store.transition(job["id"], "QUEUED")
         return self.store.get(job["id"])
 
     def resume(self, job_id, checkpoint=None):
         job = self.store.get(job_id)
+        if job.get("graph_run_id"):   # before the v1 manifest is read (11.5 R1 m7; the store refuses it too)
+            raise ValueError(GRAPH_RESUME_REFUSED)
         directory = self.directory(job_id)
         verify_manifest(job["manifest"])
+        from .capabilities import compatibility
+        if not compatibility(job["manifest"]["config"])["resume_supported"]:
+            raise ValueError("checkpoint resume is unsupported for this training stage/method")
         if checkpoint:
             path = Path(checkpoint).resolve()
             if not path.is_relative_to(directory / "output") or not path.is_dir():
@@ -53,12 +64,46 @@ class Factory:
 
     def work(self, executor=None, backend=None, gpu="mock-cpu", approved_transfer=False, select_mode=False, target_job_id=None):
         executor = executor or LocalExecutor()
+        if getattr(executor, "recovery_only", False):
+            raise ValueError("recovery-only executor cannot claim or launch a job")
         job = self.store.claim(gpu, self.policy.max_concurrent, self.policy.max_gpus,
-                               simulation=not executor.remote if select_mode else None, job_id=target_job_id)
+                               simulation=not executor.remote if select_mode else None, job_id=target_job_id,
+                               server_profile=getattr(executor, "server_profile", None),
+                               server_facts=getattr(executor, "server_facts", None))
         if job is None:
             return None
+        return self.run_claimed(job, executor, backend, approved_transfer)
+
+    def run_claimed(self, claimed, executor=None, backend=None, approval=False):
+        """Execute one preclaimed attempt. A takeover reconciles; it never relaunches."""
+        lease = claimed["lease"]
+        job = self.store.get(lease.job_id)
+        if job["manifest"].get("schema_version") == 2:
+            raise NotImplementedError("v2 graph execution requires the operation worker adapter")
+        executor = executor or LocalExecutor()
+        server_facts = getattr(executor, "server_facts", None)
+        try:
+            self._verify_before_launch(job, lease, executor, server_facts)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            try:
+                abandoned = self.store.abandon_unlaunched(lease, error)
+            except ValueError:
+                abandoned = False  # A newer actor owns the attempt; its lock stays untouched.
+            if abandoned:
+                # Same evidence as other failures; a started attempt's own error.txt stays intact.
+                with contextlib.suppress(OSError):
+                    directory = self.root / "jobs" / lease.job_id
+                    directory.mkdir(parents=True, exist_ok=True)
+                    (directory / "error.txt").write_text(error, encoding="utf-8")
+            raise
+        launch_id = self.store.begin_launch(lease)
+        approved_transfer = approval
+        gpu = lease.resource_id
         job_id = job["id"]
         directory = self.directory(job_id)
+        self.store.materialize_job_evidence(job_id)
+        (directory / "launch.json").write_bytes(canonical({"attempt_id": lease.attempt_id, "launch_id": launch_id}))
         manifest = job["manifest"]
         backend = backend or (MockTrainingBackend() if manifest["simulation"] else LlamaFactoryBackend())
         status, error, metrics, uncertain = "FAILED", None, {}, False
@@ -66,7 +111,10 @@ class Factory:
 
         def heartbeat():
             while not stop_heartbeat.wait(10):
-                self.store.heartbeat(job_id)
+                try:
+                    self.store.heartbeat(lease)
+                except ValueError:
+                    return  # Actor ownership changed; subsequent mutations remain fenced.
 
         thread = threading.Thread(target=heartbeat, daemon=True)
         thread.start()
@@ -83,39 +131,44 @@ class Factory:
             if not manifest["simulation"] and not executor.remote:
                 raise ValueError("real training requires the approved RunPod executor")
             dataset = self.registry.get_dataset(config.dataset_id, config.dataset_version)
-            self.policy.check(config, dataset, execute=executor.remote, approved_transfer=approved_transfer)
+            self.policy.check(config, dataset, execute=executor.remote, approved_transfer=approved_transfer,
+                              server_facts=server_facts)
             executor.validate_config(config)
             if dataset != manifest["dataset"]:
                 raise ValueError("dataset registration differs from manifest")
             if self.tracker:
                 run_id = self.tracker.start(job_id, manifest)
-                self.store.set_run_id(job_id, run_id)
+                self.store.set_run_id(lease, run_id)
             backend.prepare(config, directory, self.registry.dataset_path(dataset).read_bytes())
             validation = manifest.get("validation_dataset")
             if validation:
                 actual = self.registry.get_dataset(validation["dataset_id"], validation["version"])
                 if actual != validation:
                     raise ValueError("validation data differs from immutable manifest")
-                self.policy.check(config, actual, execute=executor.remote, approved_transfer=approved_transfer)
-                backend.prepare_validation(directory, self.registry.dataset_path(actual).read_bytes())
+                self.policy.check(config, actual, execute=executor.remote, approved_transfer=approved_transfer,
+                                  server_facts=server_facts)
+                validation_kind = "preference" if config.evaluation_profile.kind == "reward" else "instruction"
+                backend.prepare_validation(directory, self.registry.dataset_path(actual).read_bytes(), kind=validation_kind)
             if getattr(executor, "pod", None):
                 pod = executor.pod
                 (directory / "execution.json").write_bytes(canonical({
                     "pod_id": gpu, "gpu": pod["gpu"], "image": pod.get("image"),
                     "cost_per_hour_usd": float(pod["costPerHr"]),
                     "network_volume": pod["networkVolume"]["id"]}))
+            elif server_facts is not None:
+                (directory / "execution.json").write_bytes(canonical(server_facts.model_dump(mode="json")))
             # Remove markers from an earlier attempt, without touching its output/checkpoints.
             for name in ("result.json", "cancel", "error.txt", "tracking-error.txt"):
                 (directory / name).unlink(missing_ok=True)
             checkpoint = None
             if (directory / "resume.json").exists():
                 checkpoint = directory / json.loads((directory / "resume.json").read_text())["checkpoint"]
-            self.store.transition(job_id, "RUNNING")
+            self.store.transition(lease, "RUNNING")
             executor.run(backend, directory, config.resource_profile.timeout_seconds,
-                         lambda: bool(self.store.get(job_id)["cancel_requested"]), checkpoint)
+                         lambda: bool(self.store.get(job_id)["cancel_requested"]), checkpoint, launch_id=launch_id)
             if self.store.get(job_id)["cancel_requested"]:
                 raise CanceledError("cancellation requested")
-            self.store.transition(job_id, "EVALUATING")
+            self.store.transition(lease, "EVALUATING")
             metrics, quality = self.evaluate(directory, config, manifest["simulation"],
                                              (manifest.get("validation_dataset") or {}).get("sha256"))
             if dataset.get("synthetic") or (manifest.get("validation_dataset") or {}).get("synthetic"):
@@ -151,27 +204,40 @@ class Factory:
                     self.tracker.finish(run_id, metrics, directory, status, error)
                     if status == "COMPLETED" and not manifest["simulation"] and not manifest["dataset"].get("synthetic"):
                         quality = json.loads((directory / "evaluation.json").read_text())
-                        self.tracker.register_candidate(run_id, manifest, quality["quality_status"] == "qualified")
+                        self.tracker.register_candidate(run_id, manifest, quality["quality_status"] == "qualified",
+                                                       attempt_id=lease.attempt_id)
                 except Exception as exc:
                     (directory / "tracking-error.txt").write_text(str(exc), encoding="utf-8")
                     status, error = "FAILED", "MLflow persistence failed; training artifacts retained; see tracking-error.txt"
             # Preserve attempt evidence before any retry/resume overwrites live logs.
             archive = directory / "attempts" / str(job["attempts"])
             archive.mkdir(parents=True, exist_ok=True)
-            for name in ("train.log", "train.yaml", "error.txt", "evaluation.json", "tracking-error.txt", "runtime.json", "execution.json"):
+            for name in ("train.log", "train.yaml", "error.txt", "evaluation.json", "tracking-error.txt", "runtime.json", "execution.json",
+                         "launch.json", "remote-attempt.json", "remote-result.json", "remote-artifacts.json"):
                 if (directory / name).is_file():
                     (archive / name).write_bytes((directory / name).read_bytes())
             (archive / "outcome.json").write_bytes(canonical({"status": status, "error": error,
                                                              "run_id": run_id, "timestamp": time.time()}))
             try:
-                self.store.transition(job_id, status, error)
+                self.store.transition(lease, status, error)
                 if status == "RETRYING":
-                    self.store.transition(job_id, "QUEUED", error)
+                    self.store.transition(lease, "QUEUED", error)
             finally:
                 if not uncertain:
-                    self.store.release_gpu(job_id)
+                    self.store.release_gpu(lease, execution_stopped=True)
                 backend.cleanup(directory)
         return self.store.get(job_id)
+
+    def _verify_before_launch(self, job, lease, executor, server_facts):
+        if getattr(executor, "recovery_only", False):
+            raise ValueError("recovery-only executor cannot launch a job")
+        if server_facts is not None:
+            self.store.verify_server_destination(job['id'], executor.server_profile, server_facts)
+            if lease.resource_id != server_facts.exclusivity_key:
+                raise ValueError("attempt resource differs from verified destination")
+            executor.validate_config(AIConfig.model_validate(job['manifest']['config']))
+        elif self.store.server_receipt(job['id']) is not None:
+            raise ValueError("original SSH server destination executor required")
 
     @staticmethod
     def evaluate(directory, config, simulation, validation_sha=None):
@@ -180,6 +246,17 @@ class Factory:
         evaluator = CommonEvaluator()
         profile = config.evaluation_profile
         predictions = directory / "output" / "predictions.json"
+        reward_metrics = directory / "output" / "reward_metrics.json"
+        if not simulation and profile.kind == "reward" and reward_metrics.is_file() and validation_sha:
+            data = json.loads(reward_metrics.read_text())
+            if data.get("validation_sha256") != validation_sha:
+                raise ValueError("reward metrics do not match registered validation data")
+            metrics.update({key: value for key, value in data["metrics"].items()
+                            if key in {"eval_accuracy", "eval_loss"}})
+            quality_status = "measured"
+            if profile.thresholds:
+                quality_status = "qualified" if all(key in metrics and metrics[key] >= value
+                                                    for key, value in profile.thresholds.items()) else "below_threshold"
         if not simulation and predictions.is_file() and profile.kind != "pipeline" and validation_sha:
             data = json.loads(predictions.read_text())
             if data.get("validation_sha256") != validation_sha:
@@ -196,6 +273,7 @@ class Factory:
                                 if isinstance(v, (int, float)) and k in {"train_loss", "eval_loss", "train_runtime"}})
         evaluator.summarize_metrics(metrics)
         return metrics, {"simulation": simulation, "metrics": metrics, "quality_status": quality_status,
+                         "training_stage": config.training_stage,
                          "training_success": True, "approval": "pending",
                          "note": "No task quality measured without actual model predictions and supplied criteria."}
 
@@ -204,7 +282,7 @@ class Factory:
         hashes = json.loads((directory / "artifacts.json").read_text())
         for name, expected in hashes.items():
             path = (directory / name).resolve()
-            if not path.is_relative_to(directory) or digest(path.read_bytes()) != expected:
+            if not path.is_relative_to(directory) or file_digest(path) != expected:
                 raise ValueError("artifact hash mismatch")
         return hashes
 
@@ -212,9 +290,17 @@ class Factory:
         job = self.store.get(job_id)
         if job["status"] != "FAILED":
             raise ValueError("recover stale active jobs before reconciling; only FAILED jobs are eligible")
+        lease = self.store.current_lease(job_id)
         manifest = job["manifest"]
         verify_manifest(manifest)
         directory = self.directory(job_id)
+        with self.store.connection() as db:
+            attempt = self.store.validate_lease(db, lease)
+        receipt_path = directory / "remote-attempt.json"
+        if attempt["launch_id"] and receipt_path.is_file():
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if receipt.get("remote_path", "").rsplit("/", 1)[-1] != attempt["launch_id"]:
+                raise ValueError("remote receipt differs from current immutable launch identity")
         result = executor.collect_result(directory)
         if result is None:
             return job
@@ -233,7 +319,8 @@ class Factory:
         if self.tracker and job["run_id"]:
             self.tracker.finish(job["run_id"], metrics, directory, status, error)
             if status == "COMPLETED" and not manifest["simulation"] and not manifest["dataset"].get("synthetic"):
-                self.tracker.register_candidate(job["run_id"], manifest, quality["quality_status"] == "qualified")
-        self.store.reconcile_result(job_id, status, error)
+                self.tracker.register_candidate(job["run_id"], manifest, quality["quality_status"] == "qualified",
+                                               attempt_id=lease.attempt_id)
+        self.store.reconcile_result(lease, status, error)
         (directory / "reconciliation.json").write_bytes(canonical({"status": status, "run_id": job["run_id"], "at": time.time()}))
         return self.store.get(job_id)

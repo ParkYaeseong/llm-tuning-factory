@@ -1,6 +1,14 @@
 type Obj = Record<string, any>;
 export const escapeHtml = (v: unknown) => String(v ?? "").replace(/[&<>"']/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
+/** A user-provided name inside a sentence, escaped and isolated from the text around it (`<bdi>`: a right-to-left
+ * override or a right-to-left name cannot reorder the rest of the sentence). */
+export const isolate = (name: unknown) => `<bdi>${escapeHtml(name)}</bdi>`;
+/** Unicode format characters (category Cf: zero-width spaces and joiners, bidi controls, soft hyphens, BOM), which
+ * render as nothing or reorder text. */
+const FORMAT_CHARACTERS = /\p{Cf}/gu;
+/** A name as it can be typed: NFC, trimmed, without format characters (a typed confirmation compares this on both sides). */
+export const typedForm = (name: string) => name.replace(FORMAT_CHARACTERS, "").normalize("NFC").trim();
 const paths: Record<string, string> = {
   overview: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
   training: '<path d="M9 3h6m-5 0v6L4 19a1.5 1.5 0 0 0 1.3 2h13.4A1.5 1.5 0 0 0 20 19L14 9V3M7 14h10"/>',
@@ -15,10 +23,25 @@ const paths: Record<string, string> = {
   file: '<path d="M14 2H5v20h14V7zM14 2v6h5M8 13h8M8 17h5"/>',
   chevron: '<path d="m9 5 7 7-7 7"/>',
   folder: '<path d="M3 6V4h6l2 3h10v13H3z"/>',
+  tutorial: '<circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2.2 4.8-4.8 2.2 2.2-4.8z"/>',
+  projects: '<path d="M3 7V5h7l2 2h9v12H3z"/><path d="M8 13h8M8 16h5"/>',
+  recipes: '<path d="M6 3h12v18H6z"/><path d="M9 8h6M9 12h6M9 16h3"/>',
+  runs: '<circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M8.5 6H12v12H8.5M12 12h3.5"/>',
+  profiles: '<rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="13" width="18" height="7" rx="1.5"/><path d="M7 7.5h.01M7 16.5h.01"/>',
 };
 export function icon(name: string, size = 16) {
   return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.file}</svg>`;
 }
+/** A labelled input. `label` and `help` are fixed markup (not escaped); the value is escaped. */
+export function field(label: string, key: string, value: unknown = "", type = "text", help = "") {
+  return `<label class="field"><span>${label}</span><input aria-label="${escapeHtml(label)}" data-key="${key}" type="${type}" value="${escapeHtml(value)}" ${type === "password" ? 'autocomplete="new-password"' : ""}>${help ? `<small>${help}</small>` : ""}</label>`;
+}
+/** A labelled select. `label` is fixed markup; option IDs and titles are escaped. */
+export function select(label: string, key: string, value: string, options: [string, string][]) {
+  return `<label class="field"><span>${label}</span><select aria-label="${escapeHtml(label)}" data-key="${key}">${options.map(([id, title]) => `<option value="${escapeHtml(id)}" ${id === String(value ?? "") ? "selected" : ""}>${escapeHtml(title)}</option>`).join("")}</select></label>`;
+}
+export const button = (label: string, action: string, cls = "", disabled = false) =>
+  `<button type="button" class="${cls}" data-action="${escapeHtml(action)}"${disabled ? " disabled" : ""}>${label}</button>`;
 export function formatDate(seconds: unknown) {
   return typeof seconds === "number" ? new Date(seconds * 1000).toLocaleString("ko-KR", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
 }
@@ -43,4 +66,122 @@ export function progressView(progress: Obj | null) {
   return `<div class="progress-summary"><div><small>진행 단계</small><b>${number(progress.current_step)} <span>/ ${number(progress.total_steps)}</span></b></div><div><small>최근 train loss</small><b>${number(progress.loss)}</b></div><div><small>경과 시간</small><b>${escapeHtml(progress.elapsed_time || "—")}</b></div><div><small>남은 시간 · 엔진 추정</small><b>${escapeHtml(progress.remaining_time || "—")}</b></div></div>
   ${progress.percent !== null && progress.percent !== undefined ? `<progress max="100" value="${Number(progress.percent)}" aria-label="학습 진행률"></progress>` : ""}
   ${chart}<div class="chart-caption">LLaMA-Factory 원본 학습 로그 · 최대 200개 지점 · 업무 품질 점수가 아닙니다</div>`;
+}
+
+/** Graph-owned jobs (D15): a `graph_run_id`, or a manifest without the v1 `config`. Legacy lists never show them. */
+export const isGraphJob = (job: Obj) => Boolean(job?.graph_run_id) || !job?.manifest?.config;
+
+/** What identifies a focusable control across re-renders: `data-focus-key`, else `data-action`, else `id`. */
+export function focusKey(element: Element | null): string | null {
+  if (!(element instanceof HTMLElement)) return null;
+  return element.dataset.focusKey ?? element.dataset.action ?? (element.id || null);
+}
+
+/** The controls under `root` that a focus key names: by `data-focus-key`, else `data-action`, else `id`. */
+export function focusMatches(root: ParentNode, key: string): HTMLElement[] {
+  const quoted = CSS.escape(key);
+  for (const selector of [`[data-focus-key="${quoted}"]`, `[data-action="${quoted}"]`, `#${quoted}`]) {
+    const found = [...root.querySelectorAll<HTMLElement>(selector)];
+    if (found.length) return found;
+  }
+  return [];
+}
+
+/** Focuses the element under `root` that `focusKey` named before a re-render (no scrolling); for the whole document
+ * the page content (`#app main`) is searched first, so the sidebar never wins over the page. */
+export function restoreFocus(root: ParentNode, key: string | null): void {
+  if (!key) return;
+  const scopes = root === document ? [document.querySelector("#app main"), document] : [root];
+  for (const scope of scopes) {
+    const target = scope ? focusMatches(scope, key)[0] : undefined;
+    if (target) { target.focus({ preventScroll: true }); return; }
+  }
+}
+
+/** The text of an error for the user: its message, never an "Error: " or "BridgeError: " prefix. */
+export const errorText = (error: unknown) => error instanceof Error ? error.message || error.name : String(error);
+
+/** After a dialog closes on a click, its repetition within 400 ms is swallowed so it never activates what was underneath:
+ * for a pointer close, a pointer click at the same spot (8 px for a mouse, 24 px for touch and pen); for a keyboard close
+ * (`detail` 0), a keyboard activation of the control the focus was returned to — other keyboard activations pass.
+ * A click inside a dialog opened since (the closed one is removed from the page) is meant for that dialog and passes. */
+function swallowRepeat(origin: MouseEvent, returnedTo: Element | null) {
+  const until = performance.now() + 400;
+  const types = ["mousedown", "click", "dblclick"];
+  const keyboard = origin.detail === 0;
+  const pointerType = (origin as PointerEvent).pointerType;
+  const radius = pointerType === "touch" || pointerType === "pen" ? 24 : 8;
+  const swallow = (event: Event) => {
+    const mouse = event as MouseEvent;
+    if (performance.now() > until) { stop(); return; }
+    if (event.target instanceof Element && event.target.closest("dialog[open]")) return;
+    const repeat = keyboard
+      ? mouse.detail === 0 && returnedTo !== null && event.target instanceof Node && returnedTo.contains(event.target)
+      : mouse.detail !== 0 && Math.abs(mouse.clientX - origin.clientX) <= radius && Math.abs(mouse.clientY - origin.clientY) <= radius;
+    if (repeat) { event.preventDefault(); event.stopImmediatePropagation(); }
+  };
+  const stop = () => types.forEach(type => window.removeEventListener(type, swallow, true));
+  types.forEach(type => window.addEventListener(type, swallow, true));
+  setTimeout(stop, 450);
+}
+
+/** A state pill (not a `.badge`): semantic colour for real states only. */
+export function statusPill(kind: "neutral" | "good" | "warn" | "bad", text: string): string {
+  return `<span class="status-pill ${kind}">${escapeHtml(text)}</span>`;
+}
+
+export interface DialogSpec {
+  title: string; bodyHtml: string;                               // caller escapes dynamic parts
+  checks?: { id: string; label: string }[];
+  actions: { id: string; label: string; primary?: boolean; requires?: string[] }[];
+}
+let dialogs = 0;
+
+/**
+ * A modal `<dialog>` appended to `body`. Resolves null (and opens nothing) when a dialog is already open, and on Esc.
+ * The heading takes focus; an action that requires checks stays disabled until they are all checked; the first
+ * activation disables every action; on close, focus returns to the control that was focused before opening, and the
+ * rest of a double click or a repeated Enter at the same spot is swallowed for 400 ms (`swallowRepeat`).
+ */
+export function openDialog(spec: DialogSpec): Promise<{ action: string; checked: string[] } | null> {
+  if (document.querySelector("dialog[open]")) return Promise.resolve(null);
+  const opener = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
+  const openerKey = focusKey(opener);
+  const titleId = `wf-dialog-title-${++dialogs}`;
+  const dialog = document.createElement("dialog");
+  dialog.className = "wf-dialog";
+  dialog.setAttribute("aria-labelledby", titleId);
+  dialog.innerHTML = `<h2 id="${titleId}" tabindex="-1">${escapeHtml(spec.title)}</h2><div class="wf-dialog-body">${spec.bodyHtml}</div>
+    ${(spec.checks ?? []).map(check => `<label class="check"><input type="checkbox" data-dialog-check="${escapeHtml(check.id)}">${escapeHtml(check.label)}</label>`).join("")}
+    <div class="actions">${spec.actions.map(item => `<button type="button" class="${item.primary ? "primary" : ""}" data-dialog-action="${escapeHtml(item.id)}">${escapeHtml(item.label)}</button>`).join("")}</div>`;
+  document.body.append(dialog);
+  const checks = [...dialog.querySelectorAll<HTMLInputElement>("[data-dialog-check]")];
+  const buttons = [...dialog.querySelectorAll<HTMLButtonElement>("[data-dialog-action]")];
+  const checked = () => checks.filter(input => input.checked).map(input => input.dataset.dialogCheck!);
+  const update = () => buttons.forEach((button, index) => {
+    const requires = spec.actions[index].requires ?? [];
+    button.disabled = !requires.every(id => checked().includes(id));
+  });
+  update();
+  dialog.showModal();
+  dialog.querySelector<HTMLElement>(`#${titleId}`)!.focus();
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (result: { action: string; checked: string[] } | null) => {
+      if (settled) return;
+      settled = true;
+      buttons.forEach(button => button.disabled = true);
+      dialog.close(); dialog.remove();
+      if (opener?.isConnected) opener.focus({ preventScroll: true });
+      else restoreFocus(document, openerKey);
+      resolve(result);
+    };
+    checks.forEach(input => input.addEventListener("change", update));
+    buttons.forEach((button, index) => button.addEventListener("click", event => {
+      if (button.disabled) return;
+      finish({ action: spec.actions[index].id, checked: checked() });
+      swallowRepeat(event, document.activeElement);   // finish() has returned the focus to the opener
+    }));
+    dialog.addEventListener("cancel", event => { event.preventDefault(); finish(null); });
+  });
 }

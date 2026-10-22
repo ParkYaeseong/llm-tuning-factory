@@ -1,0 +1,76 @@
+/* Plan panel and approval dialog (10.6): bright and restrained, one accent, semantic colours only for real states. */
+.plan-panel{padding:20px 22px}
+.plan-panel h4{font-size:12px;font-weight:600;color:#4b5361;margin:0 0 8px}
+.plan-lead{margin:-10px 0 16px}
+.plan-grid{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:22px;align-items:start}
+.plan-column{display:grid;gap:16px;min-width:0}
+.plan-fieldset{border:0;margin:0;padding:0;min-width:0;display:grid;gap:14px}
+.plan-mode{border:1px solid var(--line);border-radius:6px;padding:10px 12px;margin:0;display:grid;gap:2px}
+.plan-mode legend{font-size:11px;font-weight:550;color:#555d6b;padding:0 4px}
+.plan-mode .check{margin:6px 0 0}
+.plan-mode input[type=radio]{width:14px;height:14px;min-height:0;padding:0;margin:0;border:0;flex:none;accent-color:#5d70c4}
+.plan-mode small{font-size:10px;line-height:1.6;color:var(--muted);padding-left:23px}
+.plan-limits{width:100%;border-collapse:collapse;font-size:11px}
+.plan-limits caption{text-align:left;font-size:11px;font-weight:550;color:#555d6b;padding-bottom:6px}
+.plan-limits th,.plan-limits td{padding:6px 8px 6px 0;border-top:1px solid #eff1f4;text-align:left;vertical-align:top}
+.plan-limits thead th{border-top:0;font-weight:500;color:var(--muted);font-size:10px}
+.plan-limits th[scope=row]{background:none;font-weight:400}
+.plan-limits th[scope=row] span{display:block;overflow-wrap:anywhere;font-weight:500;color:#4b5361}
+.plan-limits th[scope=row] small{display:block;font-size:10px;font-weight:400}
+.plan-limits input{max-width:120px;min-height:30px;padding:5px 8px}
+.plan-limits input[aria-invalid=true]{border-color:#e2b8b0}
+.plan-limits .issue-list{margin:6px 0 0}
+.plan-estimates,.plan-resources,.plan-tracking,.plan-datasets,.plan-graph-issues{border-top:1px solid #eff1f4;padding-top:12px}
+.plan-estimates .actions,.plan-resources .actions,.plan-datasets .actions{margin-top:8px}
+.plan-estimate-list,.plan-profile-list{list-style:none;margin:0;padding:0;display:grid;gap:8px}
+.plan-estimate,.plan-profile{border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:11px;overflow-wrap:anywhere}
+.plan-estimate{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 8px;align-items:start}
+.plan-estimate>.issue-list,.plan-estimate>.plan-warnings{grid-column:1/-1}
+.plan-estimate small,.plan-profile small{display:block;font-size:10px;color:var(--muted);margin-top:2px}
+.plan-estimate:focus-visible,.plan-summary h4:focus-visible{outline:2px solid #7d8ddd;outline-offset:2px}
+.plan-estimate:focus:not(:focus-visible),.plan-summary h4:focus:not(:focus-visible){outline:none}
+.plan-profile .status-pill{margin-left:4px;font-size:10px;padding:1px 7px}
+.plan-profile .issue-list,.plan-warnings{margin:6px 0 0}
+.plan-warnings{padding:0 0 0 18px;font-size:11px;line-height:1.7;color:#8f6420}
+.plan-warnings details{margin:2px 0 0}
+.plan-warnings summary{font-size:10px}
+.plan-estimate-form{border:1px solid #e3e7f3;background:#f9fafd;border-radius:6px;padding:12px 14px}
+.plan-estimate-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 14px}
+.plan-prefixed{display:flex;align-items:center;gap:6px}
+.plan-prefixed .mono{color:var(--muted)}
+.plan-estimate-form .actions{margin-top:10px}
+.plan-estimate-form .issue-list{margin:10px 0 0}
+.plan-tracking p{margin:0;font-size:11px}
+.plan-uri{font-family:'Cascadia Code',Consolas,monospace;font-size:10px;overflow-wrap:anywhere}
+.plan-hint{font-size:11px;line-height:1.7;color:#8f6420;margin:8px 0 0}
+.plan-actions{border-top:1px solid var(--line);margin-top:18px;padding-top:14px}
+.plan-actions .actions{margin-top:8px}
+.plan-blockers ul{margin:0;padding:0 0 0 18px;font-size:11px;line-height:1.7;color:#8f6420}
+.plan-note{margin:6px 0 0}
+.plan-result:not(:empty){margin-top:14px}
+.plan-summary{border:1px solid #dfe4f6;border-left:3px solid #7789cd;border-radius:8px;padding:14px 16px;background:#fff}
+.plan-summary-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
+.plan-summary-head h4{margin:0;font-size:13px}
+.plan-totals{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 10px}
+.plan-totals>div{background:#f7f8fa;border:1px solid #eff1f5;border-radius:5px;padding:8px 10px;min-width:0}
+.plan-totals dt{font-size:10px;color:var(--muted)}
+.plan-totals dd{margin:4px 0 0;font-size:12px;font-weight:550;color:#4a5361;overflow-wrap:anywhere}
+.plan-totals dd small{display:block;font-size:10px;font-weight:400;line-height:1.5;margin-top:3px}
+.plan-steps{margin:0;padding:0 0 0 18px;font-size:11px;line-height:1.8;color:#5f6775;overflow-wrap:anywhere}
+.plan-wait{display:inline-block;margin-left:4px;padding:0 6px;border:1px dashed #c9cfdf;border-radius:4px;font-size:10px;color:#5d6573}
+.plan-submitted{font-size:11px;color:#3f7a55;margin:10px 0 0}
+.plan-summary .actions{margin-top:12px}
+.plan-summary>.muted{margin:6px 0 0}
+.plan-summary .issue-list{margin:10px 0 0}
+/* the approval dialog body */
+.wf-dialog:has(.plan-approval){width:min(780px,calc(100vw - 48px))}
+.plan-approval h3{font-size:12px;margin:14px 0 6px}
+.plan-approval-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.plan-hash .mono{overflow-wrap:anywhere}
+.plan-table-wrap{overflow-x:auto}
+.plan-table{width:100%;border-collapse:collapse;font-size:11px}
+.plan-table th,.plan-table td{padding:6px 8px 6px 0;border-top:1px solid #eff1f4;text-align:left;vertical-align:top;overflow-wrap:anywhere}
+.plan-table thead th{border-top:0;font-weight:500;color:var(--muted);font-size:10px}
+.plan-table td small{display:block;font-size:10px;color:var(--muted)}
+.plan-waiting{margin:0;padding:0 0 0 18px;font-size:11px}
+@media (max-width:1100px){.plan-grid{grid-template-columns:minmax(0,1fr)}.plan-totals{grid-template-columns:repeat(2,minmax(0,1fr))}}

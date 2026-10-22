@@ -6,8 +6,15 @@ on:
       - 'desktop/**'
       - 'src/**'
       - 'scripts/build_desktop.py'
+      - 'scripts/pyinstaller-hooks/**'
       - 'scripts/desktop_entry.py'
       - 'scripts/verify_desktop_package.py'
+      - 'scripts/seed_acceptance_root.py'
+      - 'examples/**'
+      - 'configs/ai/**'
+      - 'containers/gpu*.lock'
+      - 'pyproject.toml'
+      - 'uv.lock'
       - '.github/workflows/windows-desktop.yml'
 permissions:
   contents: read
@@ -32,7 +39,7 @@ jobs:
           toolchain: '1.99.0'
       - run: uv sync --python 3.12 --extra dev --extra tracking --locked
       - run: uv run pytest
-      - run: uv run ruff check src tests
+      - run: uv run ruff check src tests scripts
       - run: uv run python scripts/build_desktop.py
       - run: uv run python scripts/verify_desktop_package.py
       - run: npm ci

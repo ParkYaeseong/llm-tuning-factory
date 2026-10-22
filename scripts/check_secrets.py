@@ -32,7 +32,9 @@ def main():
             continue
         for line in path.read_text(encoding="utf-8-sig").splitlines():
             match = re.fullmatch(r"\s*(?:export )?(RUNPOD_API_KEY|MLFLOW_OIDC_CLIENT_SECRET|"
-                                 r"MLFLOW_TRACKING_TOKEN|Client_Secret)\s*[:=]\s*(.*?)\s*", line)
+                                 r"MLFLOW_TRACKING_TOKEN|Client_Secret|S3_ACCESS_KEY_ID|S3_SECRET_ACCESS_KEY|"
+                                 r"S3_SESSION_TOKEN|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|HF_TOKEN|"
+                                 r"HUGGING_FACE_HUB_TOKEN)\s*[:=]\s*(.*?)\s*", line)
             if match:
                 value = match[2].strip("\"'")
                 if len(value) >= 8:

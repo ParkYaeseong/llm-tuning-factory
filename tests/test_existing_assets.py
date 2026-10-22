@@ -49,6 +49,26 @@ def test_keycloak_token_refresh_contract(monkeypatch):
     monkeypatch.delenv("MLFLOW_TRACKING_TOKEN")
 
 
+@pytest.mark.parametrize("client_id,client_secret", [(None, "fixture-secret"), ("mlflow", None),
+                                                     ("mlflow", ""), ("", "fixture-secret")])
+def test_oidc_without_client_credentials_reports_a_clear_error(monkeypatch, client_id, client_secret):
+    from tuning_factory import auth
+
+    monkeypatch.setattr(auth, "OIDCTokenRefresher", lambda *a, **kw: pytest.fail("token request attempted"))
+    monkeypatch.setenv("MLFLOW_OIDC_TOKEN_URL", "https://sso.example/token")
+    for key, value in (("MLFLOW_OIDC_CLIENT_ID", client_id), ("MLFLOW_OIDC_CLIENT_SECRET", client_secret)):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError) as error:
+        auth.configure_oidc()
+    assert str(error.value) == ("OIDC 인증을 선택했지만 클라이언트 인증값이 없습니다. "
+                                "인증값을 입력하거나 토큰·OIDC 값을 비우세요(앱에서는 ‘인증 없음’ 선택).")
+    monkeypatch.delenv("MLFLOW_OIDC_TOKEN_URL")
+    assert auth.configure_oidc() is None
+
+
 def test_reused_kbf_partial_credit_is_explicitly_distinct_from_json_validity():
     ev = CommonEvaluator()
     reference = '{"name":"Sample","catalog_id":"UO1"}'
