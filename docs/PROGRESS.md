@@ -6500,6 +6500,90 @@ model_artifacts,controller_entry}.py`) and this file.
   - the 11.6 installer acceptance.
 - No GPU, paid resource, network data or real credential was used.
 
+## Task 11.6 installer acceptance on this PC, 2026-10-22
+
+Receipt: [`docs/acceptance/2026-10-22-desktop-040.json`](acceptance/2026-10-22-desktop-040.json).
+
+**After `bc3cb39`, before the acceptance.**
+- Hosted CI on `bc3cb39`: the Windows desktop pilot succeeded (39575435511), but the ubuntu CPU job failed.
+  - Cause: `posixpath.abspath` prefixed a `\\?\` test name, so `0d5cc13` judges such a name before making it absolute.
+- `91b7bdc` adds `scripts` to the lint command in AGENTS.md. The user approved this on 2026-10-21.
+
+**User decisions for the acceptance.**
+- The app data on this PC already held a real legacy RunPod key in Credential Manager, `FACTORY_OPERATOR`, an MLflow
+  address and a tutorial registration. The user chose: back up, accept, restore, and never write or forget the key.
+- Both app-data folders were snapshotted and hashed (302 files), then moved aside, so the acceptance ran on a fresh
+  state.
+
+**Defect found and fixed: `b4e359a`.**
+- The installed app refused a Hangul project name ("unable to parse raw data as a unicode string").
+- Cause: the Rust bridge writes raw UTF-8 JSON, while the one-request sidecar read stdin as text in the cp949 code page.
+  Every earlier check sent ASCII-escaped JSON.
+- Fix: the request line is now decoded from stdin's byte buffer as UTF-8.
+- The verifier now sends raw UTF-8 like the bridge. Against the old sidecar it fails with the app's error, and against
+  the fixed one it passes.
+- A subprocess test with `PYTHONIOENCODING=cp949` reproduces the code page on any OS.
+- The legacy single-job paths still read some JSON with the locale code page. Their content is ASCII today; this is a
+  follow-up.
+
+**Release candidate `b4e359a`.**
+
+| Check | Result |
+|---|---|
+| `pytest` | 1931 passed, 1 skipped |
+| CPU acceptance | 29/29; source `2d8b667c…`, which equals the frozen receipt |
+| Frozen sidecar | SHA256 `98f996f9…5023`; verifier: all 23 checks true, `gpu_started: false` |
+| Installer | `LLM.Tuning.Factory_0.4.0_x64-setup.exe`, 48,200,394 bytes, SHA256 `ac6f2e25…7c02`; the `.sha256` file is one LF line |
+| Hosted CI | all success: CPU verification push 39703288416 and PR 39703295195, Windows desktop pilot 39703295204 |
+
+The NSIS 3.11 toolchain was copied from the existing local Tauri cache after the GitHub download stalled.
+
+**Installed-app results.**
+- **Upgrade from 0.3.0.** The 0.3.0 installer matches F3. A silent install of 0.3.0, then 0.4.0, into
+  `dist\desktop-acceptance-040\app` gives `DisplayVersion 0.4.0`.
+  - The installed bridge equals the build, and the main binary differs only by the 3-byte bundle marker.
+  - The 0.4.0 footer shows, and both public settings and the saved-key flag carried over.
+  - Only public settings were saved in 0.3.0, because its `settings_save` writes only non-empty secrets.
+- **Native smoke.** It passed with no network or GPU, and the Hangul project was created.
+  - The vault sections skipped because the key exists.
+- **Background controller and flow.** These ran from an acceptance copy of the smoke whose offline guard ignores only
+  `RUNPOD_API_KEY_saved`. The broker never hands the legacy key to the controller (`broker.rs:507`), and `forget` stays
+  guarded.
+  - The controller started and the broker read the synthetic profile key.
+  - A second start was refused, and the stop dialog handled focus correctly.
+  - The controller stopped, and a simulated train → evaluate run completed through it.
+- **Installed sidecar.** The verifier passed on it (arguments, workflow channel, controller).
+- **D21 status round trip.** The median was 3483 ms idle and 7063 ms under load.
+  - No base interval change in 0.4.0: D10 already waits max(base, 2 × last call) with one call in flight.
+  - Follow-up: reduce the one-file sidecar start time. WINDOWS_APP now states the 3–4 s per action.
+- **Job object and EOF.**
+  - The shell and the app are not in a job.
+  - The controller survived the window close for 60 s.
+  - After the broker was killed, the sidecar drained in about 1 s: state `absent`, `code: stopped`.
+- **Installer and controller.**
+  - Stopped path: the reinstall exited 0 and left the sidecar unchanged.
+  - A silent uninstall removed the files and the uninstall key and kept the app data and the credential entry.
+  - The running-idle interactive installer path was not observed; it needs a person at the prompt.
+- **UI checks.**
+  - M1 blank Korean project: pass.
+  - M7 legacy pages: pass.
+  - M8 escaping: pass (screenshot).
+  - M9 tutorial: all 16 steps and anchors found with the practice done. The invoke hook recorded no calls, so
+    "no mutating call" rests on `tutorial.spec.ts`.
+  - M5, M6 and M10: partial, as listed in the receipt.
+  - Not run or not verified: M2 (native file picker), M4 (in the UI), M11 (IME and hidden-window polling) and M12
+    (optional).
+- **Restore.** The original app data was moved back. All 302 files are byte-identical to the snapshot with no extra
+  files, and the credential count is 1 before and after.
+- **Left in place.** The acceptance install (0.4.0 at `b4e359a`) stays for 11.8. The user's earlier copy in
+  `dist\desktop-acceptance-030` was built from `4877791` and lacks the 11.5 fixes and `b4e359a`.
+
+**Still outstanding.**
+- L1–L3.
+- The running-idle interactive installer path.
+- IME, hidden-window polling and Narrator.
+- A clean second PC, code signing and redirected AppData.
+
 ## Windows workbench refinement — 0.2.1
 
 User selected the light Linear/Vercel direction after requesting getdesign.md references and similar open-source
