@@ -181,7 +181,8 @@
   - `GPUIncompatible`(`incompatible`): 이 GPU 세대를 환경이 지원하지 않는다.
 - 확인 코드는 `torch.cuda.device_count()`를 `devices`로 보고하고(이전의 assert 대신), 결과 줄 앞에 `TF_PROBE `를 붙인다.
   뒤에 다른 출력이 붙어도 그 줄을 찾아 해석한다.
-- `(torch.ones(8, device="cuda") * 2).sum().item() == 16`(`kernel_ok`). 세대 불일치는 여기서 확정된다.
+- `(torch.ones(8, device="cuda") * 2).sum().item() == 16`(`kernel_ok`). 세대 지원은 `arch_ok`로 판정하고,
+  세대는 지원하는데 연산이 실패하면 GPU 사용 중·오류(`GPUUnavailable`)로 본다.
 - `torch.cuda.is_bf16_supported()`를 기록한다. 실행 판정에서 작업 정밀도와 비교한다.
 
 이 함수는 그래프 실행과 CLI도 쓰므로, 모든 경로에서 호환되지 않는 GPU의 학습 시작을 막는다.

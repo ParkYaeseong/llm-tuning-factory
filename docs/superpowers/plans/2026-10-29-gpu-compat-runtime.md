@@ -989,6 +989,10 @@ git commit -m "feat: judge a job against observed GPU facts with block and warn 
 
 ### Task 8: 학습 환경 검사 강화 — 세대·연산·bf16과 예외 3종
 
+> **검토 후 변경(2026-10-29):** 구현 후 검토에서 `GPUUnavailable`(GPU 없음·수 불일치·사용 중)이 추가되었다.
+> 확인 코드는 장치 수를 assert하지 않고 `devices`로 보고하며, 결과 줄은 `TF_PROBE ` 접두어로 출력한다.
+> 아래 코드 블록은 최초 계획이며, 확정 동작은 커밋 `dec7eb9`와 설계 4.7을 따른다.
+
 **Files:**
 - Modify: `src/tuning_factory/desktop_runtime.py:41-43` (예외), `:147-183` (`check`)
 - Test: `tests/test_desktop_runtime.py`, `tests/test_runtime_profiles.py:11-27`
