@@ -45,6 +45,11 @@ RUNTIME_MISSING = ("GPU runtime command failed. The private runtime is not prepa
                    "prepare runtime first")
 RUNTIME_MISMATCH = "GPU runtime source, lock, engine or CUDA preflight mismatch; prepare runtime first"
 GPU_INCOMPATIBLE = "이 GPU에서 앱 학습 환경의 CUDA 연산이 실행되지 않습니다. 지원하는 GPU 세대인지 확인하세요."
+RUNTIME_PREPARATION_REQUIRED = ("Pod에 이 앱 버전의 학습 환경이 없습니다. 실행 승인에서 학습 환경 준비를 함께 "
+                                "승인하거나 연결 설정의 '학습 환경 준비'를 먼저 누르세요.")
+SERVER_RUNTIME_REQUIRED = ("GPU 서버에 이 앱 버전의 학습 환경이 없습니다. 연결 설정에서 GPU 목록을 조회한 뒤 "
+                           "'학습 환경 준비'를 먼저 누르세요.")
+PREPARE_IN_EXECUTION_RUNPOD_ONLY = "runtime preparation during execution applies to a RunPod preflight only"
 
 
 class RuntimeMissing(RemoteCommandFailed):
@@ -461,17 +466,24 @@ def _profile_identity(settings, profile_identity, server_receipt):
 
 @contextmanager
 def executor_for(settings, state_root, preflight=True, training_stage="sft", *, server_receipt=None,
-                 recovery=False, runtime_profile=None, model_ops=False, profile_identity=None):
+                 recovery=False, runtime_profile=None, model_ops=False, profile_identity=None,
+                 gate=None, prepare_runtime=False):
     """Executor for one destination. ``runtime_profile`` (a v2 operation's runtime) selects the private runtime;
     ``model_ops`` adds the MODEL_OPS_PINS probe for merge/materialize. Launch executors carry the remote model
     cache root (``<remote_root>/model-cache``) for v2 operations; v1 runs ignore it. ``profile_identity`` (Task 8.4)
     gives an SSH launch executor's profile the pinned profile ID, revision, name and credential scope; without it
-    the default identity is unchanged."""
+    the default identity is unchanged.
+    ``gate`` (the desktop's compatibility judge) receives this destination's GPU observation before any runtime
+    work and raises to refuse it. ``prepare_runtime`` (RunPod preflight only) installs a missing or mismatched
+    private runtime instead of refusing."""
     # recovery=True always means the SSH recovery-only executor; RunPod reconciles with preflight=False.
     identity = _profile_identity(settings, profile_identity, server_receipt)   # before any contact
     training_stage = operation_stage(training_stage, runtime_profile)
     if model_ops and engine_profile(training_stage)["profile"] != "primary":
         raise ValueError(MODEL_OPS_RUNTIME)
+    if prepare_runtime and (recovery or not preflight
+                            or settings.get("provider", "existing_runpod") == "ssh_server"):
+        raise ValueError(PREPARE_IN_EXECUTION_RUNPOD_ONLY)
     pins = {"model_ops": True} if model_ops else {}
     if recovery:
         if settings.get("provider", "existing_runpod") != "ssh_server":
@@ -482,12 +494,19 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
     if server_receipt is not None:
         server_receipt = validate_server_receipt(settings, server_receipt)
     with connection(settings) as (pod, client):
+        if gate is not None:
+            gate(observe(client, settings, state_root, pod))
         if isinstance(pod, SSHServerFacts):
             config = server_settings(settings)
             if server_receipt is not None:
                 server_receipt.validate_destination(server_receipt.manifest_sha256, config.transport, pod)
             if preflight:
-                check(client, training_stage, config.remote_root, config.selected_gpu_uuids, **pins)
+                try:
+                    check(client, training_stage, config.remote_root, config.selected_gpu_uuids, **pins)
+                except (RuntimeMissing, RuntimeMismatch):
+                    if gate is None:
+                        raise
+                    raise ValueError(SERVER_RUNTIME_REQUIRED) from None
             root = runtime_path(training_stage, config.remote_root)
             lock_name = Path(engine_profile(training_stage)["lock_file"]).name
             executor = SSHExecutor("", 22, config.ssh_username, "", client=client,
@@ -500,7 +519,18 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
             yield executor
             return
         if preflight:
-            check(client, training_stage, **pins)
+            try:
+                check(client, training_stage, **pins)
+            except (RuntimeMissing, RuntimeMismatch):
+                if not prepare_runtime:
+                    if gate is None:
+                        raise
+                    raise ValueError(RUNTIME_PREPARATION_REQUIRED) from None
+                with preparation_guard(state_root, None, pod) as preparation:
+                    prerequisites(client)
+                    bootstrap_prerequisites(client)
+                    install_runtime(client, training_stage, REMOTE, pod, preparation)
+                check(client, training_stage, **pins)
         root = runtime_path(training_stage)
         lock_name = Path(engine_profile(training_stage)["lock_file"]).name
         executor = SSHExecutor("", 22, "root", "", client=client, pod=pod,

@@ -525,3 +525,115 @@ def test_check_rejects_a_probe_line_that_is_not_an_object(monkeypatch):
     monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: "" if argv[0] == "sh" else "16")
     with pytest.raises(runtime.RuntimeMismatch, match="preflight mismatch"):
         runtime.check(None)
+
+
+def runpod_executor_fixture(monkeypatch, states, events):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tuning_factory import desktop_runtime as runtime
+
+    @contextmanager
+    def connect(settings, **kwargs):
+        yield POD, SimpleNamespace(close=lambda: None)
+
+    def check(client, stage, *args, **kwargs):
+        events.append("check")
+        if states.pop(0) == "missing":
+            raise runtime.RuntimeMissing(runtime.RUNTIME_MISSING)
+        return {}
+
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    monkeypatch.setattr(runtime, "check", check)
+    monkeypatch.setattr(runtime, "prerequisites", lambda client: events.append("prerequisites"))
+    monkeypatch.setattr(runtime, "bootstrap_prerequisites", lambda client: events.append("bootstrap"))
+    monkeypatch.setattr(runtime, "install_runtime", lambda *args: events.append("install"))
+    return runtime
+
+
+def test_executor_for_gates_first_and_prepares_only_when_approved(tmp_path, monkeypatch):
+    events = []
+    runtime = runpod_executor_fixture(monkeypatch, ["missing"], events)
+
+    def gate(observation):
+        events.append(("gate", observation["gpus"][0]["capability"]))
+
+    with pytest.raises(ValueError, match="학습 환경이 없습니다"):
+        with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=gate):
+            pytest.fail("ran without a runtime")
+    assert events == [("gate", "12.0"), "check"]
+    events.clear()
+    runtime = runpod_executor_fixture(monkeypatch, ["missing", "ready"], events)
+    with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=gate, prepare_runtime=True) as executor:
+        assert executor.pod == POD
+    assert events == [("gate", "12.0"), "check", "prerequisites", "bootstrap", "install", "check"]
+
+
+def test_a_gate_refusal_stops_before_any_runtime_work(tmp_path, monkeypatch):
+    events = []
+    runtime = runpod_executor_fixture(monkeypatch, ["ready"], events)
+
+    def gate(observation):
+        raise ValueError("실행할 수 없습니다. fixture")
+
+    with pytest.raises(ValueError, match="fixture"):
+        with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=gate, prepare_runtime=True):
+            pytest.fail("refused destination used")
+    assert events == []
+
+
+def test_without_a_gate_the_missing_runtime_error_is_unchanged(tmp_path, monkeypatch):
+    events = []
+    runtime = runpod_executor_fixture(monkeypatch, ["missing"], events)
+    with pytest.raises(runtime.RuntimeMissing):
+        with runtime.executor_for({"pod_id": "borrowed"}, tmp_path):
+            pytest.fail("ran without a runtime")
+
+
+def test_execution_preparation_is_runpod_preflight_only(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+
+    monkeypatch.setattr(runtime, "connection", lambda *a, **kw: pytest.fail("GPU host contacted"))
+    for settings, kwargs in (({"provider": "ssh_server"}, {}), ({"pod_id": "borrowed"}, {"preflight": False})):
+        with pytest.raises(ValueError, match="RunPod preflight only"):
+            with runtime.executor_for(settings, tmp_path, prepare_runtime=True, **kwargs):
+                pytest.fail("prepared outside a RunPod preflight")
+
+
+@pytest.mark.parametrize("error, state", [("RuntimeMissing", "missing"), ("RuntimeMismatch", "mismatch"),
+                                          ("GPUIncompatible", "incompatible"), ("GPUUnavailable", "unavailable")])
+def test_runtime_reports_each_check_failure_as_a_state(tmp_path, monkeypatch, error, state):
+    from contextlib import contextmanager
+
+    from tuning_factory import desktop_runtime as runtime
+
+    @contextmanager
+    def connect(settings, **kwargs):
+        yield POD, object()
+
+    def failing(*args, **kwargs):
+        raise getattr(runtime, error)("fixture")
+
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    monkeypatch.setattr(runtime, "check", failing)
+    report = runtime.runtime({"pod_id": "borrowed"}, tmp_path)
+    assert report["ready"] is False and report["runtime_state"] == state
+    assert report["observation"]["gpus"][0]["capability"] == "12.0"
+
+
+def test_observe_an_ssh_server_keeps_only_the_selected_gpus(tmp_path, monkeypatch):
+    from test_gpu_servers import UUID1, UUID2, observation, settings
+
+    from tuning_factory import desktop_runtime as runtime
+
+    config = settings()
+    facts = observation(config)
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    output = (f"{UUID1}, NVIDIA A100, 8.0, 81920, 550.00\n{UUID2}, NVIDIA A100, 8.0, 81920, 550.00\n")
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: output)
+    result = runtime.observe(None, native, tmp_path, facts)
+    assert result["key"].startswith("server-") and result["key"] == runtime.observation_key(native)
+    assert result["pod"] is None
+    assert [gpu["uuid"] for gpu in result["gpus"]] == [UUID2]
