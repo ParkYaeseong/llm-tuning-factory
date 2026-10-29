@@ -67,7 +67,7 @@ ARCH_PROBE = (
     "if torch.cuda.is_available():\n"
     " cap=tuple(torch.cuda.get_device_capability())\n"
     " capability='%d.%d'%cap\n"
-    " codes=[re.fullmatch(r'(sm|compute)_(\d+)(\d)[a-z]?',a) for a in torch.cuda.get_arch_list()]\n"
+    " codes=[re.fullmatch(r'(sm|compute)_(\\d+)(\\d)[a-z]?',a) for a in torch.cuda.get_arch_list()]\n"
     " codes=[(m[1],int(m[2]),int(m[3])) for m in codes if m]\n"
     " arch_ok=any(k=='sm' and j==cap[0] and n<=cap[1] for k,j,n in codes)"
     " or any(k=='compute' and (j,n)<=cap for k,j,n in codes)\n"
