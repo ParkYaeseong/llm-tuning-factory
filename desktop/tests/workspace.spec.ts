@@ -384,3 +384,61 @@ test("model revision metadata stays outside strict training config and clears on
   await page.getByLabel("기반 모델", { exact: true }).selectOption("example/ServerCatalogModel");
   await expect(page.getByText("고정 버전 메타데이터 · 확인됨", { exact: true })).toHaveCount(0);
 });
+
+async function overrideActions(page: import("@playwright/test").Page, answers: Record<string, unknown>) {
+  await page.evaluate(answers => {
+    const bridge = (window as any).__TAURI_INTERNALS__;
+    const original = bridge.invoke;
+    (window as any).__overridden = [];
+    bridge.invoke = async (command: string, args: any) => {
+      if (command === "factory_action" && args.action in answers) {
+        (window as any).__overridden.push(args);
+        const answer = answers[args.action];
+        return args.action === "plan" ? { ...(await original(command, args)), ...(answer as object) } : answer;
+      }
+      return original(command, args);
+    };
+  }, answers);
+}
+
+test("plan lists escaped GPU compatibility findings from the stored observation", async ({ page }) => {
+  await overrideActions(page, { plan: { compatibility: { observed_at: 1793249000, findings: [
+    { level: "block", code: "GPU_TYPE_MISMATCH", message: "학습 설정의 GPU 종류(<b>A4000</b>)가 다릅니다." },
+    { level: "warn", code: "MODEL_UNVERIFIED", message: "이 모델은 아직 GPU에서 검증되지 않았습니다." }] } } });
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  const section = page.getByTestId("plan-compatibility");
+  await expect(section).toContainText("실행 시 거부될 항목");
+  await expect(section).toContainText("학습 설정의 GPU 종류(<b>A4000</b>)가 다릅니다.");
+  await expect(section).toContainText("주의 항목");
+  await expect(section.locator("b")).toHaveCount(0);
+});
+
+test("blocking preflight findings stop the run before approval or submit", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { ready: true, runtime_state: "ready", findings: [
+    { level: "block", code: "GPU_ARCH_UNSUPPORTED", message: "이 GPU는 지원하지 않는 세대입니다." }] } });
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).click();
+  await expect(page.getByRole("alert")).toContainText("이 GPU는 지원하지 않는 세대입니다.");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__testCalls.some((c: any) => c.args?.action === "submit"))).toBe(false);
+});
+
+test("a missing RunPod runtime is folded into the single run approval", async ({ page }) => {
+  await overrideActions(page, {
+    runtime_check: { ready: false, runtime_state: "missing", findings: [
+      { level: "warn", code: "MEMORY_TIGHT", message: "예상 메모리가 GPU 메모리에 빠듯합니다." }] },
+    execute: null });
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("학습 환경이 없어 학습 전에 먼저 설치합니다");
+  await expect(dialog).toContainText("예상 메모리가 GPU 메모리에 빠듯합니다.");
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__overridden
+    .find((args: any) => args.action === "execute")?.data?.prepare_runtime)).toBe(true);
+  const check = await page.evaluate(() => (window as any).__overridden.find((args: any) => args.action === "runtime_check"));
+  expect(check.data.config.base_model).toBeTruthy();
+});
