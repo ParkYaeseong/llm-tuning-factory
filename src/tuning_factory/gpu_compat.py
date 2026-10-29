@@ -147,6 +147,11 @@ def evaluate(config, observation, capabilities, model, *, stage, now=None):
                                      f"NVIDIA 드라이버 {driver}는 CUDA {capabilities['torch_cuda']} 정식 지원 드라이버"
                                      f"({capabilities['recommended_driver']}) 미만입니다. 일부 기능이 제한될 수 "
                                      "있습니다."))
+        if (model is not None and model.get("gpu_verified") and "verified_capabilities" in model
+                and capability not in model["verified_capabilities"]):
+            findings.append(_finding("warn", "MODEL_UNVERIFIED",
+                                     f"이 모델은 이 GPU 세대(compute capability {capability})에서 아직 검증되지 "
+                                     "않았습니다."))
         if (hyper.get("precision", "bf16") == "bf16"
                 and version_tuple(capability) < version_tuple(capabilities["bf16_min_capability"])):
             findings.append(_finding("block", "BF16_UNSUPPORTED",
@@ -188,12 +193,12 @@ def evaluate(config, observation, capabilities, model, *, stage, now=None):
             findings.append(_finding("warn", "MEMORY_UNKNOWN", MEMORY_UNKNOWN))
         elif estimate["weights_gib"] > vram * WEIGHTS_BLOCK_RATIO:
             findings.append(_finding("block", "MEMORY_WEIGHTS_EXCEED",
-                                     f"모델 가중치만 약 {estimate['weights_gib']:.0f}GiB로 GPU 메모리 {vram:.0f}GiB를 "
-                                     "넘습니다. 4비트 QLoRA, 더 작은 모델 또는 더 큰 GPU를 선택하세요."))
+                                     f"모델 가중치만 약 {estimate['weights_gib']:.0f}GiB로 GPU 메모리 {vram:.0f}GiB의 "
+                                     "95%를 넘습니다. 4비트 QLoRA, 더 작은 모델 또는 더 큰 GPU를 선택하세요."))
         elif estimate["total_gib"] > vram * TOTAL_WARN_RATIO:
             findings.append(_finding("warn", "MEMORY_TIGHT",
-                                     f"예상 메모리 약 {estimate['total_gib']:.0f}GiB로 GPU 메모리 {vram:.0f}GiB에 "
-                                     "빠듯합니다. 4비트 QLoRA, 배치 1, 더 짧은 최대 길이(cutoff_len)를 고려하세요. "
+                                     f"예상 메모리 약 {estimate['total_gib']:.0f}GiB로 GPU 메모리 {vram:.0f}GiB의 "
+                                     "90%를 넘어 부족할 수 있습니다. 4비트 QLoRA, 배치 1, 더 짧은 최대 길이(cutoff_len)를 고려하세요. "
                                      "추정치이므로 실제와 다를 수 있습니다."))
     return findings
 

@@ -370,7 +370,10 @@ def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspec
                 prerequisites(client)
                 bootstrap_prerequisites(client)
                 install_runtime(client, training_stage, remote_root, pod, preparation)
-                result = check(client, training_stage, remote_root, selected)
+                try:
+                    result = check(client, training_stage, remote_root, selected)
+                except (RuntimeMissing, RuntimeMismatch):
+                    raise ValueError(POST_PREPARATION_FAILED) from None
         else:
             try:
                 result = check(client, training_stage, remote_root, selected)

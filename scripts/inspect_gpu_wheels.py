@@ -6,7 +6,8 @@ This checks the compile-flag list torch reports (torch.cuda.get_arch_list()), no
 GPU run; the runtime ARCH_PROBE and the GPU acceptance test remain separate.
 Usage: uv run python scripts/inspect_gpu_wheels.py [--lock containers/gpu-requirements.lock]
 Exit codes: 0 all required architectures and the bitsandbytes CUDA 12.8 library found; 1 a finding (missing
-architecture or library); 2 the inspection itself failed (network, index, hash or zip error).
+architecture or library, or compiled architectures that differ from the app's GPU support sheet); 2 the
+inspection itself failed (network, index, hash or zip error).
 """
 import argparse
 import io
@@ -19,6 +20,7 @@ from pathlib import Path
 import httpx
 
 from tuning_factory.gpu_compat import capability_supported, version_tuple
+from tuning_factory.runtime_profiles import runtime_capabilities
 
 TORCH_INDEX = "https://download.pytorch.org/whl/cu128/torch/"
 TORCH_WHEEL = "torch-2.7.1+cu128-cp312-cp312-manylinux_2_28_x86_64.whl"
@@ -45,6 +47,11 @@ def parse_arch_flags(data):
 
 def unsupported(flags):
     return [code for code in REQUIRED if not capability_supported(code, flags["sass"], flags["ptx"])]
+
+
+def sheet_drift(flags, capabilities):
+    """True when the wheel's compiled architectures differ from the app's GPU support sheet."""
+    return flags["sass"] != capabilities["sass"] or flags["ptx"] != capabilities["ptx"]
 
 
 def has_cuda128_library(names):
@@ -133,9 +140,10 @@ def main(argv=None):
         print(f"inspection failed: {error!r}", file=sys.stderr)
         return 2
     missing = unsupported(flags)
+    drift = sheet_drift(flags, runtime_capabilities("primary"))
     print(json.dumps({"torch_wheel": url, **flags, "unsupported_required": missing,
-                      "bitsandbytes_cuda128": cuda128}, indent=2))
-    return 0 if not missing and cuda128 else 1
+                      "bitsandbytes_cuda128": cuda128, "capability_sheet_matches": not drift}, indent=2))
+    return 0 if not missing and cuda128 and not drift else 1
 
 
 if __name__ == "__main__":

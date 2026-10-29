@@ -278,3 +278,12 @@ def test_catalog_records_sizes_for_memory_estimates_and_adds_llama_70b():
         assert (model["template"], model["architecture"], model["gated"]) == ("llama3", "llama", True)
         assert (model["parameters_b"], model["hidden_size"], model["num_layers"]) == (70, 8192, 80)
         assert model["gpu_verified"] is False
+
+
+def test_catalog_lists_the_verified_gpu_generations():
+    from tuning_factory.capabilities import model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    assert all("verified_capabilities" in model for model in models.values())
+    assert models["Qwen/Qwen2.5-0.5B-Instruct"]["verified_capabilities"] == ["9.0"]
+    assert all(model["verified_capabilities"] == [] for name, model in models.items()
+               if name != "Qwen/Qwen2.5-0.5B-Instruct")

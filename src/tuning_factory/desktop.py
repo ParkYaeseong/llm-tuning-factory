@@ -17,7 +17,7 @@ from .connections import ENV_SETTINGS
 from .desktop_inspection import inspect_dataset, parameter_changes, parse_progress
 from .execution import ExecutionUncertain, Policy, RunPodController
 from .gpu_servers import ServerApprovalReceipt, SSHServerInspection, server_settings
-from .manifest import resolve
+from .manifest import resolve, source_hash
 from .model_hub import ModelHub, register_model, registered_models
 from .registry import canonical, digest, parse_dataset, safe_name
 from .runner import Factory
@@ -45,6 +45,8 @@ SERVER_RESERVED = ("GPU 서버가 작업이나 다른 환경 준비에 예약되
                    "작업을 재조정하거나 준비 예약을 해제한 뒤 다시 준비하세요.")
 SERVER_PREPARE_IN_EXECUTION = ("GPU 서버는 실행 승인에서 학습 환경을 함께 준비하지 않습니다. 연결 설정에서 GPU 목록을 "
                                "조회한 뒤 '학습 환경 준비'를 먼저 누르세요.")
+STALE_JOB = ("앱이 업데이트되어 이 작업은 실행할 수 없습니다. 같은 설정으로 실행 계획을 다시 확인해 새로 제출하세요. "
+             "기존 작업은 '취소 요청'으로 정리할 수 있습니다.")
 POD_RESERVED_FOR_PREPARATION = ("다른 작업이 이 Pod를 사용 중이라 학습 환경을 준비할 수 없습니다. 실행 관리에서 그 작업을 "
                                 "재연결·결과 회수해 끝낸 뒤 다시 시도하세요.")
 
@@ -180,11 +182,18 @@ class DesktopService:
             findings = self.compatibility(config, None, "plan")
         return {"observed_at": (observation or {}).get("observed_at"), "findings": findings}
 
+    def job_manifest(self, job_id):
+        """The stored manifest, refusing a job submitted by another app version before any contact."""
+        manifest = self.factory.store.get(job_id)["manifest"]
+        if "source_sha256" in manifest and manifest["source_sha256"] != source_hash():
+            raise ValueError(STALE_JOB)
+        return manifest
+
     def preflight_config(self, data):
         """The job config (job_id) or plan config a runtime check should judge, validated before any contact."""
         if data.get("job_id"):
             self.job_directory(data["job_id"])
-            return self.factory.store.get(data["job_id"])["manifest"]["config"]
+            return self.job_manifest(data["job_id"])["config"]
         if data.get("config"):
             return AIConfig.model_validate(data["config"]).model_dump(mode="json")
         return None
@@ -437,7 +446,7 @@ class DesktopService:
                 raise ValueError(SERVER_PREPARE_IN_EXECUTION)
             job_id = data["job_id"]
             self.job_directory(job_id)
-            config = self.factory.store.get(job_id)["manifest"]["config"]
+            config = self.job_manifest(job_id)["config"]
             stage = config.get("training_stage", "sft")
             if prepare and self.factory.store.gpu_locked("existing_runpod:" + self.settings.get("pod_id", "")):
                 raise ValueError(POD_RESERVED_FOR_PREPARATION)
@@ -542,8 +551,8 @@ class DesktopService:
             if action == "runtime_prepare" and self.factory.store.gpu_locked("existing_runpod:" + self.settings.get("pod_id", "")):
                 raise ValueError(POD_RESERVED_FOR_PREPARATION)
             config = self.preflight_config(data) if action == "runtime_check" else None
-            report = runtime(self.settings, self.root, prepare=action == "runtime_prepare",
-                             training_stage=data.get("training_stage", "sft"))
+            stage = (config or {}).get("training_stage") or data.get("training_stage", "sft")
+            report = runtime(self.settings, self.root, prepare=action == "runtime_prepare", training_stage=stage)
             if action == "runtime_check":
                 self.add_findings(report, config)
             return report

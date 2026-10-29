@@ -50,3 +50,10 @@ def test_bitsandbytes_cuda128_library_is_recognised():
     assert gate.has_cuda128_library(["bitsandbytes/libbitsandbytes_cuda126.so",
                                      "bitsandbytes/libbitsandbytes_cuda128.so"])
     assert not gate.has_cuda128_library(["bitsandbytes/libbitsandbytes_cuda126.so"])
+
+
+def test_sheet_drift_compares_the_wheel_flags_with_the_support_sheet():
+    sheet = {"sass": ["8.0", "9.0"], "ptx": ["9.0"]}
+    assert gate.sheet_drift({"sass": ["8.0", "9.0"], "ptx": ["9.0"]}, sheet) is False
+    assert gate.sheet_drift({"sass": ["8.0"], "ptx": ["9.0"]}, sheet) is True
+    assert gate.sheet_drift({"sass": ["8.0", "9.0"], "ptx": []}, sheet) is True

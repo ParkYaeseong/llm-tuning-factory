@@ -17,7 +17,8 @@ METHODS = ["lora", "qlora", "full", "freeze", "oft"]
 
 def model_catalog():
     models = []
-    # (name, parameters in billions, hidden_size, num_hidden_layers) from each model's config.json
+    # (name, nominal parameters in billions, hidden_size, num_hidden_layers): parameters_b are nominal model
+    # sizes; hidden_size and num_hidden_layers come from each model's config.json.
     for family, architecture, template, variants, length, gated in [
         ("Qwen", "qwen2", "qwen", [
             ("Qwen2.5-0.5B-Instruct", 0.5, 896, 24), ("Qwen2.5-1.5B-Instruct", 1.5, 1536, 28),
@@ -39,6 +40,7 @@ def model_catalog():
                            "max_length": length, "parameters_b": size, "hidden_size": hidden, "num_layers": layers,
                            "gated": gated,
                            "gpu_verified": model_id == "Qwen/Qwen2.5-0.5B-Instruct",
+                           "verified_capabilities": ["9.0"] if model_id == "Qwen/Qwen2.5-0.5B-Instruct" else [],
                            "verification_scope": ("0.2.3 SFT LoRA/4-bit QLoRA synthetic H100 only"
                                                   if model_id == "Qwen/Qwen2.5-0.5B-Instruct"
                                                   else "architecture profile; GPU verification pending")})

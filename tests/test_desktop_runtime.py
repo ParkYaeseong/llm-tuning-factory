@@ -793,3 +793,27 @@ def test_ssh_destination_receipt_is_validated_before_the_gate(tmp_path, monkeypa
                                       ValueError("stop here")))):
             pytest.fail("refused")
     assert events == ["receipt", "gate"]
+
+
+@pytest.mark.parametrize("error", ["RuntimeMissing", "RuntimeMismatch"])
+def test_runtime_preparation_that_fails_its_check_gets_the_fixed_message(tmp_path, monkeypatch, error):
+    from contextlib import contextmanager
+
+    from tuning_factory import desktop_runtime as runtime
+
+    @contextmanager
+    def connect(settings, **kwargs):
+        yield POD, object()
+
+    def failing(*args, **kwargs):
+        raise getattr(runtime, error)("fixture detail")
+
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    monkeypatch.setattr(runtime, "prerequisites", lambda *a: None)
+    monkeypatch.setattr(runtime, "bootstrap_prerequisites", lambda *a: None)
+    monkeypatch.setattr(runtime, "install_runtime", lambda *a: None)
+    monkeypatch.setattr(runtime, "check", failing)
+    with pytest.raises(ValueError) as caught:
+        runtime.runtime({"pod_id": "borrowed"}, tmp_path, prepare=True)
+    assert str(caught.value) == runtime.POST_PREPARATION_FAILED

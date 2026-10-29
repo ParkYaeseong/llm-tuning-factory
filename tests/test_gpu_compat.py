@@ -216,3 +216,31 @@ def test_saving_twice_overwrites_and_leaves_no_temp_files(tmp_path):
     gpu_compat.save_observation(tmp_path, second)
     assert gpu_compat.load_observation(tmp_path, "runpod-borrowed") == second
     assert list((tmp_path / "gpu-observations").glob("*.tmp")) == []
+
+
+def test_a_verified_model_warns_on_a_generation_it_was_not_verified_on():
+    h100 = {**BLACKWELL, "name": "NVIDIA H100 80GB HBM3", "capability": "9.0", "memory_mib": 81559}
+    pod = {**POD, "gpu_id": "NVIDIA H100 80GB HBM3", "hourly_cost_usd": 2.0}
+    verified = {**QWEN05, "verified_capabilities": ["9.0"]}
+    on_blackwell = gpu_compat.evaluate(job(), observed(), CAPS, verified, stage="execute")
+    assert codes(on_blackwell) == {("warn", "MODEL_UNVERIFIED")}
+    message = next(item for item in on_blackwell if item["code"] == "MODEL_UNVERIFIED")["message"]
+    assert message == "이 모델은 이 GPU 세대(compute capability 12.0)에서 아직 검증되지 않았습니다."
+    on_h100 = gpu_compat.evaluate(job(gpu_type="NVIDIA H100 80GB HBM3", hourly_cost_usd=3.0), observed([h100], pod),
+                                  CAPS, verified, stage="execute")
+    assert not any(code == "MODEL_UNVERIFIED" for _, code in codes(on_h100))
+    assert gpu_compat.evaluate(job(), observed(), CAPS, QWEN05, stage="execute") == []
+
+
+def test_memory_messages_name_their_thresholds():
+    h100 = {**BLACKWELL, "name": "NVIDIA H100 80GB HBM3", "capability": "9.0", "memory_mib": 81559}
+    pod = {**POD, "gpu_id": "NVIDIA H100 80GB HBM3", "hourly_cost_usd": 2.0}
+    lora = gpu_compat.evaluate(job(gpu_type="NVIDIA H100 80GB HBM3", hourly_cost_usd=3.0), observed([h100], pod),
+                               CAPS, LLAMA70, stage="execute")
+    assert "의 95%를 넘습니다" in next(i for i in lora if i["code"] == "MEMORY_WEIGHTS_EXCEED")["message"]
+    qwen7 = {"id": "Qwen/Qwen2.5-7B-Instruct", "parameters_b": 7, "hidden_size": 3584, "num_layers": 28,
+             "gpu_verified": False}
+    tight = job()
+    tight["hyperparameters"].update(cutoff_len=8192, per_device_train_batch_size=4)
+    findings = gpu_compat.evaluate(tight, observed(), CAPS, qwen7, stage="execute")
+    assert "의 90%를 넘어 부족할 수 있습니다" in next(i for i in findings if i["code"] == "MEMORY_TIGHT")["message"]

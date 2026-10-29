@@ -310,3 +310,35 @@ def test_runtime_check_validates_the_job_before_any_remote_contact(tmp_path, mon
     monkeypatch.setattr(desktop_runtime, "runtime", lambda *a, **kw: pytest.fail("runtime contacted"))
     with pytest.raises(ValueError):
         app.dispatch("runtime_check", {"training_stage": "sft", "job_id": "not-a-job"})
+
+
+def test_a_job_from_another_app_version_is_refused_before_any_contact(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    store = app.factory.store
+    job = store.submit({"sha256": "old", "simulation": False, "config": A4000_JOB, "source_sha256": "0" * 64}, "old")
+    store.transition(job["id"], "QUEUED")
+    monkeypatch.setattr(desktop_runtime, "runtime", lambda *a, **kw: pytest.fail("runtime contacted"))
+    monkeypatch.setattr(desktop_runtime, "executor_for", lambda *a, **kw: pytest.fail("Pod was prepared"))
+    with pytest.raises(ValueError) as caught:
+        app.dispatch("runtime_check", {"training_stage": "sft", "job_id": job["id"]})
+    assert str(caught.value) == desktop.STALE_JOB
+    with pytest.raises(ValueError) as caught:
+        app.dispatch("execute", {"approved": True, "job_id": job["id"], "prepare_runtime": True})
+    assert str(caught.value) == desktop.STALE_JOB
+
+
+def test_runtime_check_judges_a_job_with_its_own_training_stage(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    job = app.factory.store.submit({"sha256": "p", "simulation": False,
+                                    "config": {**A4000_JOB, "training_stage": "ppo"}}, "p")
+    seen = {}
+
+    def fake(settings, root, **kwargs):
+        seen.update(kwargs)
+        return {"ready": False, "runtime_state": "missing", "observation": None}
+
+    monkeypatch.setattr(desktop_runtime, "runtime", fake)
+    app.dispatch("runtime_check", {"training_stage": "sft", "job_id": job["id"]})
+    assert seen["training_stage"] == "ppo"
