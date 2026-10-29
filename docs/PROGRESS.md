@@ -25,14 +25,20 @@
   `desktop`의 `npm run build` 통과, `npm test` 280 passed; `cargo test --manifest-path src-tauri/Cargo.toml --locked` 54 passed.
   실패·재실행 없음.
 - GPU·Pod·데이터 전송·MLflow 쓰기는 사용하지 않았다. GPU 인수 대기.
-- Task 15 결과: 설치 프로그램 `desktop/src-tauri/target/release/bundle/nsis/LLM Tuning Factory_0.5.0_x64-setup.exe`,
-  48,286,105 바이트, SHA-256 `80cb0e3ed911cb18fc7228c025f901a000224bbe755b74892aaecf83fc343bf2`, 커밋 `59f7b98`에서 빌드.
-  `scripts/verify_desktop_package.py` 영수증 `dist/verify-0.5.0.json`: bridge_mode frozen, 모든 검사 true, gpu_started false.
-  설치하지 않았다(설치는 사용자 확인이 필요). 주의: 이 설치 프로그램은 최종 검토 수정보다 앞선 것이므로 사용 전에 다시 빌드해야 한다.
+- Task 15 결과(다시 빌드): 설치 프로그램 `desktop/src-tauri/target/release/bundle/nsis/LLM Tuning Factory_0.5.0_x64-setup.exe`,
+  48,285,418 바이트, SHA-256 `9007ef4b500e00004df587c3492674b8913bc18da789f29860ca1f6024b899ed`, 커밋 `0163b8a`에서 빌드
+  (`scripts/build_desktop.py` 후 `npm run tauri -- build --ci`; 빌드 뒤 추적 파일 변경 없음).
+  `scripts/verify_desktop_package.py` 영수증 `dist/verify-0.5.0-final.json`: bridge_mode frozen,
+  source_commit `0163b8af01572ad8e1ae6fef5bbae2a7f0b5abdf`, 모든 검사 true, gpu_started false.
+  설치하지 않았다. 설치는 사용자 확인이 필요하며, 설치 프로그램이 이전 설치 폴더를 기억하므로 NSIS `/D=<폴더>`로 실제 설치 폴더를 지정해야 한다.
 - 최종 검토 결과와 수정: 다른 앱 버전(소스 해시가 다름)의 작업은 원격 접속·환경 설치 전에 한국어로 거부한다(`runtime_check`와 실행 모두).
   준비 직후 확인 실패는 고정 문구로 거부한다. 검증된 모델도 검증되지 않은 GPU 세대에서는 `MODEL_UNVERIFIED`로 경고한다.
   메모리 문구에 95%·90% 기준을 밝혔다. `inspect_gpu_wheels.py`는 호환표와 어긋나면 종료 코드 1을 돌려준다. 환경 확인은 작업 자체의
   학습 단계를 쓴다. 화면은 점검·승인 뒤 대기 작업의 연결 대상을 다시 확인하고 환경 준비 중 안내를 보여 준다.
+- 마지막 수정(`0163b8a`): 실행 전 점검 중이나 승인 창 뒤에 저장된 RunPod Pod ID가 바뀌면 "연결된 Pod가 바뀌었습니다. 실행 전 확인을 다시 진행하세요."로 멈추고,
+  `resume`은 작업 매니페스트의 소스 해시를 먼저 확인해 다른 앱 버전의 작업을 QUEUED로 되돌리기 전에 거부한다. 두 수정 모두 테스트를 먼저 작성해 실패를 확인했다.
+- 최종 코드 검증(2026-10-29, `0163b8a`): `uv run pytest` 2030 passed, 1 skipped(497.26초); `uv run ruff check src tests scripts` 통과;
+  `desktop`의 `npm run build` 통과, `npm test` 282 passed. `cargo test` 54 passed는 Task 14에서 마지막으로 실행했고 그 뒤 Rust 변경은 없다.
 - 사용자의 대기 작업 `76986bce…`는 0.4.0으로 제출되어 0.5.0에서 실행할 수 없다. '취소 요청'으로 정리하고 다시 제출한다
   (GPU 종류·요금은 'GPU 정보 → 학습 설정에 적용'으로 맞춘다).
 - **남은 일(후속):** SSH 서버의 시간당 요금은 호환성 판정이 아직 보지 않는다(기존 서버 예산 검사만 적용). 판정 표에 넣을 것.
