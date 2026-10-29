@@ -637,3 +637,159 @@ def test_observe_an_ssh_server_keeps_only_the_selected_gpus(tmp_path, monkeypatc
     assert result["key"].startswith("server-") and result["key"] == runtime.observation_key(native)
     assert result["pod"] is None
     assert [gpu["uuid"] for gpu in result["gpus"]] == [UUID2]
+
+
+@pytest.mark.parametrize("error", ["GPUIncompatible", "GPUUnavailable"])
+def test_a_bad_gpu_never_triggers_preparation(tmp_path, monkeypatch, error):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tuning_factory import desktop_runtime as runtime
+
+    events = []
+
+    @contextmanager
+    def connect(settings, **kwargs):
+        yield POD, SimpleNamespace(close=lambda: None)
+
+    def check(client, stage, *args, **kwargs):
+        events.append("check")
+        raise getattr(runtime, error)("fixture")
+
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    monkeypatch.setattr(runtime, "check", check)
+    for name in ("prerequisites", "bootstrap_prerequisites"):
+        monkeypatch.setattr(runtime, name, lambda client, name=name: events.append(name))
+    monkeypatch.setattr(runtime, "install_runtime", lambda *args: events.append("install"))
+    with pytest.raises(getattr(runtime, error)):
+        with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=lambda o: events.append("gate"),
+                                  prepare_runtime=True):
+            pytest.fail("ran with a bad GPU")
+    assert events == ["gate", "check"]
+
+
+@pytest.mark.parametrize("gated", [True, False])
+def test_ssh_server_missing_runtime_is_explained_only_when_gated(tmp_path, monkeypatch, gated):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from test_gpu_servers import UUID1, UUID2, observation, settings
+
+    from tuning_factory import desktop_runtime as runtime
+
+    config = settings()
+    facts = observation(config)
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    events = []
+
+    @contextmanager
+    def connect(_settings, **kwargs):
+        yield facts, SimpleNamespace(close=lambda: None)
+
+    def check(client, stage, *args, **kwargs):
+        events.append("check")
+        raise runtime.RuntimeMissing(runtime.RUNTIME_MISSING)
+
+    output = f"{UUID1}, NVIDIA A100, 8.0, 81920, 550.00\n{UUID2}, NVIDIA A100, 8.0, 81920, 550.00\n"
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: output)
+    monkeypatch.setattr(runtime, "check", check)
+    kwargs = {"gate": lambda o: events.append("gate")} if gated else {}
+    expected, match = (ValueError, "GPU 서버에 이 앱 버전의 학습 환경이 없습니다") if gated else (
+        runtime.RuntimeMissing, None)
+    with pytest.raises(expected, match=match):
+        with runtime.executor_for(native, tmp_path, **kwargs):
+            pytest.fail("ran without a runtime")
+    assert events == (["gate", "check"] if gated else ["check"])
+
+
+def test_without_a_gate_no_gpu_query_runs_and_no_observation_is_stored(tmp_path, monkeypatch):
+    events = []
+    commands = []
+    runtime = runpod_executor_fixture(monkeypatch, ["missing"], events)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: commands.append(argv) or SMI)
+    with pytest.raises(runtime.RuntimeMissing):
+        with runtime.executor_for({"pod_id": "borrowed"}, tmp_path):
+            pytest.fail("ran without a runtime")
+    assert commands == [] and not (tmp_path / "gpu-observations").exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_failed_post_preparation_check_is_explained(tmp_path, monkeypatch):
+    events = []
+    runtime = runpod_executor_fixture(monkeypatch, ["missing"], events)
+    calls = []
+
+    def check(client, stage, *args, **kwargs):
+        events.append("check")
+        calls.append(1)
+        raise (runtime.RuntimeMissing if len(calls) == 1 else runtime.RuntimeMismatch)("fixture")
+
+    monkeypatch.setattr(runtime, "check", check)
+    with pytest.raises(ValueError, match="학습 환경을 준비했지만 확인을 통과하지 못했습니다"):
+        with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=lambda o: None, prepare_runtime=True):
+            pytest.fail("ran an unverified runtime")
+    assert events.count("install") == 1
+
+
+def test_a_concurrent_preparation_is_reported_as_busy(tmp_path, monkeypatch):
+    from test_remote_worker import FakeSSH
+
+    from tuning_factory import desktop
+    from tuning_factory import desktop_runtime as runtime
+
+    assets = tmp_path / "assets"
+    (assets / "dist").mkdir(parents=True)
+    (assets / "containers").mkdir()
+    (assets / "dist/llm_tuning_factory-fixture.whl").write_text("fixture")
+    (assets / "containers/gpu-requirements.lock").write_text("fixture")
+    monkeypatch.setattr(desktop, "assets_root", lambda: assets)
+    client = FakeSSH(tmp_path / "remote")
+    client.sftp.root.mkdir()
+    scripts = []
+
+    def busy(_, argv, **kw):
+        scripts.append(argv[2])
+        raise runtime.RemoteCommandFailed("GPU runtime command failed. TF_PREPARE_BUSY")
+
+    monkeypatch.setattr(runtime, "command", busy)
+    preparation = {"started": False, "stopped": False}
+    with pytest.raises(ValueError, match="다른 학습 환경 준비가 이 GPU에서 진행 중입니다"):
+        runtime.install_runtime(client, "sft", runtime.REMOTE, POD, preparation)
+    assert preparation == {"started": True, "stopped": True}
+    assert "flock -n 9 || { echo TF_PREPARE_BUSY; exit 75; }" in scripts[0]
+
+
+def test_ssh_destination_receipt_is_validated_before_the_gate(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from test_gpu_servers import observation, settings
+
+    from tuning_factory import desktop_runtime as runtime
+
+    config = settings()
+    facts = observation(config)
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    events = []
+
+    @contextmanager
+    def connect(_settings, **kwargs):
+        yield facts, SimpleNamespace(close=lambda: None)
+
+    class Receipt:
+        manifest_sha256 = "x"
+
+        def validate_destination(self, *args):
+            events.append("receipt")
+
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "validate_server_receipt", lambda settings, receipt: receipt)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: "")
+    with pytest.raises(ValueError, match="stop here"):
+        with runtime.executor_for(native, tmp_path, server_receipt=Receipt(), preflight=False,
+                                  gate=lambda o: (events.append("gate"), (_ for _ in ()).throw(
+                                      ValueError("stop here")))):
+            pytest.fail("refused")
+    assert events == ["receipt", "gate"]

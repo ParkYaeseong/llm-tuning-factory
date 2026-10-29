@@ -49,6 +49,9 @@ RUNTIME_PREPARATION_REQUIRED = ("Pod에 이 앱 버전의 학습 환경이 없�
                                 "승인하거나 연결 설정의 '학습 환경 준비'를 먼저 누르세요.")
 SERVER_RUNTIME_REQUIRED = ("GPU 서버에 이 앱 버전의 학습 환경이 없습니다. 연결 설정에서 GPU 목록을 조회한 뒤 "
                            "'학습 환경 준비'를 먼저 누르세요.")
+POST_PREPARATION_FAILED = ("학습 환경을 준비했지만 확인을 통과하지 못했습니다. "
+                           "Pod의 /workspace/factory-desktop 설치 기록을 확인한 뒤 다시 시도하세요.")
+PREPARATION_BUSY = "다른 학습 환경 준비가 이 GPU에서 진행 중입니다. 끝난 뒤 다시 시도하세요."
 PREPARE_IN_EXECUTION_RUNPOD_ONLY = "runtime preparation during execution applies to a RunPod preflight only"
 
 
@@ -317,7 +320,7 @@ def install_runtime(client, training_stage, remote_root, pod, preparation):
     script = (
         "set -eu\n"
         "command -v flock >/dev/null\n"
-        f"exec 9>{shlex.quote(root + '/prepare.lock')}\nflock -n 9\n"
+        f"exec 9>{shlex.quote(root + '/prepare.lock')}\nflock -n 9 || {{ echo TF_PREPARE_BUSY; exit 75; }}\n"
         f"export UV_PYTHON_INSTALL_DIR={shlex.quote(remote_root + '/python')}\n"
         f"export UV_CACHE_DIR={shlex.quote(remote_root + '/uv-cache')}\n"
         f"python3 -m pip install --disable-pip-version-check --no-cache-dir "
@@ -332,8 +335,10 @@ def install_runtime(client, training_stage, remote_root, pod, preparation):
     preparation["started"] = True
     try:
         command(client, ["sh", "-c", script], timeout=1800)
-    except RemoteCommandFailed:
+    except RemoteCommandFailed as error:
         preparation["stopped"] = True
+        if "TF_PREPARE_BUSY" in str(error):
+            raise ValueError(PREPARATION_BUSY) from None
         raise
     preparation["stopped"] = True
 
@@ -494,12 +499,13 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
     if server_receipt is not None:
         server_receipt = validate_server_receipt(settings, server_receipt)
     with connection(settings) as (pod, client):
+        if isinstance(pod, SSHServerFacts):
+            config = server_settings(settings)
+            if server_receipt is not None:   # before the gate: destination drift is then the reported cause
+                server_receipt.validate_destination(server_receipt.manifest_sha256, config.transport, pod)
         if gate is not None:
             gate(observe(client, settings, state_root, pod))
         if isinstance(pod, SSHServerFacts):
-            config = server_settings(settings)
-            if server_receipt is not None:
-                server_receipt.validate_destination(server_receipt.manifest_sha256, config.transport, pod)
             if preflight:
                 try:
                     check(client, training_stage, config.remote_root, config.selected_gpu_uuids, **pins)
@@ -530,7 +536,10 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
                     prerequisites(client)
                     bootstrap_prerequisites(client)
                     install_runtime(client, training_stage, REMOTE, pod, preparation)
-                check(client, training_stage, **pins)
+                try:
+                    check(client, training_stage, **pins)
+                except (RuntimeMissing, RuntimeMismatch):
+                    raise ValueError(POST_PREPARATION_FAILED) from None
         root = runtime_path(training_stage)
         lock_name = Path(engine_profile(training_stage)["lock_file"]).name
         executor = SSHExecutor("", 22, "root", "", client=client, pod=pod,
