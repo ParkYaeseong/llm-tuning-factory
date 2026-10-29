@@ -100,7 +100,7 @@ def test_unauthenticated_tracking_allows_local_http_and_drops_stale_credentials(
 def test_runtime_preparation_refuses_a_reserved_pod(tmp_path, monkeypatch):
     app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
     monkeypatch.setattr(app.factory.store, "gpu_locked", lambda pod: True)
-    with pytest.raises(ValueError, match="reserved"):
+    with pytest.raises(ValueError, match="다른 작업이 이 Pod를 사용 중"):
         app.dispatch("runtime_prepare", {"approved": True})
 
 
@@ -153,7 +153,7 @@ def test_desktop_runtime_prepare_observes_canonical_and_unknown_locks(tmp_path, 
     claimed = store.claim(lock_key)
     store.transition(claimed['lease'], 'FAILED')
     monkeypatch.setattr(desktop_runtime, 'runtime', lambda *args, **kwargs: pytest.fail('reserved Pod runtime was prepared'))
-    with pytest.raises(ValueError, match='reserved'):
+    with pytest.raises(ValueError, match="다른 작업이 이 Pod를 사용 중"):
         app.dispatch('runtime_prepare', {'approved': True})
     assert store.gpu_locked(lock_key)
 
@@ -270,3 +270,43 @@ def test_execute_gates_the_job_and_forwards_runtime_preparation(tmp_path, monkey
     server = desktop.DesktopService(tmp_path / "server", {"provider": "ssh_server"})
     with pytest.raises(ValueError, match="GPU 서버는 실행 승인에서"):
         server.dispatch("execute", {"approved": True, "job_id": "0" * 32, "prepare_runtime": True})
+
+
+def test_execute_with_preparation_refuses_a_pod_held_by_another_job(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    store = app.factory.store
+    old = store.submit({"sha256": "old", "simulation": False}, "old")
+    store.transition(old["id"], "QUEUED")
+    claimed = store.claim("existing_runpod:borrowed")
+    store.transition(claimed["lease"], "FAILED")
+    second = store.submit({"sha256": "a4000", "simulation": False, "config": A4000_JOB}, "a4000")
+    store.transition(second["id"], "QUEUED")
+    monkeypatch.setattr(desktop_runtime, "executor_for", lambda *a, **kw: pytest.fail("held Pod was prepared"))
+    with pytest.raises(ValueError, match="다른 작업이 이 Pod를 사용 중"):
+        app.dispatch("execute", {"approved": True, "job_id": second["id"], "prepare_runtime": True})
+
+
+def test_plan_survives_an_observation_key_that_cannot_be_derived(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    catalog = app.dispatch("catalog", {})
+    config = next(x["config"] for x in catalog["templates"] if x["name"] == "paper_extraction")
+    source = tmp_path / "input.json"
+    source.write_text(json.dumps([{"instruction": "question", "output": "answer"}]))
+    app.dispatch("dataset", {"dataset_id": "dummy", "version": "1", "path": str(source)})
+
+    def broken(settings):
+        raise RuntimeError("no home directory")
+
+    monkeypatch.setattr(desktop_runtime, "observation_key", broken)
+    compat = app.dispatch("plan", {"config": config})["compatibility"]
+    assert ("warn", "OBSERVATION_MISSING") in finding_codes(compat["findings"])
+
+
+def test_runtime_check_validates_the_job_before_any_remote_contact(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    monkeypatch.setattr(desktop_runtime, "runtime", lambda *a, **kw: pytest.fail("runtime contacted"))
+    with pytest.raises(ValueError):
+        app.dispatch("runtime_check", {"training_stage": "sft", "job_id": "not-a-job"})

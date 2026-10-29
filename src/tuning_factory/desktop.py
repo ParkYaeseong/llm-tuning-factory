@@ -45,7 +45,8 @@ SERVER_RESERVED = ("GPU 서버가 작업이나 다른 환경 준비에 예약되
                    "작업을 재조정하거나 준비 예약을 해제한 뒤 다시 준비하세요.")
 SERVER_PREPARE_IN_EXECUTION = ("GPU 서버는 실행 승인에서 학습 환경을 함께 준비하지 않습니다. 연결 설정에서 GPU 목록을 "
                                "조회한 뒤 '학습 환경 준비'를 먼저 누르세요.")
-POD_RESERVED_FOR_PREPARATION = "Pod is reserved by a job; reconcile and finish it before preparing runtime"
+POD_RESERVED_FOR_PREPARATION = ("다른 작업이 이 Pod를 사용 중이라 학습 환경을 준비할 수 없습니다. 실행 관리에서 그 작업을 "
+                                "재연결·결과 회수해 끝낸 뒤 다시 시도하세요.")
 
 
 def assets_root():
@@ -169,7 +170,7 @@ class DesktopService:
         from .gpu_compat import load_observation
         try:
             key = observation_key(self.settings)
-        except (ValueError, TypeError):   # incomplete connection settings: nothing was observed yet
+        except (ValueError, TypeError, RuntimeError, OSError):   # incomplete connection settings: nothing was observed yet
             key = None
         observation = load_observation(self.root, key) if key else None
         try:
@@ -179,16 +180,17 @@ class DesktopService:
             findings = self.compatibility(config, None, "plan")
         return {"observed_at": (observation or {}).get("observed_at"), "findings": findings}
 
-    def add_findings(self, report, data):
-        """A runtime check for a queued job (job_id) or an unsubmitted plan (config) also judges that config."""
+    def preflight_config(self, data):
+        """The job config (job_id) or plan config a runtime check should judge, validated before any contact."""
         if data.get("job_id"):
             self.job_directory(data["job_id"])
-            config = self.factory.store.get(data["job_id"])["manifest"]["config"]
-        elif data.get("config"):
-            config = AIConfig.model_validate(data["config"]).model_dump(mode="json")
-        else:
-            return
-        if report.get("observation") is not None:
+            return self.factory.store.get(data["job_id"])["manifest"]["config"]
+        if data.get("config"):
+            return AIConfig.model_validate(data["config"]).model_dump(mode="json")
+        return None
+
+    def add_findings(self, report, config):
+        if config is not None and report.get("observation") is not None:
             report["findings"] = self.compatibility(config, report["observation"], "execute")
 
     def execution_gate(self, config):
@@ -539,10 +541,11 @@ class DesktopService:
                                training_stage=data.get("training_stage", "sft"), inspection=inspection)
             if action == "runtime_prepare" and self.factory.store.gpu_locked("existing_runpod:" + self.settings.get("pod_id", "")):
                 raise ValueError(POD_RESERVED_FOR_PREPARATION)
+            config = self.preflight_config(data) if action == "runtime_check" else None
             report = runtime(self.settings, self.root, prepare=action == "runtime_prepare",
                              training_stage=data.get("training_stage", "sft"))
             if action == "runtime_check":
-                self.add_findings(report, data)
+                self.add_findings(report, config)
             return report
         if action == "runtime_reservations":
             from .desktop_runtime import runtime_reservations

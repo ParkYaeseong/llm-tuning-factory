@@ -1548,3 +1548,4 @@ def test_cli_server_runtime_exit_code_follows_readiness(tmp_path, monkeypatch, r
     monkeypatch.setattr(desktop_runtime, "runtime", lambda *a, **kw: {"ready": ready, "runtime_state": "x"})
     result = CliRunner().invoke(cli.app, ["--state-dir", str(tmp_path / "state"), "server-runtime", str(path)])
     assert result.exit_code == code, result.output
+    assert json.loads(result.stdout)["ready"] is ready
