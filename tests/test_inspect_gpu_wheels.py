@@ -23,8 +23,17 @@ def test_the_longest_compiled_flag_list_becomes_versions():
     data = b"\x00sm_80\x00sm_75 sm_80 sm_86 sm_90 sm_100 sm_120 compute_120\x00tail"
     with archive(gate.TORCH_LIBRARY, data) as wheel:
         flags = gate.parse_arch_flags(wheel.read(gate.TORCH_LIBRARY))
-    assert flags == {"sass": ["7.5", "8.0", "8.6", "9.0", "10.0", "12.0"], "ptx": ["12.0"]}
+    assert flags == {"sass": ["7.5", "8.0", "8.6", "9.0", "10.0", "12.0"], "ptx": ["12.0"],
+                     "flags": "sm_75 sm_80 sm_86 sm_90 sm_100 sm_120 compute_120",
+                     "other_candidates": []}
     assert gate.unsupported(flags) == []
+
+
+def test_shorter_flag_lists_are_reported_as_other_candidates():
+    flags = gate.parse_arch_flags(b"sm_50 sm_60\x00sm_80 sm_90 compute_90\x00")
+    assert flags["sass"] == ["8.0", "9.0"] and flags["ptx"] == ["9.0"]
+    assert flags["flags"] == "sm_80 sm_90 compute_90"
+    assert flags["other_candidates"] == ["sm_50 sm_60"]
 
 
 def test_a_build_without_blackwell_code_is_reported():

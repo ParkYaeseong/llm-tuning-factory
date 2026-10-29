@@ -2,7 +2,11 @@
 
 Reads the CUDA architectures compiled into the pinned torch wheel and checks that bitsandbytes ships a CUDA 12.8
 library. Wheel members are read with HTTP range requests, so only the zip directory and one library are fetched.
+This checks the compile-flag list torch reports (torch.cuda.get_arch_list()), not the cubins themselves and not a
+GPU run; the runtime ARCH_PROBE and the GPU acceptance test remain separate.
 Usage: uv run python scripts/inspect_gpu_wheels.py [--lock containers/gpu-requirements.lock]
+Exit codes: 0 all required architectures and the bitsandbytes CUDA 12.8 library found; 1 a finding (missing
+architecture or library); 2 the inspection itself failed (network, index, hash or zip error).
 """
 import argparse
 import io
@@ -29,11 +33,14 @@ def parse_arch_flags(data):
     matches = ARCH_FLAGS.findall(data)
     if not matches:
         raise ValueError("compiled CUDA architecture list not found")
+    chosen = max(matches, key=len).decode("ascii")
+    others = sorted({match.decode("ascii") for match in matches} - {chosen})
     sass, ptx = set(), set()
-    for token in max(matches, key=len).decode("ascii").split():
+    for token in chosen.split():
         kind, digits = re.fullmatch(r"(sm|compute)_(\d+)[a-z]?", token).groups()
         (sass if kind == "sm" else ptx).add(f"{int(digits[:-1])}.{digits[-1]}")
-    return {"sass": sorted(sass, key=version_tuple), "ptx": sorted(ptx, key=version_tuple)}
+    return {"sass": sorted(sass, key=version_tuple), "ptx": sorted(ptx, key=version_tuple),
+            "flags": chosen, "other_candidates": others}
 
 
 def unsupported(flags):
@@ -94,16 +101,18 @@ def torch_wheel_url(client, lock_text):
     match = re.search(r'href="([^"#]*' + name + r')#sha256=([0-9a-f]{64})"', page.text)
     if not match:
         raise ValueError("pinned torch wheel is not listed on the PyTorch cu128 index")
-    if match.group(2) not in lock_text:
-        raise ValueError("PyTorch index hash differs from the lock")
+    if "sha256:" + match.group(2) not in lock_text:
+        raise ValueError("PyTorch index hash differs from the lock; update TORCH_WHEEL or the lock")
     return str(httpx.URL(TORCH_INDEX).join(match.group(1)))
 
 
-def bitsandbytes_wheel_url(client):
+def bitsandbytes_wheel_url(client, lock_text):
     response = client.get(BITSANDBYTES_JSON, follow_redirects=True)
     response.raise_for_status()
     for item in response.json()["urls"]:
         if item["filename"].endswith(".whl") and "manylinux" in item["filename"] and "x86_64" in item["filename"]:
+            if "sha256:" + item["digests"]["sha256"] not in lock_text:
+                raise ValueError("bitsandbytes index hash differs from the lock; update BITSANDBYTES_JSON or the lock")
             return item["url"]
     raise ValueError("bitsandbytes 0.48.1 Linux x86_64 wheel not found")
 
@@ -113,12 +122,16 @@ def main(argv=None):
     parser.add_argument("--lock", default="containers/gpu-requirements.lock")
     args = parser.parse_args(argv)
     lock_text = Path(args.lock).read_text(encoding="utf-8")
-    with httpx.Client(timeout=60) as client:
-        url = torch_wheel_url(client, lock_text)
-        with remote_zip(client, url) as wheel:
-            flags = parse_arch_flags(wheel.read(TORCH_LIBRARY))
-        with remote_zip(client, bitsandbytes_wheel_url(client)) as wheel:
-            cuda128 = has_cuda128_library(wheel.namelist())
+    try:
+        with httpx.Client(timeout=60) as client:
+            url = torch_wheel_url(client, lock_text)
+            with remote_zip(client, url) as wheel:
+                flags = parse_arch_flags(wheel.read(TORCH_LIBRARY))
+            with remote_zip(client, bitsandbytes_wheel_url(client, lock_text)) as wheel:
+                cuda128 = has_cuda128_library(wheel.namelist())
+    except (ValueError, KeyError, httpx.HTTPError, zipfile.BadZipFile) as error:
+        print(f"inspection failed: {error!r}", file=sys.stderr)
+        return 2
     missing = unsupported(flags)
     print(json.dumps({"torch_wheel": url, **flags, "unsupported_required": missing,
                       "bitsandbytes_cuda128": cuda128}, indent=2))
