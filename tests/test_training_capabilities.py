@@ -265,3 +265,16 @@ def test_reward_preflight_rejects_incompatible_pinned_reward_inventory(tmp_path,
     monkeypatch.setattr(training, "Path", lambda value: reward if value == "/workspace/reward" else Path(value))
     with pytest.raises(ValueError, match=reason):
         training.LlamaFactoryBackend.verify_reward_model(config)
+
+
+def test_catalog_records_sizes_for_memory_estimates_and_adds_llama_70b():
+    from tuning_factory.capabilities import model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    assert all(model["hidden_size"] > 0 and model["num_layers"] > 0 for model in models.values())
+    qwen = models["Qwen/Qwen2.5-0.5B-Instruct"]
+    assert (qwen["hidden_size"], qwen["num_layers"], qwen["gpu_verified"]) == (896, 24, True)
+    for name in ("meta-llama/Llama-3.1-70B-Instruct", "meta-llama/Llama-3.1-70B"):
+        model = models[name]
+        assert (model["template"], model["architecture"], model["gated"]) == ("llama3", "llama", True)
+        assert (model["parameters_b"], model["hidden_size"], model["num_layers"]) == (70, 8192, 80)
+        assert model["gpu_verified"] is False

@@ -17,23 +17,27 @@ METHODS = ["lora", "qlora", "full", "freeze", "oft"]
 
 def model_catalog():
     models = []
+    # (name, parameters in billions, hidden_size, num_hidden_layers) from each model's config.json
     for family, architecture, template, variants, length, gated in [
         ("Qwen", "qwen2", "qwen", [
-            ("Qwen2.5-0.5B-Instruct", 0.5), ("Qwen2.5-1.5B-Instruct", 1.5),
-            ("Qwen2.5-3B-Instruct", 3), ("Qwen2.5-7B-Instruct", 7), ("Qwen2.5-14B-Instruct", 14),
-            ("Qwen2.5-0.5B", 0.5), ("Qwen2.5-1.5B", 1.5), ("Qwen2.5-7B", 7),
+            ("Qwen2.5-0.5B-Instruct", 0.5, 896, 24), ("Qwen2.5-1.5B-Instruct", 1.5, 1536, 28),
+            ("Qwen2.5-3B-Instruct", 3, 2048, 36), ("Qwen2.5-7B-Instruct", 7, 3584, 28),
+            ("Qwen2.5-14B-Instruct", 14, 5120, 48),
+            ("Qwen2.5-0.5B", 0.5, 896, 24), ("Qwen2.5-1.5B", 1.5, 1536, 28), ("Qwen2.5-7B", 7, 3584, 28),
         ], 32768, False),
         ("meta-llama", "llama", "llama3", [
-            ("Llama-3.1-8B-Instruct", 8), ("Llama-3.2-1B-Instruct", 1),
-            ("Llama-3.2-3B-Instruct", 3), ("Llama-3.1-8B", 8),
+            ("Llama-3.1-8B-Instruct", 8, 4096, 32), ("Llama-3.2-1B-Instruct", 1, 2048, 16),
+            ("Llama-3.2-3B-Instruct", 3, 3072, 28), ("Llama-3.1-8B", 8, 4096, 32),
+            ("Llama-3.1-70B-Instruct", 70, 8192, 80), ("Llama-3.1-70B", 70, 8192, 80),
         ], 32768, True),
-        ("mistralai", "mistral", "mistral", [("Mistral-7B-Instruct-v0.3", 7)], 32768, False),
-        ("google", "gemma2", "gemma", [("gemma-2-2b-it", 2), ("gemma-2-9b-it", 9)], 8192, True),
+        ("mistralai", "mistral", "mistral", [("Mistral-7B-Instruct-v0.3", 7, 4096, 32)], 32768, False),
+        ("google", "gemma2", "gemma", [("gemma-2-2b-it", 2, 2304, 26), ("gemma-2-9b-it", 9, 3584, 42)], 8192, True),
     ]:
-        for name, size in variants:
+        for name, size, hidden, layers in variants:
             model_id = f"{family}/{name}"
             models.append({"id": model_id, "template": template, "architecture": architecture,
-                           "max_length": length, "parameters_b": size, "gated": gated,
+                           "max_length": length, "parameters_b": size, "hidden_size": hidden, "num_layers": layers,
+                           "gated": gated,
                            "gpu_verified": model_id == "Qwen/Qwen2.5-0.5B-Instruct",
                            "verification_scope": ("0.2.3 SFT LoRA/4-bit QLoRA synthetic H100 only"
                                                   if model_id == "Qwen/Qwen2.5-0.5B-Instruct"
