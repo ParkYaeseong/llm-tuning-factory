@@ -21,7 +21,8 @@ def parse_gpu_facts(text):
         if len(fields) != 5:
             raise ValueError("unexpected nvidia-smi GPU query output")
         uuid, name, capability, memory, driver = fields
-        if (not re.fullmatch(r"\d+\.\d+", capability) or not memory.isdigit()
+        if (not re.fullmatch(r"GPU-[0-9A-Fa-f-]+", uuid) or not name or len(name) > 128 or not name.isprintable()
+                or not re.fullmatch(r"\d+\.\d+", capability) or not memory.isdigit()
                 or not re.fullmatch(r"\d+(\.\d+)*", driver)):
             raise ValueError("unexpected nvidia-smi GPU query output")
         gpus.append({"uuid": uuid, "name": name, "capability": capability, "memory_mib": int(memory),
@@ -33,7 +34,9 @@ def parse_gpu_facts(text):
 
 def capability_supported(capability, sass, ptx=()):
     """CUDA binary compatibility: same-major machine code with a lower or equal minor, or PTX at or below the
-    device. desktop_runtime.ARCH_PROBE applies the same rule inside the installed runtime."""
+    device. desktop_runtime.ARCH_PROBE applies the same rule inside the installed runtime. The capability and
+    every sass/ptx entry are "major.minor" strings (for example "8.6"); callers convert torch's sm_XY/compute_XY
+    names before calling."""
     major, minor = version_tuple(capability)
     if any(version_tuple(code)[0] == major and version_tuple(code)[1] <= minor for code in sass):
         return True
@@ -41,4 +44,6 @@ def capability_supported(capability, sass, ptx=()):
 
 
 def driver_at_least(driver, minimum):
-    return version_tuple(driver) >= version_tuple(minimum)
+    left, right = version_tuple(driver), version_tuple(minimum)
+    width = max(len(left), len(right))
+    return left + (0,) * (width - len(left)) >= right + (0,) * (width - len(right))
