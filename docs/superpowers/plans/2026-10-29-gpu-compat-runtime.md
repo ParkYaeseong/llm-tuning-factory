@@ -1847,6 +1847,11 @@ git commit -m "feat: judge plans, runtime checks and executions against the obse
 
 ### Task 12: 화면 — 계획 호환성, 실행 전 확인, 승인 창 안의 환경 준비
 
+> **검토 후 변경(2026-10-29, 커밋 `9ad85ec`·`41c9e76`):** 실행 전 확인 중 중복 클릭을 막는 `preflightRunning` 플래그를 두고,
+> 확인·승인 사이에 실행 계획이 바뀌거나(시작) 선택한 작업이 바뀌면(대기 작업 실행) 실행하지 않는다.
+> 대기 작업 실행은 확인·승인한 그 작업(`approvedJob`)만 실행한다. GPU 서버의 환경 없음 안내는 연결 설정을 가리키고,
+> `incompatible`·`unavailable`·알 수 없는 상태는 오류로 멈춘다. 아래 코드 블록은 최초 계획이다.
+
 **Files:**
 - Create: `desktop/src/gpu-preflight.ts`
 - Modify: `desktop/src/main.ts` (import, 계획 카드 448행, `execute()` 695행, 실행 승인 943–951행, 시작·실행 1039–1042행, 환경 확인 983행), `desktop/src/style.css`
