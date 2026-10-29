@@ -173,8 +173,14 @@
 
 - `cap = torch.cuda.get_device_capability()`와 `torch.cuda.get_arch_list()`를 읽는다. 4.2의 세대 지원 규칙을 만족하면
   `arch_ok`다(`sm_XY`는 기계어, `compute_XY`는 PTX).
-- 환경이 없으면(가상환경 Python이 없음) `RuntimeMissing`, 있지만 고정값이 다르거나 확인 코드가 실패하면 `RuntimeMismatch`,
-  연산이 실패하면 `GPUIncompatible`을 낸다. `runtime_check`는 예외 대신 `runtime_state`로 알려 준다.
+- 확인 결과에 따라 다음 예외를 낸다. `runtime_check`는 예외 대신 `runtime_state`로 알려 준다.
+  - `RuntimeMissing`(`missing`): 환경이 없다(가상환경 Python이 없음).
+  - `RuntimeMismatch`(`mismatch`): 환경은 있지만 소스·고정 파일·엔진이 다르거나 확인 코드가 실패했다. 다시 준비하면 고쳐진다.
+  - `GPUUnavailable`(`unavailable`): 환경은 맞지만 GPU가 인식되지 않거나 선택한 GPU 수와 다르거나, 세대는 지원하는데
+    연산이 실패했다(사용 중·오류 상태). 다시 준비해도 고쳐지지 않으므로 **준비 대상이 아니다**.
+  - `GPUIncompatible`(`incompatible`): 이 GPU 세대를 환경이 지원하지 않는다.
+- 확인 코드는 `torch.cuda.device_count()`를 `devices`로 보고하고(이전의 assert 대신), 결과 줄 앞에 `TF_PROBE `를 붙인다.
+  뒤에 다른 출력이 붙어도 그 줄을 찾아 해석한다.
 - `(torch.ones(8, device="cuda") * 2).sum().item() == 16`(`kernel_ok`). 세대 불일치는 여기서 확정된다.
 - `torch.cuda.is_bf16_supported()`를 기록한다. 실행 판정에서 작업 정밀도와 비교한다.
 

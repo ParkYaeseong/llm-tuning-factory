@@ -1379,7 +1379,8 @@ def install_runtime(client, training_stage, remote_root, pod, preparation):
 def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspection=None):
     """Check (or, approved, prepare) the private runtime and record this destination's GPU facts.
 
-    A check reports ``runtime_state`` ("ready", "missing", "mismatch" or "incompatible") instead of raising."""
+    A check reports ``runtime_state`` ("ready", "missing", "mismatch", "incompatible" or "unavailable") instead of
+    raising."""
     if settings.get("provider") == "ssh_server" and prepare:
         if inspection is None:
             raise ValueError("approved destination inspection required for server preparation")
@@ -1412,6 +1413,8 @@ def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspec
                 result, state = {}, "mismatch"
             except GPUIncompatible:
                 result, state = {}, "incompatible"
+            except GPUUnavailable:
+                result, state = {}, "unavailable"
         report = {"ready": state == "ready", "runtime_state": state, "observation": observation,
                   "profile": profile["profile"], **result}
         if generic:
@@ -1921,6 +1924,7 @@ export const RUNTIME_PREPARATION_NOTICE = "Pod에 이 앱 버전의 학습 환�
 export const SERVER_RUNTIME_REQUIRED = "GPU 서버에 이 앱 버전의 학습 환경이 없습니다. "
   + "연결 설정에서 GPU 목록을 조회한 뒤 '학습 환경 준비'를 먼저 누르세요.";
 export const GPU_INCOMPATIBLE = "이 GPU에서 앱 학습 환경의 CUDA 연산이 실행되지 않습니다. 지원하는 GPU 세대인지 확인하세요.";
+export const GPU_UNAVAILABLE = "GPU를 사용할 수 없거나 사용 중입니다. 다른 작업이 GPU를 쓰고 있는지, Pod·서버의 GPU 상태를 확인하세요.";
 
 const items = (findings: Obj[]) => `<ul>${findings.map(item => `<li>${esc(item.message)}</li>`).join("")}</ul>`;
 
@@ -1946,6 +1950,7 @@ export function preflightOutcome(report: Obj | null | undefined, server: boolean
   if (blocks.length) return { error: ["실행할 수 없습니다.", ...blocks.map(item => item.message)].join("\n") };
   const state = report?.ready === false ? report.runtime_state : "ready";
   if (state === "incompatible") return { error: GPU_INCOMPATIBLE };
+  if (state === "unavailable") return { error: GPU_UNAVAILABLE };
   const missing = state === "missing" || state === "mismatch";
   if (missing && server) return { error: SERVER_RUNTIME_REQUIRED };
   const warns = findings.filter(item => item.level !== "block").map(item => "· " + item.message);
@@ -1960,6 +1965,7 @@ export function runtimeNotice(report: Obj, server: boolean): string {
     + `${(gpu.memory_mib / 1024).toFixed(1)}GiB · 드라이버 ${gpu.driver}` : "";
   const target = server ? "GPU 서버" : "Pod";
   if (report?.ready === false && report.runtime_state === "incompatible") return GPU_INCOMPATIBLE + facts;
+  if (report?.ready === false && report.runtime_state === "unavailable") return GPU_UNAVAILABLE + facts;
   if (report?.ready === false) return `선택한 ${target}에 이 앱 버전의 학습 환경이 아직 없습니다. `
     + "'학습 환경 준비'를 누르거나 학습 실행 승인에서 함께 준비하세요." + facts;
   return `선택한 ${target}에서 앱과 일치하는 학습 환경과 CUDA를 확인했습니다.` + facts;
