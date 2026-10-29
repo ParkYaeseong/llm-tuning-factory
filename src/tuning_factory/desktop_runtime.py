@@ -41,6 +41,44 @@ class RemoteCommandFailed(ValueError):
     """The remote command returned an observed nonzero exit status."""
 
 
+RUNTIME_MISSING = ("GPU runtime command failed. The private runtime is not prepared on this host; "
+                   "prepare runtime first")
+RUNTIME_MISMATCH = "GPU runtime source, lock, engine or CUDA preflight mismatch; prepare runtime first"
+GPU_INCOMPATIBLE = "이 GPU에서 앱 학습 환경의 CUDA 연산이 실행되지 않습니다. 지원하는 GPU 세대인지 확인하세요."
+
+
+class RuntimeMissing(RemoteCommandFailed):
+    """The private runtime's interpreter is absent on the GPU host."""
+
+
+class RuntimeMismatch(ValueError):
+    """The private runtime exists but its source, lock, engine or CUDA availability differs, or its probe failed."""
+
+
+class GPUIncompatible(ValueError):
+    """The installed runtime cannot run CUDA kernels on this GPU."""
+
+
+# gpu_compat.capability_supported's rule, run inside the private runtime: same-major machine code with a lower or
+# equal minor, or PTX at or below the device. A failing kernel is reported, never raised.
+ARCH_PROBE = (
+    "arch_ok=kernel_ok=bf16=False\n"
+    "capability=None\n"
+    "if torch.cuda.is_available():\n"
+    " cap=tuple(torch.cuda.get_device_capability())\n"
+    " capability='%d.%d'%cap\n"
+    " codes=[re.fullmatch(r'(sm|compute)_(\d+)(\d)[a-z]?',a) for a in torch.cuda.get_arch_list()]\n"
+    " codes=[(m[1],int(m[2]),int(m[3])) for m in codes if m]\n"
+    " arch_ok=any(k=='sm' and j==cap[0] and n<=cap[1] for k,j,n in codes)"
+    " or any(k=='compute' and (j,n)<=cap for k,j,n in codes)\n"
+    " try:\n"
+    "  kernel_ok=(torch.ones(8,device='cuda')*2).sum().item()==16\n"
+    "  bf16=bool(torch.cuda.is_bf16_supported())\n"
+    " except Exception:\n"
+    "  kernel_ok=False\n"
+)
+
+
 class PinnedHostKey(paramiko.MissingHostKeyPolicy):
     def __init__(self, fingerprint):
         self.fingerprint = fingerprint
@@ -146,7 +184,7 @@ def bootstrap_prerequisites(client):
 
 def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=(), *, model_ops=False):
     """Probe the private runtime. ``model_ops=True`` (merge/materialize) also requires the installed
-    MODEL_OPS_PINS versions; the default probe and result are unchanged."""
+    MODEL_OPS_PINS versions. Raises RuntimeMissing, RuntimeMismatch or GPUIncompatible."""
     profile = engine_profile(training_stage)
     if model_ops and profile["profile"] != "primary":
         raise ValueError(MODEL_OPS_RUNTIME)
@@ -156,27 +194,40 @@ def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=(
     pins = (",model_ops=dict((n,importlib.metadata.version(n).split('+')[0]) for n in "
             + repr(tuple(MODEL_OPS_PINS)) + ")") if model_ops else ""
     probe = (
-        "import json,torch,importlib.metadata;"
-        + ("from llamafactory.train.ppo.trainer import CustomPPOTrainer;" if training_stage == "ppo" else "") +
-        "from pathlib import Path;"
-        "from tuning_factory.manifest import source_hash;"
-        "from tuning_factory.registry import digest;"
-        + ("assert torch.cuda.device_count()==" + str(len(selected_gpu_uuids)) + ";" if selected_gpu_uuids else "") +
-        "print(json.dumps(dict(source=source_hash(),engine=importlib.metadata.version('llamafactory'),"
-        "cuda=torch.cuda.is_available(),lock=digest(Path(" + repr(root + "/" + lock_name) +
-        ").read_bytes())" + pins + ")))"
+        "import json,re,torch,importlib.metadata\n"
+        + ("from llamafactory.train.ppo.trainer import CustomPPOTrainer\n" if training_stage == "ppo" else "")
+        + "from pathlib import Path\n"
+        "from tuning_factory.manifest import source_hash\n"
+        "from tuning_factory.registry import digest\n"
+        + ("assert torch.cuda.device_count()==" + str(len(selected_gpu_uuids)) + "\n" if selected_gpu_uuids else "")
+        + ARCH_PROBE
+        + "print(json.dumps(dict(source=source_hash(),engine=importlib.metadata.version('llamafactory'),"
+        "cuda=torch.cuda.is_available(),lock=digest(Path(" + repr(root + "/" + lock_name) + ").read_bytes()),"
+        "arch_ok=arch_ok,kernel_ok=kernel_ok,bf16=bf16,capability=capability" + pins + ")))"
     )
-    argv = [root + "/venv/bin/python", "-c", probe]
+    python = root + "/venv/bin/python"
+    argv = [python, "-c", probe]
     if selected_gpu_uuids:
         argv = ["env", "CUDA_VISIBLE_DEVICES=" + ",".join(selected_gpu_uuids), *argv]
-    result = json.loads(command(client, argv).splitlines()[-1])
+    try:
+        output = command(client, argv)
+    except RemoteCommandFailed:
+        try:
+            command(client, ["test", "-x", python])
+        except RemoteCommandFailed:
+            raise RuntimeMissing(RUNTIME_MISSING) from None
+        raise RuntimeMismatch(RUNTIME_MISMATCH) from None
+    result = json.loads(output.splitlines()[-1])
     from .desktop import assets_root
     expected = hashlib.sha256((assets_root() / profile["lock_file"]).read_bytes()).hexdigest()
-    base = {key: value for key, value in result.items() if key != "model_ops"} if model_ops else result
-    if base != {"source": source_hash(), "engine": profile["engine_version"], "cuda": True, "lock": expected}:
-        raise ValueError("GPU runtime source, lock, engine or CUDA preflight mismatch; prepare runtime first")
+    base = {key: result.get(key) for key in ("source", "engine", "cuda", "lock")}
+    if (base != {"source": source_hash(), "engine": profile["engine_version"], "cuda": True, "lock": expected}
+            or ("model_ops" in result and not model_ops)):
+        raise RuntimeMismatch(RUNTIME_MISMATCH)
     if model_ops and result.get("model_ops") != dict(MODEL_OPS_PINS):
         raise ValueError(MODEL_OPS_RUNTIME)
+    if result.get("arch_ok") is not True or result.get("kernel_ok") is not True:
+        raise GPUIncompatible(GPU_INCOMPATIBLE)
     return result
 
 

@@ -16,7 +16,8 @@ def test_ppo_preflight_uses_exact_legacy_lock(monkeypatch):
     from tuning_factory.registry import digest
 
     expected = {'source': source_hash(), 'engine': '0.9.3', 'cuda': True,
-                'lock': digest((assets_root() / 'containers/gpu-ppo-requirements.lock').read_bytes())}
+                'lock': digest((assets_root() / 'containers/gpu-ppo-requirements.lock').read_bytes()),
+                'arch_ok': True, 'kernel_ok': True, 'bf16': True, 'capability': '9.0'}
     calls = []
     def run(client, argv, **kw):
         calls.append(argv)

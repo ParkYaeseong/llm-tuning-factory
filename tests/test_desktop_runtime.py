@@ -58,11 +58,8 @@ def test_remote_command_timeout_message_names_no_provider():
 
 def test_runtime_rejects_missing_compiler_even_when_cuda_is_available(monkeypatch):
     from tuning_factory import desktop_runtime as runtime
-    from tuning_factory.desktop import assets_root
-    from tuning_factory.registry import digest
 
-    ready = {"source": runtime.source_hash(), "engine": "0.9.5", "cuda": True,
-             "lock": digest((assets_root() / "containers/gpu-requirements.lock").read_bytes())}
+    ready = ready_reply(runtime)
 
     def run(client, argv, **kwargs):
         if argv[0] == "sh":
@@ -76,11 +73,8 @@ def test_runtime_rejects_missing_compiler_even_when_cuda_is_available(monkeypatc
 
 def test_runtime_accepts_compiler_with_matching_cuda_and_lock(monkeypatch):
     from tuning_factory import desktop_runtime as runtime
-    from tuning_factory.desktop import assets_root
-    from tuning_factory.registry import digest
 
-    ready = {"source": runtime.source_hash(), "engine": "0.9.5", "cuda": True,
-             "lock": digest((assets_root() / "containers/gpu-requirements.lock").read_bytes())}
+    ready = ready_reply(runtime)
     monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: "" if argv[0] == "sh" else json.dumps(ready))
     assert runtime.check(None) == ready
 
@@ -137,12 +131,9 @@ def test_executor_for_v2_selects_runtime_profile_and_cache_root(tmp_path, monkey
 
 def test_check_model_ops_pins_only_when_requested(monkeypatch):
     from tuning_factory import desktop_runtime as runtime
-    from tuning_factory.desktop import assets_root
-    from tuning_factory.registry import digest
     from tuning_factory.runtime_profiles import MODEL_OPS_PINS
 
-    ready = {"source": runtime.source_hash(), "engine": "0.9.5", "cuda": True,
-             "lock": digest((assets_root() / "containers/gpu-requirements.lock").read_bytes())}
+    ready = ready_reply(runtime)
     probes, replies = [], []
 
     def run(client, argv, **kwargs):
@@ -154,17 +145,14 @@ def test_check_model_ops_pins_only_when_requested(monkeypatch):
     monkeypatch.setattr(runtime, "command", run)
     replies.append(ready)
     assert runtime.check(None) == ready
-    root = runtime.runtime_path("sft")
-    legacy = ("import json,torch,importlib.metadata;from pathlib import Path;"
-              "from tuning_factory.manifest import source_hash;from tuning_factory.registry import digest;"
-              "print(json.dumps(dict(source=source_hash(),engine=importlib.metadata.version('llamafactory'),"
-              "cuda=torch.cuda.is_available(),lock=digest(Path(" + repr(root + "/gpu-requirements.lock")
-              + ").read_bytes()))))")
-    assert probes[0] == legacy   # the default probe and result dict are byte-identical to before
+    import ast
+    ast.parse(probes[0])
+    assert "arch_ok=arch_ok,kernel_ok=kernel_ok" in probes[0] and "model_ops" not in probes[0]
+    assert repr(runtime.runtime_path("sft") + "/gpu-requirements.lock") in probes[0]
     pinned = {**ready, "model_ops": dict(MODEL_OPS_PINS)}
     replies.append(pinned)
     assert runtime.check(None, model_ops=True) == pinned
-    assert all(repr(name) in probes[1] for name in MODEL_OPS_PINS) and probes[1] != legacy
+    assert all(repr(name) in probes[1] for name in MODEL_OPS_PINS) and probes[1] != probes[0]
     replies.append({**ready, "model_ops": {**MODEL_OPS_PINS, "peft": "0.18.0"}})
     with pytest.raises(ValueError, match="pinned PEFT 0.18.1"):
         runtime.check(None, model_ops=True)
@@ -270,3 +258,73 @@ def _yield(pod):
         yield dict(pod), SimpleNamespace(close=lambda: None)
 
     return manager()
+
+
+def ready_reply(runtime, lock="containers/gpu-requirements.lock", engine="0.9.5", **extra):
+    from tuning_factory.desktop import assets_root
+    from tuning_factory.registry import digest
+    return {"source": runtime.source_hash(), "engine": engine, "cuda": True,
+            "lock": digest((assets_root() / lock).read_bytes()), "arch_ok": True, "kernel_ok": True,
+            "bf16": True, "capability": "12.0", **extra}
+
+
+def test_check_separates_a_missing_runtime_from_a_broken_one(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+
+    calls = []
+
+    def absent(client, argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == "sh":
+            return ""
+        raise runtime.RemoteCommandFailed("GPU runtime command failed. not found")
+
+    monkeypatch.setattr(runtime, "command", absent)
+    with pytest.raises(runtime.RuntimeMissing, match="GPU runtime command failed"):
+        runtime.check(None)
+    assert calls[-1] == ["test", "-x", runtime.runtime_path("sft") + "/venv/bin/python"]
+
+    def broken(client, argv, **kwargs):
+        if argv[0] in {"sh", "test"}:
+            return ""
+        raise runtime.RemoteCommandFailed("GPU runtime command failed. ImportError")
+
+    monkeypatch.setattr(runtime, "command", broken)
+    with pytest.raises(runtime.RuntimeMismatch, match="preflight mismatch"):
+        runtime.check(None)
+
+
+@pytest.mark.parametrize("field", ["arch_ok", "kernel_ok"])
+def test_check_refuses_a_gpu_whose_kernels_cannot_run(monkeypatch, field):
+    from tuning_factory import desktop_runtime as runtime
+
+    reply = ready_reply(runtime, **{field: False})
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: "" if argv[0] == "sh" else json.dumps(reply))
+    with pytest.raises(runtime.GPUIncompatible, match="CUDA 연산"):
+        runtime.check(None)
+
+
+@pytest.mark.parametrize("capability,arch,ok", [
+    ((8, 9), ["sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"], True),   # Ada runs sm_86 machine code
+    ((12, 0), ["sm_80", "sm_90", "compute_90"], True),                           # PTX JIT
+    ((12, 0), ["sm_80", "sm_86", "sm_90"], False),                               # the cu126 situation
+    ((7, 0), ["sm_75", "sm_80"], False)])
+def test_arch_probe_applies_the_same_major_rule(capability, arch, ok):
+    import re
+    from types import SimpleNamespace
+
+    from tuning_factory import desktop_runtime as runtime
+
+    class Tensor:
+        def __mul__(self, other):
+            return self
+
+        def sum(self):
+            return SimpleNamespace(item=lambda: 16)
+
+    cuda = SimpleNamespace(is_available=lambda: True, get_device_capability=lambda: capability,
+                           get_arch_list=lambda: arch, is_bf16_supported=lambda: True)
+    namespace = {"torch": SimpleNamespace(cuda=cuda, ones=lambda n, device: Tensor()), "re": re}
+    exec(runtime.ARCH_PROBE, namespace)
+    assert namespace["arch_ok"] is ok and namespace["kernel_ok"] is True
+    assert namespace["capability"] == "%d.%d" % capability
