@@ -431,7 +431,7 @@ test("a missing RunPod runtime is folded into the single run approval", async ({
   await overrideActions(page, {
     runtime_check: { ready: false, runtime_state: "missing", findings: [
       { level: "warn", code: "MEMORY_TIGHT", message: "예상 메모리가 GPU 메모리에 빠듯합니다." }] },
-    execute: null });
+    execute: { __hold: true } });
   await page.locator('nav [data-action="nav:training"]').click();
   await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
   await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).click();
@@ -439,6 +439,7 @@ test("a missing RunPod runtime is folded into the single run approval", async ({
   await expect(dialog).toContainText("학습 환경이 없어 학습 전에 먼저 설치합니다");
   await expect(dialog).toContainText("예상 메모리가 GPU 메모리에 빠듯합니다.");
   await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.getByText("Pod에 학습 환경을 준비한 뒤 학습을 시작합니다. 최대 30분 걸릴 수 있습니다.", { exact: true })).toBeVisible();
   await expect.poll(() => page.evaluate(() => (window as any).__overridden
     .find((args: any) => args.action === "execute")?.data?.prepare_runtime)).toBe(true);
   const check = await page.evaluate(() => (window as any).__overridden.find((args: any) => args.action === "runtime_check"));
@@ -538,6 +539,24 @@ test("a queued job runs only if it is still the selected job after the preflight
   await page.getByRole("button", { name: "선택", exact: true }).nth(1).click();
   await page.evaluate(() => (window as any).__releases.forEach((release: () => void) => release()));
   await expect(page.getByRole("alert")).toContainText("선택한 작업이 바뀌었습니다");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("execute");
+});
+
+test("a queued job whose destination stops matching during the preflight is not executed", async ({ page }) => {
+  const queued = (route: unknown) => ({ id: "a".repeat(32), status: "QUEUED", attempts: 0, manifest: { config, simulation: false }, server_destination: route });
+  await overrideActions(page, { jobs: [queued(null)], execute: null,
+    runtime_check: { __hold: true, ready: true, runtime_state: "ready", findings: [] } });
+  await page.locator('nav [data-action="nav:jobs"]').click();
+  await page.getByRole("button", { name: "새로고침", exact: true }).click();
+  await page.getByRole("button", { name: "선택", exact: true }).first().click();
+  await page.getByRole("button", { name: "대기 작업 실행", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__releases?.length ?? 0)).toBe(1);
+  // The job now carries a GPU server route that the saved RunPod connection does not match.
+  await overrideActions(page, { jobs: [queued({ ssh_host: "gpu.example.org", ssh_port: 22, ssh_username: "researcher", remote_root: "/srv/factory", selected_gpu_uuids: ["GPU-1"] })] });
+  await page.getByRole("button", { name: "새로고침", exact: true }).click();
+  await page.evaluate(() => (window as any).__releases.forEach((release: () => void) => release()));
+  await expect(page.getByRole("alert")).toContainText("GPU 서버용으로 승인되었습니다");
   await expect(page.getByRole("dialog")).toHaveCount(0);
   expect(await calledActions(page)).not.toContain("execute");
 });

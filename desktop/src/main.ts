@@ -715,6 +715,7 @@ async function execute(job: Obj, prepareRuntime = false) {
   // The job's task may have run while the user typed on another page, which this switch to 실행 관리 replaces.
   captureDrafts();
   state.active = job.id; state.jobCapabilities = null; state.page = "jobs"; await refresh(); render();
+  if (prepareRuntime) { state.notice = "Pod에 학습 환경을 준비한 뒤 학습을 시작합니다. 최대 30분 걸릴 수 있습니다."; render(); }
   // Deliberately do not block navigation: a separate bridge process owns this attempt.
   api("execute", { job_id: job.id, approved: true, prepare_runtime: prepareRuntime }).then(async result => {
     await refresh();
@@ -980,11 +981,18 @@ async function action(name: string) {
       }
       const planChanged = () => name === "start" && (!state.plan || state.plan !== planAtCheck);
       const jobChanged = () => name === "execute" && state.active !== job?.id;
+      // Settings or the job list may have changed during the check or the dialog: judge the current route again.
+      const destinationIssue = () => {
+        const current = job && name === "execute" ? state.jobs.find((j: Obj) => j.id === job.id) ?? job : null;
+        return current ? jobDestinationIssue(current, state.settings) : null;
+      };
       if (planChanged()) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
       if (jobChanged()) { state.error = "선택한 작업이 바뀌었습니다. 작업을 다시 선택한 뒤 실행하세요."; render(); return; }
+      { const moved = destinationIssue(); if (moved) { state.error = moved; render(); return; } }
       if (!await approve("실제 GPU 학습 실행", transferApproval(job ? job.server_destination ?? null : settingsRoute(state.settings)) + extra)) return;
       if (planChanged()) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
       if (jobChanged()) { state.error = "선택한 작업이 바뀌었습니다. 작업을 다시 선택한 뒤 실행하세요."; render(); return; }
+      { const moved = destinationIssue(); if (moved) { state.error = moved; render(); return; } }
       approvedJob = job;
     } finally { preflightRunning = false; }
   }
