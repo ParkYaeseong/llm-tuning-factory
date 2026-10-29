@@ -1,8 +1,10 @@
 """GPU and training-runtime compatibility: nvidia-smi facts, architecture and driver rules, memory estimates and
 block/warn findings. Pure functions plus a small JSON observation store; no SSH, provider or MLflow calls."""
 import json
+import math
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -98,6 +100,8 @@ OBSERVATION_MISSING = ("저장된 GPU 정보가 없습니다. 연결 설정의 '
 OBSERVATION_STALE = "저장된 GPU 정보가 24시간보다 오래되었습니다. 연결 설정의 '환경 확인'을 다시 누르세요."
 GPU_FACTS_UNKNOWN = ("GPU 정보를 읽지 못해 세대·드라이버·메모리를 미리 점검하지 못했습니다. "
                      "학습 직전 환경 검사가 대신 확인합니다.")
+POD_FACTS_UNKNOWN = "RunPod에서 Pod의 GPU 종류·개수를 확인하지 못했습니다. 잠시 후 '환경 확인'을 다시 누르세요."
+PRICE_UNKNOWN = "RunPod에서 Pod의 현재 시간당 요금을 확인하지 못했습니다. 잠시 후 다시 시도하세요."
 
 
 def _finding(level, code, message):
@@ -120,7 +124,7 @@ def evaluate(config, observation, capabilities, model, *, stage, now=None):
             findings.append(_finding("warn", "OBSERVATION_MISSING", OBSERVATION_MISSING))
         return findings
     now = time.time() if now is None else now
-    if stage == "plan" and now - float(observation.get("observed_at") or 0) > STALE_SECONDS:
+    if stage == "plan" and now - float(observation.get("observed_at") or 0) >= STALE_SECONDS:
         findings.append(_finding("warn", "OBSERVATION_STALE", OBSERVATION_STALE))
     resource = config.get("resource_profile") or {}
     hyper = config.get("hyperparameters") or {}
@@ -147,23 +151,36 @@ def evaluate(config, observation, capabilities, model, *, stage, now=None):
                 and version_tuple(capability) < version_tuple(capabilities["bf16_min_capability"])):
             findings.append(_finding("block", "BF16_UNSUPPORTED",
                                      "이 GPU는 bf16을 지원하지 않습니다. 학습 설정의 정밀도를 fp16으로 바꾸세요."))
-    names = ({pod.get("gpu_id"), pod.get("gpu_display_name")} - {None}) if pod else {item["name"] for item in gpus}
-    configured = resource.get("gpu_type")
-    if names and configured not in names:
-        expected = (pod or {}).get("gpu_id") or sorted(names)[0]
-        findings.append(_finding("block", "GPU_TYPE_MISMATCH",
-                                 f"학습 설정의 GPU 종류({configured})가 연결된 GPU({expected})와 다릅니다. 연결 설정의 "
-                                 "'GPU 정보 → 학습 설정에 적용'으로 맞춘 뒤 실행 계획을 다시 확인하세요."))
-    count = int(resource.get("gpu_count", 1))
-    observed_count = pod.get("gpu_count") if pod else len(gpus)
-    if observed_count and count != observed_count:
-        findings.append(_finding("block", "GPU_COUNT_MISMATCH",
-                                 f"학습 설정의 GPU 수({count})가 연결된 GPU 수({observed_count})와 다릅니다."))
-    price = (pod or {}).get("hourly_cost_usd")
-    limit = float(resource.get("hourly_cost_usd", 0)) * count
-    if price is not None and price > limit + 1e-9:
-        findings.append(_finding("block", "PRICE_OVER_BUDGET",
-                                 f"현재 시간당 요금 ${price:.2f}가 학습 설정의 한도 ${limit:.2f}를 넘습니다."))
+    if pod is None:
+        names, observed_count = {item["name"] for item in gpus}, len(gpus)
+    else:
+        names = {pod.get("gpu_id"), pod.get("gpu_display_name")} - {None}
+        observed_count = pod.get("gpu_count")
+    pod_facts_known = pod is None or (
+        bool(names) and isinstance(observed_count, int) and not isinstance(observed_count, bool) and observed_count > 0)
+    if not pod_facts_known:
+        findings.append(_finding("block", "POD_FACTS_UNKNOWN", POD_FACTS_UNKNOWN))
+    else:
+        configured = resource.get("gpu_type")
+        if names and configured not in names:
+            expected = (pod or {}).get("gpu_id") or sorted(names)[0]
+            findings.append(_finding("block", "GPU_TYPE_MISMATCH",
+                                     f"학습 설정의 GPU 종류({configured})가 연결된 GPU({expected})와 다릅니다. 연결 설정의 "
+                                     "'GPU 정보 → 학습 설정에 적용'으로 맞춘 뒤 실행 계획을 다시 확인하세요."))
+        count = int(resource.get("gpu_count", 1))
+        if observed_count and count != observed_count:
+            findings.append(_finding("block", "GPU_COUNT_MISMATCH",
+                                     f"학습 설정의 GPU 수({count})가 연결된 GPU 수({observed_count})와 다릅니다."))
+    if pod is not None:
+        price = pod.get("hourly_cost_usd")
+        if (isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price)
+                or price <= 0):
+            findings.append(_finding("block", "PRICE_UNKNOWN", PRICE_UNKNOWN))
+        else:
+            limit = float(resource.get("hourly_cost_usd", 0)) * int(resource.get("gpu_count", 1))
+            if price > limit:
+                findings.append(_finding("block", "PRICE_OVER_BUDGET",
+                                         f"현재 시간당 요금 ${price:.3f}가 학습 설정의 한도 ${limit:.3f}를 넘습니다."))
     if gpu is not None and model is not None:
         estimate = estimate_memory(model, config)
         vram = gpu["memory_mib"] / 1024
@@ -210,14 +227,37 @@ def _observation_path(root, key):
 def save_observation(root, observation):
     path = _observation_path(root, observation["key"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(observation, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-    os.replace(temporary, path)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix=path.stem + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(observation, ensure_ascii=False, sort_keys=True))
+        os.replace(name, path)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+
+
+def _valid_observation(data, key):
+    if not isinstance(data, dict) or data.get("key") != key:
+        return False
+    observed_at = data.get("observed_at")
+    if isinstance(observed_at, bool) or not isinstance(observed_at, (int, float)):
+        return False
+    gpus = data.get("gpus")
+    if not isinstance(gpus, list) or not all(
+            isinstance(gpu, dict) and all(field in gpu for field in ("uuid", "name", "capability", "memory_mib", "driver"))
+            for gpu in gpus):
+        return False
+    return data.get("pod") is None or isinstance(data["pod"], dict)
 
 
 def load_observation(root, key):
     path = _observation_path(root, key)
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    return data if _valid_observation(data, key) else None

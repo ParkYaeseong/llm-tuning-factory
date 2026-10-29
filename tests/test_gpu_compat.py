@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from tuning_factory import gpu_compat
@@ -119,8 +121,8 @@ def test_old_architecture_driver_and_bf16_block():
     old = {**BLACKWELL, "name": "Tesla V100-SXM2-32GB", "capability": "7.0", "memory_mib": 32768, "driver": "470.82"}
     findings = gpu_compat.evaluate(job(gpu_type="Tesla V100-SXM2-32GB"), observed([old], pod=None), CAPS, QWEN05,
                                    stage="execute")
-    assert {("block", "GPU_ARCH_UNSUPPORTED"), ("block", "DRIVER_TOO_OLD"), ("block", "BF16_UNSUPPORTED")} <= codes(
-        findings)
+    assert codes(findings) == {("block", "GPU_ARCH_UNSUPPORTED"), ("block", "DRIVER_TOO_OLD"),
+                               ("block", "BF16_UNSUPPORTED")}
 
 
 def test_a_driver_below_the_cuda_12_8_release_warns():
@@ -172,3 +174,45 @@ def test_observation_store_round_trips_and_refuses_unsafe_keys(tmp_path):
     with pytest.raises(ValueError, match="key"):
         gpu_compat.load_observation(tmp_path, "../escape")
     assert gpu_compat.make_observation("server-0123456789abcdef", [BLACKWELL], None, now=1.0)["pod"] is None
+
+
+def test_a_gpu_count_mismatch_blocks_without_a_price_finding():
+    findings = gpu_compat.evaluate(job(), observed(pod={**POD, "gpu_count": 2}), CAPS, QWEN05, stage="execute")
+    assert ("block", "GPU_COUNT_MISMATCH") in codes(findings)
+    assert "PRICE_UNKNOWN" not in {item["code"] for item in findings}
+
+
+def test_a_price_equal_to_the_limit_passes():
+    findings = gpu_compat.evaluate(job(), observed(pod={**POD, "hourly_cost_usd": 0.6}), CAPS, QWEN05,
+                                   stage="execute")
+    assert "PRICE_OVER_BUDGET" not in {item["code"] for item in findings}
+
+
+def test_incomplete_pod_facts_block():
+    for pod in ({**POD, "gpu_id": None, "gpu_display_name": None}, {**POD, "gpu_count": None}):
+        findings = gpu_compat.evaluate(job(), observed(pod=pod), CAPS, QWEN05, stage="execute")
+        assert codes(findings) == {("block", "POD_FACTS_UNKNOWN")}
+    for price in (None, 0, float("nan")):
+        findings = gpu_compat.evaluate(job(), observed(pod={**POD, "hourly_cost_usd": price}), CAPS, QWEN05,
+                                       stage="execute")
+        assert codes(findings) == {("block", "PRICE_UNKNOWN")}
+
+
+def test_unreadable_or_foreign_observation_files_load_as_none(tmp_path):
+    observation = gpu_compat.make_observation("runpod-borrowed", [BLACKWELL], None, now=5.0)
+    path = tmp_path / "gpu-observations" / "runpod-borrowed.json"
+    gpu_compat.save_observation(tmp_path, observation)
+    broken = {k: v for k, v in BLACKWELL.items() if k != "memory_mib"}
+    for text in ("{not json", "[]", json.dumps({**observation, "key": "runpod-other"}),
+                 json.dumps({**observation, "gpus": [broken]})):
+        path.write_text(text, encoding="utf-8")
+        assert gpu_compat.load_observation(tmp_path, "runpod-borrowed") is None
+
+
+def test_saving_twice_overwrites_and_leaves_no_temp_files(tmp_path):
+    first = gpu_compat.make_observation("runpod-borrowed", [BLACKWELL], None, now=1.0)
+    second = gpu_compat.make_observation("runpod-borrowed", [BLACKWELL], None, now=2.0)
+    gpu_compat.save_observation(tmp_path, first)
+    gpu_compat.save_observation(tmp_path, second)
+    assert gpu_compat.load_observation(tmp_path, "runpod-borrowed") == second
+    assert list((tmp_path / "gpu-observations").glob("*.tmp")) == []
