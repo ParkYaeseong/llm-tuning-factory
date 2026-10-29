@@ -127,3 +127,13 @@ PPO는 격리된 실제 패키지 환경에서 CPU import/API/config 생성까�
 **새 학습 조합의 실제 GPU 시험과 AWS/NCP/MinIO 실계정 시험은 아직 수행하지 않았습니다.**
 0.2.3의 H100 SFT LoRA/4비트 QLoRA 검증을 새 조합의 성공 증거로 사용하지 않습니다.
 정확한 최신 검사 수와 패키지 결과는 [진행 기록](PROGRESS.md)에 기록합니다.
+
+## 지원 GPU와 메모리 추정
+
+두 학습 환경(주 환경·PPO 환경)은 PyTorch 2.7.1 CUDA 12.8 빌드를 씁니다. 지원 세대와 드라이버 조건은
+`runtime_profiles.runtime_capabilities()`에 있고, 실제 torch 패키지에서 읽은 값입니다(`scripts/inspect_gpu_wheels.py`).
+학습 환경 검사는 설치된 환경에서 GPU 세대 지원과 실제 CUDA 연산 한 번을 확인합니다.
+
+앱 기본 목록 모델은 매개변수 수·`hidden_size`·층 수로 단일 GPU 학습 메모리를 추정합니다. 가중치만으로 GPU 메모리의 95%를
+넘으면 실행을 거부하고, 전체 추정이 90%를 넘으면 경고합니다. 예: Llama 3.1 70B bf16 LoRA(가중치 약 130GiB)는 80GB GPU에서
+거부되고, 4비트 QLoRA(전체 약 50GiB)는 80GB GPU에서 허용됩니다. 여러 GPU를 쓰는 분산 학습은 지원하지 않습니다.

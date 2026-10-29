@@ -113,7 +113,7 @@
 
 ### 4.4 호환성 판정 — `gpu_compat.evaluate(config, facts, profile, model)`
 
-결과는 `{level: "block" | "warn", code, message, suggestion}` 목록이다. 문구는 한국어이고 비밀값을 담지 않는다.
+결과는 `{level: "block" | "warn", code, message}` 목록이다(조언은 `message`에 포함). 문구는 한국어이고 비밀값을 담지 않는다.
 
 단계별 처리는 다음과 같다.
 - **계획:** 저장값을 쓰므로 제출을 막지 않는다. 차단 수준은 "실행 시 거부될 항목", 경고 수준은 "주의 항목"으로 보여 준다.
@@ -128,13 +128,15 @@
 | `GPU_TYPE_MISMATCH` | 차단 | 작업 GPU 종류가 관측 GPU 이름·RunPod GPU ID와 다름. 입력할 정확한 값을 함께 보여 줌 |
 | `GPU_COUNT_MISMATCH` | 차단 | 작업 GPU 개수 ≠ 관측 개수 |
 | `PRICE_OVER_BUDGET` | 차단 | RunPod 시간당 요금 > 작업의 GPU당 요금 × 개수 |
+| `POD_FACTS_UNKNOWN` | 차단 | RunPod API가 GPU 종류·개수를 주지 않음 |
+| `PRICE_UNKNOWN` | 차단 | RunPod API가 유효한 현재 요금을 주지 않음 |
 | `MEMORY_WEIGHTS_EXCEED` | 차단 | 가중치 추정 > GPU 메모리 × 0.95 |
 | `MEMORY_TIGHT` | 경고 | 전체 추정 > GPU 메모리 × 0.90. QLoRA 4비트·배치 1·짧은 길이를 제안 |
 | `MEMORY_UNKNOWN` | 경고 | 목록에 없는 모델이라 크기를 모름 |
 | `MODEL_UNVERIFIED` | 경고 | 목록의 `gpu_verified`가 거짓이거나 검증된 세대가 아님 |
 | `OBSERVATION_MISSING` / `OBSERVATION_STALE` | 경고(계획만) | 저장된 GPU 정보가 없거나 24시간 이상 지남. "환경 확인"을 다시 누르라고 안내 |
 
-기존 `validate_budget`의 GPU 종류·개수·요금 거부는 안전장치로 그대로 둔다. 데스크톱은 그 전에 위 판정을 한국어로 보여 준다.
+SSH 서버의 요금은 아직 이 표가 아니라 기존 서버 예산 검사가 판정한다. 기존 `validate_budget`의 GPU 종류·개수·요금 거부는 안전장치로 그대로 둔다. 데스크톱은 그 전에 위 판정을 한국어로 보여 준다.
 
 ### 4.5 메모리 추정
 

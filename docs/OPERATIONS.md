@@ -109,7 +109,7 @@ docker build -f containers/Dockerfile -t YOUR_REGISTRY/llm-tuning-factory:0.1.0 
 ```
 
 The recipe uses a digest-pinned Python 3.12 base and containers/gpu-requirements.lock with hashes, including
-LLaMA-Factory 0.9.5, PyTorch 2.7.1 and bitsandbytes 0.48.1. CUDA user-space libraries come through PyTorch's wheel dependencies;
+LLaMA-Factory 0.9.5, PyTorch 2.7.1 (CUDA 12.8 build, cu128) and bitsandbytes 0.48.1. CUDA user-space libraries come through PyTorch's wheel dependencies;
 the host needs a compatible NVIDIA driver and container runtime. No image compatibility/GPU memory claim has been verified.
 Build/publish only after reviewing the resolved image, then use its registry digest for managed Pod creation.
 Install no separate training engine on the control plane.
@@ -119,11 +119,18 @@ Attach a RunPod Network Volume at /workspace. Cache, checkpoints and attempt dir
 Verify the SSH host fingerprint via a trusted channel before adding it to known_hosts; automatic trust is disabled.
 Direct TCP SSH is supported; the RunPod SSH proxy is not supported in this initial implementation.
 
-Regenerate the Linux dependency lock deliberately with:
+Regenerate the Linux dependency locks deliberately, over the existing files so current pins stay preferred:
 
 ```powershell
-uv pip compile pyproject.toml containers/gpu-requirements.in --python-version 3.12 --python-platform x86_64-manylinux_2_28 --generate-hashes --output-file containers/gpu-requirements.lock --no-header
+uv pip compile pyproject.toml containers/gpu-requirements.in --python-version 3.12 --python-platform x86_64-manylinux_2_28 --generate-hashes --torch-backend cu128 --output-file containers/gpu-requirements.lock --no-header
+uv pip compile pyproject.toml containers/gpu-ppo-requirements.in --override containers/gpu-ppo-overrides.txt --python-version 3.12 --python-platform x86_64-manylinux_2_28 --generate-hashes --torch-backend cu128 --output-file containers/gpu-ppo-requirements.lock --no-header
+uv run python scripts/inspect_gpu_wheels.py
 ```
+
+The lock records no index URL, so every install of it passes the same `--torch-backend cu128` (`uv pip sync`) or
+`--extra-index-url https://download.pytorch.org/whl/cu128` (pip). `inspect_gpu_wheels.py` must exit 0: the torch
+wheel's compiled architectures cover Ampere (8.0, 8.6), Ada (8.9), Hopper (9.0) and Blackwell (10.0, 12.0), and
+bitsandbytes ships a CUDA 12.8 library. Copy its `sass`/`ptx` into `runtime_profiles.RUNTIME_CAPABILITIES`.
 
 The isolated existing-Pod venv has been GPU-tested with BF16 LoRA/native generation. The container image itself
 has not been built or tested. Complete artifact collection and native checkpoint restoration have since
@@ -218,6 +225,7 @@ uv run factory doctor --server-profile server.json
 2. `server-runtime` without `--prepare` checks the private runtime; like `--prepare`, it needs at least one selected GPU UUID
    in the profile. `--prepare` installs it and requires
    `--approve-preparation`. `--training-stage` selects the stage environment (default `sft`).
+   Without `--prepare`, `server-runtime` prints the JSON result and exits 1 when the runtime is not `ready`.
 3. `plan --real --server-profile` makes one read-only observation and prints the destination receipt. The AI YAML's GPU type and
    count must equal the selected GPUs, and its per-GPU price times the count must be at least the declared whole-server cost. `run ... --submit --real --server-profile`
    freezes that receipt for the job. Without `--submit` the command only prints the plan.

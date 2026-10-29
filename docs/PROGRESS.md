@@ -1,3 +1,34 @@
+# GPU 호환성 점검과 CUDA 12.8 학습 환경 (1단계) — 소프트웨어 완료, GPU 인수 대기
+
+[설계](superpowers/specs/2026-10-29-gpu-compat-runtime-design.md) · [계획](superpowers/plans/2026-10-29-gpu-compat-runtime.md) ·
+브랜치 `claude/gpu-compat-runtime` (기준 `96aea2e`). Task 1–13은 구현·검토를 마쳤고 Task 14(문서·전체 검증)를 2026-10-29에 실행했다.
+
+- 고정 파일: 두 GPU 고정 파일이 torch·torchaudio·torchvision `+cu128`, NVIDIA 12.8 계열로 바뀌었다
+  (`uv pip compile ... --torch-backend cu128`을 기존 파일 위에 실행, PPO는 `--override containers/gpu-ppo-overrides.txt`,
+  pydantic==2.10.6). 재생성이 `pyproject.toml`이 요구하지만 옛 고정 파일에 없던 의존성도 추가했다: 두 파일 모두
+  boto3 1.43.114, botocore 1.43.121, jmespath 1.1.0, s3transfer 0.19.3; PPO 파일은 추가로 bcrypt 5.0.0,
+  cryptography 50.0.2, invoke 3.0.3, paramiko 5.0.0, pynacl 1.6.2. 그 밖의 버전은 바뀌지 않았다.
+- `scripts/inspect_gpu_wheels.py`(2026-10-29, 종료 코드 0): 컴파일된 구조 `sm_75 sm_80 sm_86 sm_90 sm_100 sm_120 compute_120`,
+  기타 후보 없음, sass `["7.5","8.0","8.6","9.0","10.0","12.0"]`, ptx `["12.0"]`, bitsandbytes CUDA 12.8 라이브러리 있음,
+  torch·bitsandbytes 해시가 고정 파일과 일치.
+- 런타임 검사 상태: ready / missing / mismatch / incompatible(GPU 세대 미지원) / unavailable(GPU 없음·개수 불일치·사용 중·오류,
+  준비를 제안하지 않음). 준비는 RunPod에서만 실행 시 단일 승인 안에서 하고, GPU 서버는 연결 설정의 검토된 조회 흐름으로만
+  준비한다. `factory server-runtime`은 `ready`가 아니면 JSON을 출력하고 종료 코드 1을 돌려준다.
+- 호환성 판정은 계획의 코드에 더해 `POD_FACTS_UNKNOWN`(RunPod API가 GPU 종류·개수를 주지 않음)과 `PRICE_UNKNOWN`
+  (유효한 현재 요금 없음)을 차단한다. 요금 비교에 허용 오차는 없다(`execution.validate_budget`과 같음).
+  결과는 `{level, code, message}`이며 조언은 `message`에 있다.
+- 화면: 계획 카드에 "실행 시 거부될 항목"/"주의 항목"; "학습 시작"/"대기 작업 실행"은 읽기 전용 점검을 먼저 하고, 거부 항목·
+  incompatible·unavailable이면 멈추며, RunPod 환경 설치 안내를 한 번의 승인 창에 합치고, 점검 중 중복 클릭을 무시하며,
+  그 사이 계획·선택 작업이 바뀌면 멈추고, 승인받은 작업만 실행한다. 데스크톱 앱 버전 0.5.0(Python 패키지는 0.1.0).
+- 검증(2026-10-29, 문서 변경 후): `uv run pytest` 2021 passed, 1 skipped(616.82초); `uv run ruff check src tests scripts` 통과;
+  `desktop`의 `npm run build` 통과, `npm test` 280 passed; `cargo test --manifest-path src-tauri/Cargo.toml --locked` 54 passed.
+  실패·재실행 없음.
+- GPU·Pod·데이터 전송·MLflow 쓰기는 사용하지 않았다. 설치 프로그램은 아직 빌드하지 않았다(Task 15). GPU 인수 대기.
+- **남은 일(후속):** SSH 서버의 시간당 요금은 호환성 판정이 아직 보지 않는다(기존 서버 예산 검사만 적용). 판정 표에 넣을 것.
+- **남은 일(유료, 별도 승인):** Task 16 GPU 인수 시험. Blackwell Pod와 Ampere 또는 Hopper Pod에서 새 환경 준비,
+  `arch_ok`·`kernel_ok`, Qwen2.5-0.5B SFT LoRA 회귀, 메모리 추정과 실제 최대 사용량 비교.
+- **2단계 남음:** Qwen3.5·Gemma 4 텍스트 학습 GPU 검증과 수정, 허브 모델 메모리 추정.
+
 # General-purpose workflows — Windows 0.4.0 accepted on one PC, 2026-10-22
 
 User approved the [design](superpowers/specs/2026-10-17-general-training-workflows-design.md) and
@@ -6586,6 +6617,69 @@ The NSIS 3.11 toolchain was copied from the existing local Tauri cache after the
 - The running-idle interactive installer path.
 - IME, hidden-window polling and Narrator.
 - A clean second PC, code signing and redirected AppData.
+
+## SSH reachability check on a borrowed RunPod Pod, 2026-10-29
+
+A read-only check the user asked for. There is no `.env` or `RUNPOD_API_KEY` environment variable. The desktop app
+has a RunPod key in Credential Manager, but it was not read. The CLI check below used the 2026-10-14 connection
+profile instead.
+
+- **Key.** The supplied ed25519 key is in OpenSSH format with no passphrase. Its public half matches, and paramiko
+  loads it.
+- **Pod.** `yuft63rjggvh5z` (EU-RO-1, 1 × RTX PRO 4000 Blackwell, 24,467 MiB, idle) accepted the key over both the
+  RunPod SSH proxy and direct TCP. Inside the container, `RUNPOD_POD_ID`, `RUNPOD_PUBLIC_IP` and `RUNPOD_TCP_PORT_22`
+  match the direct-TCP address the user gave.
+- **Host key.** The ED25519 host key offered on direct TCP matches the one read inside the container over the proxy.
+- **App path.** paramiko with `RejectPolicy`, as the CLI's `RemoteExecutor` uses it, connected and ran commands once
+  given that pinned host key. The user's `~/.ssh/known_hosts` has no entry for the Pod, so CLI `work` would refuse the
+  host. The desktop app uses its `ssh_fingerprint` setting (`PinnedHostKey`) instead, and that setting is empty.
+- **Desktop MLflow.** The saved desktop settings still point at `http://127.0.0.1:5999` (operator
+  `acceptance-upgrade`), where nothing listens, and no MLflow secret is saved. Reproduced with `check_connections`:
+  that URI raises `MlflowException` (connection refused). `https://mlflow.kbiofoundry.kr` without credentials returns
+  the SSO login page, which raises `MlflowException` (response not valid JSON). The check stops at MLflow before
+  reading the Pod.
+- **CLI doctor.** `factory --state-dir <temp> --connection-file .factory/connection.json doctor --pod-id
+  yuft63rjggvh5z` passed. That is the gitignored 2026-10-14 profile: OIDC, client ID `mlflow`, the secret from its
+  referenced credential file. MLflow authenticated read and model-registry read passed (`mlflow_auth: oidc`). The
+  RunPod API read the Pod as RUNNING, 1 × RTX PRO 4000 Blackwell, $0.57/h, network volume `m1b4qscsnl`, with the
+  SSH mapping available. No MLflow write test was run.
+- **Desktop check, slow MLflow failure.** The user then saved the desktop settings (13:26:39): OIDC, URI
+  `https://mlflow.kbiofoundry.kr/`, the Pod ID, the key file and the fingerprint. The saved OIDC secret and RunPod key
+  equal the CLI profile's files (compared in-process, never printed). Results, each with a temporary state root:
+  - The installed 0.4.0 `factory-bridge.exe` passed the `connection` action with the saved settings in 7.0 s, and
+    `DesktopService.dispatch` from source passed in 2.8 s.
+  - With the pre-save settings (`http://127.0.0.1:5999`), the installed bridge failed after 269.2 s, returning only
+    `{"ok": false, "error": "MlflowException"}`. MLflow retries a refused connection with backoff, and `desktop.main`
+    shows only the class name of non-`ValueError` exceptions.
+  - The button checks only saved settings, so the slow failure came from a check against the old address.
+  - Product follow-ups, not fixed: give the connection check a short MLflow retry budget, and map refused, timeout
+    and HTML-login responses to fixed Korean messages.
+- **Runtime prerequisites (read-only SSH).**
+  - Present: `cc` (GCC 13.3), `python3 -m pip`, outbound PyPI, HF and GitHub, and driver 595.91 (CUDA 13.2).
+  - No `/workspace/factory*` folder exists (the desktop runtime root is `/workspace/factory-desktop`), so the runtime
+    has never been prepared on this volume. `/workspace` holds the
+    Pod owner's other project folders.
+- **GPU architecture risk (unverified on this GPU).**
+  - The GPU's compute capability is 12.0 (sm_120). `containers/gpu-requirements.lock` pins the PyPI `torch==2.7.1`
+    with CUDA 12.6 libraries. Public reports say cu126 wheels ship no sm_120 kernels and Blackwell needs cu128.
+  - `desktop_runtime.check` only asserts `torch.cuda.is_available()`, so preparation and the runtime check would
+    likely pass while the first CUDA kernel fails.
+  - The image's own torch 2.8.0+cu128 lists sm_120, but the factory runtime does not use it.
+  - Earlier GPU evidence was on H200 (sm_90). Not tested here; needs a non-Blackwell Pod, a cu128 lock with an
+    architecture check, or an approved throwaway probe.
+- **Remote tools.** Python 3.12.3, rsync, tar and sha256sum are present, and `/workspace` is a RunPod network-volume
+  mount.
+- **Not done.** Nothing was installed, transferred or started, and the Pod was not stopped. MLflow was only read, and
+  HF was not contacted.
+
+**Still outstanding.**
+- A desktop "연결 검사" click after the save, and the operator label, which is still `acceptance-upgrade`.
+- The user's queued desktop job `76986bce…` (QUEUED, 0 attempts, `Qwen/Qwen2.5-0.5B-Instruct` SFT) declares 1 ×
+  `NVIDIA RTX A4000` at $0.50/h. Against this Pod, "실행" would first stop at the unprepared runtime, then at the
+  GPU-type and price checks.
+- The known_hosts entry, for CLI use only.
+- Runtime preparation.
+- L1–L3.
 
 ## Windows workbench refinement — 0.2.1
 
