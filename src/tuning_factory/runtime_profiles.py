@@ -12,6 +12,22 @@ def engine_profile(stage="sft"):
             "lock_file": "containers/gpu-requirements.lock"}
 
 
+# Both private runtimes use the CUDA 12.8 PyTorch build. sass/ptx are the architectures compiled into the pinned
+# torch wheel (scripts/inspect_gpu_wheels.py, recorded in docs/PROGRESS.md). min_driver is the CUDA 12 minor-version
+# compatibility floor; recommended_driver is the CUDA 12.8 release driver.
+RUNTIME_CAPABILITIES = MappingProxyType({
+    "torch_backend": "cu128", "torch_cuda": "12.8",
+    "sass": ("7.5", "8.0", "8.6", "9.0", "10.0", "12.0"), "ptx": ("12.0",),
+    "bf16_min_capability": "8.0", "min_driver": "525.60.13", "recommended_driver": "570.26"})
+
+
+def runtime_capabilities(profile):
+    """The GPU support sheet of one private runtime (primary or ppo); kept apart from engine_profile() snapshots."""
+    if profile not in {"primary", "ppo"}:
+        raise ValueError("unsupported runtime profile")
+    return {key: list(value) if isinstance(value, tuple) else value for key, value in RUNTIME_CAPABILITIES.items()}
+
+
 # Model-operation (merge/materialize) library pins; base versions (without +cu128) equal containers/gpu-requirements.lock.
 MODEL_OPS_PINS = MappingProxyType({"torch": "2.7.1", "peft": "0.18.1", "transformers": "5.6.0",
                                    "safetensors": "0.8.0"})
