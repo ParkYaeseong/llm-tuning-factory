@@ -78,3 +78,97 @@ def test_memory_estimates_cover_lora_qlora_full_and_freeze():
 def test_memory_estimate_needs_catalog_sizes():
     assert gpu_compat.estimate_memory(None, training()) is None
     assert gpu_compat.estimate_memory({"parameters_b": 7}, training()) is None
+
+
+CAPS = {"torch_cuda": "12.8", "sass": SASS, "ptx": [], "bf16_min_capability": "8.0",
+        "min_driver": "525.60.13", "recommended_driver": "570.26"}
+BLACKWELL = gpu_compat.parse_gpu_facts(SMI)[0]
+POD = {"gpu_id": "NVIDIA RTX PRO 4000 Blackwell", "gpu_display_name": None, "gpu_count": 1, "hourly_cost_usd": 0.57}
+
+
+def job(method="lora", **resource):
+    config = training(method)
+    config["resource_profile"] = {"gpu_type": "NVIDIA RTX PRO 4000 Blackwell", "gpu_count": 1,
+                                  "hourly_cost_usd": 0.6, **resource}
+    return config
+
+
+def observed(gpus=(BLACKWELL,), pod=POD, at=1000.0):
+    return {"key": "runpod-borrowed", "observed_at": at, "gpus": list(gpus), "pod": pod}
+
+
+def codes(findings):
+    return {(item["level"], item["code"]) for item in findings}
+
+
+def test_a_matching_job_on_a_supported_gpu_has_no_findings():
+    assert gpu_compat.evaluate(job(), observed(), CAPS, QWEN05, stage="execute") == []
+
+
+def test_the_queued_a4000_job_is_refused_on_the_blackwell_pod():
+    findings = gpu_compat.evaluate(job(gpu_type="NVIDIA RTX A4000", hourly_cost_usd=0.5), observed(), CAPS, QWEN05,
+                                   stage="execute")
+    assert codes(findings) == {("block", "GPU_TYPE_MISMATCH"), ("block", "PRICE_OVER_BUDGET")}
+    mismatch = next(item for item in findings if item["code"] == "GPU_TYPE_MISMATCH")
+    assert "NVIDIA RTX A4000" in mismatch["message"] and "NVIDIA RTX PRO 4000 Blackwell" in mismatch["message"]
+    assert gpu_compat.refusal(findings).startswith("실행할 수 없습니다.")
+    assert gpu_compat.refusal([]) is None
+
+
+def test_old_architecture_driver_and_bf16_block():
+    old = {**BLACKWELL, "name": "Tesla V100-SXM2-32GB", "capability": "7.0", "memory_mib": 32768, "driver": "470.82"}
+    findings = gpu_compat.evaluate(job(gpu_type="Tesla V100-SXM2-32GB"), observed([old], pod=None), CAPS, QWEN05,
+                                   stage="execute")
+    assert {("block", "GPU_ARCH_UNSUPPORTED"), ("block", "DRIVER_TOO_OLD"), ("block", "BF16_UNSUPPORTED")} <= codes(
+        findings)
+
+
+def test_a_driver_below_the_cuda_12_8_release_warns():
+    findings = gpu_compat.evaluate(job(), observed([{**BLACKWELL, "driver": "535.104.05"}]), CAPS, QWEN05,
+                                   stage="execute")
+    assert codes(findings) == {("warn", "DRIVER_OLD")}
+
+
+def test_memory_blocks_on_weights_and_warns_when_tight():
+    h100 = {**BLACKWELL, "name": "NVIDIA H100 80GB HBM3", "capability": "9.0", "memory_mib": 81559}
+    pod = {**POD, "gpu_id": "NVIDIA H100 80GB HBM3", "hourly_cost_usd": 2.0}
+    lora = gpu_compat.evaluate(job(gpu_type="NVIDIA H100 80GB HBM3", hourly_cost_usd=3.0), observed([h100], pod),
+                               CAPS, LLAMA70, stage="execute")
+    assert ("block", "MEMORY_WEIGHTS_EXCEED") in codes(lora)
+    qlora = gpu_compat.evaluate(job("qlora", gpu_type="NVIDIA H100 80GB HBM3", hourly_cost_usd=3.0),
+                                observed([h100], pod), CAPS, LLAMA70, stage="execute")
+    assert codes(qlora) == {("warn", "MODEL_UNVERIFIED")}
+    qwen7 = {"id": "Qwen/Qwen2.5-7B-Instruct", "parameters_b": 7, "hidden_size": 3584, "num_layers": 28,
+             "gpu_verified": False}
+    tight = job()
+    tight["hyperparameters"].update(cutoff_len=8192, per_device_train_batch_size=4)
+    assert codes(gpu_compat.evaluate(tight, observed(), CAPS, qwen7, stage="execute")) == {
+        ("warn", "MEMORY_TIGHT"), ("warn", "MODEL_UNVERIFIED")}
+
+
+def test_unknown_models_and_unreadable_gpu_facts_warn():
+    findings = gpu_compat.evaluate(job(), observed(gpus=[]), CAPS, None, stage="execute")
+    assert codes(findings) == {("warn", "MEMORY_UNKNOWN"), ("warn", "MODEL_UNVERIFIED"),
+                               ("warn", "GPU_FACTS_UNKNOWN")}
+
+
+def test_plan_reports_missing_and_stale_observations_only():
+    assert codes(gpu_compat.evaluate(job(), None, CAPS, QWEN05, stage="plan")) == {("warn", "OBSERVATION_MISSING")}
+    stale = gpu_compat.evaluate(job(), observed(at=0.0), CAPS, QWEN05, stage="plan",
+                                now=gpu_compat.STALE_SECONDS + 1)
+    assert codes(stale) == {("warn", "OBSERVATION_STALE")}
+    assert gpu_compat.evaluate(job(), None, CAPS, QWEN05, stage="execute") == []
+    with pytest.raises(ValueError, match="stage"):
+        gpu_compat.evaluate(job(), None, CAPS, QWEN05, stage="later")
+
+
+def test_observation_store_round_trips_and_refuses_unsafe_keys(tmp_path):
+    pod = {"gpu": {"id": "NVIDIA RTX PRO 4000 Blackwell", "displayName": None, "count": 1}, "costPerHr": "0.57"}
+    observation = gpu_compat.make_observation("runpod-borrowed", [BLACKWELL], pod, now=5.0)
+    assert observation == {"key": "runpod-borrowed", "observed_at": 5.0, "gpus": [BLACKWELL], "pod": POD}
+    gpu_compat.save_observation(tmp_path, observation)
+    assert gpu_compat.load_observation(tmp_path, "runpod-borrowed") == observation
+    assert gpu_compat.load_observation(tmp_path, "runpod-other") is None
+    with pytest.raises(ValueError, match="key"):
+        gpu_compat.load_observation(tmp_path, "../escape")
+    assert gpu_compat.make_observation("server-0123456789abcdef", [BLACKWELL], None, now=1.0)["pod"] is None

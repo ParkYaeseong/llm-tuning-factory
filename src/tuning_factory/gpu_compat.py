@@ -1,6 +1,10 @@
 """GPU and training-runtime compatibility: nvidia-smi facts, architecture and driver rules, memory estimates and
 block/warn findings. Pure functions plus a small JSON observation store; no SSH, provider or MLflow calls."""
+import json
+import os
 import re
+import time
+from pathlib import Path
 
 # One fixed read-only query; compute_cap needs a driver from 2021 or later.
 GPU_QUERY = ("nvidia-smi", "--query-gpu=uuid,name,compute_cap,memory.total,driver_version",
@@ -81,3 +85,139 @@ def estimate_memory(model, config):
     activations = (int(hyper.get("per_device_train_batch_size", 1)) * int(hyper.get("cutoff_len", 1024))
                    * int(model["hidden_size"]) * (2 * layers + 34))
     return {"weights_gib": weights / GIB, "total_gib": (weights + state + activations) / GIB + OVERHEAD_GIB}
+
+
+STALE_SECONDS = 24 * 3600
+WEIGHTS_BLOCK_RATIO, TOTAL_WARN_RATIO = 0.95, 0.90
+OBSERVATION_KEY = re.compile(r"(runpod|server)-[A-Za-z0-9_-]{1,64}")
+
+MEMORY_UNKNOWN = "앱 기본 목록에 없는 모델이라 메모리 요구량을 추정하지 못했습니다."
+MODEL_UNVERIFIED = "이 모델은 아직 GPU에서 검증되지 않았습니다."
+OBSERVATION_MISSING = ("저장된 GPU 정보가 없습니다. 연결 설정의 '환경 확인'을 누르면 실행 전에 GPU를 미리 "
+                       "점검할 수 있습니다.")
+OBSERVATION_STALE = "저장된 GPU 정보가 24시간보다 오래되었습니다. 연결 설정의 '환경 확인'을 다시 누르세요."
+GPU_FACTS_UNKNOWN = ("GPU 정보를 읽지 못해 세대·드라이버·메모리를 미리 점검하지 못했습니다. "
+                     "학습 직전 환경 검사가 대신 확인합니다.")
+
+
+def _finding(level, code, message):
+    return {"level": level, "code": code, "message": message}
+
+
+def evaluate(config, observation, capabilities, model, *, stage, now=None):
+    """Block/warn findings for one job config against one observed destination.
+
+    ``stage`` is "plan" (a stored observation; missing or stale facts are reported) or "execute" (live facts)."""
+    if stage not in {"plan", "execute"}:
+        raise ValueError("unsupported compatibility stage")
+    findings = []
+    if model is None:
+        findings.append(_finding("warn", "MEMORY_UNKNOWN", MEMORY_UNKNOWN))
+    if model is None or not model.get("gpu_verified"):
+        findings.append(_finding("warn", "MODEL_UNVERIFIED", MODEL_UNVERIFIED))
+    if observation is None:
+        if stage == "plan":
+            findings.append(_finding("warn", "OBSERVATION_MISSING", OBSERVATION_MISSING))
+        return findings
+    now = time.time() if now is None else now
+    if stage == "plan" and now - float(observation.get("observed_at") or 0) > STALE_SECONDS:
+        findings.append(_finding("warn", "OBSERVATION_STALE", OBSERVATION_STALE))
+    resource = config.get("resource_profile") or {}
+    hyper = config.get("hyperparameters") or {}
+    gpus, pod = observation.get("gpus") or [], observation.get("pod")
+    gpu = min(gpus, key=lambda item: item["memory_mib"]) if gpus else None   # the smallest GPU bounds the job
+    if gpu is None:
+        findings.append(_finding("warn", "GPU_FACTS_UNKNOWN", GPU_FACTS_UNKNOWN))
+    else:
+        capability, driver = gpu["capability"], gpu["driver"]
+        if not capability_supported(capability, capabilities["sass"], capabilities["ptx"]):
+            findings.append(_finding("block", "GPU_ARCH_UNSUPPORTED",
+                                     f"이 GPU({gpu['name']}, compute capability {capability})는 앱 학습 환경"
+                                     f"(PyTorch CUDA {capabilities['torch_cuda']})이 지원하지 않는 세대입니다."))
+        if not driver_at_least(driver, capabilities["min_driver"]):
+            findings.append(_finding("block", "DRIVER_TOO_OLD",
+                                     f"NVIDIA 드라이버 {driver}는 너무 오래되었습니다. "
+                                     f"{capabilities['min_driver']} 이상이 필요합니다."))
+        elif not driver_at_least(driver, capabilities["recommended_driver"]):
+            findings.append(_finding("warn", "DRIVER_OLD",
+                                     f"NVIDIA 드라이버 {driver}는 CUDA {capabilities['torch_cuda']} 정식 지원 드라이버"
+                                     f"({capabilities['recommended_driver']}) 미만입니다. 일부 기능이 제한될 수 "
+                                     "있습니다."))
+        if (hyper.get("precision", "bf16") == "bf16"
+                and version_tuple(capability) < version_tuple(capabilities["bf16_min_capability"])):
+            findings.append(_finding("block", "BF16_UNSUPPORTED",
+                                     "이 GPU는 bf16을 지원하지 않습니다. 학습 설정의 정밀도를 fp16으로 바꾸세요."))
+    names = ({pod.get("gpu_id"), pod.get("gpu_display_name")} - {None}) if pod else {item["name"] for item in gpus}
+    configured = resource.get("gpu_type")
+    if names and configured not in names:
+        expected = (pod or {}).get("gpu_id") or sorted(names)[0]
+        findings.append(_finding("block", "GPU_TYPE_MISMATCH",
+                                 f"학습 설정의 GPU 종류({configured})가 연결된 GPU({expected})와 다릅니다. 연결 설정의 "
+                                 "'GPU 정보 → 학습 설정에 적용'으로 맞춘 뒤 실행 계획을 다시 확인하세요."))
+    count = int(resource.get("gpu_count", 1))
+    observed_count = pod.get("gpu_count") if pod else len(gpus)
+    if observed_count and count != observed_count:
+        findings.append(_finding("block", "GPU_COUNT_MISMATCH",
+                                 f"학습 설정의 GPU 수({count})가 연결된 GPU 수({observed_count})와 다릅니다."))
+    price = (pod or {}).get("hourly_cost_usd")
+    limit = float(resource.get("hourly_cost_usd", 0)) * count
+    if price is not None and price > limit + 1e-9:
+        findings.append(_finding("block", "PRICE_OVER_BUDGET",
+                                 f"현재 시간당 요금 ${price:.2f}가 학습 설정의 한도 ${limit:.2f}를 넘습니다."))
+    if gpu is not None and model is not None:
+        estimate = estimate_memory(model, config)
+        vram = gpu["memory_mib"] / 1024
+        if estimate is None:
+            findings.append(_finding("warn", "MEMORY_UNKNOWN", MEMORY_UNKNOWN))
+        elif estimate["weights_gib"] > vram * WEIGHTS_BLOCK_RATIO:
+            findings.append(_finding("block", "MEMORY_WEIGHTS_EXCEED",
+                                     f"모델 가중치만 약 {estimate['weights_gib']:.0f}GiB로 GPU 메모리 {vram:.0f}GiB를 "
+                                     "넘습니다. 4비트 QLoRA, 더 작은 모델 또는 더 큰 GPU를 선택하세요."))
+        elif estimate["total_gib"] > vram * TOTAL_WARN_RATIO:
+            findings.append(_finding("warn", "MEMORY_TIGHT",
+                                     f"예상 메모리 약 {estimate['total_gib']:.0f}GiB로 GPU 메모리 {vram:.0f}GiB에 "
+                                     "빠듯합니다. 4비트 QLoRA, 배치 1, 더 짧은 최대 길이(cutoff_len)를 고려하세요. "
+                                     "추정치이므로 실제와 다를 수 있습니다."))
+    return findings
+
+
+def refusal(findings):
+    """The Korean refusal for block findings, or None when nothing blocks."""
+    blocks = [item["message"] for item in findings if item["level"] == "block"]
+    return "실행할 수 없습니다. " + " ".join(blocks) if blocks else None
+
+
+def make_observation(key, gpus, pod=None, now=None):
+    """A destination's GPU facts; ``pod`` is the normalized RunPod API record (None for an SSH server)."""
+    observation = {"key": key, "observed_at": time.time() if now is None else now, "gpus": list(gpus), "pod": None}
+    if pod is not None:
+        gpu = pod.get("gpu") or {}
+        try:
+            price = float(pod.get("costPerHr"))
+        except (TypeError, ValueError):
+            price = None
+        observation["pod"] = {"gpu_id": gpu.get("id"), "gpu_display_name": gpu.get("displayName"),
+                              "gpu_count": gpu.get("count"), "hourly_cost_usd": price}
+    return observation
+
+
+def _observation_path(root, key):
+    if not isinstance(key, str) or not OBSERVATION_KEY.fullmatch(key):
+        raise ValueError("invalid GPU observation key")
+    return Path(root) / "gpu-observations" / f"{key}.json"
+
+
+def save_observation(root, observation):
+    path = _observation_path(root, observation["key"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(observation, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def load_observation(root, key):
+    path = _observation_path(root, key)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
