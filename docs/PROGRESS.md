@@ -1,7 +1,7 @@
 # GPU 호환성 점검과 CUDA 12.8 학습 환경 (1단계) — 소프트웨어 완료, GPU 인수 대기
 
 [설계](superpowers/specs/2026-10-29-gpu-compat-runtime-design.md) · [계획](superpowers/plans/2026-10-29-gpu-compat-runtime.md) ·
-브랜치 `claude/gpu-compat-runtime` (기준 `96aea2e`). Task 1–13은 구현·검토를 마쳤고 Task 14(문서·전체 검증)를 2026-10-29에 실행했다.
+브랜치 `claude/gpu-compat-runtime` (작업 시작 기준 `96aea2e`). Task 1–13은 구현·검토를 마쳤고 Task 14(문서·전체 검증)를 2026-10-29에 실행했다.
 
 - 고정 파일: 두 GPU 고정 파일이 torch·torchaudio·torchvision `+cu128`, NVIDIA 12.8 계열로 바뀌었다
   (`uv pip compile ... --torch-backend cu128`을 기존 파일 위에 실행, PPO는 `--override containers/gpu-ppo-overrides.txt`,
@@ -14,6 +14,7 @@
 - 런타임 검사 상태: ready / missing / mismatch / incompatible(GPU 세대 미지원) / unavailable(GPU 없음·개수 불일치·사용 중·오류,
   준비를 제안하지 않음). 준비는 RunPod에서만 실행 시 단일 승인 안에서 하고, GPU 서버는 연결 설정의 검토된 조회 흐름으로만
   준비한다. `factory server-runtime`은 `ready`가 아니면 JSON을 출력하고 종료 코드 1을 돌려준다.
+- 런타임 검사는 결과를 `TF_PROBE <json>` 한 줄로 출력하고 `devices`를 보고한다. 실행 중에는 Pod를 다른 작업이 쓰는 경우와 준비 직후 확인이 실패한 경우에도 한국어 문구로 거부한다(동시 준비 거부와 별도).
 - 호환성 판정은 계획의 코드에 더해 `POD_FACTS_UNKNOWN`(RunPod API가 GPU 종류·개수를 주지 않음)과 `PRICE_UNKNOWN`
   (유효한 현재 요금 없음)을 차단한다. 요금 비교에 허용 오차는 없다(`execution.validate_budget`과 같음).
   결과는 `{level, code, message}`이며 조언은 `message`에 있다.
