@@ -442,6 +442,7 @@ def test_server_runtime_preparation_requires_same_inspection_and_unlocked_server
         yield facts, object()
 
     monkeypatch.setattr(desktop_runtime, "connection", connect)
+    monkeypatch.setattr(desktop_runtime, "command", lambda client, argv, **kw: "")   # observe() queries nvidia-smi
     native = {"provider": "ssh_server", **config.model_dump(mode="json")}
     with pytest.raises(ValueError, match="inspection"):
         desktop_runtime.runtime(native, tmp_path, prepare=True)

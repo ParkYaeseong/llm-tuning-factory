@@ -423,3 +423,105 @@ def test_generated_probe_program_runs_with_its_own_imports(monkeypatch, tmp_path
     result = json.loads(last[len("TF_PROBE "):])
     assert result["arch_ok"] is True and result["kernel_ok"] is True
     assert result["devices"] == 3 and result["capability"] == "12.0"
+
+
+SMI = ("GPU-aaaa, NVIDIA RTX PRO 4000 Blackwell, 12.0, 24467, 595.91.07\n"
+       "GPU-bbbb, NVIDIA RTX PRO 4000 Blackwell, 12.0, 24467, 595.91.07\n")
+POD = {"id": "borrowed", "gpu": {"id": "NVIDIA RTX PRO 4000 Blackwell", "displayName": None, "count": 1},
+       "costPerHr": 0.57}
+
+
+def test_observation_keys_and_gpu_selection(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+    from tuning_factory.gpu_compat import GPU_QUERY
+
+    assert runtime.observation_key({"pod_id": "yuft63rjggvh5z"}) == "runpod-yuft63rjggvh5z"
+    with pytest.raises(ValueError, match="Pod ID"):
+        runtime.observation_key({"pod_id": "../x"})
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI if tuple(argv) == GPU_QUERY else "")
+    assert [gpu["uuid"] for gpu in runtime.read_gpu_facts(None, ("GPU-bbbb",))] == ["GPU-bbbb"]
+    with pytest.raises(ValueError, match="selected GPU"):
+        runtime.read_gpu_facts(None, ("GPU-cccc",))
+
+
+def test_observe_saves_facts_and_tolerates_an_unreadable_query(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+    from tuning_factory.gpu_compat import load_observation
+
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    observation = runtime.observe(None, {"pod_id": "borrowed"}, tmp_path, POD)
+    assert observation["pod"]["hourly_cost_usd"] == 0.57 and len(observation["gpus"]) == 2
+    assert load_observation(tmp_path, "runpod-borrowed") == observation
+
+    def refused(client, argv, **kwargs):
+        raise runtime.RemoteCommandFailed("GPU runtime command failed. Field compute_cap is not valid")
+
+    monkeypatch.setattr(runtime, "command", refused)
+    assert runtime.observe(None, {"pod_id": "borrowed"}, tmp_path, POD)["gpus"] == []
+
+
+def test_runtime_check_reports_a_missing_runtime_with_gpu_facts(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from tuning_factory import desktop_runtime as runtime
+
+    @contextmanager
+    def connect(settings, **kwargs):
+        yield POD, object()
+
+    def missing(*args, **kwargs):
+        raise runtime.RuntimeMissing(runtime.RUNTIME_MISSING)
+
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    monkeypatch.setattr(runtime, "check", missing)
+    report = runtime.runtime({"pod_id": "borrowed"}, tmp_path)
+    assert report["ready"] is False and report["runtime_state"] == "missing" and report["pod_id"] == "borrowed"
+    assert report["observation"]["gpus"][0]["capability"] == "12.0"
+    monkeypatch.setattr(runtime, "check", lambda *a, **kw: {"source": "fixture"})
+    ready = runtime.runtime({"pod_id": "borrowed"}, tmp_path)
+    assert ready["ready"] is True and ready["runtime_state"] == "ready" and ready["source"] == "fixture"
+
+
+def test_install_runtime_uses_the_cu128_backend(tmp_path, monkeypatch):
+    from test_remote_worker import FakeSSH
+
+    from tuning_factory import desktop
+    from tuning_factory import desktop_runtime as runtime
+
+    assets = tmp_path / "assets"
+    (assets / "dist").mkdir(parents=True)
+    (assets / "containers").mkdir()
+    (assets / "dist/llm_tuning_factory-fixture.whl").write_text("fixture")
+    (assets / "containers/gpu-requirements.lock").write_text("fixture")
+    monkeypatch.setattr(desktop, "assets_root", lambda: assets)
+    client = FakeSSH(tmp_path / "remote")
+    client.sftp.root.mkdir()
+    scripts = []
+    monkeypatch.setattr(runtime, "command", lambda _, argv, **kw: scripts.append(argv[2]) or "")
+    preparation = {"started": False, "stopped": False}
+    runtime.install_runtime(client, "sft", runtime.REMOTE, POD, preparation)
+    assert preparation == {"started": True, "stopped": True}
+    assert "--require-hashes --torch-backend cu128 " in scripts[0]
+
+
+
+def test_observe_survives_an_unwritable_state_file(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+    from tuning_factory import gpu_compat
+
+    def locked(root, observation):
+        raise PermissionError("state file is locked")
+
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    monkeypatch.setattr(gpu_compat, "save_observation", locked)
+    observation = runtime.observe(None, {"pod_id": "borrowed"}, tmp_path, POD)
+    assert observation["pod"]["hourly_cost_usd"] == 0.57 and len(observation["gpus"]) == 2
+
+
+def test_check_rejects_a_probe_line_that_is_not_an_object(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: "" if argv[0] == "sh" else "16")
+    with pytest.raises(runtime.RuntimeMismatch, match="preflight mismatch"):
+        runtime.check(None)

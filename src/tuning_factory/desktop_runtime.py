@@ -232,6 +232,8 @@ def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=(
         result = json.loads(marked[-1][len("TF_PROBE "):] if marked else lines[-1])
     except (json.JSONDecodeError, IndexError):
         raise RuntimeMismatch(RUNTIME_MISMATCH) from None
+    if not isinstance(result, dict):
+        raise RuntimeMismatch(RUNTIME_MISMATCH)
     from .desktop import assets_root
     expected = hashlib.sha256((assets_root() / profile["lock_file"]).read_bytes()).hexdigest()
     base = {key: result.get(key) for key in ("source", "engine", "lock")}
@@ -249,7 +251,93 @@ def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=(
     return result
 
 
+def observation_key(settings):
+    """The local GPU observation key of the saved destination; never contacts it."""
+    if settings.get("provider", "existing_runpod") == "ssh_server":
+        return "server-" + server_settings(settings).destination_sha256[:16]
+    pod_id = str(settings.get("pod_id", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", pod_id):
+        raise ValueError("invalid Pod ID")
+    return "runpod-" + pod_id
+
+
+def read_gpu_facts(client, gpu_uuids=()):
+    from .gpu_compat import GPU_QUERY, parse_gpu_facts
+    gpus = parse_gpu_facts(command(client, list(GPU_QUERY)))
+    if not gpu_uuids:
+        return gpus
+    selected = [gpu for gpu in gpus if gpu["uuid"] in set(gpu_uuids)]
+    if len(selected) != len(set(gpu_uuids)):
+        raise ValueError("selected GPU missing from nvidia-smi output")
+    return selected
+
+
+def observe(client, settings, state_root, pod):
+    """Read (read-only nvidia-smi) and store this destination's GPU facts. An unreadable query is recorded as no
+    facts, so the compatibility judge warns and the runtime check still decides."""
+    from .gpu_compat import make_observation, save_observation
+    server = isinstance(pod, SSHServerFacts)
+    try:
+        gpus = read_gpu_facts(client, server_settings(settings).selected_gpu_uuids if server else ())
+    except ValueError:   # RemoteCommandFailed included
+        gpus = []
+    observation = make_observation(observation_key(settings), gpus, None if server else pod)
+    try:
+        save_observation(state_root, observation)
+    except OSError:
+        pass   # the live observation is still returned; a locked or unwritable state file must not abort a run
+    return observation
+
+
+def install_runtime(client, training_stage, remote_root, pod, preparation):
+    """Upload the pinned lock and worker wheel, then install the private runtime below ``remote_root``.
+
+    The caller holds ``preparation_guard`` and has run prerequisites() and bootstrap_prerequisites()."""
+    from .desktop import assets_root
+    from .runtime_profiles import runtime_capabilities
+    profile = engine_profile(training_stage)
+    lock_name = Path(profile["lock_file"]).name
+    backend = runtime_capabilities(profile["profile"])["torch_backend"]
+    assets = assets_root()
+    wheels = list((assets / "dist").glob("llm_tuning_factory-*.whl"))
+    if len(wheels) != 1:
+        raise ValueError("matching worker wheel missing; rebuild desktop package")
+    root = runtime_path(training_stage, remote_root)
+    helper = SSHExecutor("", 22, "root", "", client=client, pod=None if isinstance(pod, SSHServerFacts) else pod)
+    with client.open_sftp() as sftp:
+        helper.mkdir(sftp, root)
+        for path in [assets / profile["lock_file"], wheels[0]]:
+            sftp.put(str(path), root + "/" + path.name)
+    # All installs, Python downloads and caches stay below the private root.
+    script = (
+        "set -eu\n"
+        "command -v flock >/dev/null\n"
+        f"exec 9>{shlex.quote(root + '/prepare.lock')}\nflock -n 9\n"
+        f"export UV_PYTHON_INSTALL_DIR={shlex.quote(remote_root + '/python')}\n"
+        f"export UV_CACHE_DIR={shlex.quote(remote_root + '/uv-cache')}\n"
+        f"python3 -m pip install --disable-pip-version-check --no-cache-dir "
+        f"--target {shlex.quote(root + '/bootstrap')} uv==0.11.23\n"
+        f"export PYTHONPATH={shlex.quote(root + '/bootstrap')}\n"
+        f"python3 -m uv venv --python 3.12 --allow-existing {shlex.quote(root + '/venv')}\n"
+        f"python3 -m uv pip sync --python {shlex.quote(root + '/venv/bin/python')} --require-hashes "
+        f"--torch-backend {backend} {shlex.quote(root + '/' + lock_name)}\n"
+        f"python3 -m uv pip install --python {shlex.quote(root + '/venv/bin/python')} --no-deps "
+        f"{shlex.quote(root + '/' + wheels[0].name)}\n"
+    )
+    preparation["started"] = True
+    try:
+        command(client, ["sh", "-c", script], timeout=1800)
+    except RemoteCommandFailed:
+        preparation["stopped"] = True
+        raise
+    preparation["stopped"] = True
+
+
 def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspection=None):
+    """Check (or, approved, prepare) the private runtime and record this destination's GPU facts.
+
+    A check reports ``runtime_state`` ("ready", "missing", "mismatch", "incompatible" or "unavailable") instead of
+    raising."""
     if settings.get("provider") == "ssh_server" and prepare:
         if inspection is None:
             raise ValueError("approved destination inspection required for server preparation")
@@ -257,7 +345,6 @@ def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspec
             if hasattr(inspection, "model_dump") else inspection)
         inspection.validate_settings(server_settings(settings))
     profile = engine_profile(training_stage)
-    lock_name = Path(profile["lock_file"]).name
     with connection(settings) as (pod, client):
         generic = isinstance(pod, SSHServerFacts)
         config = server_settings(settings) if generic else None
@@ -266,52 +353,31 @@ def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspec
         if generic and inspection is not None and (inspection.server_id != pod.server_id
                                                    or inspection.inventory != pod.inventory):
             raise ValueError("server hardware differs from approved preparation inspection")
+        observation = observe(client, settings, state_root, pod)
+        state = "ready"
         if prepare:
             with preparation_guard(state_root, config.profile(pod) if generic else None, pod) as preparation:
                 prerequisites(client)
                 bootstrap_prerequisites(client)
-                from .desktop import assets_root
-                assets = assets_root()
-                wheels = list((assets / "dist").glob("llm_tuning_factory-*.whl"))
-                if len(wheels) != 1:
-                    raise ValueError("matching worker wheel missing; rebuild desktop package")
-                root = runtime_path(training_stage, remote_root)
-                helper = SSHExecutor("", 22, "root", "", client=client, pod=None if generic else pod)
-                with client.open_sftp() as sftp:
-                    helper.mkdir(sftp, root)
-                    for path in [assets / profile["lock_file"], wheels[0]]:
-                        sftp.put(str(path), root + "/" + path.name)
-                # All installs, Python downloads and caches stay below the private root.
-                script = (
-                    "set -eu\n"
-                    "command -v flock >/dev/null\n"
-                    f"exec 9>{shlex.quote(root + '/prepare.lock')}\nflock -n 9\n"
-                    f"export UV_PYTHON_INSTALL_DIR={shlex.quote(remote_root + '/python')}\n"
-                    f"export UV_CACHE_DIR={shlex.quote(remote_root + '/uv-cache')}\n"
-                    f"python3 -m pip install --disable-pip-version-check --no-cache-dir "
-                    f"--target {shlex.quote(root + '/bootstrap')} uv==0.11.23\n"
-                    f"export PYTHONPATH={shlex.quote(root + '/bootstrap')}\n"
-                    f"python3 -m uv venv --python 3.12 --allow-existing {shlex.quote(root + '/venv')}\n"
-                    f"python3 -m uv pip sync --python {shlex.quote(root + '/venv/bin/python')} --require-hashes "
-                    f"{shlex.quote(root + '/' + lock_name)}\n"
-                    f"python3 -m uv pip install --python {shlex.quote(root + '/venv/bin/python')} --no-deps "
-                    f"{shlex.quote(root + '/' + wheels[0].name)}\n"
-                )
-                preparation["started"] = True
-                try:
-                    command(client, ["sh", "-c", script], timeout=1800)
-                except RemoteCommandFailed:
-                    preparation["stopped"] = True
-                    raise
-                preparation["stopped"] = True
-                result = check(client, training_stage, remote_root, selected) if generic else check(client, training_stage)
+                install_runtime(client, training_stage, remote_root, pod, preparation)
+                result = check(client, training_stage, remote_root, selected)
         else:
-            result = check(client, training_stage, remote_root, selected) if generic else check(client, training_stage)
+            try:
+                result = check(client, training_stage, remote_root, selected)
+            except RuntimeMissing:
+                result, state = {}, "missing"
+            except RuntimeMismatch:
+                result, state = {}, "mismatch"
+            except GPUIncompatible:
+                result, state = {}, "incompatible"
+            except GPUUnavailable:
+                result, state = {}, "unavailable"
+        report = {"ready": state == "ready", "runtime_state": state, "observation": observation,
+                  "profile": profile["profile"], **result}
         if generic:
-            return {"ready": True, "provider": "ssh_server", "facts": pod.model_dump(mode="json"),
-                    "runtime": runtime_path(training_stage, remote_root), "profile": profile["profile"], **result}
-        return {"ready": True, "pod_id": pod["id"], "runtime": runtime_path(training_stage),
-                "profile": profile["profile"], **result}
+            return {**report, "provider": "ssh_server", "facts": pod.model_dump(mode="json"),
+                    "runtime": runtime_path(training_stage, remote_root)}
+        return {**report, "pod_id": pod["id"], "runtime": runtime_path(training_stage)}
 
 
 @contextmanager
