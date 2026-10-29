@@ -15,8 +15,9 @@
 - **늦고 알기 어려운 거부.** 작업 설정 GPU(`NVIDIA RTX A4000`, $0.50)와 실제 Pod(RTX PRO 4000 Blackwell, $0.57)의 차이는
   "실행" 시 Pod 접속 후에야 영어 오류로 드러난다. 학습 환경이 없을 때도 영어 오류만 보이고 별도 버튼을 찾아야 한다.
 - **최신 모델.** 고정된 LLaMA-Factory 0.9.5와 transformers 5.6.0은 Qwen3·Qwen3.5·Gemma 3/4·Llama 3.3/4를 이미 등록한다.
-  그러나 Qwen3.5와 Gemma 4는 이미지 겸용 구조(`*ForConditionalGeneration`)이고, 앱 코드(대상 검사·병합·평가)는
-  텍스트 전용 `AutoModelForCausalLM`만 다룬다.
+  앱의 모델 허브(`model_hub.py`)도 `qwen3_5`·`gemma4` 구조를 SFT(LoRA·QLoRA·full·freeze)용으로 이미 등록한다.
+  그러나 두 계열은 이미지 겸용 구조(`*ForConditionalGeneration`)이고, 앱 코드(대상 검사·병합·평가)는
+  텍스트 전용 `AutoModelForCausalLM`만 다룬다. GPU 검증도 없다.
 
 ## 2. 사용자 결정
 
@@ -59,10 +60,15 @@
 
 ### 4.1 학습 환경 고정 파일
 
-- `containers/gpu-requirements.lock`과 `containers/gpu-ppo-requirements.lock`을 다시 만든다. `torch`만 PyTorch cu128 색인
-  (`https://download.pytorch.org/whl/cu128`)에서 받고 나머지는 PyPI에서 받는다. 해시 검증(`--require-hashes`)은 유지한다.
-  `nvidia-*-cu12` 의존성은 12.8 계열로 바뀐다.
-- 원격 설치(`uv pip sync`)가 torch를 PyTorch 색인에서 받을 수 있도록 고정 파일에 색인 주소를 함께 기록한다.
+- `containers/gpu-requirements.lock`과 `containers/gpu-ppo-requirements.lock`을 `uv pip compile --torch-backend cu128`로
+  **기존 파일 위에** 다시 만든다. 기존 고정 버전을 선호값으로 쓰므로 바뀌는 것은 PyTorch 계열과 그 의존성뿐이다.
+  - torch·torchaudio·torchvision은 `+cu128` 빌드가 된다.
+  - `nvidia-*-cu12`는 12.8 계열이 된다.
+  - 해시 검증(`--require-hashes`)은 유지한다.
+  2026-10-29 시험 생성에서 이 결과를 확인했다.
+- 고정 파일에는 색인 주소가 기록되지 않는다. 그래서 원격 설치(`uv pip sync`)에도 같은 `--torch-backend cu128`을 준다.
+  uv 0.11.23의 `pip sync`가 이 옵션을 지원한다. 같은 고정 파일을 설치하는 `containers/Dockerfile`과
+  `scripts/bootstrap_approved_pod.py`·`scripts/update_approved_runtime.py`도 같이 고친다.
   2026-10-29 대상 Pod에서 `download.pytorch.org` 접속(200)과 `torch-2.7.1+cu128-cp312-cp312-manylinux_2_28_x86_64.whl`
   존재를 확인했다.
 - 고정 파일 생성 직후 CPU에서 다음을 검사하고 결과를 PROGRESS에 기록한다. 하나라도 실패하면 고정 파일을 쓰지 않는다.
@@ -71,24 +77,34 @@
 
 ### 4.2 환경 호환표 — `runtime_profiles.py`
 
-`engine_profile()`이 돌려주는 값에 다음을 더한다. 값은 4.1 검사 결과에서 옮겨 적는다.
+새 함수 `runtime_capabilities(profile)`이 다음을 돌려준다. `engine_profile()` 값은 그래프 계획 기록에 들어가므로 바꾸지 않는다.
+값은 4.1 검사 결과에서 옮겨 적는다.
 
 | 필드 | 값(예정) | 용도 |
 |---|---|---|
+| `torch_backend` | `"cu128"` | 원격 설치 옵션 |
 | `torch_cuda` | `"12.8"` | 기록·표시 |
-| `supported_capabilities` | 4.1에서 추출한 목록(예: `["8.0","8.6","8.9","9.0","10.0","12.0"]`) | 세대 지원 판정 |
+| `sass` | 4.1에서 추출한 기계어 세대 목록(예: `["7.5","8.0","8.6","9.0","10.0","12.0"]`) | 세대 지원 판정 |
+| `ptx` | 4.1에서 추출한 PTX 세대 목록(없으면 빈 목록) | 세대 지원 판정 |
 | `bf16_min_capability` | `"8.0"` | bf16 판정 |
 | `min_driver` | `"525.60.13"` | CUDA 12 하위 버전 호환 최소 드라이버. 미만이면 차단 |
 | `recommended_driver` | `"570.26"` | CUDA 12.8 정식 드라이버. 미만이면 경고 |
 
-시험으로 호환표의 `torch_cuda`와 고정 파일의 torch 빌드가 일치하는지 확인한다.
+시험으로 호환표의 `torch_backend`와 고정 파일의 torch 빌드(`+cu128`)가 일치하는지 확인한다.
+
+**세대 지원 규칙**(CUDA 기계어 호환): GPU 세대 `M.m`은 다음 중 하나면 지원된다.
+- `sass`에 같은 주 버전 `M.k`(`k ≤ m`)가 있다. 예: Ada `8.9`는 `8.6` 기계어로 동작한다.
+- `ptx`에 `≤ M.m`인 세대가 있다.
+
+4.4의 사전 판정과 4.7의 실행 검사가 같은 규칙을 쓴다.
 
 ### 4.3 GPU 정보 수집 — 새 모듈 `gpu_compat.py`
 
 - `read_gpu_facts(client, gpu_uuids=())`가 고정 명령
   `nvidia-smi --query-gpu=uuid,name,compute_cap,memory.total,driver_version --format=csv,noheader,nounits`를 실행한다.
   GPU 서버는 선택된 UUID만 남긴다. 읽기 전용이며 아무것도 설치하지 않는다.
-- "환경 확인"(`runtime_check`)과 "대기 작업 실행"이 이 함수를 호출한다.
+- "환경 확인"(`runtime_check`)·"학습 환경 준비"와 데스크톱의 "대기 작업 실행"이 이 함수를 호출한다.
+  그래프 실행과 CLI는 호출하지 않고, 4.7 검사로 보호받는다(기존 시험용 가짜 서버에 영향을 줄이기 위함).
   결과를 `state/gpu-observations/<연결 대상 키>.json`에 시각과 함께 저장한다.
   연결 대상 키는 RunPod이면 `runpod-<pod_id>`, GPU 서버이면 `server-<목적지 해시 앞 16자>`다.
   RunPod 요금·GPU 종류는 같은 시점의 RunPod API 조회값을 함께 저장한다.
@@ -138,13 +154,16 @@
 2. **"대기 작업 실행":**
    1. 화면이 먼저 `runtime_check`를 부른다(읽기 전용 SSH).
    2. 차단 항목이 있으면 한국어 사유를 보여 주고 멈춘다.
-   3. 환경이 `missing`·`mismatch`이면 승인 창에 설치 안내를 더한다. 안내에는 `/workspace/factory` 아래 설치,
+   3. 환경이 `missing`·`mismatch`이면 승인 창에 설치 안내를 더한다. 안내에는 `/workspace/factory-desktop` 아래 설치,
       최대 30분, 빌린 Pod는 주인의 동의가 필요하다는 점이 들어간다.
    4. `MEMORY_TIGHT`이면 같은 승인 창에 경고와 대안을 넣는다.
    5. 승인하면 `execute`에 `{approved: true, prepare_runtime: <설치 안내를 승인했는지>}`를 보낸다.
 3. **실행(백엔드):**
    1. 연결 후 GPU 정보를 실시간으로 다시 읽어 판정한다. 차단 항목이 있으면 한국어 `ValueError`로 거부한다.
    2. 환경이 준비되지 않았으면 `prepare_runtime`이 참일 때만 기존 준비 코드로 설치한다. 아니면 한국어로 거부한다.
+      실행 중 준비는 **RunPod만** 한다. GPU 서버는 조회 결과를 검토하는 기존 준비 절차(예약 포함)가 있다.
+      그래서 서버는 실행 화면에서 "연결 설정에서 학습 환경 준비를 먼저 누르라"고 안내하고 멈춘다.
+      다른 작업이 Pod를 잡고 있으면 준비하지 않는다(기존 `runtime_prepare`와 같은 잠금 검사).
    3. 4.7 검사를 통과하면 `work()`로 학습을 시작한다.
 4. "학습 환경 준비" 버튼은 수동 준비용으로 남긴다.
 
@@ -152,8 +171,10 @@
 
 원격 확인 코드에 다음을 더하고 기대값에 `arch_ok: true`, `kernel_ok: true`를 추가한다.
 
-- `cap = torch.cuda.get_device_capability()`를 읽는다. `torch.cuda.get_arch_list()`에 `sm_<cap>`이 있거나,
-  `compute_<c>`(PTX)가 있고 `c ≤ cap`이면 `arch_ok`다.
+- `cap = torch.cuda.get_device_capability()`와 `torch.cuda.get_arch_list()`를 읽는다. 4.2의 세대 지원 규칙을 만족하면
+  `arch_ok`다(`sm_XY`는 기계어, `compute_XY`는 PTX).
+- 환경이 없으면(가상환경 Python이 없음) `RuntimeMissing`, 있지만 고정값이 다르거나 확인 코드가 실패하면 `RuntimeMismatch`,
+  연산이 실패하면 `GPUIncompatible`을 낸다. `runtime_check`는 예외 대신 `runtime_state`로 알려 준다.
 - `(torch.ones(8, device="cuda") * 2).sum().item() == 16`(`kernel_ok`). 세대 불일치는 여기서 확정된다.
 - `torch.cuda.is_bf16_supported()`를 기록한다. 실행 판정에서 작업 정밀도와 비교한다.
 
@@ -216,8 +237,11 @@
 - Gemma 4: E2B·E4B. GPU가 감당하면 26B-A4B·31B.
 
 **구조:** 모두 `*ForConditionalGeneration` 구조이며, LLaMA-Factory 템플릿은 각각 `qwen3_5`, `gemma4n`·`gemma4`다.
+모델 허브는 이미 이 구조를 SFT용으로 등록하므로, 2단계는 **GPU 검증과 그 과정에서 드러나는 문제 수정**이 중심이다.
+1단계 메모리 추정은 앱 기본 목록 모델만 다루고, 허브에 등록한 모델은 `MEMORY_UNKNOWN` 경고를 낸다.
+2단계에서 허브 조회에 매개변수 수·`hidden_size`를 더해 추정 대상으로 넓힌다.
 
-**해야 할 일:** 텍스트 데이터만으로 학습하도록 다음을 지원한다.
+**해야 할 일:** 텍스트 데이터만으로 학습할 때 다음이 동작하는지 검증하고 고친다.
 - LoRA 대상 검사(`target_inspection.py`)
 - 병합·확정(`model_ops.py`)
 - 평가 생성
