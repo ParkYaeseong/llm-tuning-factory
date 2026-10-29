@@ -24,7 +24,17 @@
 - 검증(2026-10-29, 문서 변경 후): `uv run pytest` 2021 passed, 1 skipped(616.82초); `uv run ruff check src tests scripts` 통과;
   `desktop`의 `npm run build` 통과, `npm test` 280 passed; `cargo test --manifest-path src-tauri/Cargo.toml --locked` 54 passed.
   실패·재실행 없음.
-- GPU·Pod·데이터 전송·MLflow 쓰기는 사용하지 않았다. 설치 프로그램은 아직 빌드하지 않았다(Task 15). GPU 인수 대기.
+- GPU·Pod·데이터 전송·MLflow 쓰기는 사용하지 않았다. GPU 인수 대기.
+- Task 15 결과: 설치 프로그램 `desktop/src-tauri/target/release/bundle/nsis/LLM Tuning Factory_0.5.0_x64-setup.exe`,
+  48,286,105 바이트, SHA-256 `80cb0e3ed911cb18fc7228c025f901a000224bbe755b74892aaecf83fc343bf2`, 커밋 `59f7b98`에서 빌드.
+  `scripts/verify_desktop_package.py` 영수증 `dist/verify-0.5.0.json`: bridge_mode frozen, 모든 검사 true, gpu_started false.
+  설치하지 않았다(설치는 사용자 확인이 필요). 주의: 이 설치 프로그램은 최종 검토 수정보다 앞선 것이므로 사용 전에 다시 빌드해야 한다.
+- 최종 검토 결과와 수정: 다른 앱 버전(소스 해시가 다름)의 작업은 원격 접속·환경 설치 전에 한국어로 거부한다(`runtime_check`와 실행 모두).
+  준비 직후 확인 실패는 고정 문구로 거부한다. 검증된 모델도 검증되지 않은 GPU 세대에서는 `MODEL_UNVERIFIED`로 경고한다.
+  메모리 문구에 95%·90% 기준을 밝혔다. `inspect_gpu_wheels.py`는 호환표와 어긋나면 종료 코드 1을 돌려준다. 환경 확인은 작업 자체의
+  학습 단계를 쓴다. 화면은 점검·승인 뒤 대기 작업의 연결 대상을 다시 확인하고 환경 준비 중 안내를 보여 준다.
+- 사용자의 대기 작업 `76986bce…`는 0.4.0으로 제출되어 0.5.0에서 실행할 수 없다. '취소 요청'으로 정리하고 다시 제출한다
+  (GPU 종류·요금은 'GPU 정보 → 학습 설정에 적용'으로 맞춘다).
 - **남은 일(후속):** SSH 서버의 시간당 요금은 호환성 판정이 아직 보지 않는다(기존 서버 예산 검사만 적용). 판정 표에 넣을 것.
 - **남은 일(유료, 별도 승인):** Task 16 GPU 인수 시험. Blackwell Pod와 Ampere 또는 Hopper Pod에서 새 환경 준비,
   `arch_ok`·`kernel_ok`, Qwen2.5-0.5B SFT LoRA 회귀, 메모리 추정과 실제 최대 사용량 비교.

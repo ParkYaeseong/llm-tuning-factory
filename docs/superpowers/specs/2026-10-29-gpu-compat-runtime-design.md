@@ -23,7 +23,7 @@
 
 | 항목 | 결정 |
 |---|---|
-| 사용할 GPU | Ampere, Hopper·Ada, Blackwell. 구형(V100·T4·P100) 제외 |
+| 사용할 GPU | Ampere, Hopper·Ada, Blackwell. 구형(V100·T4·P100) 제외. 참고: Turing(7.5)은 세대 검사를 통과한다(fp16만 가능, 검증 대상 아님). "구형 제외" 결정을 다듬은 것이다 |
 | 환경 방식 | 하나의 학습 환경을 CUDA 12.8 빌드로 전환(대안 A). GPU별 다중 환경(B)·Pod 기존 PyTorch 사용(C)은 기각 |
 | 점검 시점 | "환경 확인"이 GPU 정보를 저장하고, "계획"은 저장값으로 미리 경고하고, "실행"은 실시간으로 다시 점검·차단 |
 | 학습 환경 설치 | 실행 승인에 포함한다. 환경이 없으면 승인 창에 설치 안내를 넣고, 한 번 승인으로 준비와 학습을 잇는다 |
@@ -109,7 +109,7 @@
   연결 대상 키는 RunPod이면 `runpod-<pod_id>`, GPU 서버이면 `server-<목적지 해시 앞 16자>`다.
   RunPod 요금·GPU 종류는 같은 시점의 RunPod API 조회값을 함께 저장한다.
 - 학습 환경이 없어도 GPU 정보 수집은 성공해야 한다. 그래서 `runtime_check`는 환경이 없을 때 예외 대신
-  `{"runtime": "missing" | "mismatch" | "ready", "gpu": …, "findings": […]}`를 돌려준다.
+  `{"runtime_state": "missing" | "mismatch" | "ready" | …, "observation": …, "findings": […]}`를 돌려준다(키 이름은 `runtime_state`이며 `runtime`이 아니다).
 
 ### 4.4 호환성 판정 — `gpu_compat.evaluate(config, facts, profile, model)`
 
@@ -130,10 +130,10 @@
 | `PRICE_OVER_BUDGET` | 차단 | RunPod 시간당 요금 > 작업의 GPU당 요금 × 개수 |
 | `POD_FACTS_UNKNOWN` | 차단 | RunPod API가 GPU 종류·개수를 주지 않음 |
 | `PRICE_UNKNOWN` | 차단 | RunPod API가 유효한 현재 요금을 주지 않음 |
-| `MEMORY_WEIGHTS_EXCEED` | 차단 | 가중치 추정 > GPU 메모리 × 0.95 |
-| `MEMORY_TIGHT` | 경고 | 전체 추정 > GPU 메모리 × 0.90. QLoRA 4비트·배치 1·짧은 길이를 제안 |
+| `MEMORY_WEIGHTS_EXCEED` | 차단 | 가중치 추정 > GPU 메모리 × 0.95. 메시지에 95% 기준을 밝힘 |
+| `MEMORY_TIGHT` | 경고 | 전체 추정 > GPU 메모리 × 0.90. 메시지에 90% 기준을 밝히고 QLoRA 4비트·배치 1·짧은 길이를 제안 |
 | `MEMORY_UNKNOWN` | 경고 | 목록에 없는 모델이라 크기를 모름 |
-| `MODEL_UNVERIFIED` | 경고 | 목록의 `gpu_verified`가 거짓이거나 검증된 세대가 아님 |
+| `MODEL_UNVERIFIED` | 경고 | 목록의 `gpu_verified`가 거짓이거나, 검증된 모델이 `verified_capabilities`에 없는 세대의 GPU에서 실행됨 |
 | `OBSERVATION_MISSING` / `OBSERVATION_STALE` | 경고(계획만) | 저장된 GPU 정보가 없거나 24시간 이상 지남. "환경 확인"을 다시 누르라고 안내 |
 
 SSH 서버의 요금은 아직 이 표가 아니라 기존 서버 예산 검사가 판정한다. 기존 `validate_budget`의 GPU 종류·개수·요금 거부는 안전장치로 그대로 둔다. 데스크톱은 그 전에 위 판정을 한국어로 보여 준다.
@@ -187,7 +187,7 @@ SSH 서버의 요금은 아직 이 표가 아니라 기존 서버 예산 검사�
   뒤에 다른 출력이 붙어도 그 줄을 찾아 해석한다.
 - `(torch.ones(8, device="cuda") * 2).sum().item() == 16`(`kernel_ok`). 세대 지원은 `arch_ok`로 판정하고,
   세대는 지원하는데 연산이 실패하면 GPU 사용 중·오류(`GPUUnavailable`)로 본다.
-- `torch.cuda.is_bf16_supported()`를 기록한다. 실행 판정에서 작업 정밀도와 비교한다.
+- `torch.cuda.is_bf16_supported()`를 기록하지만 참고용이다. bf16 판정은 세대 규칙(`bf16_min_capability`)으로 한다.
 
 이 함수는 그래프 실행과 CLI도 쓰므로, 모든 경로에서 호환되지 않는 GPU의 학습 시작을 막는다.
 
@@ -239,7 +239,7 @@ SSH 서버의 요금은 아직 이 표가 아니라 기존 서버 예산 검사�
   같은 torch 버전의 빌드 차이라 코드 변경은 없을 것으로 예상한다.
 - 메모리 추정은 근사치다. 차단은 가중치만 기준으로 해서 잘못 막을 가능성을 줄이고, 나머지는 경고로 둔다.
 - CUDA 12.8 라이브러리로 원격 설치 용량이 늘어난다. 설치 파일 크기는 고정 파일만 바뀌므로 거의 그대로다.
-- 0.4.0에서 제출된 작업도 0.5.0의 학습 환경과 판정을 따른다. 같은 원격 경로를 쓰지 않으므로 기존 환경을 덮어쓰지 않는다.
+- 다른 앱 버전(소스 해시가 다름)으로 제출된 작업은 실행할 수 없다. 앱은 원격 접속 전에 한국어로 거부하며, 같은 설정으로 다시 제출해야 한다. 기존 작업은 '취소 요청'으로 정리한다. 같은 원격 경로를 쓰지 않으므로 기존 환경은 덮어쓰지 않는다.
 
 ## 7. 2단계 예고(별도 명세)
 
