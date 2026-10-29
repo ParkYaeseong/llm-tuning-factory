@@ -1443,6 +1443,11 @@ git commit -m "feat: record GPU facts in runtime checks and report a missing run
 
 ### Task 10: `executor_for` — 실행 게이트와 RunPod 실행 중 준비
 
+> **검토 후 변경(2026-10-29, 커밋 `f0ffcb0`):** GPU 서버는 `server_receipt.validate_destination`을 게이트보다 먼저 한다.
+> 준비 후 확인이 `RuntimeMissing`·`RuntimeMismatch`면 한국어 `POST_PREPARATION_FAILED`로 알린다(재시도 없음).
+> 설치 스크립트는 `flock -n 9 || { echo TF_PREPARE_BUSY; exit 75; }`이고, 이를 한국어 `PREPARATION_BUSY`로 바꾼다.
+> `GPUIncompatible`·`GPUUnavailable`은 준비를 시작하지 않는다는 점을 시험으로 고정했다. 아래 코드 블록은 최초 계획이다.
+
 **Files:**
 - Modify: `src/tuning_factory/desktop_runtime.py` (`executor_for`)
 - Test: `tests/test_desktop_runtime.py`
