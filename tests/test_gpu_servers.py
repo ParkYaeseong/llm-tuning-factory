@@ -1534,3 +1534,17 @@ def test_raw_server_receipts_chunks_large_id_lists(tmp_path):
     result = store.raw_server_receipts(ids)
     assert result == {job: "receipt-" + job for job in ids[::2]}
     assert max(seen) <= 500 and len(seen) == 3
+
+
+@pytest.mark.parametrize("ready,code", [(False, 1), (True, 0)])
+def test_cli_server_runtime_exit_code_follows_readiness(tmp_path, monkeypatch, ready, code):
+    from typer.testing import CliRunner
+
+    from tuning_factory import cli, desktop_runtime
+
+    path = tmp_path / "server.json"
+    path.write_text(settings().model_dump_json())
+    monkeypatch.setattr(cli, "server_connection", lambda ctx, profile=None: {"provider": "ssh_server"})
+    monkeypatch.setattr(desktop_runtime, "runtime", lambda *a, **kw: {"ready": ready, "runtime_state": "x"})
+    result = CliRunner().invoke(cli.app, ["--state-dir", str(tmp_path / "state"), "server-runtime", str(path)])
+    assert result.exit_code == code, result.output

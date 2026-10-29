@@ -21,6 +21,7 @@ from .manifest import resolve
 from .model_hub import ModelHub, register_model, registered_models
 from .registry import canonical, digest, parse_dataset, safe_name
 from .runner import Factory
+from .runtime_profiles import engine_profile
 
 PROVIDERS = ("existing_runpod", "ssh_server")
 # Withheld for unauthenticated MLflow servers, even if a caller still sends them.
@@ -42,6 +43,9 @@ CROSS_PROVIDER_LOCK = ("다른 연결 대상(RunPod 등)의 끝나지 않은 작
 PRACTICE_SUBMIT_REFUSAL = "연습용 데이터(tutorial_sample)로는 실제 학습을 시작할 수 없습니다."
 SERVER_RESERVED = ("GPU 서버가 작업이나 다른 환경 준비에 예약되어 있습니다. "
                    "작업을 재조정하거나 준비 예약을 해제한 뒤 다시 준비하세요.")
+SERVER_PREPARE_IN_EXECUTION = ("GPU 서버는 실행 승인에서 학습 환경을 함께 준비하지 않습니다. 연결 설정에서 GPU 목록을 "
+                               "조회한 뒤 '학습 환경 준비'를 먼저 누르세요.")
+POD_RESERVED_FOR_PREPARATION = "Pod is reserved by a job; reconcile and finish it before preparing runtime"
 
 
 def assets_root():
@@ -150,6 +154,51 @@ class DesktopService:
     def require_server(self):
         if not self.is_server():
             raise ValueError("GPU 서버 연결을 선택한 경우에만 사용할 수 있습니다.")
+
+    def compatibility(self, config, observation, stage):
+        """gpu_compat findings for one job config; catalog sizes feed the memory estimate."""
+        from .gpu_compat import evaluate
+        from .runtime_profiles import runtime_capabilities
+        profile = engine_profile(config.get("training_stage", "sft"))["profile"]
+        model = next((item for item in model_catalog() if item["id"] == config.get("base_model")), None)
+        return evaluate(config, observation, runtime_capabilities(profile), model, stage=stage)
+
+    def plan_compatibility(self, config):
+        """Offline: the plan judges the last stored GPU observation of the saved destination."""
+        from .desktop_runtime import observation_key
+        from .gpu_compat import load_observation
+        try:
+            key = observation_key(self.settings)
+        except (ValueError, TypeError):   # incomplete connection settings: nothing was observed yet
+            key = None
+        observation = load_observation(self.root, key) if key else None
+        try:
+            findings = self.compatibility(config, observation, "plan")
+        except (TypeError, ValueError, KeyError):   # a stored file with wrong value types counts as missing
+            observation = None
+            findings = self.compatibility(config, None, "plan")
+        return {"observed_at": (observation or {}).get("observed_at"), "findings": findings}
+
+    def add_findings(self, report, data):
+        """A runtime check for a queued job (job_id) or an unsubmitted plan (config) also judges that config."""
+        if data.get("job_id"):
+            self.job_directory(data["job_id"])
+            config = self.factory.store.get(data["job_id"])["manifest"]["config"]
+        elif data.get("config"):
+            config = AIConfig.model_validate(data["config"]).model_dump(mode="json")
+        else:
+            return
+        if report.get("observation") is not None:
+            report["findings"] = self.compatibility(config, report["observation"], "execute")
+
+    def execution_gate(self, config):
+        from .gpu_compat import refusal
+
+        def gate(observation):
+            message = refusal(self.compatibility(config, observation, "execute"))
+            if message:
+                raise ValueError(message)
+        return gate
 
     def server_destination(self):
         """Offline (destination_sha256, issue) of the saved server settings. Never opens SSH."""
@@ -341,6 +390,7 @@ class DesktopService:
             if server:
                 # Offline only (no SSH or provider API); submit refuses a different destination.
                 result["destination_sha256"], result["destination_issue"] = self.server_destination()
+            result["compatibility"] = self.plan_compatibility(manifest["config"])
             return result
         if action == "submit":
             self.require_approval(data)
@@ -380,20 +430,28 @@ class DesktopService:
             self.require_tracking_ready()
             from .desktop_runtime import executor_for
             server = self.is_server()
+            prepare = data.get("prepare_runtime") is True
+            if prepare and server:
+                raise ValueError(SERVER_PREPARE_IN_EXECUTION)
             job_id = data["job_id"]
             self.job_directory(job_id)
-            stage = self.factory.store.get(job_id)["manifest"]["config"].get("training_stage", "sft")
+            config = self.factory.store.get(job_id)["manifest"]["config"]
+            stage = config.get("training_stage", "sft")
+            if prepare and self.factory.store.gpu_locked("existing_runpod:" + self.settings.get("pod_id", "")):
+                raise ValueError(POD_RESERVED_FOR_PREPARATION)
+            gate = self.execution_gate(config)
             receipt = self.job_receipt(job_id, server)
             if server:
                 with executor_for(self.settings, self.root, training_stage=stage,
-                                  server_receipt=receipt) as executor:
+                                  server_receipt=receipt, gate=gate) as executor:
                     result = self.factory.work(executor=executor, gpu=executor.server_facts.exclusivity_key,
                                                approved_transfer=True, select_mode=True, target_job_id=job_id)
                     if result is None and self.factory.store.foreign_provider_lock(
                             executor.server_facts.exclusivity_key):
                         raise ValueError(CROSS_PROVIDER_LOCK)
                     return result
-            with executor_for(self.settings, self.root, training_stage=stage) as executor:
+            with executor_for(self.settings, self.root, training_stage=stage, gate=gate,
+                              prepare_runtime=prepare) as executor:
                 return self.factory.work(executor=executor, gpu="existing_runpod:" + self.settings["pod_id"],
                                          approved_transfer=True, select_mode=True, target_job_id=job_id)
         if action == "jobs":
@@ -480,9 +538,12 @@ class DesktopService:
                 return runtime(self.settings, self.root, prepare=True,
                                training_stage=data.get("training_stage", "sft"), inspection=inspection)
             if action == "runtime_prepare" and self.factory.store.gpu_locked("existing_runpod:" + self.settings.get("pod_id", "")):
-                raise ValueError("Pod is reserved by a job; reconcile and finish it before preparing runtime")
-            return runtime(self.settings, self.root, prepare=action == "runtime_prepare",
-                           training_stage=data.get("training_stage", "sft"))
+                raise ValueError(POD_RESERVED_FOR_PREPARATION)
+            report = runtime(self.settings, self.root, prepare=action == "runtime_prepare",
+                             training_stage=data.get("training_stage", "sft"))
+            if action == "runtime_check":
+                self.add_findings(report, data)
+            return report
         if action == "runtime_reservations":
             from .desktop_runtime import runtime_reservations
             return runtime_reservations(self.root)

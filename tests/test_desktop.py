@@ -185,3 +185,88 @@ def test_desktop_claim_is_visible_to_canonical_workers(tmp_path, monkeypatch):
     # Ambiguous old strings remain unmapped; their uncertainty quarantines real claims.
     with store.connection() as db:
         assert db.execute('SELECT gpu FROM gpu_locks').fetchone()[0] == 'existing_runpod:borrowed'
+
+
+def test_plan_ignores_a_stored_observation_with_wrong_value_types(tmp_path):
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    catalog = app.dispatch("catalog", {})
+    config = next(x["config"] for x in catalog["templates"] if x["name"] == "paper_extraction")
+    source = tmp_path / "input.json"
+    source.write_text(json.dumps([{"instruction": "question", "output": "answer"}]))
+    app.dispatch("dataset", {"dataset_id": "dummy", "version": "1", "path": str(source)})
+    folder = tmp_path / "gpu-observations"
+    folder.mkdir()
+    broken = {"key": "runpod-borrowed", "observed_at": 1.0, "gpus": [{**BLACKWELL, "memory_mib": "24467"}],
+              "pod": POD_API}
+    (folder / "runpod-borrowed.json").write_text(json.dumps(broken))
+    compat = app.dispatch("plan", {"config": config})["compatibility"]
+    assert compat["observed_at"] is None and ("warn", "OBSERVATION_MISSING") in finding_codes(compat["findings"])
+
+
+BLACKWELL = {"uuid": "GPU-1", "name": "NVIDIA RTX PRO 4000 Blackwell", "capability": "12.0", "memory_mib": 24467,
+             "driver": "595.91.07"}
+POD_API = {"gpu": {"id": "NVIDIA RTX PRO 4000 Blackwell", "displayName": None, "count": 1}, "costPerHr": 0.57}
+A4000_JOB = {"training_stage": "sft", "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+             "resource_profile": {"gpu_type": "NVIDIA RTX A4000", "gpu_count": 1, "hourly_cost_usd": 0.5}}
+
+
+def finding_codes(findings):
+    return {(item["level"], item["code"]) for item in findings}
+
+
+def test_plan_reports_gpu_compatibility_from_the_stored_observation(tmp_path):
+    from tuning_factory.gpu_compat import make_observation, save_observation
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    catalog = app.dispatch("catalog", {})
+    config = next(x["config"] for x in catalog["templates"] if x["name"] == "paper_extraction")
+    source = tmp_path / "input.json"
+    source.write_text(json.dumps([{"instruction": "question", "output": "answer"}]))
+    app.dispatch("dataset", {"dataset_id": "dummy", "version": "1", "path": str(source)})
+    first = app.dispatch("plan", {"config": config})["compatibility"]
+    assert first["observed_at"] is None and ("warn", "OBSERVATION_MISSING") in finding_codes(first["findings"])
+    save_observation(tmp_path, make_observation("runpod-borrowed", [BLACKWELL], POD_API))
+    second = app.dispatch("plan", {"config": config})["compatibility"]
+    assert second["observed_at"] > 0
+    assert ("block", "GPU_TYPE_MISMATCH") in finding_codes(second["findings"])   # the template asks for an A4000
+    assert app.dispatch("jobs", {}) == []
+
+
+def test_runtime_check_judges_a_queued_job_or_a_plan_config(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    from tuning_factory.gpu_compat import make_observation
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    job = app.factory.store.submit({"sha256": "a4000", "simulation": False, "config": A4000_JOB}, "a4000")
+    observation = make_observation("runpod-borrowed", [BLACKWELL], POD_API)
+    monkeypatch.setattr(desktop_runtime, "runtime", lambda *a, **kw: {"ready": False, "runtime_state": "missing",
+                                                                     "observation": observation})
+    report = app.dispatch("runtime_check", {"training_stage": "sft", "job_id": job["id"]})
+    assert {("block", "GPU_TYPE_MISMATCH"), ("block", "PRICE_OVER_BUDGET")} <= finding_codes(report["findings"])
+    assert "findings" not in app.dispatch("runtime_check", {"training_stage": "sft"})
+
+
+def test_execute_gates_the_job_and_forwards_runtime_preparation(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tuning_factory import desktop_runtime
+    from tuning_factory.gpu_compat import make_observation
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    store = app.factory.store
+    job = store.submit({"sha256": "a4000", "simulation": False, "config": A4000_JOB}, "a4000")
+    store.transition(job["id"], "QUEUED")
+    seen = {}
+
+    @contextmanager
+    def fake_executor(settings, root, **kwargs):
+        seen.update(kwargs)
+        kwargs["gate"](make_observation("runpod-borrowed", [BLACKWELL], POD_API))
+        yield SimpleNamespace(remote=True)
+
+    monkeypatch.setattr(desktop_runtime, "executor_for", fake_executor)
+    monkeypatch.setattr(app.factory, "run_claimed", lambda *args: pytest.fail("refused job launched"))
+    with pytest.raises(ValueError, match="실행할 수 없습니다"):
+        app.dispatch("execute", {"approved": True, "job_id": job["id"], "prepare_runtime": True})
+    assert seen["prepare_runtime"] is True and store.get(job["id"])["attempts"] == 0
+    server = desktop.DesktopService(tmp_path / "server", {"provider": "ssh_server"})
+    with pytest.raises(ValueError, match="GPU 서버는 실행 승인에서"):
+        server.dispatch("execute", {"approved": True, "job_id": "0" * 32, "prepare_runtime": True})

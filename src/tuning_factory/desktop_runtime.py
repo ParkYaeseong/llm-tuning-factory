@@ -49,8 +49,8 @@ RUNTIME_PREPARATION_REQUIRED = ("Pod에 이 앱 버전의 학습 환경이 없�
                                 "승인하거나 연결 설정의 '학습 환경 준비'를 먼저 누르세요.")
 SERVER_RUNTIME_REQUIRED = ("GPU 서버에 이 앱 버전의 학습 환경이 없습니다. 연결 설정에서 GPU 목록을 조회한 뒤 "
                            "'학습 환경 준비'를 먼저 누르세요.")
-POST_PREPARATION_FAILED = ("학습 환경을 준비했지만 확인을 통과하지 못했습니다. "
-                           "Pod의 /workspace/factory-desktop 설치 기록을 확인한 뒤 다시 시도하세요.")
+POST_PREPARATION_FAILED = ("학습 환경을 준비했지만 확인을 통과하지 못했습니다. 연결 설정에서 '환경 확인'으로 "
+                           "상태를 확인하거나 '학습 환경 준비'를 다시 실행하세요.")
 PREPARATION_BUSY = "다른 학습 환경 준비가 이 GPU에서 진행 중입니다. 끝난 뒤 다시 시도하세요."
 PREPARE_IN_EXECUTION_RUNPOD_ONLY = "runtime preparation during execution applies to a RunPod preflight only"
 

@@ -130,7 +130,7 @@ def test_plan_is_offline_and_returns_the_saved_destination_hash(tmp_path, monkey
     assert len(hashes) == 5 and None not in hashes
     runpod = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"}).dispatch(
         "plan", {"config": zero_cost_config(app)})
-    assert set(runpod) == {"dry_run", "manifest", "estimated_cost_usd", "note"}
+    assert set(runpod) == {"dry_run", "manifest", "estimated_cost_usd", "note", "compatibility"}
 
 
 @pytest.mark.parametrize("drop,updates", [
