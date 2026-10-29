@@ -394,6 +394,8 @@ async function overrideActions(page: import("@playwright/test").Page, answers: R
       if (command === "factory_action" && args.action in answers) {
         (window as any).__overridden.push(args);
         const answer = answers[args.action];
+        if (answer && (answer as any).__reject) throw new Error((answer as any).__reject);
+        if (answer && (answer as any).__hold) await new Promise<void>(resolve => { (window as any).__release = resolve; });
         return args.action === "plan" ? { ...(await original(command, args)), ...(answer as object) } : answer;
       }
       return original(command, args);
@@ -441,4 +443,72 @@ test("a missing RunPod runtime is folded into the single run approval", async ({
     .find((args: any) => args.action === "execute")?.data?.prepare_runtime)).toBe(true);
   const check = await page.evaluate(() => (window as any).__overridden.find((args: any) => args.action === "runtime_check"));
   expect(check.data.config.base_model).toBeTruthy();
+});
+
+const startRun = async (page: import("@playwright/test").Page) => {
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).click();
+};
+const calledActions = (page: import("@playwright/test").Page) => page.evaluate(() => [
+  ...(window as any).__testCalls.map((c: any) => c.args?.action), ...(window as any).__overridden.map((a: any) => a.action)]);
+
+test("a ready environment is approved without preparing the runtime", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { ready: true, runtime_state: "ready", findings: [] }, execute: null });
+  await startRun(page);
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__overridden
+    .find((args: any) => args.action === "execute")?.data?.prepare_runtime)).toBe(false);
+});
+
+test("an unavailable GPU stops the run before approval or submit", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { ready: false, runtime_state: "unavailable", findings: [] } });
+  await startRun(page);
+  await expect(page.getByRole("alert")).toContainText("GPU를 사용할 수 없거나 사용 중입니다");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("submit");
+});
+
+test("an unknown runtime state stops the run before approval or submit", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { ready: false, runtime_state: "strange", findings: [] } });
+  await startRun(page);
+  await expect(page.getByRole("alert")).toContainText("학습 환경 상태를 확인하지 못했습니다");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("submit");
+});
+
+test("a failing runtime check stops the run before approval or submit", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { __reject: "연결 실패 테스트" } });
+  await startRun(page);
+  await expect(page.getByRole("alert")).toContainText("연결 실패 테스트");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("submit");
+});
+
+test("a GPU server with a missing runtime is told to prepare it from the connection settings", async ({ page }) => {
+  await page.addInitScript(() => {
+    const bridge = (window as any).__TAURI_INTERNALS__, original = bridge.invoke;
+    bridge.invoke = async (command: string, args: any) => command === "settings_get" ? {
+      provider: "ssh_server", server_ssh_host: "gpu.example.org", server_ssh_port: "2222", server_ssh_username: "researcher",
+      server_ssh_fingerprint: "SHA256:" + "A".repeat(43), server_remote_root: "/home/researcher/factory",
+      server_selected_gpu_uuids: JSON.stringify(["GPU-11111111-2222-3333-4444-555555555555"]) } : original(command, args);
+  });
+  await page.goto("/");
+  await overrideActions(page, { plan: { destination_sha256: "a".repeat(64) },
+    runtime_check: { ready: false, runtime_state: "missing", findings: [] }, execute: null });
+  await startRun(page);
+  await expect(page.getByRole("alert")).toContainText("연결 설정에서 GPU 목록을 조회한 뒤");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("execute");
+});
+
+test("a double click on start runs one preflight and opens one approval", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { __hold: true, ready: true, runtime_state: "ready", findings: [] }, execute: null });
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).evaluate(button => { (button as HTMLButtonElement).click(); (button as HTMLButtonElement).click(); });
+  await expect.poll(() => page.evaluate(() => typeof (window as any).__release)).toBe("function");
+  await page.evaluate(() => (window as any).__release({ ready: true, runtime_state: "ready", findings: [] }));
+  await expect(page.getByRole("dialog")).toHaveCount(1);
+  expect((await calledActions(page)).filter(action => action === "runtime_check")).toHaveLength(1);
 });

@@ -697,17 +697,20 @@ function settingsFromForm(form: HTMLFormElement) {
 async function executionPreflight(job: Obj | null): Promise<{ prepare: boolean; extra: string } | null> {
   const config = job ? job.manifest?.config : state.plan?.manifest?.config;
   const server = job ? !!job.server_destination : isServer(state.settings);
-  state.notice = "실행 전 GPU와 학습 환경을 확인하는 중입니다."; render();
+  captureDrafts();
+  state.error = ""; state.notice = "실행 전 GPU와 학습 환경을 확인하는 중입니다."; render();
   try {
     const report = await api("runtime_check", { training_stage: config?.training_stage || "sft", ...(job ? { job_id: job.id } : { config }) });
     const outcome = preflightOutcome(report, server);
     state.notice = "";
     if ("error" in outcome) { state.error = outcome.error; render(); return null; }
+    render();
     return outcome;
   } catch (error) {
     state.notice = ""; state.error = errorText(error); render(); return null;
   }
 }
+let preflightRunning = false;
 async function execute(job: Obj, prepareRuntime = false) {
   // The job's task may have run while the user typed on another page, which this switch to 실행 관리 replaces.
   captureDrafts();
@@ -965,13 +968,21 @@ async function action(name: string) {
     const job = name === "start" ? null : state.jobs.find((j: Obj) => j.id === state.active);
     const issue = job ? jobDestinationIssue(job, state.settings) : null;
     if (issue) { state.error = issue; render(); return; }
-    let extra = "";
-    if (name !== "resume") {
-      const preflight = await executionPreflight(job);
-      if (!preflight) return;
-      ({ prepare: prepareRuntime, extra } = preflight);
-    }
-    if (!await approve("실제 GPU 학습 실행", transferApproval(job ? job.server_destination ?? null : settingsRoute(state.settings)) + extra)) return;
+    if (preflightRunning) return;
+    preflightRunning = true;
+    try {
+      const planAtCheck = state.plan;
+      let extra = "";
+      if (name !== "resume") {
+        const preflight = await executionPreflight(job);
+        if (!preflight) return;
+        ({ prepare: prepareRuntime, extra } = preflight);
+      }
+      const planChanged = () => name === "start" && (!state.plan || state.plan !== planAtCheck);
+      if (planChanged()) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
+      if (!await approve("실제 GPU 학습 실행", transferApproval(job ? job.server_destination ?? null : settingsRoute(state.settings)) + extra)) return;
+      if (planChanged()) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
+    } finally { preflightRunning = false; }
   }
   const checkpoint = document.querySelector<HTMLInputElement>("#checkpoint")?.value;
   captureConfig();
@@ -1003,7 +1014,8 @@ async function action(name: string) {
         else state.notice = "저장된 인증값을 삭제했습니다.";
       }
     }
-    else if (name === "runtime_check" || name === "runtime_prepare") { state.runtimeReport = await api(name, { approved: name === "runtime_prepare", training_stage: state.config?.training_stage || "sft" }); state.notice = runtimeNotice(state.runtimeReport, isServer(state.settings)); }
+    else if (name === "runtime_check" || name === "runtime_prepare") { state.runtimeReport = await api(name, { approved: name === "runtime_prepare", training_stage: state.config?.training_stage || "sft" }); const message = runtimeNotice(state.runtimeReport, isServer(state.settings));
+      if (state.runtimeReport?.ready === false && ["incompatible", "unavailable"].includes(state.runtimeReport.runtime_state)) state.error = message; else state.notice = message; }
     else if (name === "server-inspect") { state.serverInspection = null; state.gpuDraft = null; state.serverInspection = await gpuServer.serverInspect(); }
     else if (name === "server-select") {
       const selected: string[] = state.gpuDraft ?? selectedGpus(state.settings);
