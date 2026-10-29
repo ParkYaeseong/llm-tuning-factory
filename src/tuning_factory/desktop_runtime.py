@@ -59,6 +59,14 @@ class GPUIncompatible(ValueError):
     """The installed runtime cannot run CUDA kernels on this GPU."""
 
 
+GPU_UNAVAILABLE = "GPU를 사용할 수 없습니다. 인식된 GPU가 없거나 선택한 GPU 수와 다릅니다. Pod·서버의 GPU 상태를 확인하세요."
+GPU_BUSY = "GPU가 사용 중이거나 오류 상태라 CUDA 연산을 실행하지 못했습니다. 다른 작업이 GPU를 쓰고 있는지 확인하세요."
+
+
+class GPUUnavailable(ValueError):
+    """The runtime is installed, but the GPU is absent, a different count, busy or in an error state."""
+
+
 # gpu_compat.capability_supported's rule, run inside the private runtime: same-major machine code with a lower or
 # equal minor, or PTX at or below the device. A failing kernel is reported, never raised.
 ARCH_PROBE = (
@@ -184,7 +192,9 @@ def bootstrap_prerequisites(client):
 
 def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=(), *, model_ops=False):
     """Probe the private runtime. ``model_ops=True`` (merge/materialize) also requires the installed
-    MODEL_OPS_PINS versions. Raises RuntimeMissing, RuntimeMismatch or GPUIncompatible."""
+    MODEL_OPS_PINS versions. Raises RuntimeMissing (no interpreter), RuntimeMismatch (stale or unparseable
+    runtime), GPUUnavailable (runtime fine, GPU absent, miscounted or busy) or GPUIncompatible (no kernel for
+    this GPU generation)."""
     profile = engine_profile(training_stage)
     if model_ops and profile["profile"] != "primary":
         raise ValueError(MODEL_OPS_RUNTIME)
@@ -199,11 +209,10 @@ def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=(
         + "from pathlib import Path\n"
         "from tuning_factory.manifest import source_hash\n"
         "from tuning_factory.registry import digest\n"
-        + ("assert torch.cuda.device_count()==" + str(len(selected_gpu_uuids)) + "\n" if selected_gpu_uuids else "")
         + ARCH_PROBE
-        + "print(json.dumps(dict(source=source_hash(),engine=importlib.metadata.version('llamafactory'),"
+        + "print('TF_PROBE '+json.dumps(dict(source=source_hash(),engine=importlib.metadata.version('llamafactory'),"
         "cuda=torch.cuda.is_available(),lock=digest(Path(" + repr(root + "/" + lock_name) + ").read_bytes()),"
-        "arch_ok=arch_ok,kernel_ok=kernel_ok,bf16=bf16,capability=capability" + pins + ")))"
+        "devices=torch.cuda.device_count(),arch_ok=arch_ok,kernel_ok=kernel_ok,bf16=bf16,capability=capability" + pins + ")))"
     )
     python = root + "/venv/bin/python"
     argv = [python, "-c", probe]
@@ -217,17 +226,26 @@ def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=(
         except RemoteCommandFailed:
             raise RuntimeMissing(RUNTIME_MISSING) from None
         raise RuntimeMismatch(RUNTIME_MISMATCH) from None
-    result = json.loads(output.splitlines()[-1])
+    lines = output.splitlines()
+    marked = [line for line in lines if line.startswith("TF_PROBE ")]
+    try:
+        result = json.loads(marked[-1][len("TF_PROBE "):] if marked else lines[-1])
+    except (json.JSONDecodeError, IndexError):
+        raise RuntimeMismatch(RUNTIME_MISMATCH) from None
     from .desktop import assets_root
     expected = hashlib.sha256((assets_root() / profile["lock_file"]).read_bytes()).hexdigest()
-    base = {key: result.get(key) for key in ("source", "engine", "cuda", "lock")}
-    if (base != {"source": source_hash(), "engine": profile["engine_version"], "cuda": True, "lock": expected}
+    base = {key: result.get(key) for key in ("source", "engine", "lock")}
+    if (base != {"source": source_hash(), "engine": profile["engine_version"], "lock": expected}
             or ("model_ops" in result and not model_ops)):
         raise RuntimeMismatch(RUNTIME_MISMATCH)
+    if result.get("cuda") is not True or (selected_gpu_uuids and result.get("devices") != len(selected_gpu_uuids)):
+        raise GPUUnavailable(GPU_UNAVAILABLE)
     if model_ops and result.get("model_ops") != dict(MODEL_OPS_PINS):
         raise ValueError(MODEL_OPS_RUNTIME)
-    if result.get("arch_ok") is not True or result.get("kernel_ok") is not True:
+    if result.get("arch_ok") is not True:
         raise GPUIncompatible(GPU_INCOMPATIBLE)
+    if result.get("kernel_ok") is not True:
+        raise GPUUnavailable(GPU_BUSY)
     return result
 
 

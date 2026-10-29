@@ -294,13 +294,44 @@ def test_check_separates_a_missing_runtime_from_a_broken_one(monkeypatch):
         runtime.check(None)
 
 
-@pytest.mark.parametrize("field", ["arch_ok", "kernel_ok"])
-def test_check_refuses_a_gpu_whose_kernels_cannot_run(monkeypatch, field):
+def probe_command(reply, trailer=""):
+    return lambda client, argv, **kw: "" if argv[0] == "sh" else "noise\nTF_PROBE " + json.dumps(reply) + trailer
+
+
+def test_check_separates_an_incompatible_gpu_from_a_busy_one(monkeypatch):
     from tuning_factory import desktop_runtime as runtime
 
-    reply = ready_reply(runtime, **{field: False})
-    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: "" if argv[0] == "sh" else json.dumps(reply))
-    with pytest.raises(runtime.GPUIncompatible, match="CUDA 연산"):
+    monkeypatch.setattr(runtime, "command", probe_command(ready_reply(runtime, arch_ok=False)))
+    with pytest.raises(runtime.GPUIncompatible, match="세대"):
+        runtime.check(None)
+    monkeypatch.setattr(runtime, "command", probe_command(ready_reply(runtime, kernel_ok=False)))
+    with pytest.raises(runtime.GPUUnavailable, match="사용 중"):
+        runtime.check(None)
+
+
+def test_check_reports_a_missing_or_miscounted_gpu_as_unavailable(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+
+    monkeypatch.setattr(runtime, "command", probe_command(ready_reply(runtime, cuda=False)))
+    with pytest.raises(runtime.GPUUnavailable, match="GPU를 사용할 수 없습니다"):
+        runtime.check(None)
+    uuids = ("GPU-a", "GPU-b")
+    monkeypatch.setattr(runtime, "command", probe_command(ready_reply(runtime, devices=1)))
+    with pytest.raises(runtime.GPUUnavailable):
+        runtime.check(None, selected_gpu_uuids=uuids)
+    reply = ready_reply(runtime, devices=2)
+    monkeypatch.setattr(runtime, "command", probe_command(reply))
+    assert runtime.check(None, selected_gpu_uuids=uuids) == reply
+
+
+def test_check_parses_the_marked_line_and_rejects_unparseable_output(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+
+    reply = ready_reply(runtime)
+    monkeypatch.setattr(runtime, "command", probe_command(reply, trailer="\nWARNING: garbage"))
+    assert runtime.check(None) == reply
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: "" if argv[0] == "sh" else "no json here")
+    with pytest.raises(runtime.RuntimeMismatch, match="preflight mismatch"):
         runtime.check(None)
 
 
@@ -308,7 +339,10 @@ def test_check_refuses_a_gpu_whose_kernels_cannot_run(monkeypatch, field):
     ((8, 9), ["sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"], True),   # Ada runs sm_86 machine code
     ((12, 0), ["sm_80", "sm_90", "compute_90"], True),                           # PTX JIT
     ((12, 0), ["sm_80", "sm_86", "sm_90"], False),                               # the cu126 situation
-    ((7, 0), ["sm_75", "sm_80"], False)])
+    ((7, 0), ["sm_75", "sm_80"], False),
+    ((12, 0), ["sm_80", "sm_86", "sm_90", "sm_100", "sm_120"], True),
+    ((12, 1), ["sm_120"], True),
+    ((10, 0), ["sm_120"], False)])
 def test_arch_probe_applies_the_same_major_rule(capability, arch, ok):
     import re
     from types import SimpleNamespace
@@ -328,3 +362,64 @@ def test_arch_probe_applies_the_same_major_rule(capability, arch, ok):
     exec(runtime.ARCH_PROBE, namespace)
     assert namespace["arch_ok"] is ok and namespace["kernel_ok"] is True
     assert namespace["capability"] == "%d.%d" % capability
+
+
+def fake_torch(capability=(12, 0), arch=("sm_120",), available=True, devices=1, ones=None):
+    from types import SimpleNamespace
+
+    class Tensor:
+        def __mul__(self, other):
+            return self
+
+        def sum(self):
+            return SimpleNamespace(item=lambda: 16)
+
+    cuda = SimpleNamespace(is_available=lambda: available, get_device_capability=lambda: capability,
+                           get_arch_list=lambda: list(arch), is_bf16_supported=lambda: True,
+                           device_count=lambda: devices)
+    return SimpleNamespace(cuda=cuda, ones=ones or (lambda n, device: Tensor()))
+
+
+def test_arch_probe_reports_a_failing_kernel_and_an_absent_gpu():
+    import re
+
+    from tuning_factory import desktop_runtime as runtime
+
+    def broken(n, device):
+        raise RuntimeError("no kernel image")
+
+    namespace = {"torch": fake_torch(ones=broken), "re": re}
+    exec(runtime.ARCH_PROBE, namespace)
+    assert namespace["arch_ok"] is True and namespace["kernel_ok"] is False and namespace["bf16"] is False
+    namespace = {"torch": fake_torch(available=False), "re": re}
+    exec(runtime.ARCH_PROBE, namespace)
+    assert (namespace["arch_ok"], namespace["kernel_ok"], namespace["capability"]) == (False, False, None)
+
+
+def test_generated_probe_program_runs_with_its_own_imports(monkeypatch, tmp_path, capsys):
+    import importlib.metadata
+    import sys
+
+    from tuning_factory import desktop_runtime as runtime
+
+    captured = []
+
+    def run(client, argv, **kwargs):
+        if argv[0] == "sh":
+            return ""
+        captured.append(argv)
+        return "TF_PROBE " + json.dumps(ready_reply(runtime))
+
+    monkeypatch.setattr(runtime, "command", run)
+    runtime.check(None, "sft", remote_root=str(tmp_path))
+    lock = __import__("pathlib").Path(runtime.runtime_path("sft", str(tmp_path)) + "/gpu-requirements.lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_bytes(b"pins")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch(devices=3))
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "0.9.5")
+    exec(captured[-1][-1], {})
+    last = capsys.readouterr().out.splitlines()[-1]
+    assert last.startswith("TF_PROBE ")
+    result = json.loads(last[len("TF_PROBE "):])
+    assert result["arch_ok"] is True and result["kernel_ok"] is True
+    assert result["devices"] == 3 and result["capability"] == "12.0"
