@@ -959,7 +959,7 @@ async function action(name: string) {
   if (name === "runtime_prepare" && isServer(state.settings)) { await prepareServer(); return; }
   if (name === "runtime_prepare" && !await approve("GPU 학습 환경 준비", "저장된 연결의 현재 실행 중인 Pod에 앱 전용 학습 환경을 설치합니다. 의존성과 모델 실행 도구를 다운로드하며 GPU 요금은 계속 발생합니다. 사용자 데이터는 전송하지 않습니다.")) return;
   if (name === "resume" && state.jobCapabilities?.resume_supported === false) { state.error = "이 학습 단계·방식은 체크포인트 재개를 지원하지 않습니다."; render(); return; }
-  let prepareRuntime = false;
+  let prepareRuntime = false, approvedJob: Obj | null = null;
   if (["start", "execute", "resume"].includes(name)) {
     captureConfig();
     if (name === "start" && !state.plan) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
@@ -979,9 +979,13 @@ async function action(name: string) {
         ({ prepare: prepareRuntime, extra } = preflight);
       }
       const planChanged = () => name === "start" && (!state.plan || state.plan !== planAtCheck);
+      const jobChanged = () => name === "execute" && state.active !== job?.id;
       if (planChanged()) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
+      if (jobChanged()) { state.error = "선택한 작업이 바뀌었습니다. 작업을 다시 선택한 뒤 실행하세요."; render(); return; }
       if (!await approve("실제 GPU 학습 실행", transferApproval(job ? job.server_destination ?? null : settingsRoute(state.settings)) + extra)) return;
       if (planChanged()) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
+      if (jobChanged()) { state.error = "선택한 작업이 바뀌었습니다. 작업을 다시 선택한 뒤 실행하세요."; render(); return; }
+      approvedJob = job;
     } finally { preflightRunning = false; }
   }
   const checkpoint = document.querySelector<HTMLInputElement>("#checkpoint")?.value;
@@ -1074,7 +1078,7 @@ async function action(name: string) {
       const destination = isServer(state.settings) ? { destination_sha256: state.plan.destination_sha256 } : {};
       const job = await api("submit", { config: state.plan.manifest.config, approved: true, request_key: crypto.randomUUID(), ...destination }); await execute(job, prepareRuntime); state.plan = null;
     }
-    else if (name === "execute") { await execute(state.jobs.find((j: Obj) => j.id === state.active), prepareRuntime); }
+    else if (name === "execute") { if (approvedJob) await execute(approvedJob, prepareRuntime); }
     else if (name === "refresh") { await refresh(); }
     else if (name === "recover") { await api("recover"); await refresh(); state.notice = "오래된 작업 상태를 확인했습니다. 실패한 원격 작업은 결과 회수를 시도하세요."; }
     else if (["logs", "live_logs", "evaluation"].includes(name)) { const result = await api(name === "live_logs" ? name : "logs", { job_id: state.active, name: name === "evaluation" ? "evaluation.json" : "train.log" }); state.logs = result.text || result.note || "아직 로그가 없습니다."; }

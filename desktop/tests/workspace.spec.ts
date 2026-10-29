@@ -395,7 +395,7 @@ async function overrideActions(page: import("@playwright/test").Page, answers: R
         (window as any).__overridden.push(args);
         const answer = answers[args.action];
         if (answer && (answer as any).__reject) throw new Error((answer as any).__reject);
-        if (answer && (answer as any).__hold) await new Promise<void>(resolve => { (window as any).__release = resolve; });
+        if (answer && (answer as any).__hold) await new Promise<void>(resolve => { ((window as any).__releases ||= []).push(resolve); });
         return args.action === "plan" ? { ...(await original(command, args)), ...(answer as object) } : answer;
       }
       return original(command, args);
@@ -500,6 +500,7 @@ test("a GPU server with a missing runtime is told to prepare it from the connect
   await expect(page.getByRole("alert")).toContainText("연결 설정에서 GPU 목록을 조회한 뒤");
   await expect(page.getByRole("dialog")).toHaveCount(0);
   expect(await calledActions(page)).not.toContain("execute");
+  expect(await calledActions(page)).not.toContain("submit");
 });
 
 test("a double click on start runs one preflight and opens one approval", async ({ page }) => {
@@ -507,8 +508,36 @@ test("a double click on start runs one preflight and opens one approval", async 
   await page.locator('nav [data-action="nav:training"]').click();
   await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
   await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).evaluate(button => { (button as HTMLButtonElement).click(); (button as HTMLButtonElement).click(); });
-  await expect.poll(() => page.evaluate(() => typeof (window as any).__release)).toBe("function");
-  await page.evaluate(() => (window as any).__release({ ready: true, runtime_state: "ready", findings: [] }));
+  await expect.poll(() => page.evaluate(() => (window as any).__releases?.length ?? 0)).toBeGreaterThan(0);
+  await page.evaluate(() => (window as any).__releases.forEach((release: () => void) => release()));
   await expect(page.getByRole("dialog")).toHaveCount(1);
   expect((await calledActions(page)).filter(action => action === "runtime_check")).toHaveLength(1);
+});
+
+test("a plan changed during the preflight is not submitted", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { __hold: true, ready: true, runtime_state: "ready", findings: [] } });
+  await startRun(page);
+  await expect.poll(() => page.evaluate(() => (window as any).__releases?.length ?? 0)).toBe(1);
+  await page.getByLabel("학습 횟수 (epoch)", { exact: true }).fill("3");
+  await page.getByLabel("학습 횟수 (epoch)", { exact: true }).blur();
+  await page.evaluate(() => (window as any).__releases.forEach((release: () => void) => release()));
+  await expect(page.getByRole("alert")).toContainText("변경된 설정으로 실행 계획을 다시 확인하세요.");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("submit");
+});
+
+test("a queued job runs only if it is still the selected job after the preflight", async ({ page }) => {
+  const queued = (id: string) => ({ id: id.repeat(32), status: "QUEUED", attempts: 0, manifest: { config, simulation: false } });
+  await overrideActions(page, { jobs: [queued("a"), queued("b")], execute: null,
+    runtime_check: { __hold: true, ready: true, runtime_state: "ready", findings: [] } });
+  await page.locator('nav [data-action="nav:jobs"]').click();
+  await page.getByRole("button", { name: "새로고침", exact: true }).click();
+  await page.getByRole("button", { name: "선택", exact: true }).first().click();
+  await page.getByRole("button", { name: "대기 작업 실행", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__releases?.length ?? 0)).toBe(1);
+  await page.getByRole("button", { name: "선택", exact: true }).nth(1).click();
+  await page.evaluate(() => (window as any).__releases.forEach((release: () => void) => release()));
+  await expect(page.getByRole("alert")).toContainText("선택한 작업이 바뀌었습니다");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("execute");
 });
