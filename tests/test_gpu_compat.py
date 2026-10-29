@@ -51,3 +51,30 @@ def test_driver_versions_compare_numerically():
     assert gpu_compat.driver_at_least("1000.1", "999.99")
     assert gpu_compat.driver_at_least("570.26", "570.26.0")
     assert not gpu_compat.driver_at_least("570.25.9", "570.26")
+
+
+QWEN05 = {"id": "Qwen/Qwen2.5-0.5B-Instruct", "parameters_b": 0.5, "hidden_size": 896, "num_layers": 24,
+          "gpu_verified": True}
+LLAMA70 = {"id": "meta-llama/Llama-3.1-70B-Instruct", "parameters_b": 70, "hidden_size": 8192, "num_layers": 80,
+           "gpu_verified": False}
+
+
+def training(method="lora", **hyper):
+    return {"training_method": method, "quantization_bit": 4,
+            "hyperparameters": {"precision": "bf16", "per_device_train_batch_size": 1, "cutoff_len": 1024, **hyper},
+            "finetuning_options": {"freeze_trainable_layers": 2}}
+
+
+def test_memory_estimates_cover_lora_qlora_full_and_freeze():
+    small = gpu_compat.estimate_memory(QWEN05, training())
+    assert 0.9 < small["weights_gib"] < 1.0 and small["total_gib"] < 3
+    assert 8.5 < gpu_compat.estimate_memory(QWEN05, training("full"))["total_gib"] < 9.5
+    assert 2.9 < gpu_compat.estimate_memory(QWEN05, training("freeze"))["total_gib"] < 3.2
+    assert gpu_compat.estimate_memory(LLAMA70, training())["weights_gib"] > 120
+    qlora = gpu_compat.estimate_memory(LLAMA70, training("qlora"))
+    assert 34 < qlora["weights_gib"] < 37 and 45 < qlora["total_gib"] < 55
+
+
+def test_memory_estimate_needs_catalog_sizes():
+    assert gpu_compat.estimate_memory(None, training()) is None
+    assert gpu_compat.estimate_memory({"parameters_b": 7}, training()) is None
