@@ -328,6 +328,18 @@ def test_a_job_from_another_app_version_is_refused_before_any_contact(tmp_path, 
     assert str(caught.value) == desktop.STALE_JOB
 
 
+def test_a_stale_job_is_refused_before_resume_resets_it(tmp_path):
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    store = app.factory.store
+    job = store.submit({"sha256": "old", "simulation": False, "config": A4000_JOB, "source_sha256": "0" * 64}, "old")
+    store.transition(job["id"], "QUEUED")
+    store.transition(job["id"], "CANCELED")
+    with pytest.raises(ValueError) as caught:
+        app.dispatch("resume", {"approved": True, "job_id": job["id"], "checkpoint": "checkpoint-1"})
+    assert str(caught.value) == desktop.STALE_JOB
+    assert store.get(job["id"])["status"] == "CANCELED"
+
+
 def test_runtime_check_judges_a_job_with_its_own_training_stage(tmp_path, monkeypatch):
     from tuning_factory import desktop_runtime
     app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})

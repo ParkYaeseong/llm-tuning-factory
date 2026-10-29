@@ -505,6 +505,8 @@ class DesktopService:
             self.require_approval(data)
             directory = self.job_directory(data["job_id"])
             checkpoint = safe_name(data["checkpoint"])
+            # A job from another app version is refused before resume could reset it to QUEUED.
+            self.job_manifest(data["job_id"])
             # Destination checks precede resume, which moves the job back to QUEUED.
             server = self.is_server()
             receipt = self.job_receipt(data["job_id"], server)

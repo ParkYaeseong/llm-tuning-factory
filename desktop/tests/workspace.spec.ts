@@ -527,6 +527,19 @@ test("a plan changed during the preflight is not submitted", async ({ page }) =>
   expect(await calledActions(page)).not.toContain("submit");
 });
 
+test("a Pod changed during the preflight is not submitted", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { __hold: true, ready: true, runtime_state: "ready", findings: [] } });
+  await startRun(page);
+  await expect.poll(() => page.evaluate(() => (window as any).__releases?.length ?? 0)).toBe(1);
+  await page.locator('nav [data-action="nav:connections"]').click();
+  await page.getByLabel("Pod ID", { exact: true }).fill("another-pod");
+  await page.getByRole("button", { name: "연결 정보 저장", exact: true }).click();
+  await page.evaluate(() => (window as any).__releases.forEach((release: () => void) => release()));
+  await expect(page.getByRole("alert")).toContainText("연결된 Pod가 바뀌었습니다. 실행 전 확인을 다시 진행하세요.");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("submit");
+});
+
 test("a queued job runs only if it is still the selected job after the preflight", async ({ page }) => {
   const queued = (id: string) => ({ id: id.repeat(32), status: "QUEUED", attempts: 0, manifest: { config, simulation: false } });
   await overrideActions(page, { jobs: [queued("a"), queued("b")], execute: null,

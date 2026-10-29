@@ -972,13 +972,16 @@ async function action(name: string) {
     if (preflightRunning) return;
     preflightRunning = true;
     try {
-      const planAtCheck = state.plan;
+      const planAtCheck = state.plan, podAtCheck = state.settings.pod_id;
       let extra = "";
       if (name !== "resume") {
         const preflight = await executionPreflight(job);
         if (!preflight) return;
         ({ prepare: prepareRuntime, extra } = preflight);
       }
+      // A saved Pod change during the check or the dialog moves a RunPod run to a Pod that was never checked.
+      const podChanged = () => !isServer(state.settings) && !(name === "execute" && job?.server_destination) && state.settings.pod_id !== podAtCheck;
+      const podMessage = "연결된 Pod가 바뀌었습니다. 실행 전 확인을 다시 진행하세요.";
       const planChanged = () => name === "start" && (!state.plan || state.plan !== planAtCheck);
       const jobChanged = () => name === "execute" && state.active !== job?.id;
       // Settings or the job list may have changed during the check or the dialog: judge the current route again.
@@ -986,10 +989,12 @@ async function action(name: string) {
         const current = job && name === "execute" ? state.jobs.find((j: Obj) => j.id === job.id) ?? job : null;
         return current ? jobDestinationIssue(current, state.settings) : null;
       };
+      if (podChanged()) { state.error = podMessage; render(); return; }
       if (planChanged()) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
       if (jobChanged()) { state.error = "선택한 작업이 바뀌었습니다. 작업을 다시 선택한 뒤 실행하세요."; render(); return; }
       { const moved = destinationIssue(); if (moved) { state.error = moved; render(); return; } }
       if (!await approve("실제 GPU 학습 실행", transferApproval(job ? job.server_destination ?? null : settingsRoute(state.settings)) + extra)) return;
+      if (podChanged()) { state.error = podMessage; render(); return; }
       if (planChanged()) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
       if (jobChanged()) { state.error = "선택한 작업이 바뀌었습니다. 작업을 다시 선택한 뒤 실행하세요."; render(); return; }
       { const moved = destinationIssue(); if (moved) { state.error = moved; render(); return; } }
