@@ -92,3 +92,16 @@ def test_model_ops_pin_drift_is_reported_without_importing_the_runtime(monkeypat
     installed['peft'] = '0.18.0'
     del installed['safetensors']
     assert model_ops_pin_drift() == ('peft', 'safetensors')
+
+
+def test_gpu_locks_pin_the_cu128_pytorch_family():
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for name in ("gpu-requirements.lock", "gpu-ppo-requirements.lock"):
+        text = (root / "containers" / name).read_text(encoding="utf-8")
+        for package, version in (("torch", "2.7.1+cu128"), ("torchaudio", "2.7.1+cu128"),
+                                 ("torchvision", "0.22.1+cu128")):
+            assert re.search(rf"^{package}=={re.escape(version)} \\$", text, re.M), (name, package)
+        assert "\nnvidia-cuda-runtime-cu12==12.8." in text, name

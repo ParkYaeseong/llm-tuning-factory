@@ -12,7 +12,7 @@ def engine_profile(stage="sft"):
             "lock_file": "containers/gpu-requirements.lock"}
 
 
-# Model-operation (merge/materialize) library pins; equal to containers/gpu-requirements.lock.
+# Model-operation (merge/materialize) library pins; base versions (without +cu128) equal containers/gpu-requirements.lock.
 MODEL_OPS_PINS = MappingProxyType({"torch": "2.7.1", "peft": "0.18.1", "transformers": "5.6.0",
                                    "safetensors": "0.8.0"})
 # Numerical acceptance environment only; never a GPU runtime.

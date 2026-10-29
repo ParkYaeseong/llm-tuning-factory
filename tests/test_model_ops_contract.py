@@ -975,7 +975,8 @@ def test_cpu_lock_pins_primary_runtime_versions_with_hashes():
     assert forbidden == []
     from tuning_factory.runtime_profiles import MODEL_OPS_CPU_LOCK, MODEL_OPS_PINS
     assert MODEL_OPS_CPU_LOCK == "containers/model-ops-cpu-requirements.lock"
-    assert dict(MODEL_OPS_PINS) == {name: gpu[name] for name in ("torch", "peft", "transformers", "safetensors")}
+    assert dict(MODEL_OPS_PINS) == {name: gpu[name].split("+")[0]
+                                    for name in ("torch", "peft", "transformers", "safetensors")}
     with pytest.raises(TypeError):
         MODEL_OPS_PINS["torch"] = "0"
 

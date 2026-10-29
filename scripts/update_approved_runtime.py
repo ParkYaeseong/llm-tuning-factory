@@ -23,7 +23,8 @@ root = '/workspace/factory-acceptance/runtime'
 with c.open_sftp() as sftp:
     sftp.put('containers/gpu-requirements.lock', root + '/containers/gpu-requirements.lock')
     sftp.put('dist/llm_tuning_factory-0.1.0-py3-none-any.whl', root + '/llm_tuning_factory-0.1.0-py3-none-any.whl')
-command = 'uv pip sync --python ' + root + '/venv/bin/python --require-hashes ' + root + '/containers/gpu-requirements.lock'
+command = ('uv pip sync --python ' + root + '/venv/bin/python --require-hashes --torch-backend cu128 '
+           + root + '/containers/gpu-requirements.lock')
 command += ' && uv pip install --python ' + root + '/venv/bin/python --no-deps ' + root + '/llm_tuning_factory-0.1.0-py3-none-any.whl'
 _, out, err = c.exec_command(command, timeout=180)
 print(out.read().decode())

@@ -1,0 +1,3 @@
+# PPO keeps LLaMA-Factory 0.9.3's pydantic even though the control plane (pyproject.toml) pins a newer one.
+# The worker wheel is installed with --no-deps, as the current PPO lock already does.
+pydantic==2.10.6
