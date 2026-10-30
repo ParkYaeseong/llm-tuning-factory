@@ -67,8 +67,12 @@ MLflow는 껐다. Ampere와 Hopper를 모두 시험했다.
   bridge_mode frozen, source_commit `953168a91885cce3cce260868ebbc207a325e066`, 모든 검사 true, gpu_started false.
   이 빌드의 엔진 소스는 GPU 인수에 쓴 `9871d8b` 빌드와 모델 목록의 검증 범위만 다르다.
 
+- 이 PC 재설치(2026-10-30 16:11): 설치된 0.5.0(`0163b8a`)에는 위 세 결함이 있어 transformers 5 학습이 실패하므로, 앱이 꺼진 상태에서 위 설치
+  프로그램을 `/S /D=%LOCALAPPDATA%\LLM Tuning Factory`로 같은 위치에 설치했다(종료 코드 0). 설치된 `factory-bridge.exe`의 SHA-256
+  `73c3522dbea4fec9472be1d50f8c859e64eea169948ad12764c30b85de400e71`이 영수증의 `bridge_sha256`과 같고, 앱 설정 파일은 바뀌지 않았다.
+
 **남은 일:**
-- 이 PC 재설치: 설치된 0.5.0(`0163b8a`)에는 위 세 결함이 있어 transformers 5 학습이 실패한다. 위 설치 프로그램으로 바꿔야 한다.
+- 앱 설정의 SSH 개인 키 경로(`ssh_key_file`)가 사라진 바탕화면 파일을 가리킨다. 사용자가 키를 권한이 제한된 위치로 옮기고 연결 설정에서 다시 지정해야 한다.
 - 볼륨의 런타임 정리: 앱 소스가 바뀔 때마다 새 런타임(5–12 GB)이 생기고 지우지 않는다(`ls9ua5ymse`에 4벌). 사용자 볼륨이 차는 원인이다.
 - 긴 probe 동안 SSH keepalive, GPU 서버(SSH) 연결의 요금은 점검이 판단하지 않는 점, 2단계(Qwen3.5·Gemma 4).
 
