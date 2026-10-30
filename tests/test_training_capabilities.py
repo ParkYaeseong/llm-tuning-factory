@@ -284,6 +284,9 @@ def test_catalog_lists_the_verified_gpu_generations():
     from tuning_factory.capabilities import model_catalog
     models = {model["id"]: model for model in model_catalog()}
     assert all("verified_capabilities" in model for model in models.values())
-    assert models["Qwen/Qwen2.5-0.5B-Instruct"]["verified_capabilities"] == ["9.0"]
+    qwen = models["Qwen/Qwen2.5-0.5B-Instruct"]
+    # 0.5.0 GPU acceptance (2026-10-30): SFT LoRA on A40, H100 and RTX PRO 4000 Blackwell.
+    assert qwen["verified_capabilities"] == ["8.6", "9.0", "12.0"]
+    assert "0.5.0" in qwen["verification_scope"] and "A40" in qwen["verification_scope"]
     assert all(model["verified_capabilities"] == [] for name, model in models.items()
                if name != "Qwen/Qwen2.5-0.5B-Instruct")

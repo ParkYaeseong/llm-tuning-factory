@@ -40,8 +40,10 @@ def model_catalog():
                            "max_length": length, "parameters_b": size, "hidden_size": hidden, "num_layers": layers,
                            "gated": gated,
                            "gpu_verified": model_id == "Qwen/Qwen2.5-0.5B-Instruct",
-                           "verified_capabilities": ["9.0"] if model_id == "Qwen/Qwen2.5-0.5B-Instruct" else [],
-                           "verification_scope": ("0.2.3 SFT LoRA/4-bit QLoRA synthetic H100 only"
+                           "verified_capabilities": (["8.6", "9.0", "12.0"] if model_id == "Qwen/Qwen2.5-0.5B-Instruct"
+                                                     else []),
+                           "verification_scope": ("0.2.3 SFT LoRA/4-bit QLoRA synthetic H100; 0.5.0 (CUDA 12.8) SFT LoRA "
+                                                  "synthetic A40, H100, RTX PRO 4000 Blackwell"
                                                   if model_id == "Qwen/Qwen2.5-0.5B-Instruct"
                                                   else "architecture profile; GPU verification pending")})
     return models
