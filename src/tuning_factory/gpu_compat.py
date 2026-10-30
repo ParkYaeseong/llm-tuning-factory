@@ -65,10 +65,11 @@ ADAPTER_FRACTION, ADAPTER_STATE_BYTES = 0.01, 16.0   # adapter weight, gradient 
 # fp32 copy for the loss and its fp32/bf16 gradients (10-12 bytes). Calibrated on the 0.6.0 A40 peaks (spec 4.5): 11
 # lies between the 10.4 Gemma 4 E2B PT (packed to cutoff_len) needs and the 11.6 that keeps Qwen3.5-0.8B SFT LoRA
 # within twice its peak. dpo/kto x3: chosen + rejected, and the measured peaks hold about one more set (likely the
-# reference pass, adapters disabled); x2 would still miss Gemma 4 E2B DPO. full x2: covers the measured full peak, whose surplus
+# reference pass, adapters disabled); x2 would still miss Gemma 4 E2B DPO. rm x2: the pairwise collator concatenates chosen
+# and rejected and trl's value head still computes full fp32 lm_logits; unmeasured, so conservative until RM peaks are measured. full x2: covers the measured full peak, whose surplus
 # is mostly fp32 weights and optimizer temporaries rather than logits (FULL_STATE_BYTES is shared with every model).
 LOGITS_BYTES = 11.0
-LOGITS_STAGE_FACTOR = {"dpo": 3, "kto": 3}
+LOGITS_STAGE_FACTOR = {"dpo": 3, "kto": 3, "rm": 2}
 LOGITS_FULL_FACTOR = 2
 
 

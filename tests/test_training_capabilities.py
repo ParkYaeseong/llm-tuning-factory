@@ -385,7 +385,7 @@ QWEN35 = {"base_model": "Qwen/Qwen3.5-0.8B", "template": "qwen3_5"}
 
 
 @pytest.mark.parametrize("change,message", [
-    ({"training_stage": "kto"}, "Qwen3.5의 KTO 학습은 현재 학습 엔진(LLaMA-Factory 0.9.5·transformers 5.6.0)에서 "
+    ({"training_stage": "kto"}, "Qwen3.5·Qwen3.6의 KTO 학습은 현재 학습 엔진(LLaMA-Factory 0.9.5·transformers 5.6.0)에서 "
                                 "멀티모달 위치 계산 오류로 실패하므로 지원하지 않습니다. SFT·DPO·RM·PT를 쓰세요."),
     ({"training_stage": "ppo"}, "PPO 전용 학습 환경"),
     ({"training_method": "freeze", "finetuning_options": {"freeze_trainable_modules": "self_attn"}},
@@ -412,7 +412,7 @@ def test_composite_models_allow_text_stages(stage):
     ("google/gemma-4-E2B-it", "gemma4n", "rm", True), ("google/gemma-4-31B", "gemma4", "rm", True),
     ("google/gemma-4-E2B-it", "gemma4n", "kto", False), ("google/gemma-4-26B-A4B-it", "gemma4", "kto", False),
     ("google/gemma-4-E2B-it", "gemma4n", "ppo", False)])
-def test_stage_policy_is_per_architecture(model, template, stage, allowed):
+def test_composite_stage_policy_is_shared_by_the_families(model, template, stage, allowed):
     from tuning_factory.capabilities import compatibility
     result = compatibility({"base_model": model, "template": template, "training_stage": stage})
     assert result["valid"] is allowed
@@ -540,3 +540,33 @@ def test_gemma4_text_turns_thinking_off_without_freezing_a_vision_tower():
     plan = LlamaFactoryBackend.translate(configuration(**hub_registered("gemma4_text", "gemma4",
                                                                         "someone/gemma-4-text-only")))
     assert plan["enable_thinking"] is False and not set(FROZEN) & set(plan)
+
+
+def test_a_catalog_model_with_another_template_is_refused_in_korean_with_the_fix():
+    from tuning_factory.capabilities import compatibility
+    result = compatibility({**QWEN35, "template": "qwen3_5_nothink"})
+    assert not result["valid"] and result["errors"] == [
+        "이 모델의 템플릿은 qwen3_5입니다. 학습 설정에서 모델의 '버전 확인'을 다시 눌러 템플릿을 적용하세요."]
+
+
+NOTHINK_WARNING = ("qwen3_5_nothink 템플릿으로 학습하면 모델이 답마다 빈 <think> 블록을 생성합니다. "
+                   "모델의 '버전 확인'을 다시 눌러 qwen3_5 템플릿을 적용하세요.")
+
+
+def test_a_registered_qwen35_profile_with_the_nothink_template_still_validates_but_warns():
+    from tuning_factory.capabilities import compatibility
+    old = compatibility(hub_registered("qwen3_5", "qwen3_5_nothink", "Qwen/Qwen3.5-0.8B"))
+    assert old["valid"] and NOTHINK_WARNING in old["warnings"]
+    moe = compatibility(hub_registered("qwen3_5_moe", "qwen3_5_nothink", "someone/Qwen3.6-A3B"))
+    assert moe["valid"] and NOTHINK_WARNING in moe["warnings"]
+    for template in ("qwen3_5", "qwen3_6"):
+        current = compatibility(hub_registered("qwen3_5", template, "Qwen/Qwen3.5-0.8B"))
+        assert current["valid"] and NOTHINK_WARNING not in current["warnings"]
+    assert NOTHINK_WARNING not in compatibility(QWEN35)["warnings"]
+
+
+def test_kto_refusal_of_a_hub_qwen36_model_names_both_families():
+    from tuning_factory.capabilities import compatibility
+    result = compatibility({**hub_registered("qwen3_5_moe", "qwen3_6", "someone/Qwen3.6-A3B"),
+                            "training_stage": "kto"})
+    assert any("Qwen3.5·Qwen3.6의 KTO" in error for error in result["errors"])

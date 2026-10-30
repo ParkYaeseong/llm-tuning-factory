@@ -813,11 +813,12 @@ def test_new_operations_default_to_the_current_policy_and_receipts_read_both():
                                          output_files=()).policy_id == policy_id
 
 
-def test_only_model_ops_names_the_v1_policy():
-    """New operations, their acceptance checks, the simulated dispatcher and the CPU acceptance use CURRENT_POLICY."""
+def test_only_model_ops_and_collection_name_the_v1_policy():
+    """New operations, the simulated dispatcher and the CPU acceptance use CURRENT_POLICY; collection also reads v1
+    receipts of an operation an older build launched."""
     sources = [*sorted((ROOT / "src" / "tuning_factory").glob("*.py")), SCRIPT]
     named = sorted(path.name for path in sources if "POLICY_F32_V1" in path.read_text(encoding="utf-8"))
-    assert named == ["model_ops.py"]
+    assert named == ["model_ops.py", "operation_outputs.py"]
     assert "CURRENT_POLICY" in SCRIPT.read_text(encoding="utf-8")
 
 

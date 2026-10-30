@@ -116,7 +116,7 @@ CPU forward가 된다(2026-10-30 확인).
 | 출시 | 데스크톱 앱 0.6.0. Python 패키지 버전은 그대로 |
 | 작업 순서 | 작고 독립적인 F2 → F3 → F1, 그다음 2단계 엔진 작업, 버전·문서, 빌드·전체 검증, GPU 인수, 검증 결과 반영, 화면 끝까지 시험, 최종 빌드·재설치·PR |
 | 모델 목록 | 1.1의 저장소를 모두 넣는다(지시형과 Base, Qwen3.5-27B-Base 제외). `gpu_verified: false`, `verified_capabilities: []`로 시작하고 GPU 인수 결과로만 바꾼다. A40 결과(`capabilities.VERIFIED_COMPOSITE`, `verified_capabilities: ["8.6"]`): `Qwen/Qwen3.5-0.8B` "0.6.0 SFT LoRA/QLoRA/full/freeze, DPO, PT, RM (engine-level), materialize synthetic A40", `Qwen/Qwen3.5-9B` "0.6.0 SFT LoRA synthetic A40", `google/gemma-4-E2B-it` "0.6.0 SFT LoRA, DPO, PT, RM (engine-level) synthetic A40". Base와 다른 크기는 미검증 |
-| 템플릿 | Qwen3.5 → `qwen3_5`(추론 템플릿) + `enable_thinking: false`. 일반 템플릿 `qwen3_5_nothink`는 프롬프트가 assistant 헤더 줄로 끝나는데, Qwen3.5는 사고 끄기에서 그 자리에 `<think></think>(빈 줄 포함)`을 보도록 학습돼 있어 SFT 뒤 모델이 답마다 빈 사고 블록을 스스로 생성했다(A40 실측, json_validity 0.0). `qwen3_5`는 `enable_thinking: false`일 때 빈 사고 블록을 프롬프트(손실 없음)에 붙이므로 공식 채팅 템플릿과 같고 학습 라벨에는 사고가 없다. `qwen3_5_nothink`는 저장된 설정을 위해 허용만 한다. Gemma 4 E2B·E4B → `gemma4n`, 26B-A4B·31B → `gemma4`. Base 모델도 같은 계열 템플릿 |
+| 템플릿 | Qwen3.5 → `qwen3_5`(추론 템플릿) + `enable_thinking: false`. 일반 템플릿 `qwen3_5_nothink`는 프롬프트가 assistant 헤더 줄로 끝나는데, Qwen3.5는 사고 끄기에서 그 자리에 `<think></think>(빈 줄 포함)`을 보도록 학습돼 있어 SFT 뒤 모델이 답마다 빈 사고 블록을 스스로 생성했다(A40 실측, json_validity 0.0). `qwen3_5`는 `enable_thinking: false`일 때 빈 사고 블록을 프롬프트(손실 없음)에 붙이므로 공식 채팅 템플릿과 같고 학습 라벨에는 사고가 없다. `qwen3_5_nothink`는 카탈로그 모델에서 템플릿 불일치로 거부되고(오류가 '버전 확인' 재실행을 안내), 허브 프로필(0.5.0 등록)이 가진 경우에는 프로필 다이제스트가 불변이라 이전하지 않고 호환성 경고만 낸다. Gemma 4 E2B·E4B → `gemma4n`, 26B-A4B·31B → `gemma4`. Base 모델도 같은 계열 템플릿 |
 | 복합 구조 동결 | `qwen3_5`·`qwen3_5_moe`·`gemma4` 학습 설정에 `freeze_vision_tower: true`, `freeze_multi_modal_projector: true`, `freeze_language_model: false`를 쓴다 |
 | 추론 템플릿 | `qwen3_5`·`qwen3_6`·`gemma4`·`gemma4n`이면 학습·예측·평가 설정에 `enable_thinking: false`를 쓴다 |
 | 기존 구조 | 설정 변환 결과가 바이트 단위로 같다. `tests/test_model_inputs.py`의 고정 다이제스트를 바꾸지 않는다 |
@@ -299,7 +299,7 @@ CPU forward가 된다(2026-10-30 확인).
     측정 최대치에는 대략 한 벌이 더 있다(기준 모델 패스, LoRA는 어댑터를 끈 같은 모델의 로짓으로 보인다). 2배면 gemma-4-E2B-it DPO를
     17.39GiB로 낮게 잡는다. full 2배: Qwen3.5-0.8B full의 초과분(짧은 행에서 약 3GiB)은 로짓보다 fp32 학습 가중치와 옵티마이저
     임시 버퍼(학습 매개변수당 약 4바이트)로 보이지만, `FULL_STATE_BYTES`는 모든 모델이 같이 써서 바꾸면 기존 추정이 바뀌므로
-    로짓 항을 두 배로 해 덮는다. RM·PT는 자료상 계수 1로 충분하다(RM 메모리는 재지 않았다).
+    로짓 항을 두 배로 해 덮는다. PT는 자료상 계수 1로 충분하다. RM은 LLaMA-Factory의 쌍별 콜레이터가 chosen·rejected를 이어 붙이고 trl 값 헤드가 fp32 lm_logits 전체를 계산하므로 RM 메모리를 재기 전까지 계수 2로 잡는다.
   - 한계: cutoff_len까지 채운 긴 행의 SFT·DPO와 full은 재지 않았다. 짧은 행에서 잰 DPO·full 최대치를 덮도록 보정했다.
 - `DesktopService.compatibility`는 기본 목록에 없으면 설정의 `model_profile`로 만든 항목(`imported_model`)을 쓴다.
   허브 프로필이 기본 목록과 같은 저장소·같은 구조이면 기본 목록 항목(`gpu_verified`·`verified_capabilities` 포함)을

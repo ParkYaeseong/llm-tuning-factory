@@ -44,7 +44,8 @@ from .model_artifacts import (
     tensor_header,
 )
 from .model_ops import (
-    CURRENT_POLICY,
+    POLICY_F32_V1,
+    POLICY_F32_V2,
     MaterializeReceipt,
     MergeReceipt,
     adapter_metadata_from_config,
@@ -255,8 +256,10 @@ def operation_receipt(result: OperationResult, launch_dir: Path, operation) -> d
     receipt = read_json(_evidence_file(result, launch_dir, OPERATION_RECEIPT))
     model = MergeReceipt if isinstance(operation, MergeOperation) else MaterializeReceipt
     inner = model.model_validate(receipt.get("receipt") if isinstance(receipt, Mapping) else None)
-    if (receipt.get("schema_version"), receipt.get("kind"), receipt.get("output"), inner.policy_id) != (
-            1, operation.kind, f"{MODEL_OP_PARENT}/output", CURRENT_POLICY):
+    # An operation launched by a pre-v2 build is collected after the update: both defined policies are accepted
+    # (new operations still run under CURRENT_POLICY at dispatch).
+    if (receipt.get("schema_version"), receipt.get("kind"), receipt.get("output")) != (
+            1, operation.kind, f"{MODEL_OP_PARENT}/output") or inner.policy_id not in {POLICY_F32_V1, POLICY_F32_V2}:
         raise ValueError("operation receipt differs from this operation")
     return {**receipt, "receipt": inner}
 

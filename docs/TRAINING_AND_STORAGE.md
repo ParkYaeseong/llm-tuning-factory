@@ -146,7 +146,7 @@ Qwen3.5와 Gemma 4는 텍스트·비전·오디오를 한 체크포인트에 담
 
 - **동결 키**: 복합 구조에는 학습 설정에 `freeze_vision_tower: true`, `freeze_multi_modal_projector: true`,
   `freeze_language_model: false` 세 키가 들어가 비전·오디오 부분이 항상 동결됩니다. 다른 구조에는 이 키가 없습니다.
-- **Qwen3.5 템플릿**: 기본값은 `qwen3_5`입니다. `enable_thinking: false`일 때 이 템플릿은 빈 사고 블록(`<think></think>(빈 줄 포함)`)을 프롬프트에 붙이므로(손실 없음) 학습 뒤 모델이 빈 사고 블록을 스스로 생성하지 않습니다. `qwen3_5_nothink`는 저장된 설정에서만 허용됩니다.
+- **Qwen3.5 템플릿**: 기본값은 `qwen3_5`입니다. `enable_thinking: false`일 때 이 템플릿은 빈 사고 블록(`<think></think>(빈 줄 포함)`)을 프롬프트에 붙이므로(손실 없음) 학습 뒤 모델이 빈 사고 블록을 스스로 생성하지 않습니다. `qwen3_5_nothink`는 카탈로그 모델에서는 거부되고(오류가 '버전 확인'을 다시 누르라고 안내합니다), 이전에 등록한 모델 프로필이 이 템플릿을 가진 설정은 경고만 표시한 채 검증되므로 '버전 확인'을 다시 눌러 `qwen3_5`를 적용하세요.
 - **추론 템플릿**: 템플릿이 qwen3_5, qwen3_6, gemma4, gemma4n이면 학습·예측·보상 평가 설정에 `enable_thinking: false`가 더해집니다.
   허브에 등록된 `gemma4_text` 작업도 이 영향을 받습니다.
 - **processor 파일**: `preprocessor_config.json`, `video_preprocessor_config.json`, `processor_config.json`, `chat_template.json`은

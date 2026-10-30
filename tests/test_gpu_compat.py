@@ -158,8 +158,9 @@ def test_the_logits_term_scales_with_tokens_and_vocabulary_by_stage_and_method()
     for name, vocabulary in (("google/gemma-4-E2B-it", 262_144), ("Qwen/Qwen3.5-0.8B", 248_320)):
         model = next(m for m in model_catalog() if m["id"] == name)
         without = {key: value for key, value in model.items() if key != "vocab_size"}
-        # chosen + rejected (+ the reference pass) for dpo/kto; full training doubles the term (spec 4.5)
-        for stage, method, factor in (("sft", "lora", 1), ("pt", "lora", 1), ("rm", "lora", 1), ("dpo", "lora", 3),
+        # chosen + rejected (+ the reference pass) for dpo/kto, chosen + rejected for rm (the pairwise collator
+        # concatenates them; unmeasured); full training doubles the term (spec 4.5)
+        for stage, method, factor in (("sft", "lora", 1), ("pt", "lora", 1), ("rm", "lora", 2), ("dpo", "lora", 3),
                                       ("kto", "lora", 3), ("sft", "qlora", 1), ("sft", "freeze", 1),
                                       ("sft", "full", 2), ("dpo", "full", 6)):
             for batch, cutoff in ((1, 1024), (2, 4096)):

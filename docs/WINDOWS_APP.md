@@ -336,7 +336,7 @@ Hopper(H100·H200), Blackwell(B200·RTX PRO 4000/6000)입니다. Turing(T4·RTX 
 - **단계와 방법**: Qwen3.5와 Gemma 4는 SFT·DPO·RM·PT를 지원합니다. KTO는 현재 학습 엔진(LLaMA-Factory 0.9.5·transformers 5.6.0)에서 실패해(Qwen3.5는 멀티모달 위치 계산 오류, Gemma 4는 KL 배치의 멀티모달 입력 처리 오류) 지원하지 않습니다. PPO는 지원하지 않습니다.
   freeze 방식에서 Qwen3.5는 학습 모듈로 'Attention'과 'Attention + MLP'를 고를 수 없고, 입력·출력 임베딩을 공유하는 모델은
   'LM head'를 따로 학습할 수 없습니다.
-- **Qwen3.5 템플릿**: 기본값은 `qwen3_5`(+`enable_thinking: false`)입니다. 일반 템플릿 `qwen3_5_nothink`로 학습하면 모델이 답마다 빈 `<think>` 블록을 스스로 생성하므로 기본으로 쓰지 않으며, 저장된 설정에서는 계속 허용됩니다.
+- **Qwen3.5 템플릿**: 기본값은 `qwen3_5`(+`enable_thinking: false`)입니다. 일반 템플릿 `qwen3_5_nothink`로 학습하면 모델이 답마다 빈 `<think>` 블록을 스스로 생성하므로 기본으로 쓰지 않습니다. 카탈로그 모델의 저장된 설정은 템플릿 불일치로 거부되며('버전 확인'을 다시 누르세요), 이전에 등록한 모델 프로필이 이 템플릿을 가진 설정은 경고와 함께 검증됩니다.
 - **추론 템플릿**: 추론형 템플릿(qwen3_5, qwen3_6, gemma4, gemma4n)에는 `enable_thinking: false`가 더해집니다. 허브에서 등록한
   `gemma4_text` 모델의 기존 작업도 이 설정이 바뀝니다.
 - **메모리 추정**: 가중치는 비전·오디오를 포함한 전체 매개변수로, 학습 상태는 텍스트 매개변수로 계산합니다. QLoRA는 임베딩 표

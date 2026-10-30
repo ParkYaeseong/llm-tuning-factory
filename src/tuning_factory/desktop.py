@@ -18,7 +18,7 @@ from .desktop_inspection import inspect_dataset, parameter_changes, parse_progre
 from .execution import ExecutionUncertain, Policy, RunPodController
 from .gpu_servers import ServerApprovalReceipt, SSHServerInspection, server_settings
 from .manifest import resolve, source_hash
-from .model_hub import ModelHub, _count, recommended_precision, register_model, registered_models
+from .model_hub import ModelHub, positive_count, recommended_precision, register_model, registered_models
 from .registry import canonical, digest, parse_dataset, safe_name
 from .runner import Factory
 from .runtime_profiles import engine_profile
@@ -330,12 +330,12 @@ class DesktopService:
             if metadata.get("model_type") != profile["architecture"]:
                 raise ValueError("model architecture differs from the reviewed compatibility profile")
             text = metadata.get("text_config") or metadata   # composite configs nest the text model
-            positions = _count(text.get("max_position_embeddings"), 10_000_000, low=64)
+            positions = positive_count(text.get("max_position_embeddings"), 10_000_000, low=64)
             return {"model_revision": revision, "tokenizer_revision": revision,
                     "template": profile["template"], "architecture": profile["architecture"],
                     "max_length": min(profile["max_length"], positions or profile["max_length"]),
                     "recommended_precision": recommended_precision(metadata),
-                    "hidden_layers": _count(text.get("num_hidden_layers"), 10000), "metadata_verified": True}
+                    "hidden_layers": positive_count(text.get("num_hidden_layers"), 10000), "metadata_verified": True}
         if action == "save_profile":
             config = AIConfig.model_validate(data["config"])
             directory = self.root / "profiles"

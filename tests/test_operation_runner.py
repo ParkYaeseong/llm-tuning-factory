@@ -1171,22 +1171,35 @@ def test_model_op_output_differing_from_its_receipt_leaves_no_artifact(tmp_path,
 
 
 @pytest.mark.parametrize("kinds", [("merge",), ("full",)])
-def test_model_op_receipt_under_the_v1_policy_leaves_no_artifact(tmp_path, monkeypatch, kinds):
-    """Acceptance requires the policy new operations run under (model-ops-f32-v2), not the older v1."""
+def test_model_op_receipt_under_an_undefined_policy_leaves_no_artifact(tmp_path, monkeypatch, kinds):
+    """Collection accepts the two defined policies (v1 receipts of an operation launched by an older build)."""
     w = world(tmp_path, monkeypatch, kinds)
     before = artifact_entries(w.store)
 
     def forge_policy(directory):
         receipt = json.loads((directory / "operation-receipt.json").read_bytes())
         assert receipt["receipt"]["policy_id"] == "model-ops-f32-v2"
-        receipt["receipt"]["policy_id"] = "model-ops-f32-v1"
+        receipt["receipt"]["policy_id"] = "model-ops-f32-v0"
         forge_evidence(directory, "operation-receipt.json", canonical(receipt))
 
     w.host.after_worker = forge_policy
     outcome = run(w)
     assert (outcome.status, outcome.uncertain, outcome.outputs) == ("FAILED", False, None)
-    assert "operation receipt differs from this operation" in outcome.error
     assert artifact_entries(w.store) == before and not held_locks(w)
+
+
+@pytest.mark.parametrize("kinds", [("merge",), ("full",)])
+def test_model_op_receipt_under_the_v1_policy_is_collected(tmp_path, monkeypatch, kinds):
+    w = world(tmp_path, monkeypatch, kinds)
+
+    def older_build(directory):
+        receipt = json.loads((directory / "operation-receipt.json").read_bytes())
+        receipt["receipt"]["policy_id"] = "model-ops-f32-v1"
+        forge_evidence(directory, "operation-receipt.json", canonical(receipt))
+
+    w.host.after_worker = older_build
+    outcome = run(w)
+    assert (outcome.status, outcome.uncertain) == ("COMPLETED", False) and outcome.outputs
 
 
 @pytest.mark.parametrize("kinds,engine", [(("full_train",), {"method": "full"}), (("full",), {})])

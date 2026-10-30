@@ -38,7 +38,7 @@ ARCHITECTURES = {
 }
 
 
-def _count(value, high, low=1):
+def positive_count(value, high, low=1):
     """A config or API count within [low, high]; anything else (bool, text, float, out of range) is unknown (None),
     so one malformed optional fact never blocks an import."""
     return value if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high else None
@@ -87,6 +87,7 @@ class ModelProfile(BaseModel):
     hidden_size: int | None = Field(default=None, ge=1, le=1_000_000)
     moe: bool | None = None
     tie_word_embeddings: bool | None = None
+    vocab_size: int | None = Field(default=None, ge=1, le=10_000_000)   # sizes the LM-head logits of a memory estimate
 
     @model_validator(mode="after")
     def reviewed_architecture(self):
@@ -109,7 +110,7 @@ class ModelProfile(BaseModel):
         # Profiles registered before these facts keep their exact bytes and digests (model-profiles/<digest>.json,
         # graph plans): absent facts are omitted instead of dumped as null.
         data = handler(self)
-        for key in ("parameters_total", "hidden_size", "moe", "tie_word_embeddings"):
+        for key in ("parameters_total", "hidden_size", "moe", "tie_word_embeddings", "vocab_size"):
             if data.get(key) is None:
                 data.pop(key, None)
         return data
@@ -122,7 +123,7 @@ def imported_model(profile):
     if profile.parameters_total and profile.hidden_size and profile.hidden_layers:
         sizes = {"parameters_total": profile.parameters_total, "parameters_b": round(profile.parameters_total / 1e9, 2),
                  "hidden_size": profile.hidden_size, "num_layers": profile.hidden_layers}
-    sizes.update({key: value for key in ("moe", "tie_word_embeddings")
+    sizes.update({key: value for key in ("moe", "tie_word_embeddings", "vocab_size")
                   if (value := getattr(profile, key)) is not None})
     return {"id": profile.repo_id, "template": profile.template, "architecture": profile.architecture,
             "max_length": profile.max_length, "gated": profile.gated, "gpu_verified": False,
@@ -219,22 +220,24 @@ class ModelHub:
         reasons = [reason.replace("Unsupported", "unsupported").replace("Pre-quantized", "pre-quantized") for reason in reasons]
         text = metadata.get("text_config") if isinstance(metadata.get("text_config"), dict) else metadata
         summary = info.get("safetensors")
-        facts = {"parameters_total": _count(summary.get("total"), 10 ** 15) if isinstance(summary, dict) else None,
-                 "hidden_size": _count(text.get("hidden_size"), 1_000_000),
-                 "moe": _count(text.get("num_experts"), 1_000_000) is not None,
-                 "tie_word_embeddings": _tied(metadata, text, architecture)}
-        positions = _count(text.get("max_position_embeddings"), 10_000_000, low=64) or 32768
+        facts = {"parameters_total": positive_count(summary.get("total"), 10 ** 15) if isinstance(summary, dict) else None,
+                 "hidden_size": positive_count(text.get("hidden_size"), 1_000_000),
+                 "moe": positive_count(text.get("num_experts"), 1_000_000) is not None,
+                 "tie_word_embeddings": _tied(metadata, text, architecture),
+                 "vocab_size": (positive_count(text.get("vocab_size"), 10_000_000)
+                                or positive_count(metadata.get("vocab_size"), 10_000_000))}
+        positions = positive_count(text.get("max_position_embeddings"), 10_000_000, low=64) or 32768
         result = {"repo_id": model, "revision": pinned, "architecture": architecture,
                   "supported": not reasons, "reasons": reasons, "profile": None,
                   "model_revision": pinned, "tokenizer_revision": pinned, "metadata_verified": True,
-                  "max_length": min(32768, positions), "hidden_layers": _count(text.get("num_hidden_layers"), 10000),
+                  "max_length": min(32768, positions), "hidden_layers": positive_count(text.get("num_hidden_layers"), 10000),
                   "recommended_precision": recommended_precision(metadata), **facts}
         if reasons:
             return result
         template = ARCHITECTURES[architecture][0]
         if architecture in {"qwen3_5", "qwen3_5_moe"} and "qwen3.6" in model.lower():
             template = "qwen3_6"
-        if architecture == "gemma4" and _count(text.get("hidden_size_per_layer_input"), 1_000_000):
+        if architecture == "gemma4" and positive_count(text.get("hidden_size_per_layer_input"), 1_000_000):
             template = "gemma4n"   # Gemma 4 E2B/E4B (per-layer inputs 256); 26B-A4B and 31B have 0
         tokenizer = self.get(f"https://huggingface.co/{model}/resolve/{pinned}/tokenizer_config.json", optional=True)
         chat = (tokenizer.json().get("chat_template") or "") if tokenizer else ""

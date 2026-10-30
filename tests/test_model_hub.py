@@ -226,3 +226,40 @@ def test_gpu_preflight_checks_actual_pinned_config_bytes(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, 'huggingface_hub', SimpleNamespace(hf_hub_download=lambda **kwargs: str(source)))
     with pytest.raises(ValueError, match='metadata hash'):
         runtime_preflight(AIConfig.model_validate(value))
+
+
+def test_hub_profile_records_the_vocabulary_from_text_config_then_the_top_level():
+    for extra, expected in (({'text_config': {'num_hidden_layers': 24, 'vocab_size': 248320}}, 248320),
+                            ({'vocab_size': 262144, 'text_config': {'num_hidden_layers': 24}}, 262144),
+                            ({'vocab_size': 1, 'text_config': {'num_hidden_layers': 24, 'vocab_size': 248320}}, 248320)):
+        service, _ = hub('qwen3_5', extra)
+        profile = service.inspect('someone/model')['profile']
+        assert profile['vocab_size'] == expected
+        assert imported_model(profile)['vocab_size'] == expected
+
+
+@pytest.mark.parametrize('bad', [True, '248320', 0, -1, 10 ** 9, 1.5, [1], None])
+def test_a_malformed_vocabulary_is_unknown_and_omitted(bad):
+    service, _ = hub('qwen3_5', {'text_config': {'num_hidden_layers': 24, 'vocab_size': bad}})
+    profile = service.inspect('someone/model')['profile']
+    assert 'vocab_size' not in profile and 'vocab_size' not in imported_model(profile)
+
+
+def test_a_hub_registered_large_vocabulary_model_gets_the_logits_term():
+    from tuning_factory import gpu_compat
+    profile = ModelProfile(repo_id='someone/model', revision=REVISION, config_sha256='c' * 64, architecture='qwen3_5',
+                           template='qwen3_5', hidden_layers=24, hidden_size=1024, parameters_total=10 ** 9,
+                           vocab_size=248320)
+    model = imported_model(profile)
+    without = {key: value for key, value in model.items() if key != 'vocab_size'}
+    config = {'training_method': 'lora', 'hyperparameters': {'cutoff_len': 1024, 'per_device_train_batch_size': 1}}
+    extra = gpu_compat.estimate_memory(model, config)['total_gib'] - gpu_compat.estimate_memory(without, config)['total_gib']
+    assert extra == pytest.approx(1024 * 248320 * gpu_compat.LOGITS_BYTES / 1024 ** 3)
+
+
+def test_profiles_without_a_vocabulary_keep_their_exact_bytes_and_a_vocabulary_is_dumped():
+    old = {'repo_id': 'Qwen/Qwen3.5-0.8B', 'revision': REVISION, 'config_sha256': 'c' * 64,
+           'architecture': 'qwen3_5', 'template': 'qwen3_5', 'max_length': 32768,
+           'context_length': 262144, 'hidden_layers': 24, 'recommended_precision': 'bfloat16', 'gated': False}
+    assert ModelProfile.model_validate(old).model_dump_json() == json.dumps(old, separators=(',', ':'))
+    assert ModelProfile.model_validate({**old, 'vocab_size': 248320}).model_dump()['vocab_size'] == 248320

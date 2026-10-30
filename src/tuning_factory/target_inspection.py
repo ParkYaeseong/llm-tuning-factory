@@ -36,7 +36,8 @@ def unloaded_modules(config) -> frozenset:
     if not isinstance(text, dict):
         raise ValueError("invalid Gemma 4 text_config")
     layers, shared = text.get("num_hidden_layers"), text.get("num_kv_shared_layers") or 0
-    if type(shared) is not int or shared < 0 or (shared and (type(layers) is not int or not 1 <= layers <= MAX_HIDDEN_LAYERS)):
+    if type(shared) is not int or shared < 0 or (
+            shared and (type(layers) is not int or not 1 <= layers <= MAX_HIDDEN_LAYERS)):
         raise ValueError("invalid Gemma 4 text_config")
     if not shared or layers - shared <= 0:
         return frozenset()
