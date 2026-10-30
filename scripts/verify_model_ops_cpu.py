@@ -4,8 +4,9 @@ Run only in the separate runtime installed from containers/model-ops-cpu-require
 
     .factory/model-ops-cpu-venv/Scripts/python.exe -I scripts/verify_model_ops_cpu.py --receipt PATH
 
-Every fixture is generated locally (a WordLevel tokenizer and a tiny seeded Qwen2). Nothing is
-downloaded, no GPU is used and no institution data is read. A missing runtime exits with code 2.
+Every fixture is generated locally (a WordLevel tokenizer, a tiny seeded Qwen2 and tiny seeded Qwen3.5 and
+Gemma 4 composites). Nothing is downloaded, no GPU is used and no institution data is read. A missing runtime
+exits with code 2.
 The exit code is 0 only if every check passes. Module import touches only the standard library.
 """
 from __future__ import annotations
@@ -43,6 +44,29 @@ QWEN2 = dict(num_hidden_layers=2, hidden_size=16, intermediate_size=32, num_atte
 TARGETS = ("q_proj", "v_proj")
 PROBE = (2, 4, 9, 17, 22, 5, 30, 11, 27, 3)
 PEFT_PREFIX = "base_model.model."
+# Tiny composite (vision + text) models, trained on text only: vocabulary 32 matches the tiny tokenizer. Qwen3.5 mixes
+# linear-attention layers (0-2) with a full-attention layer (3). Gemma 4's per-layer input embedding
+# (vocab_size_per_layer_input x layers x hidden_size_per_layer_input, 262144 x 3 x 256 by default) and its global
+# attention head size (512 by default) are shrunk; its per-layer projections (the E models') stay. Both have 20 or
+# more language-model Linear modules, so an adapter over all of them is one PEFT 0.18.1 condenses to the shortest
+# distinguishing suffixes, as it does for real models (Gemma 4's vision tower reuses q_proj..down_proj).
+QWEN3_5 = dict(text_config=dict(num_hidden_layers=4, hidden_size=32, intermediate_size=64, num_attention_heads=2,
+                                num_key_value_heads=1, head_dim=16, vocab_size=32, linear_num_key_heads=2,
+                                linear_num_value_heads=2, linear_key_head_dim=8, linear_value_head_dim=8),
+               vision_config=dict(depth=1, hidden_size=16, intermediate_size=32, num_heads=2, out_hidden_size=32))
+GEMMA4 = dict(text_config=dict(num_hidden_layers=3, hidden_size=32, intermediate_size=64, num_attention_heads=2,
+                               num_key_value_heads=1, head_dim=16, vocab_size=32, vocab_size_per_layer_input=32,
+                               hidden_size_per_layer_input=8, global_head_dim=16),
+              vision_config=dict(num_hidden_layers=1, hidden_size=16, intermediate_size=32, num_attention_heads=2,
+                                 num_key_value_heads=2, head_dim=8), audio_config=None)
+# kind: (config class, settings, saved architecture, language-model Linear modules, frozen non-language prefixes)
+COMPOSITES = {
+    "qwen3_5": ("Qwen3_5Config", QWEN3_5, "Qwen3_5ForConditionalGeneration", 31, ("model.visual.",)),
+    "gemma4": ("Gemma4Config", GEMMA4, "Gemma4ForConditionalGeneration", 28,
+               ("model.vision_tower.", "model.embed_vision.")),
+}
+MTP_WEIGHT = "mtp.fc.weight"        # real Qwen3.5 checkpoints carry mtp.*, which transformers never loads
+PROCESSOR_FILE = "preprocessor_config.json"
 
 
 def check_versions(installed) -> dict:
@@ -140,8 +164,13 @@ class Acceptance:
             raise PrerequisiteFailed(name)
 
     def load(self, path):
-        model = self.transformers.AutoModelForCausalLM.from_pretrained(
-            str(path), dtype=self.torch.float32, local_files_only=True, use_safetensors=True)
+        from tuning_factory.target_inspection import COMPOSITE_MODEL_TYPES
+        config = json.loads((Path(path) / "config.json").read_text(encoding="utf-8"))
+        transformers = self.transformers
+        loader = (transformers.AutoModelForImageTextToText if config.get("model_type") in COMPOSITE_MODEL_TYPES
+                  else transformers.AutoModelForCausalLM)
+        model = loader.from_pretrained(str(path), dtype=self.torch.float32, local_files_only=True,
+                                       use_safetensors=True)
         return model.eval()
 
     def logits(self, model, ids=PROBE):
@@ -191,13 +220,14 @@ class Acceptance:
                                    config_sha256=descriptor.config_sha256,
                                    tokenizer_fingerprint=descriptor.tokenizer_fingerprint)
 
-    def descriptor(self, directory, *, marker, storage_kind, effective_base, parents=(), adapter=None):
+    def descriptor(self, directory, *, marker, storage_kind, effective_base, parents=(), adapter=None, root=None):
+        root = root or self.root
         return self.artifacts.ModelDescriptor(
             producer_job_id=marker, producer_attempt_id=marker, producer_manifest_sha256="0" * 64,
-            storage_kind=storage_kind, semantic_kind="causal_lm", has_value_head=False, root=self.root,
+            storage_kind=storage_kind, semantic_kind="causal_lm", has_value_head=False, root=root,
             effective_base=effective_base, parents=parents,
             config_sha256=sha256_file(Path(directory) / "config.json"),
-            tokenizer_fingerprint=self.root.tokenizer_fingerprint, adapter=adapter,
+            tokenizer_fingerprint=root.tokenizer_fingerprint, adapter=adapter,
             tensors=self.headers(directory), synthetic=True)
 
     # -- fixtures --------------------------------------------------------------------------------
@@ -239,11 +269,12 @@ class Acceptance:
         self.base_ref = self.store.freeze(self.base_dir, self.descriptor(
             self.base_dir, marker="synthetic-base", storage_kind="full_model", effective_base=self.root))
 
-    def make_adapter(self, marker, rank, alpha, seed, *, base_dir, effective_base, parents=()):
+    def make_adapter(self, marker, rank, alpha, seed, *, base_dir, effective_base, parents=(), target_modules=TARGETS,
+                     root=None):
         torch = self.torch
         export = self.work / marker
         model = self.get_peft_model(self.load(base_dir), self.LoraConfig(
-            r=rank, lora_alpha=alpha, target_modules=list(TARGETS), lora_dropout=0.0, task_type="CAUSAL_LM"))
+            r=rank, lora_alpha=alpha, target_modules=list(target_modules), lora_dropout=0.0, task_type="CAUSAL_LM"))
         generator = torch.Generator().manual_seed(seed)
         with torch.no_grad():
             for name, parameter in model.named_parameters():
@@ -253,12 +284,12 @@ class Acceptance:
         (export / "README.md").unlink(missing_ok=True)
         config = json.loads((export / "adapter_config.json").read_text(encoding="utf-8"))
         self.raw_target_orders.append(list(config["target_modules"]))   # PEFT writes them from a set
-        self.ops.write_adapter_config(export / "adapter_config.json", config, self.root.repo_id)
+        self.ops.write_adapter_config(export / "adapter_config.json", config, (root or self.root).repo_id)
         self.copy_snapshot(base_dir, export, config=True)
         adapter = self.ops.adapter_metadata_from_config(config, method="lora")
         ref = self.store.freeze(export, self.descriptor(export, marker=marker, storage_kind="adapter",
                                                         effective_base=effective_base, parents=parents,
-                                                        adapter=adapter))
+                                                        adapter=adapter, root=root))
         return self.local(ref)
 
     # -- checks ----------------------------------------------------------------------------------
@@ -678,6 +709,194 @@ class Acceptance:
 
         self.record("freeze_dispatched_outputs", freeze)
 
+    # -- composite (vision + text) models, trained on text only ---------------------------------------
+
+    def check_composite(self):
+        """Phase 2: Qwen3.5 and Gemma 4 load through their image-text class; adapters record full language-model
+        names, as LLaMA-Factory 0.9.5 writes them. Three checks per architecture: targets, merge, materialize."""
+        for kind in COMPOSITES:
+            self.check_composite_kind(kind)
+
+    def build_composite(self, kind):
+        """A seeded tiny composite model with the tiny tokenizer and a processor file; Qwen3.5 also gets an mtp.*
+        tensor. Returns (directory, HF root, local base, frozen full-model artifact)."""
+        torch, transformers = self.torch, self.transformers
+        config_class, settings = COMPOSITES[kind][:2]
+        base = self.work / f"composite-{kind}"
+        base.mkdir()
+        self.copy_snapshot(self.base_dir, base, config=False)
+        torch.manual_seed(0)
+        model = transformers.AutoModelForImageTextToText.from_config(
+            getattr(transformers, config_class)(**settings), dtype=torch.float32)
+        model.save_pretrained(str(base), safe_serialization=True)
+        del model
+        if kind == "qwen3_5":
+            file = base / "model.safetensors"
+            tensors = self.load_file(str(file))
+            tensors[MTP_WEIGHT] = torch.randn(32, 64, generator=torch.Generator().manual_seed(5))
+            self.save_file(tensors, str(file), metadata={"format": "pt"})
+        (base / PROCESSOR_FILE).write_bytes(json.dumps({"processor_class": f"factory-synthetic-{kind}"}).encode())
+        root = self.artifacts.HFRootRef(
+            repo_id=f"factory-synthetic/tiny-{kind}",
+            revision=hashlib.sha1(f"factory-synthetic tiny {kind} seed 0".encode()).hexdigest(),
+            config_sha256=sha256_file(base / "config.json"),
+            tokenizer_fingerprint=self.artifacts.tokenizer_fingerprint(base))
+        local = self.ops.LocalModel(path=base, identity=root, descriptor=None, config_sha256=root.config_sha256,
+                                    tokenizer_fingerprint=root.tokenizer_fingerprint)
+        ref = self.store.freeze(base, self.descriptor(base, marker=f"composite-{kind}", storage_kind="full_model",
+                                                      effective_base=root, root=root))
+        return base, root, local, ref
+
+    def with_deltas(self, directory, deltas):
+        """The model with each LoRA delta added to its weight directly (float64 sum, stored as float32)."""
+        torch, model = self.torch, self.load(directory)
+        with torch.no_grad():
+            for module, value in deltas.items():
+                weight = model.get_submodule(module).weight
+                weight.copy_((weight.to(torch.float64) + value).to(torch.float32))
+        return model
+
+    def composite_materialized(self, kind, base, root, local, adapter, wanted, out):
+        """Materialize one adapter (made for the ``wanted`` modules) into the composite base and check the output
+        independently."""
+        ops, torch = self.ops, self.torch
+        _, _, architecture, module_count, frozen_prefixes = COMPOSITES[kind]
+        receipt = ops.materialize_model(ops.StagedLoad(base=local, adapter=adapter), out, probe_ids=PROBE)
+        before, result = self.tensors(base), self.tensors(out)
+        loaded = {name for name in before if not name.startswith("mtp.")}
+        metadata = adapter.descriptor.adapter
+        deltas = self.lora_delta(adapter.path, metadata.alpha / metadata.rank)
+        targets = {module + ".weight": value for module, value in deltas.items()}
+        delta = [self.close(result[name].to(torch.float64) - before[name].to(torch.float64), value, "delta")
+                 for name, value in targets.items()]
+        frozen = sorted(name for name in before if name.startswith(frozen_prefixes))
+        others = sorted(loaded - set(targets))
+        merged = self.load(out)
+        ok, error = self.close(self.logits(merged), self.logits(self.with_deltas(base, deltas)), "logits")
+        unmerged = self.PeftModel.from_pretrained(self.load(base), str(adapter.path)).eval()
+        peft_ok, peft_error = self.close(self.logits(merged), self.logits(unmerged), "logits")
+        config = json.loads((out / "config.json").read_text(encoding="utf-8"))
+        full_ref = self.store.freeze(out, self.descriptor(out, marker=out.name, storage_kind="full_model",
+                                                          effective_base=root, parents=(adapter.identity,), root=root))
+        full = self.store.verify(full_ref)
+        evidence = ops.verify_inspected_targets(ops.inspect_target_modules(self.store.path(full_ref), full_ref),
+                                                full, full_ref)
+        copied = [name for name in (PROCESSOR_FILE, "tokenizer.json", "tokenizer_config.json")
+                  if (out / name).read_bytes() == (base / name).read_bytes()]
+        conditions = {
+            "key_set_is_base_without_unloaded": set(result) == loaded,
+            "every_target_changed_by_its_delta": set(deltas) == set(wanted) and all(good for good, _ in delta),
+            "frozen_and_other_tensors_identical": bool(frozen)
+            and all(torch.equal(result[name], before[name]) for name in others),
+            "composite_architecture": config.get("architectures") == [architecture],
+            "logits_match_base_plus_delta": ok, "logits_match_unmerged_adapter": peft_ok,
+            "processor_and_tokenizer_bytes_copied": len(copied) == 3,
+            "frozen_output_targets_verified": len(evidence.modules) == module_count
+            and full.storage_kind == "full_model",
+            "finite_f32": all(tensor.dtype == torch.float32 and bool(torch.isfinite(tensor).all())
+                              for tensor in result.values()),
+        }
+        return all(conditions.values()), {
+            "failed_conditions": sorted(name for name, value in conditions.items() if not value),
+            "targets": len(targets), "recorded_target_modules": list(metadata.target_modules),
+            "frozen_tensors_identical": len(frozen),
+            "other_tensors_identical": len(others) - len(frozen), "output_tensors": len(result),
+            "base_tensors": len(before), "architectures": config.get("architectures"),
+            "max_abs_delta_error": max(error for _, error in delta), "max_abs_logits_error": error,
+            "max_abs_logits_error_vs_unmerged": peft_error, "receipt_max_abs_delta_error": receipt.max_abs_delta_error,
+            "receipt_max_abs_logits_error": receipt.max_abs_logits_error, "copied_files": copied}
+
+    def check_composite_kind(self, kind):
+        from tuning_factory import hf_targets
+        from tuning_factory.target_inspection import (
+            LANGUAGE_MODEL_PREFIX,
+            resolved_lora_targets,
+            target_leaves,
+        )
+        ops = self.ops
+        module_count, frozen_prefixes = COMPOSITES[kind][3:]
+        state = {}
+
+        def targets():
+            base, root, _, ref = state["base"] = self.build_composite(kind)
+            descriptor = self.store.verify(ref)
+            inspected = ops.inspect_target_modules(base, root)                     # meta device, HF root
+            frozen = ops.inspect_target_modules(self.store.path(ref), ref)          # the frozen artifact
+            header = hf_targets.target_evidence(root, self.headers(base))           # safetensors headers only
+            names = state["names"] = [item.name for item in inspected.modules]
+            accepted = ops.verify_inspected_targets(frozen, descriptor, ref) == frozen
+            try:
+                ops.verify_inspected_targets(frozen.model_copy(update={"modules": frozen.modules[1:]}), descriptor,
+                                             ref)
+                partial_refused = False
+            except ValueError:
+                partial_refused = True
+            tensors = {tensor.name for tensor in descriptor.tensors}
+            return {"passed": len(names) == module_count and all(name.startswith(LANGUAGE_MODEL_PREFIX)
+                                                                 for name in names)
+                    and accepted and partial_refused and header.modules == inspected.modules == frozen.modules
+                    and kind in hf_targets.HEADER_TARGET_ARCHITECTURES
+                    and any(name.startswith(frozen_prefixes) for name in tensors)
+                    and (kind != "qwen3_5" or MTP_WEIGHT in tensors),
+                    "modules": len(names), "leaves": list(target_leaves(names)), "base_tensors": len(tensors)}
+
+        def merge():
+            base, root, local, _ = state["base"]
+            wanted = state["wanted"] = resolved_lora_targets("q_proj,v_proj", state["names"])   # full names
+            adapters = state["adapters"] = tuple(
+                self.make_adapter(f"composite-{kind}-r{rank}", rank, alpha, seed, base_dir=base, effective_base=root,
+                                  target_modules=wanted, root=root) for rank, alpha, seed in ((2, 4, 1), (3, 9, 2)))
+            out = self.work / f"composite-{kind}-merged"
+            receipt = ops.merge_adapters(adapters, (0.25, 0.75), out, base=local, require_real=False, probe_ids=PROBE)
+            self.receipts[f"composite_{kind}_merge"] = receipt.model_dump(mode="json")
+            config = json.loads((out / "adapter_config.json").read_text(encoding="utf-8"))
+            expected = {}
+            for model, weight, scale in zip(adapters, (0.25, 0.75), (4 / 2, 9 / 3)):
+                for module, value in self.lora_delta(model.path, weight * scale).items():
+                    expected[module] = expected.get(module, 0) + value
+            actual = self.lora_delta(out, config["lora_alpha"] / config["r"])
+            delta = [self.close(actual[module], expected[module], "delta") for module in expected if module in actual]
+            reloaded = self.PeftModel.from_pretrained(self.load(base), str(out)).eval()
+            ok, error = self.close(self.logits(reloaded), self.logits(self.with_deltas(base, expected)), "logits")
+            frozen = self.store.verify(self.store.freeze(out, self.descriptor(
+                out, marker=out.name, storage_kind="adapter", effective_base=root,
+                parents=tuple(model.identity for model in adapters),
+                adapter=ops.adapter_metadata_from_config(config, method="lora"), root=root)))
+            return {"passed": set(actual) == set(expected) == set(wanted) and bool(wanted)
+                    and all(name.startswith(LANGUAGE_MODEL_PREFIX) for name in wanted)
+                    and sorted(config["target_modules"]) == list(wanted)
+                    and config["r"] == config["lora_alpha"] == receipt.output_rank == 5
+                    and all(good for good, _ in delta) and ok and frozen.adapter.rank == 5
+                    and (out / PROCESSOR_FILE).read_bytes() == (base / PROCESSOR_FILE).read_bytes(),
+                    "max_abs_error": max(error for _, error in delta), "max_abs_logits_error": error,
+                    "targets": list(wanted), "receipt_max_abs_delta_error": receipt.max_abs_delta_error,
+                    "receipt_max_abs_logits_error": receipt.max_abs_logits_error}
+
+        def materialize():
+            """The merge's first adapter (q_proj, v_proj) and one over every language-model Linear module
+            (``lora_target: all``: Qwen3.5's linear attention, Gemma 4's per-layer projections)."""
+            base, root, local, _ = state["base"]
+            every = resolved_lora_targets("all", state["names"])
+            everything = self.make_adapter(f"composite-{kind}-all", 2, 4, 3, base_dir=base, effective_base=root,
+                                           target_modules=every, root=root)
+            results = {label: self.composite_materialized(kind, base, root, local, adapter, wanted,
+                                                          self.work / f"composite-{kind}-materialized-{suffix}")
+                       for label, suffix, adapter, wanted in (
+                           ("q_proj,v_proj", "qv", state["adapters"][0], state["wanted"]),
+                           ("all", "all", everything, every))}
+            details = {label: item for label, (_, item) in results.items()}
+            # PEFT condensed the 20+ full names to suffixes; the deltas still touch exactly the language-model modules
+            condensed = len(everything.descriptor.adapter.target_modules) < len(every)
+            return {"passed": all(passed for passed, _ in results.values())
+                    and details["all"]["targets"] == module_count and condensed,
+                    "max_abs_error": max(item["max_abs_delta_error"] for item in details.values()),
+                    "max_abs_logits_error": max(item["max_abs_logits_error"] for item in details.values()),
+                    "adapters": details}
+
+        self.record(f"composite_{kind}_targets", targets)
+        self.record(f"composite_{kind}_merge", merge)
+        self.record(f"composite_{kind}_materialize", materialize)
+
     def run(self):
         from unittest import mock
 
@@ -693,7 +912,7 @@ class Acceptance:
             try:
                 for phase in (self.check_fixtures, self.check_merge, self.check_materialize, self.check_parent_child,
                               self.check_frozen_reference, self.check_nonfinite, self.check_targets,
-                              self.check_execute_operation):
+                              self.check_execute_operation, self.check_composite):
                     phase()
             except PrerequisiteFailed as exc:
                 self.stopped_after = str(exc)   # dependent checks did not run; the receipt says so

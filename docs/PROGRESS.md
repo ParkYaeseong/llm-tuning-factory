@@ -1,3 +1,37 @@
+# Qwen3.5·Gemma 4 텍스트 학습 (2단계) — Task 13–14 대상 규칙·병합·확정과 CPU 수치 검증, 2026-10-30
+
+[설계](superpowers/specs/2026-10-30-phase2-latest-models-design.md) · [계획](superpowers/plans/2026-10-30-phase2-latest-models.md) ·
+브랜치 `claude/phase2-models`.
+
+- Task 13(torch 없이): 복합 모델(`qwen3_5`·`qwen3_5_moe`·`gemma4`)의 LoRA 대상은 `model.language_model.` 아래 Linear다. 헤더 증거는
+  `qwen3_5`·`gemma4`를 받아 언어 모델 텐서만 본다(비전·오디오·투영·`mtp.*` 무시, `linear_attn.conv1d` 3차원 커널 허용, 전문가 텐서와
+  `qwen3_5_moe`는 계속 거부). 계획의 대상 비교는 잎 이름(`target_leaves`)으로 하고, 모의 실행 어댑터는 `resolved_lora_targets`로
+  전체 이름을 쓴다. `verify_inspected_targets`는 증거가 모두 언어 모델 안에 있을 때만 기대 집합을 줄인다(비전 모듈을 함께 내는
+  gemma3 증거는 전체 규칙 그대로).
+- Task 14: 복합 모델은 meta 대상 검사와 병합·확정의 FP32 로드를 `AutoModelForImageTextToText`로 한다. 확정의 키 집합 검사는
+  transformers가 불러오지 않는 Qwen3.5 `mtp.*`만 기대 집합에서 뺀다.
+- PEFT 0.18.1은 20개 이상의 전체 이름을 가장 짧은 구별 접미사로 기록한다(CPU 검증에서 Qwen3.5 `all` 31개 → 잎 이름 12개,
+  Gemma 4 `all` 28개 → `language_model.layers.0.self_attn.q_proj`, `1.self_attn.q_proj` 등 24개; Gemma 4 비전 타워도 q_proj~down_proj를 쓰기 때문).
+  앱의 비교는 잎 이름과 접미사 일치로 하므로 그대로 동작한다. 실제 0.8B·9B의 `q_proj,v_proj`는 20개 미만이라 전체 이름으로 남는다.
+- CPU 수치 검증(2026-10-30, `.factory/model-ops-cpu-venv`: torch 2.7.1+cpu, transformers 5.6.0, peft 0.18.1):
+  `scripts/verify_model_ops_cpu.py --receipt dist/model-ops-cpu-0.6.0.json` 종료 코드 0, **35/35 통과**, `stopped_after` null.
+  기존 29개 검사 기록과 병합·확정 영수증은 이전 영수증(`.factory/model-ops-cpu-receipt.json`)과 같다(텍스트 모델 출력 불변). 새 6개:
+
+| 작은 무작위 모델 | 대상 검사 | 병합(q_proj·v_proj 전체 이름, r2+r3 → r5) | 확정(q·v 어댑터와 `all` 어댑터) |
+|---|---|---|---|
+| `qwen3_5`(linear_attn 3층 + self_attn 1층, 비전 1블록, 가짜 `mtp.fc.weight`) | 언어 모델 Linear 31개, meta = 헤더 = 동결 산출물, 검증 통과 | 대상 2개, 델타 오차 9.1e-9, 로짓 오차 6.0e-8 | 텐서 77개 = 기본 78개 − mtp, 비전 21개 동일, 델타 ≤ 2.4e-8, 로짓 ≤ 8.9e-8 |
+| `gemma4`(3층, 층별 입력 투영 포함, 비전 1층, 오디오 없음) | 28개, 같은 일치 | 대상 6개, 델타 1.2e-8, 로짓 5.1e-7 | 72개 = 기본 72개, 비전·투영 16개 동일, 델타 ≤ 1.5e-8, 로짓 ≤ 9.6e-7 |
+
+  로짓은 병합·확정 결과를 기본 모델 가중치에 델타를 직접 더한 모델과 비교했다(허용 오차 정책 `model-ops-f32-v1`). 확정 결과의
+  `architectures`는 복합 클래스이고, 토크나이저와 `preprocessor_config.json`이 바이트 그대로 복사되며, 동결 뒤 대상 검사도 통과한다.
+  Task 14 소스 전(Task 13 커밋)에는 대상 검사 둘이 계획대로 실패했고(`'Qwen3_5Config' object has no attribute 'vocab_size'`,
+  `'Gemma4ClippableLinear' object has no attribute 'in_features'`), 텍스트 전용 로더로는 Qwen3.5 병합·확정이 어댑터 대상을 찾지 못했으며,
+  `mtp.*` 제외 없이는 Qwen3.5 확정이 키 집합 검사에서 실패했다.
+- 계획과 다른 점: `GEMMA4` 상수에 `vocab_size_per_layer_input=32`, `hidden_size_per_layer_input=8`, `global_head_dim=16`을 더하고
+  층을 3개로 했다(기본 층별 임베딩은 fp32로 약 0.5 GB이고, 3층이면 `all`이 20개를 넘어 PEFT 접미사 기록을 시험한다). 확정 검사는 계획의 q·v
+  어댑터에 더해 언어 모델 Linear 전체 어댑터도 확정한다.
+- 남은 일(GPU 인수): 실제 LLaMA-Factory 어댑터의 `target_modules`와 meta 검사 비교, Qwen3.5-0.8B 어댑터 병합.
+
 # Task 16 GPU 인수 시험 — 승인 범위와 결과, 2026-10-30
 
 사용자 승인(2026-10-30): Blackwell Pod `yuft63rjggvh5z`(1 × RTX PRO 4000 Blackwell, 시간당 $0.57, 이미 실행 중)에서 먼저 시험하고,

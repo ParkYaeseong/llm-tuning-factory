@@ -38,8 +38,11 @@ def target_leaves(targets) -> tuple:
 
 
 def resolved_lora_targets(lora_target: str, module_names) -> tuple:
-    """The ``target_modules`` LLaMA-Factory 0.9.5 writes for ``lora_target`` over a base's inspected Linear modules:
-    leaf names for text models, full language-model module names for composite models (``patch_target_modules``)."""
+    """The ``target_modules`` LLaMA-Factory 0.9.5 passes to PEFT for ``lora_target`` over a base's inspected Linear
+    modules: leaf names for text models, full language-model module names for composite models
+    (``patch_target_modules``). PEFT 0.18.1 records a list of 20 or more names as the shortest suffixes that still
+    select only those modules (Gemma 4: ``language_model.layers.0.self_attn.q_proj``, ``1.self_attn.q_proj``), so
+    recorded targets are compared by leaf (``target_leaves``) or by suffix matching, never as strings."""
     names = tuple(module_names)
     wanted = set(target_leaves(names)) if lora_target == "all" else set(lora_target.split(","))
     if not is_composite_inventory(names):
@@ -96,23 +99,28 @@ def inspect_linear_modules(model_dir: Path) -> tuple:
     """The sorted ``TargetModuleEvidence`` of a local full model, before it has an artifact identity.
 
     The worker writes these for full-model outputs; the control plane binds them to the frozen
-    artifact and accepts them only through ``verify_inspected_targets``.
+    artifact and accepts them only through ``verify_inspected_targets``. Composite models:
+    AutoModelForImageTextToText, language-model modules only (LLaMA-Factory's rule).
     """
     from .graph_planner import TargetModuleEvidence
     from .runtime_profiles import model_ops_runtime
     model_dir = Path(model_dir).absolute()
     torch, _, _, transformers = model_ops_runtime()
     config = transformers.AutoConfig.from_pretrained(str(model_dir), local_files_only=True)
+    composite = config.model_type in COMPOSITE_MODEL_TYPES
+    loader = transformers.AutoModelForImageTextToText if composite else transformers.AutoModelForCausalLM
     with torch.device("meta"):
-        model = transformers.AutoModelForCausalLM.from_config(config)
+        model = loader.from_config(config)
     excluded = {"lm_head"}
     if config.model_type == "chatglm":
         excluded.add("output_layer")
     elif config.model_type == "internlm2":
         excluded.add("output")
+    # The prefix comes first: Gemma 4's vision Gemma4ClippableLinear wrappers have no in_features.
     modules = sorted(
         (TargetModuleEvidence(name=name, input_dimension=module.in_features, output_dimension=module.out_features)
          for name, module in model.named_modules()
-         if "Linear" in type(module).__name__ and "Embedding" not in type(module).__name__
+         if (not composite or name.startswith(LANGUAGE_MODEL_PREFIX))
+         and "Linear" in type(module).__name__ and "Embedding" not in type(module).__name__
          and not any(item in name for item in excluded)), key=lambda item: item.name)
     return tuple(modules)

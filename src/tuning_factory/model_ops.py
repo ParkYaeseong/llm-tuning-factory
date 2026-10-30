@@ -59,7 +59,13 @@ from .model_artifacts import (
 )
 from .runtime_profiles import model_ops_runtime
 from .safetensors_scan import scan_finite_safetensors
-from .target_inspection import inspect_linear_modules, inspect_target_modules, verify_inspected_targets
+from .target_inspection import (
+    COMPOSITE_MODEL_TYPES,
+    inspect_linear_modules,
+    inspect_target_modules,
+    unloaded_prefixes,
+    verify_inspected_targets,
+)
 
 __all__ = [
     "CONTINUATION_REFUSAL", "EXPORT_ONLY_ADAPTER_FIELDS", "POLICY_F32_V1", "TOLERANCE_POLICIES", "LocalModel",
@@ -464,8 +470,11 @@ def _device(torch, device: str):
 
 
 def _load_fp32(torch, transformers, path: Path, device):
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        str(path), dtype=torch.float32, local_files_only=True, use_safetensors=True)
+    """FP32 load; composite models through their image-text class, so the vision/audio towers stay in the model
+    and adapters recorded with full language-model names (LLaMA-Factory's) apply."""
+    composite = _read_json(path / "config.json").get("model_type") in COMPOSITE_MODEL_TYPES
+    loader = transformers.AutoModelForImageTextToText if composite else transformers.AutoModelForCausalLM
+    model = loader.from_pretrained(str(path), dtype=torch.float32, local_files_only=True, use_safetensors=True)
     return model.to(device).eval()
 
 
@@ -822,7 +831,10 @@ def materialize_model(input: StagedLoad, output: Path, *, policy: str = POLICY_F
 
 
 def _verify_materialized(torch, adapter: LocalModel, base_path: Path, payload: Path, tolerance) -> float:
-    base, result = _load_tensors(base_path, adapter=False), _load_tensors(payload, adapter=False)
+    skipped = unloaded_prefixes(_read_json(base_path / "config.json"))   # never loaded, so never saved
+    base = {name: tensor for name, tensor in _load_tensors(base_path, adapter=False).items()
+            if not name.startswith(skipped)}
+    result = _load_tensors(payload, adapter=False)
     if set(base) != set(result):
         raise ValueError(DELTA_FAILED)
     metadata = adapter.descriptor.adapter

@@ -1852,3 +1852,87 @@ def test_merge_lineage_compares_composite_adapter_targets_by_leaf_name():
     recipe = NS(hyperparameters=NS(lora_target="q_proj,v_proj"))
     assert lineage.candidates(ref) == frozenset({(adapter.effective_base.model_dump_json(),
                                                   lineage._targets(recipe, adapter.effective_base))})
+
+
+class FakeLinear:
+    def __init__(self, inputs, outputs):
+        self.in_features, self.out_features = inputs, outputs
+
+
+def test_composite_inspection_uses_the_image_text_class_and_keeps_the_language_model(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace as NS
+
+    from tuning_factory import runtime_profiles, target_inspection
+    modules = [("model.visual.blocks.0.attn.qkv", FakeLinear(16, 48)),
+               ("model.visual.merger.linear_fc1", FakeLinear(64, 64)),
+               ("model.language_model.layers.0.linear_attn.in_proj_qkv", FakeLinear(32, 96)),
+               ("model.language_model.layers.3.self_attn.q_proj", FakeLinear(32, 64)), ("lm_head", FakeLinear(32, 64))]
+    model = NS(named_modules=lambda: iter(modules))
+    transformers = NS(AutoConfig=NS(from_pretrained=lambda *a, **k: NS(model_type="qwen3_5")),
+                      AutoModelForCausalLM=NS(from_config=lambda config: pytest.fail("text-only class")),
+                      AutoModelForImageTextToText=NS(from_config=lambda config: model))
+    monkeypatch.setattr(runtime_profiles, "model_ops_runtime",
+                        lambda: (NS(device=lambda name: nullcontext()), None, None, transformers))
+    assert [item.name for item in target_inspection.inspect_linear_modules(tmp_path)] == [
+        "model.language_model.layers.0.linear_attn.in_proj_qkv", "model.language_model.layers.3.self_attn.q_proj"]
+
+
+def test_composite_models_load_through_the_image_text_class(tmp_path):
+    from types import SimpleNamespace as NS
+
+    from tuning_factory import model_ops
+    (tmp_path / "config.json").write_text('{"model_type": "gemma4"}')
+    loaded = NS(to=lambda device: NS(eval=lambda: "composite"))
+    transformers = NS(AutoModelForCausalLM=NS(from_pretrained=lambda *a, **k: pytest.fail("text-only class")),
+                      AutoModelForImageTextToText=NS(from_pretrained=lambda *a, **k: loaded))
+    assert model_ops._load_fp32(NS(float32="f32"), transformers, tmp_path, "cpu") == "composite"
+
+
+def test_materialized_key_set_ignores_only_the_checkpoint_tensors_transformers_never_loads(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+
+    from tuning_factory import model_ops
+
+    class Tensor(int):
+        def to(self, *args):
+            return self
+
+    base, payload = tmp_path / "base", tmp_path / "payload"
+    stored = {base: {"model.language_model.norm.weight": Tensor(1), "mtp.fc.weight": Tensor(2)},
+              payload: {"model.language_model.norm.weight": Tensor(1)}}
+    monkeypatch.setattr(model_ops, "_load_tensors", lambda directory, *, adapter: dict(stored[directory]))
+    monkeypatch.setattr(model_ops, "_expected_deltas", lambda *args: {})
+    torch = NS(float32="f32", equal=lambda left, right: left == right)
+    adapter = NS(descriptor=NS(adapter=NS(alpha=4, rank=2)))
+    base.mkdir()
+    (base / "config.json").write_text('{"model_type": "qwen3_5"}')
+    assert model_ops._verify_materialized(torch, adapter, base, payload, None) == 0.0
+    (base / "config.json").write_text('{"model_type": "qwen2"}')      # a text model keeps the exact key set
+    with pytest.raises(ValueError, match=model_ops.DELTA_FAILED):
+        model_ops._verify_materialized(torch, adapter, base, payload, None)
+    (base / "config.json").write_text('{"model_type": "qwen3_5"}')
+    stored[payload] = {"model.language_model.norm.weight": Tensor(1), "mtp.fc.weight": Tensor(2)}
+    with pytest.raises(ValueError, match=model_ops.DELTA_FAILED):     # never loaded, so never saved
+        model_ops._verify_materialized(torch, adapter, base, payload, None)
+
+
+def test_condensed_peft_suffixes_compare_by_leaf_and_select_the_same_modules():
+    # PEFT 0.18.1 condenses 20+ full names to distinguishing suffixes; recorded by the CPU acceptance for a tiny
+    # 3-layer Gemma 4 whose vision tower also has q_proj..down_proj (Task 14).
+    from types import SimpleNamespace as NS
+
+    from tuning_factory.target_inspection import target_leaves
+    module = api()
+    layer = ("mlp.down_proj", "mlp.gate_proj", "mlp.up_proj", "self_attn.k_proj", "self_attn.o_proj",
+             "self_attn.q_proj", "self_attn.v_proj", "per_layer_input_gate", "per_layer_projection")
+    names = [f"model.language_model.layers.{index}.{leaf}" for index in range(3) for leaf in layer]
+    names.append("model.language_model.per_layer_model_projection")
+    evidence = NS(modules=tuple(NS(name=name) for name in names))
+    recorded = [f"{index}.{leaf}" for index in (1, 2) for leaf in layer[:7]]
+    recorded += [f"language_model.layers.0.{leaf}" for leaf in layer[:7]]
+    recorded += ["per_layer_input_gate", "per_layer_model_projection", "per_layer_projection"]
+    assert target_leaves(recorded) == target_leaves(names)
+    module.check_continuation_targets("all", recorded, evidence)
+    with pytest.raises(ValueError, match="resolved adapter targets differ from requested targets"):
+        module.check_continuation_targets("q_proj,v_proj", recorded, evidence)
