@@ -134,6 +134,27 @@ PPO는 격리된 실제 패키지 환경에서 CPU import/API/config 생성까�
 `runtime_profiles.runtime_capabilities()`에 있고, 실제 torch 패키지에서 읽은 값입니다(`scripts/inspect_gpu_wheels.py`).
 학습 환경 검사는 설치된 환경에서 GPU 세대 지원과 실제 CUDA 연산 한 번을 확인합니다.
 
-앱 기본 목록 모델은 매개변수 수·`hidden_size`·층 수로 단일 GPU 학습 메모리를 추정합니다. 가중치만으로 GPU 메모리의 95%를
+앱 기본 목록 모델과, 크기 정보가 있는 Hugging Face 등록 모델은 매개변수 수·`hidden_size`·층 수로 단일 GPU 학습 메모리를 추정합니다.
+크기 정보가 없는 모델은 "메모리 추정 불가" 주의가 나옵니다. 가중치만으로 GPU 메모리의 95%를
 넘으면 실행을 거부하고, 전체 추정이 90%를 넘으면 경고합니다. 예: Llama 3.1 70B bf16 LoRA(가중치 약 130GiB)는 80GB GPU에서
 거부되고, 4비트 QLoRA(전체 약 50GiB)는 80GB GPU에서 허용됩니다. 여러 GPU를 쓰는 분산 학습은 지원하지 않습니다.
+
+## 비전·오디오 겸용 모델(Qwen3.5·Gemma 4)
+
+Qwen3.5와 Gemma 4는 텍스트·비전·오디오를 한 체크포인트에 담은 복합 구조입니다. 이 앱은 텍스트 데이터로만 SFT·DPO·KTO·PT를 학습합니다
+(RM은 GPU 인수 시험 결과로 정하고, PPO는 지원하지 않습니다).
+
+- **동결 키**: 복합 구조에는 학습 설정에 `freeze_vision_tower: true`, `freeze_multi_modal_projector: true`,
+  `freeze_language_model: false` 세 키가 들어가 비전·오디오 부분이 항상 동결됩니다. 다른 구조에는 이 키가 없습니다.
+- **추론 템플릿**: 템플릿이 qwen3_5, qwen3_6, gemma4, gemma4n이면 학습·예측·보상 평가 설정에 `enable_thinking: false`가 더해집니다.
+  허브에 등록된 `gemma4_text` 작업도 이 영향을 받습니다.
+- **processor 파일**: `preprocessor_config.json`, `video_preprocessor_config.json`, `processor_config.json`, `chat_template.json`은
+  있으면 기본 모델과 함께 받고 학습 결과·병합·확정 결과로 그대로 복사합니다. 토크나이저 지문에는 들어가지 않으므로 기존 지문은
+  바뀌지 않으며(산출물 목록 해시에는 다른 파일처럼 들어갑니다), 없어도 오류가 아닙니다. Qwen3.5 샤드 이름
+  `model.safetensors-0000N-of-0000M.safetensors`도 내려받습니다.
+- **LoRA 대상**: `model.language_model.` 아래 Linear 모듈의 전체 이름입니다. 대상이 20개 이상이면 PEFT가 공통 접미사로 줄여
+  기록할 수 있고, 앱은 그 경우도 같은 대상으로 확인합니다.
+- **병합·확정**: 복합 구조는 이미지-텍스트 클래스로 불러와 비전 가중치를 그대로 보존합니다. transformers가 불러오지 않는
+  체크포인트 텐서(Qwen3.5의 `mtp.*` 등)는 결과에 없습니다.
+- **메모리 추정**: 가중치는 비전·오디오를 포함한 전체 매개변수, 학습 상태는 텍스트 매개변수로 계산하며, QLoRA는 임베딩 표
+  (Gemma 4 E 모델의 층별 임베딩 포함)를 bf16으로 셉니다.

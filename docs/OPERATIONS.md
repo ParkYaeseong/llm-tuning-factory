@@ -190,8 +190,22 @@ written to manifests or profiles. Data transfer and execution share `--approve-e
 - An operator-entered whole-server hourly cost (0 is allowed for internal servers; it is not a cloud price).
 
 Under the work folder the app keeps a private runtime for each app source version (`runtime/`), job files (`jobs/`), the model
-cache (`hf-cache/`), downloaded Python builds (`python/`) and a uv cache (`uv-cache/`). pip runs with no cache. The selected GPU UUIDs are bound with
+cache (`hf-cache/`), the prepared base-model and processor-file snapshots (`model-cache/`), downloaded Python builds (`python/`) and a uv cache (`uv-cache/`). pip runs with no cache. The selected GPU UUIDs are bound with
 `CUDA_VISIBLE_DEVICES`. The first preparation downloads dependencies and can take a long time.
+
+Workers run under `flock -s <runtime>/in-use.lock`, so a runtime in use is never removed. Preparing a runtime first prunes
+old app-version runtimes below `runtime/` that no worker or preparation holds and that no unfinished attempt references
+(deadline: attempt mtime + timeout + 1 h); `uv-cache/`, `python/`, `hf-cache/`, `model-cache/` and `jobs/` are never touched.
+The `TF_PRUNE` report is returned as `cleanup`: `removed` is a list of runtime names, and the freed space is the change in the
+volume's free space (`free_after - free_before`; the app shows no GB figure when it is under 0.1 GB, because uv hard-links
+files with its cache). Each preparation spends at most 300 s on removal; anything left (`incomplete`) is removed at the next
+preparation. A preparation is refused while a job of the same app version uses that runtime (`TF_RUNTIME_IN_USE`, shown in
+Korean). A failure to remove some runtimes (`errors`, `cleanup_error`) does not affect the preparation. If an install step
+fails after the cleanup, the script stops before it prints the report, so the cleanup is not shown even though it happened.
+App SSH connections send keepalives every 30 s.
+
+The operator-entered hourly cost is judged at the plan stage: a cost above the job's limit, or an empty cost, is flagged
+there and refused before submit; 0 is allowed for in-house servers.
 
 ### Concurrency and locks
 
