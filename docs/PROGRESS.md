@@ -14,10 +14,65 @@
 엔진은 최종 코드 `0163b8a`로 빌드한 `dist/factory-bridge.exe`(설치 파일에 들어간 것과 바이트 동일)로 실행했고,
 이 PC의 설치된 앱은 실행 중이라 이번에는 업그레이드하지 않았다.
 
-**남은 일:** 새 Blackwell Pod와 Ampere 또는 Hopper Pod(각각 Pod 주인의 `/workspace` 사용 동의)를 받으면 같은 순서로 다시 시험한다.
-연결 설정의 Pod ID와 SSH 서버 지문(새 Pod에서 다시 확인)을 바꿔야 한다.
+**추가 승인(2026-10-30):** "api key 이용해서 필요한 runpod 진행해". 이 PC의 앱을 닫은 뒤, 저장된 RunPod API 키로 시험용 네트워크 볼륨과
+Pod를 직접 만들어 시험했다. Pod는 모두 `ManagedPods`(정책: GPU 1개, 실행당 $5, 4시간, 다이제스트 고정 이미지, 네트워크 볼륨 필수)로
+만든 공장 소유 Pod이고, SSH 서버 지문은 공인 IP와 RunPod SSH 프록시 두 경로에서 같은지 확인한 뒤 고정했다. 데이터는 같은 합성 32행,
+MLflow는 껐다. Ampere와 Hopper를 모두 시험했다.
 
-# GPU 호환성 점검과 CUDA 12.8 학습 환경 (1단계) — 소프트웨어 완료, GPU 인수 대기
+**결과(엔진 `9871d8b`로 빌드한 `dist/factory-bridge.exe`, Qwen2.5-0.5B-Instruct SFT LoRA):**
+
+| GPU | compute capability · 드라이버 | Pod · 볼륨 | 환경 | 결과 |
+|---|---|---|---|---|
+| RTX PRO 4000 Blackwell 24 GB | 12.0 · 595.91.07 | `02o4sst2tbacov` · `ls9ua5ymse`(EU-RO-1) | 실행 승인 안에서 준비, 실행 706초 | COMPLETED(시도 1), train_loss 0.148, train_runtime 12.2초 |
+| A40 48 GB | 8.6 · 595.91.07 | `p7qe8lr3a0yzm8` · `cys1ne5znp`(CA-MTL-1) | 실행 승인 안에서 준비, 실행 416초 | COMPLETED(시도 1), train_loss 0.148, train_runtime 9.5초 |
+| H100 80GB HBM3 | 9.0 · 595.91.07 | `zi5ftxz6bj0q22` · `cys1ne5znp`(CA-MTL-1) | A40이 만든 환경을 그대로 사용(`ready`), 실행 238초 | COMPLETED(시도 1), train_loss 0.147, train_runtime 10.4초 |
+
+- 세 GPU 모두 `simulation: false`, `training_success: true`, bf16 지원, 어댑터(`adapter_model.safetensors`) 저장, 런타임 torch `2.7.1+cu128`,
+  transformers 5.6.0, LLaMA-Factory 0.9.5, Python 3.12.3. 한 환경이 sm_86·sm_90·sm_120에서 모두 동작했다.
+- 점검 결과: Blackwell·A40에서는 `MODEL_UNVERIFIED` 경고만(그때 검증 목록이 9.0뿐), H100에서는 항목 없음. 거부 항목 없음.
+  H100은 시간당 $3.99라 시험 설정의 예산을 $4.00/시간·$4.50로 올렸다(기본 $0.60·$2.00이면 요금 초과로 거부되는 것이 맞다).
+- 메모리(학습 중 별도 SSH의 `nvidia-smi` 5초 간격): Blackwell 최대 1,494 MiB, H100 최대 1,977 MiB. 앱 추정치는 합계 2.58 GiB(가중치 0.93 GiB)로
+  관측치보다 크다(보수적). 학습이 10초 남짓이라 5초 간격 표본은 순간 최대를 놓칠 수 있다. A40은 측정하지 못했다(아래). 계수 보정 제안은 없다.
+- 검증 범위 반영(`2815c03`): `model_catalog()`의 Qwen2.5-0.5B-Instruct `verified_capabilities`를 `["8.6", "9.0", "12.0"]`로,
+  `verification_scope`에 0.5.0 SFT LoRA 범위를 적었다. QLoRA와 다른 학습 단계는 이번에 GPU에서 검증하지 않았다.
+
+**시험 중 찾아 고친 결함(각각 테스트를 먼저 작성해 실패를 확인):**
+- `8f08390`: 런타임 확인 probe가 60초 제한에 걸렸다. 네트워크 볼륨에서 처음 torch를 import하는 데 60초를 넘는다. probe만 900초로 늘렸다.
+- `1685eef`: transformers 5.6.0이 `save_safetensors` 인자를 거부해 학습이 시작 직후 실패했다(설치된 0.5.0 `0163b8a` 빌드에도 있는 결함).
+  인자를 넘기지 않는다(5.x는 항상 safetensors, PPO의 4.52.4는 기본값이 참).
+- `9871d8b`: 볼륨 용량 초과로 중단된 설치가 torch를 반쯤 설치된 채 남겼고(`module 'torch' has no attribute '__version__'`),
+  `uv pip sync`는 이를 설치됨으로 보아(`uv pip check`도 통과) 준비 직후 확인이 계속 실패했다. 준비할 때마다 개인 venv를
+  `uv venv --clear`로 다시 만든다(원격 `flock` 안).
+
+**운영 기록:**
+- 처음 Blackwell 시도들에서 RunPod 용량 부족(HTTP 500 "does not have the resources")으로 생성·재시작이 실패해 같은 볼륨에 새 Pod를 만들었다.
+  40 GB 볼륨이 런타임 여러 벌로 가득 차 `ls9ua5ymse`를 80 GB로 늘렸다. 새 볼륨 `cys1ne5znp`는 80 GB로 만들었다.
+- 정책이 실행 중인 Blackwell Pod와 동시에 A40을 만드는 것을 "total owned GPU count exceeds policy"로 거부했다(의도된 동작). 순서대로 실행했다.
+- 마지막 Blackwell 실행은 학습이 끝난 뒤 로그 수집 중 Claude Code가 PC 메모리 부족으로 시험 드라이버를 종료했다. Pod는 `ManagedPods.stop`으로 직접 멈췄고,
+  메모리 기록은 남은 `gpu-memory.csv`에서 계산했다. 같은 이유로 그때의 전체 테스트 실행도 끝나지 않았다(아래에서 다시 실행).
+- SSH 개인 키가 바탕화면에서 사라져, 메신저 임시 폴더(`AppData\Local\AtMessenger\temp`)에 있는 같은 이름의 키를 썼다. Pod에 넣은 공개 키와
+  같은 쌍이고 실제 인증되는 것을 확인했다(공개 키 지문 `SHA256:jTHM4Owf2rDiR9HNR12P2LbxNwk+DudZTgpP3z6HaOU`). 이 파일은 상속 권한으로 다른 계정
+  (`CodexSandboxUsers` 등)도 수정할 수 있어 Windows OpenSSH가 키를 거부한다. 이 때문에 A40 실행의 메모리 감시(Windows OpenSSH로 실행됨)가
+  아무것도 기록하지 못했다. 앱(paramiko)은 영향이 없었다. 앱 설정의 `ssh_key_file`은 여전히 바탕화면 경로를 가리킨다.
+- 정리: 공장 소유 시험 Pod 7개(위 3개와 실패한 Blackwell 시도 `36ncz2rp4rqkcu`·`cpc3fjmd36wf3f`·`2u65h3mq0i3svu`·`9w8n2eu6ur1zd2`)를 멈춘 뒤 삭제했다.
+  볼륨 `ls9ua5ymse`(EU-RO-1, 80 GB)와 `cys1ne5znp`(CA-MTL-1, 80 GB)는 사용자 결정을 기다리며 남겼다(합성 시험 결과와 런타임만 있음,
+  RunPod 네트워크 볼륨 요금으로 둘 합쳐 대략 월 $11). 다른 사람의 Pod는 쓰지 않았다.
+- 비용(추정, 정확한 금액은 RunPod 청구 내역): Blackwell Pod들 $0.57/시간로 합계 약 2–3시간, A40 $0.59/시간 약 15분, H100 $3.99/시간 약 12분.
+
+- 검증(2026-10-30, `953168a`): `uv run pytest` 2031 passed, 1 skipped(494.74초); `uv run ruff check src tests scripts` 통과.
+  그 전 실행(2815c03)에서 `tests/test_model_inputs.py`의 고정 다이제스트 2개가 실패했다. `1685eef`가 학습 설정에서 `save_safetensors`를 뺐기
+  때문이고, 그 키를 다시 넣으면 이전 다이제스트가 그대로 나오는 것을 확인한 뒤 다시 고정했다(`953168a`). 데스크톱(TypeScript·Rust)은 바뀌지 않았다.
+- 설치 프로그램 다시 빌드(`953168a`): `desktop/src-tauri/target/release/bundle/nsis/LLM Tuning Factory_0.5.0_x64-setup.exe`,
+  48,279,277 바이트, SHA-256 `18b27086335e506ea70eed8ba35ae3b2d4866c41d7692fcbdfe4b28076aaf13e`. 영수증 `dist/verify-0.5.0-acceptance.json`:
+  bridge_mode frozen, source_commit `953168a91885cce3cce260868ebbc207a325e066`, 모든 검사 true, gpu_started false.
+  이 빌드의 엔진 소스는 GPU 인수에 쓴 `9871d8b` 빌드와 모델 목록의 검증 범위만 다르다.
+
+**남은 일:**
+- 이 PC 재설치: 설치된 0.5.0(`0163b8a`)에는 위 세 결함이 있어 transformers 5 학습이 실패한다. 위 설치 프로그램으로 바꿔야 한다.
+- 볼륨의 런타임 정리: 앱 소스가 바뀔 때마다 새 런타임(5–12 GB)이 생기고 지우지 않는다(`ls9ua5ymse`에 4벌). 사용자 볼륨이 차는 원인이다.
+- 긴 probe 동안 SSH keepalive, GPU 서버(SSH) 연결의 요금은 점검이 판단하지 않는 점, 2단계(Qwen3.5·Gemma 4).
+
+# GPU 호환성 점검과 CUDA 12.8 학습 환경 (1단계) — 소프트웨어 완료, GPU 인수 완료(위 Task 16)
 
 [설계](superpowers/specs/2026-10-29-gpu-compat-runtime-design.md) · [계획](superpowers/plans/2026-10-29-gpu-compat-runtime.md) ·
 브랜치 `claude/gpu-compat-runtime` (작업 시작 기준 `96aea2e`). Task 1–13은 구현·검토를 마쳤고 Task 14(문서·전체 검증)를 2026-10-29에 실행했다.
