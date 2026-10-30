@@ -520,6 +520,7 @@ def test_install_runtime_uses_the_cu128_backend(tmp_path, monkeypatch):
     runtime.install_runtime(client, "sft", runtime.REMOTE, POD, preparation)
     assert preparation == {"started": True, "stopped": True}
     assert "--require-hashes --torch-backend cu128 " in scripts[0]
+    assert " venv --python 3.12 --clear " in scripts[0] and "--allow-existing" not in scripts[0]
 
 
 

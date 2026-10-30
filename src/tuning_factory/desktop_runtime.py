@@ -319,6 +319,8 @@ def install_runtime(client, training_stage, remote_root, pod, preparation):
         for path in [assets / profile["lock_file"], wheels[0]]:
             sftp.put(str(path), root + "/" + path.name)
     # All installs, Python downloads and caches stay below the private root.
+    # A preparation always rebuilds the private venv (--clear, under the flock): an interrupted
+    # install can leave packages that uv still reports as installed.
     script = (
         "set -eu\n"
         "command -v flock >/dev/null\n"
@@ -328,7 +330,7 @@ def install_runtime(client, training_stage, remote_root, pod, preparation):
         f"python3 -m pip install --disable-pip-version-check --no-cache-dir "
         f"--target {shlex.quote(root + '/bootstrap')} uv==0.11.23\n"
         f"export PYTHONPATH={shlex.quote(root + '/bootstrap')}\n"
-        f"python3 -m uv venv --python 3.12 --allow-existing {shlex.quote(root + '/venv')}\n"
+        f"python3 -m uv venv --python 3.12 --clear {shlex.quote(root + '/venv')}\n"
         f"python3 -m uv pip sync --python {shlex.quote(root + '/venv/bin/python')} --require-hashes "
         f"--torch-backend {backend} {shlex.quote(root + '/' + lock_name)}\n"
         f"python3 -m uv pip install --python {shlex.quote(root + '/venv/bin/python')} --no-deps "
