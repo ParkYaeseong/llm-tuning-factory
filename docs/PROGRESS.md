@@ -27,6 +27,10 @@ MLflow는 껐다. Ampere와 Hopper를 모두 시험했다.
 | A40 48 GB | 8.6 · 595.91.07 | `p7qe8lr3a0yzm8` · `cys1ne5znp`(CA-MTL-1) | 실행 승인 안에서 준비, 실행 416초 | COMPLETED(시도 1), train_loss 0.148, train_runtime 9.5초 |
 | H100 80GB HBM3 | 9.0 · 595.91.07 | `zi5ftxz6bj0q22` · `cys1ne5znp`(CA-MTL-1) | A40이 만든 환경을 그대로 사용(`ready`), 실행 238초 | COMPLETED(시도 1), train_loss 0.147, train_runtime 10.4초 |
 
+- 시험 방법: 앱 창(화면)은 조작하지 않았다. 계획 Task 16 Step 1의 화면 조작 대신, 화면이 보내는 요청 순서(환경 확인 → 데이터 등록 → 계획 →
+  제출 → 실행(`prepare_runtime`) → 작업·로그)를 시험 드라이버가 엔진에 한 줄 JSON으로 직접 보냈다. 계획 카드의 거부·주의 표시, 승인 창의 설치 안내,
+  준비 중 안내 같은 화면 동작은 `npm test`로만 확인했다. 0.5.0의 "연결 검사"(MLflow 포함)는 실행하지 않았다. 실제 앱 화면으로 처음부터 하는
+  시험이 남아 있다.
 - 세 GPU 모두 `simulation: false`, `training_success: true`, bf16 지원, 어댑터(`adapter_model.safetensors`) 저장, 런타임 torch `2.7.1+cu128`,
   transformers 5.6.0, LLaMA-Factory 0.9.5, Python 3.12.3. 한 환경이 sm_86·sm_90·sm_120에서 모두 동작했다.
 - 점검 결과: Blackwell·A40에서는 `MODEL_UNVERIFIED` 경고만(그때 검증 목록이 9.0뿐), H100에서는 항목 없음. 거부 항목 없음.
@@ -85,6 +89,7 @@ MLflow는 껐다. Ampere와 Hopper를 모두 시험했다.
   Claude Code 권한 검사가 되돌릴 수 없는 삭제로 막아 남아 있다.
 
 **남은 일:**
+- 설치된 0.5.0 앱 화면으로 처음부터 하는 시험(연결 검사, 환경 확인, 계획, 학습 시작의 설치 안내 승인, 결과 확인). 배포 안내 전에 한다.
 - 볼륨 `ls9ua5ymse`(EU-RO-1, 80 GB, 사용하는 Pod 없음) 삭제: RunPod 콘솔에서 사용자가 직접 지운다.
 - 앱의 이전 대기 작업 `76986bce`는 삭제된 Pod를 대상으로 한다. 사용자가 앱에서 취소한다.
 - 볼륨의 런타임 정리: 앱 소스가 바뀔 때마다 새 런타임(5–12 GB)이 생기고 지우지 않는다(`ls9ua5ymse`에 4벌). 사용자 볼륨이 차는 원인이다.
