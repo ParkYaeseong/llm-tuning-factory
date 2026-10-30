@@ -141,8 +141,8 @@ PPO는 격리된 실제 패키지 환경에서 CPU import/API/config 생성까�
 
 ## 비전·오디오 겸용 모델(Qwen3.5·Gemma 4)
 
-Qwen3.5와 Gemma 4는 텍스트·비전·오디오를 한 체크포인트에 담은 복합 구조입니다. 이 앱은 텍스트 데이터로만 SFT·DPO·KTO·PT를 학습합니다
-(RM은 GPU 인수 시험 결과로 정하고, PPO는 지원하지 않습니다).
+Qwen3.5와 Gemma 4는 텍스트·비전·오디오를 한 체크포인트에 담은 복합 구조입니다. 이 앱은 텍스트 데이터로만 SFT·DPO·RM·PT를 학습합니다
+(KTO는 현재 학습 엔진에서 실패해, PPO는 전용 학습 환경이 이 모델들을 몰라 지원하지 않습니다).
 
 - **동결 키**: 복합 구조에는 학습 설정에 `freeze_vision_tower: true`, `freeze_multi_modal_projector: true`,
   `freeze_language_model: false` 세 키가 들어가 비전·오디오 부분이 항상 동결됩니다. 다른 구조에는 이 키가 없습니다.

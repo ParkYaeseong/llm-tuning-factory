@@ -82,7 +82,7 @@ def test_current_qwen36_uses_its_upstream_template():
 def test_gemma4_is_discoverable_with_text_training_scope():
     service, _ = hub('gemma4')
     result = service.inspect('google/gemma-4-E2B-it')
-    assert result['supported'] and result['supported_stages'] == ['pt', 'sft', 'dpo', 'kto']
+    assert result['supported'] and result['supported_stages'] == ['pt', 'sft', 'rm', 'dpo']
 
 
 @pytest.mark.parametrize('per_layer,experts,template,moe', [(256, None, 'gemma4n', False), (0, 128, 'gemma4', True)])
@@ -98,7 +98,7 @@ def test_hub_profile_records_sizes_and_the_gemma4_template(per_layer, experts, t
     model = imported_model(profile)
     assert (model['parameters_total'], model['hidden_size'], model['num_layers'], model['parameters_b']) == (
         5123178051, 1536, 35, 5.12)
-    assert model['supported_stages'] == ['pt', 'sft', 'dpo', 'kto'] and 'oft' not in model['methods']
+    assert model['supported_stages'] == ['pt', 'sft', 'rm', 'dpo'] and 'oft' not in model['methods']
 
 
 @pytest.mark.parametrize('bad', [True, '1536', 0, -1, 10 ** 12, 1.5, [1], {'n': 1}])

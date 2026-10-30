@@ -299,8 +299,7 @@ def test_catalog_lists_qwen35_and_gemma4_with_sizes_and_text_scope():
     assert len(composite) == 19 and "Qwen/Qwen3.5-27B-Base" not in models
     assert all(not m["gated"] and not m["gpu_verified"] and m["verified_capabilities"] == []
                and 0 < m["text_parameters"] < m["parameters_total"] and m["max_length"] == 32768
-               and m["supported_stages"] == (["pt", "sft", "dpo", "kto"] if m["architecture"] == "gemma4"
-                                             else ["pt", "sft", "rm", "dpo"]) and "oft" not in m["methods"]
+               and m["supported_stages"] == ["pt", "sft", "rm", "dpo"] and "oft" not in m["methods"]
                for m in composite)
     small = models["Qwen/Qwen3.5-0.8B"]
     assert (small["template"], small["parameters_total"], small["text_parameters"], small["hidden_size"],
@@ -371,14 +370,25 @@ def test_composite_models_allow_text_stages(stage):
 
 @pytest.mark.parametrize("model,template,stage,allowed", [
     ("Qwen/Qwen3.5-35B-A3B", "qwen3_5", "rm", True), ("Qwen/Qwen3.5-35B-A3B", "qwen3_5", "kto", False),
-    ("google/gemma-4-E2B-it", "gemma4n", "kto", True), ("google/gemma-4-E2B-it", "gemma4n", "rm", False),
+    ("google/gemma-4-E2B-it", "gemma4n", "rm", True), ("google/gemma-4-31B", "gemma4", "rm", True),
+    ("google/gemma-4-E2B-it", "gemma4n", "kto", False), ("google/gemma-4-26B-A4B-it", "gemma4", "kto", False),
     ("google/gemma-4-E2B-it", "gemma4n", "ppo", False)])
 def test_stage_policy_is_per_architecture(model, template, stage, allowed):
     from tuning_factory.capabilities import compatibility
     result = compatibility({"base_model": model, "template": template, "training_stage": stage})
     assert result["valid"] is allowed
-    if model.startswith("google") and stage == "rm":
-        assert any("값 헤드" in error for error in result["errors"])
+    assert not any("값 헤드" in error for error in result["errors"])   # Gemma 4 RM passed its A40 trial
+
+
+def test_gemma4_refuses_kto_naming_the_engine_failure():
+    from tuning_factory.capabilities import compatibility
+    # A40 (LLaMA-Factory 0.9.5, transformers 5.6.0): the KTO KL batch hands Gemma 4 non-tensor multimodal inputs,
+    # AttributeError: 'bool' object has no attribute 'all' at (pixel_position_ids == -1).all(dim=-1).
+    result = compatibility({"base_model": "google/gemma-4-E2B-it", "template": "gemma4n", "training_stage": "kto"})
+    assert result["errors"] == [
+        "Gemma 4의 KTO 학습은 현재 학습 엔진(LLaMA-Factory 0.9.5·transformers 5.6.0)에서 KL 배치의 멀티모달 입력 처리 "
+        "오류로 실패하므로 지원하지 않습니다. SFT·DPO·RM·PT를 쓰세요."]
+    assert result["supported_stages"] == ["pt", "sft", "rm", "dpo"]
 
 
 def test_composite_models_allow_existing_freeze_modules():

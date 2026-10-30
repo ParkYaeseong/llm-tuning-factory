@@ -19,8 +19,8 @@ SIZE_FACTS = ("parameters_total", "parameters_b", "text_parameters", "embedding_
 COMPOSITE_STAGE_REFUSALS = {
     ("qwen3_5", "kto"): ("Qwen3.5의 KTO 학습은 현재 학습 엔진(LLaMA-Factory 0.9.5·transformers 5.6.0)에서 멀티모달 위치 "
                          "계산 오류로 실패하므로 지원하지 않습니다. SFT·DPO·RM·PT를 쓰세요."),
-    ("gemma4", "rm"): ("Gemma 4의 보상 모델(RM) 학습은 아직 GPU에서 값 헤드를 검증하지 않아 막아 두었습니다. "
-                       "SFT·DPO·KTO·PT를 쓰세요."),
+    ("gemma4", "kto"): ("Gemma 4의 KTO 학습은 현재 학습 엔진(LLaMA-Factory 0.9.5·transformers 5.6.0)에서 KL 배치의 멀티모달 "
+                        "입력 처리 오류로 실패하므로 지원하지 않습니다. SFT·DPO·RM·PT를 쓰세요."),
 }
 PPO_REFUSAL = "Qwen3.5·Gemma 4는 PPO 전용 학습 환경(transformers 4.52.4)이 지원하지 않습니다."
 # Option labels as the training screen shows them (desktop/src/components/recipe-fields.ts, freeze fields).
