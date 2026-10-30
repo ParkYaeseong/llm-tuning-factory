@@ -53,6 +53,8 @@ POST_PREPARATION_FAILED = ("학습 환경을 준비했지만 확인을 통과하
                            "상태를 확인하거나 '학습 환경 준비'를 다시 실행하세요.")
 PREPARATION_BUSY = "다른 학습 환경 준비가 이 GPU에서 진행 중입니다. 끝난 뒤 다시 시도하세요."
 PREPARE_IN_EXECUTION_RUNPOD_ONLY = "runtime preparation during execution applies to a RunPod preflight only"
+# The first import of the pinned torch/LLaMA-Factory and CUDA initialisation from a fresh venv on a network volume can take minutes.
+PROBE_TIMEOUT_SECONDS = 900
 
 
 class RuntimeMissing(RemoteCommandFailed):
@@ -227,7 +229,7 @@ def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=(
     if selected_gpu_uuids:
         argv = ["env", "CUDA_VISIBLE_DEVICES=" + ",".join(selected_gpu_uuids), *argv]
     try:
-        output = command(client, argv)
+        output = command(client, argv, timeout=PROBE_TIMEOUT_SECONDS)
     except RemoteCommandFailed:
         try:
             command(client, ["test", "-x", python])

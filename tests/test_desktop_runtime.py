@@ -298,6 +298,23 @@ def probe_command(reply, trailer=""):
     return lambda client, argv, **kw: "" if argv[0] == "sh" else "noise\nTF_PROBE " + json.dumps(reply) + trailer
 
 
+def test_check_gives_the_probe_a_long_timeout_but_not_the_prerequisites(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+
+    calls = []
+
+    def record(client, argv, **kwargs):
+        calls.append((argv, kwargs.get("timeout")))
+        return "" if argv[0] == "sh" else "TF_PROBE " + json.dumps(ready_reply(runtime))
+
+    monkeypatch.setattr(runtime, "command", record)
+    runtime.check(None)
+    assert runtime.PROBE_TIMEOUT_SECONDS >= 600
+    probe = [timeout for argv, timeout in calls if argv[0] != "sh"]
+    assert probe == [runtime.PROBE_TIMEOUT_SECONDS]
+    assert all(timeout in (None, 60) for argv, timeout in calls if argv[0] == "sh")
+
+
 def test_check_separates_an_incompatible_gpu_from_a_busy_one(monkeypatch):
     from tuning_factory import desktop_runtime as runtime
 
