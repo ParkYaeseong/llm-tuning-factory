@@ -265,7 +265,14 @@ CPU forward가 된다(2026-10-30 확인).
 - 학습 매개변수 기준 `Pt = text_parameters`(없으면 `P`). 학습 상태는 1단계 식에 `Pt`를 넣는다.
   - 전체 학습 `Pt × 14`, freeze는 학습 층 비율 × `Pt × 14`, LoRA·QLoRA·OFT는 `Pt × 0.01 × 16`.
 - 활성값은 `text_config`의 `hidden_size`·`num_layers`로 계산한다(1단계 식).
-- MoE는 `moe: true`로 표시만 한다. 모든 전문가 가중치가 GPU에 올라가므로 가중치는 전체 매개변수다.
+- MoE는 `moe: true`로 표시하고, 모든 전문가 가중치가 GPU에 올라가므로 가중치는 전체 매개변수다. 전문가 가중치는 `nn.Linear`가 아닌
+  3차원 `nn.Parameter`라 bitsandbytes 4비트가 양자화하지 못하고 bf16으로 남는다. MoE 항목은 `expert_parameters`(`SIZE_FACTS`에
+  포함, `with_catalog_sizes`가 채움)를 가지며, QLoRA 추정은 이를 임베딩처럼 bf16(2바이트)으로 센다:
+  전문가 수 × 3 × hidden_size × moe_intermediate_size × 층 수(HF config.json; 1.1 표에는 moe_intermediate_size가 없다).
+  - Qwen3.5-35B-A3B(-Base): 256 × 3 × 2048 × 512 × 40 = 32,212,254,720.
+  - Gemma 4 26B-A4B(-it): 128 × 3 × 2816 × 704 × 30 = 22,837,985,280.
+  이 값이 없으면 35B-A3B QLoRA 가중치가 약 20GiB로 추정돼 A40(46068MiB)에 맞는 것으로 판단되고 실제로는 메모리 부족이 난다.
+  반영 뒤에는 약 62GiB라 A40에서 가중치 단계에서 막힌다.
 - `DesktopService.compatibility`는 기본 목록에 없으면 설정의 `model_profile`로 만든 항목(`imported_model`)을 쓴다.
   허브 프로필이 기본 목록과 같은 저장소·같은 구조이면 기본 목록 항목(`gpu_verified`·`verified_capabilities` 포함)을
   쓴다(`capabilities.reviewed_model_entry`). 그 밖의 허브 항목도 기본 목록에 같은 저장소·구조가 있으면 없는 크기
@@ -400,6 +407,7 @@ CPU forward가 된다(2026-10-30 확인).
 - **복합 구조 LoRA 이름 규칙.** LLaMA-Factory의 이름 규칙(부분 문자열 일치, 금지 키)을 앱이 재현한다.
   meta 장치 검사와 GPU 인수의 실제 어댑터 `target_modules`를 비교해 확인한다.
 - **느린 linear attention.** fla·causal-conv1d가 없어 Qwen3.5 학습이 느리다. 9B 시간을 기록하고, 필요하면 후속으로 고정 파일에 넣는다.
+- **MoE QLoRA 메모리.** 전문가 가중치가 bf16으로 남는 점은 config 사실로 계산한 추정이며 큰 GPU에서 실측하지 않았다.
 - **빈 이미지 대조기.** 텍스트 전용 배치에 들어가는 빈 이미지·오디오 때문에 메모리·시간이 조금 늘 수 있다. GPU 인수에서 확인한다.
 - **정리의 동시성.** 네트워크 볼륨을 여러 Pod가 함께 쓰면 `flock`이 Pod 사이에서 보장되지 않을 수 있다.
   살아 있는 시도 검사가 두 번째 안전장치다. 확신이 없으면 지우지 않는다.

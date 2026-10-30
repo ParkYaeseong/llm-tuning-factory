@@ -68,7 +68,8 @@ def estimate_memory(model, config):
     {"weights_gib": weights alone, "total_gib": weights + training state + activations + overhead}.
     weights: every tensor (vision/audio and Gemma per-layer embeddings included); training state: the text model.
     QLoRA quantizes linear layers only: a model's ``embedding_parameters`` (embedding tables and an untied lm_head,
-    which bitsandbytes keeps in bf16) count at 2 bytes; without the fact every weight counts at the 4/8-bit rate."""
+    which bitsandbytes keeps in bf16) and ``expert_parameters`` (MoE experts, 3-D nn.Parameters it cannot quantize) count at
+    the bf16 rate; without the facts every weight counts at the 4/8-bit rate."""
     if not model or not (model.get("parameters_total") or model.get("parameters_b")) or not all(
             model.get(key) for key in ("hidden_size", "num_layers")):
         return None
@@ -79,7 +80,8 @@ def estimate_memory(model, config):
     hyper = config.get("hyperparameters") or {}
     unquantized = BYTES_PER_PARAMETER[hyper.get("precision", "bf16")]
     if method == "qlora":
-        embedding = min(float(model.get("embedding_parameters") or 0), parameters)
+        embedding = min(float(model.get("embedding_parameters") or 0) + float(model.get("expert_parameters") or 0),
+                        parameters)
         weights = (embedding * unquantized
                    + (parameters - embedding) * BYTES_PER_PARAMETER[int(config.get("quantization_bit", 4))])
     else:

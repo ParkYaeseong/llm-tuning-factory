@@ -116,6 +116,21 @@ def test_qlora_keeps_embedding_tables_at_bf16_and_quantizes_the_rest():
             {key: value for key, value in e2b.items() if key != "embedding_parameters"}, training(method))
 
 
+def test_qlora_keeps_moe_expert_weights_at_bf16_so_a_35b_moe_no_longer_fits_an_a40():
+    from tuning_factory.capabilities import model_catalog
+    gib = 1024 ** 3
+    moe = next(m for m in model_catalog() if m["id"] == "Qwen/Qwen3.5-35B-A3B")
+    assert moe["expert_parameters"] == 32_212_254_720
+    weights = gpu_compat.estimate_memory(moe, training("qlora"))["weights_gib"]
+    rest = moe["parameters_total"] - moe["embedding_parameters"] - moe["expert_parameters"]
+    assert weights == pytest.approx(((moe["embedding_parameters"] + moe["expert_parameters"]) * 2.0 + rest * 0.55) / gib)
+    assert weights > 0.95 * 46068 / 1024   # an A40: refused at the weights block ratio
+    without = {key: value for key, value in moe.items() if key != "expert_parameters"}
+    assert gpu_compat.estimate_memory(without, training("qlora"))["weights_gib"] < 0.95 * 46068 / 1024
+    for method in ("lora", "full", "freeze"):
+        assert gpu_compat.estimate_memory(moe, training(method)) == gpu_compat.estimate_memory(without, training(method))
+
+
 CAPS = {"torch_cuda": "12.8", "sass": SASS, "ptx": [], "bf16_min_capability": "8.0",
         "min_driver": "525.60.13", "recommended_driver": "570.26"}
 BLACKWELL = gpu_compat.parse_gpu_facts(SMI)[0]

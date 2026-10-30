@@ -14,7 +14,7 @@ STAGES = {
 }
 METHODS = ["lora", "qlora", "full", "freeze", "oft"]
 # Size facts of a model entry, under the same keys in the catalog and model_hub.imported_model.
-SIZE_FACTS = ("parameters_total", "parameters_b", "text_parameters", "embedding_parameters", "hidden_size", "num_layers",
+SIZE_FACTS = ("parameters_total", "parameters_b", "text_parameters", "embedding_parameters", "expert_parameters", "hidden_size", "num_layers",
               "moe", "tie_word_embeddings")
 COMPOSITE_STAGE_REFUSALS = {
     ("qwen3_5", "kto"): ("Qwen3.5의 KTO 학습은 현재 학습 엔진(LLaMA-Factory 0.9.5·transformers 5.6.0)에서 멀티모달 위치 "
@@ -58,6 +58,11 @@ COMPOSITE_MODELS = [
 # table of Gemma 4 E2B/E4B (template gemma4n, text_config.hidden_size_per_layer_input 256).
 COMPOSITE_VOCABULARY = {"qwen3_5": 248_320, "qwen3_5_moe": 248_320, "gemma4": 262_144}
 PER_LAYER_INPUT = 256
+# MoE expert weights are 3-D nn.Parameters, not nn.Linear, so bitsandbytes leaves them bf16 too: experts x 3 (gate, up,
+# down) x hidden_size x moe_intermediate_size x layers, from each model's HF config.json (the spec table lacks
+# moe_intermediate_size). Qwen3.5-35B-A3B: 256 experts, 512; Gemma 4 26B-A4B: 128 experts, 704.
+MOE_EXPERTS = {"Qwen/Qwen3.5-35B-A3B": (256, 512), "Qwen/Qwen3.5-35B-A3B-Base": (256, 512),
+               "google/gemma-4-26B-A4B": (128, 704), "google/gemma-4-26B-A4B-it": (128, 704)}
 
 
 def model_catalog():
@@ -97,10 +102,12 @@ def model_catalog():
         embedding = (vocabulary * hidden * (1 if tied else 2)
                      + (vocabulary * layers * PER_LAYER_INPUT if template == "gemma4n" else 0))
         for model_id in ids:
+            experts = MOE_EXPERTS.get(model_id)
             models.append({"id": model_id, "template": template, "architecture": architecture, "max_length": 32768,
                            "parameters_b": round(total / 1e9, 2), "parameters_total": total, "text_parameters": text,
                            "embedding_parameters": embedding, "hidden_size": hidden, "num_layers": layers,
                            "tie_word_embeddings": tied, "moe": moe,
+                           **({"expert_parameters": experts[0] * 3 * hidden * experts[1] * layers} if experts else {}),
                            "gated": False, "gpu_verified": False, "verified_capabilities": [],
                            "verification_scope": "text data only; vision/audio frozen; GPU verification pending",
                            "supported_stages": list(stages), "methods": list(methods)})

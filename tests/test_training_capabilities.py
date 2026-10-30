@@ -331,6 +331,18 @@ def test_composite_catalog_entries_count_the_embedding_tables_bitsandbytes_leave
     assert all("embedding_parameters" not in m for m in models.values() if m not in composite)
 
 
+def test_moe_catalog_entries_count_the_three_dimensional_expert_weights_bitsandbytes_leaves_at_bf16():
+    from tuning_factory.capabilities import model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    # experts x 3 x hidden x moe_intermediate x layers (HF config.json)
+    qwen, gemma = 256 * 3 * 2048 * 512 * 40, 128 * 3 * 2816 * 704 * 30
+    assert (qwen, gemma) == (32_212_254_720, 22_837_985_280)
+    assert {models[name]["expert_parameters"] for name in ("Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.5-35B-A3B-Base")} == {qwen}
+    assert {models[name]["expert_parameters"] for name in (
+        "google/gemma-4-26B-A4B", "google/gemma-4-26B-A4B-it")} == {gemma}
+    assert all("expert_parameters" not in m for m in models.values() if not m.get("moe"))
+
+
 QWEN35 = {"base_model": "Qwen/Qwen3.5-0.8B", "template": "qwen3_5"}
 
 
