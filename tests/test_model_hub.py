@@ -8,7 +8,7 @@ from tuning_factory.model_hub import ModelHub, ModelProfile, imported_model
 REVISION = 'a' * 40
 
 
-def hub(model_type='qwen3_5', extra=None):
+def hub(model_type='qwen3_5', extra=None, info=None):
     requests = []
     def respond(request):
         requests.append(request)
@@ -16,7 +16,7 @@ def hub(model_type='qwen3_5', extra=None):
             return httpx.Response(200, json=[{'id': 'Qwen/Qwen3.5-0.8B', 'downloads': 10,
                                              'pipeline_tag': 'image-text-to-text', 'lastModified': '2026-03-02'}])
         if '/api/models/' in request.url.path:
-            return httpx.Response(200, json={'sha': REVISION, 'gated': False})
+            return httpx.Response(200, json={'sha': REVISION, 'gated': False, **(info or {})})
         if request.url.path.endswith('tokenizer_config.json'):
             return httpx.Response(200, json={'chat_template': '<|im_start|>{{messages}}'})
         return httpx.Response(200, json={'model_type': model_type, 'text_config': {
@@ -81,7 +81,32 @@ def test_current_qwen36_uses_its_upstream_template():
 def test_gemma4_is_discoverable_with_text_training_scope():
     service, _ = hub('gemma4')
     result = service.inspect('google/gemma-4-E2B-it')
-    assert result['supported'] and result['supported_stages'] == ['sft']
+    assert result['supported'] and result['supported_stages'] == ['pt', 'sft', 'dpo', 'kto']
+
+
+@pytest.mark.parametrize('per_layer,experts,template,moe', [(256, None, 'gemma4n', False), (0, 128, 'gemma4', True)])
+def test_hub_profile_records_sizes_and_the_gemma4_template(per_layer, experts, template, moe):
+    service, _ = hub('gemma4', {'tie_word_embeddings': True, 'text_config': {
+        'max_position_embeddings': 131072, 'num_hidden_layers': 35, 'hidden_size': 1536,
+        'hidden_size_per_layer_input': per_layer, 'num_experts': experts, 'dtype': 'bfloat16'}},
+        info={'safetensors': {'total': 5123178051}})
+    profile = service.inspect('google/gemma-4-E2B-it')['profile']
+    assert profile['template'] == template
+    assert (profile['parameters_total'], profile['hidden_size'], profile['hidden_layers'], profile['moe'],
+            profile['tie_word_embeddings']) == (5123178051, 1536, 35, moe, True)
+    model = imported_model(profile)
+    assert (model['parameters_total'], model['hidden_size'], model['num_layers'], model['parameters_b']) == (
+        5123178051, 1536, 35, 5.12)
+    assert model['supported_stages'] == ['pt', 'sft', 'dpo', 'kto'] and 'oft' not in model['methods']
+
+
+def test_profiles_without_size_facts_keep_their_exact_bytes():
+    old = {'repo_id': 'Qwen/Qwen3.5-0.8B', 'revision': REVISION, 'config_sha256': 'c' * 64,
+           'architecture': 'qwen3_5', 'template': 'qwen3_5_nothink', 'max_length': 32768,
+           'context_length': 262144, 'hidden_layers': 24, 'recommended_precision': 'bfloat16', 'gated': False}
+    profile = ModelProfile.model_validate(old)
+    assert profile.model_dump() == old and profile.model_dump_json() == json.dumps(old, separators=(',', ':'))
+    assert 'parameters_total' not in imported_model(profile)
 
 
 def test_legacy_ppo_runtime_does_not_offer_a_missing_qwen3_template():

@@ -5,25 +5,31 @@ import tempfile
 from pathlib import Path
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from .registry import canonical, digest, immutable_write
 
 ALL_STAGES = ["pt", "sft", "rm", "ppo", "dpo", "kto"]
 ALL_METHODS = ["lora", "qlora", "full", "freeze", "oft"]
+# Vision(/audio) + text models trained on text only: LLaMA-Factory loads them with AutoModelForImageTextToText and the
+# app keeps their vision/audio towers and projectors frozen (training.py, target_inspection.py).
+COMPOSITE_ARCHITECTURES = frozenset({"qwen3_5", "qwen3_5_moe", "gemma4"})
+# Reward modeling waits for GPU proof of the value head; the PPO runtime (transformers 4.52.4) lacks these models.
+COMPOSITE_STAGES = [x for x in ALL_STAGES if x not in {"rm", "ppo"}]
+COMPOSITE_METHODS = ["lora", "qlora", "full", "freeze"]
 ARCHITECTURES = {
     "qwen2": ("qwen", ALL_STAGES, ALL_METHODS),
     "qwen3": ("qwen3_nothink", [x for x in ALL_STAGES if x != "ppo"], ALL_METHODS),
     "qwen3_moe": ("qwen3_nothink", [x for x in ALL_STAGES if x != "ppo"], ALL_METHODS),
     "qwen3_next": ("qwen3_nothink", [x for x in ALL_STAGES if x != "ppo"], ALL_METHODS),
-    "qwen3_5": ("qwen3_5_nothink", ["sft"], ["lora", "qlora", "full", "freeze"]),
-    "qwen3_5_moe": ("qwen3_5_nothink", ["sft"], ["lora", "qlora", "full", "freeze"]),
+    "qwen3_5": ("qwen3_5_nothink", COMPOSITE_STAGES, COMPOSITE_METHODS),
+    "qwen3_5_moe": ("qwen3_5_nothink", COMPOSITE_STAGES, COMPOSITE_METHODS),
     "llama": ("llama3", ALL_STAGES, ALL_METHODS),
     "mistral": ("mistral", ALL_STAGES, ALL_METHODS),
     "gemma2": ("gemma", ALL_STAGES, ALL_METHODS),
     "gemma3_text": ("gemma3", ALL_STAGES, ALL_METHODS),
     "gemma3": ("gemma3", ["sft"], ["lora", "qlora", "full", "freeze"]),
-    "gemma4": ("gemma4", ["sft"], ["lora", "qlora", "full", "freeze"]),
+    "gemma4": ("gemma4", COMPOSITE_STAGES, COMPOSITE_METHODS),
     "gemma4_text": ("gemma4", ["sft"], ["lora", "qlora", "full", "freeze"]),
     "deepseek_v3": ("deepseek3", [x for x in ALL_STAGES if x != "ppo"], ALL_METHODS),
     "phi3": ("phi", ALL_STAGES, ALL_METHODS),
@@ -48,6 +54,10 @@ class ModelProfile(BaseModel):
     hidden_layers: int | None = Field(default=None, ge=1, le=10000)
     recommended_precision: str | None = None
     gated: bool = False
+    parameters_total: int | None = Field(default=None, ge=1)   # safetensors total: vision/audio included
+    hidden_size: int | None = Field(default=None, ge=1, le=1_000_000)
+    moe: bool | None = None
+    tie_word_embeddings: bool | None = None
 
     @model_validator(mode="after")
     def reviewed_architecture(self):
@@ -59,19 +69,37 @@ class ModelProfile(BaseModel):
             templates.add("deepseek3")
         if self.architecture in {"qwen3_5", "qwen3_5_moe"}:
             templates.update({"qwen3_5", "qwen3_6"})
+        if self.architecture == "gemma4":
+            templates.add("gemma4n")
         if self.template not in templates:
             raise ValueError("model architecture/template combination is unsupported")
         return self
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_size_facts(self, handler):
+        # Profiles registered before these facts keep their exact bytes and digests (model-profiles/<digest>.json,
+        # graph plans): absent facts are omitted instead of dumped as null.
+        data = handler(self)
+        for key in ("parameters_total", "hidden_size", "moe", "tie_word_embeddings"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 def imported_model(profile):
     profile = profile if isinstance(profile, ModelProfile) else ModelProfile.model_validate(profile)
     _, stages, methods = ARCHITECTURES[profile.architecture]
+    sizes = {}
+    if profile.parameters_total and profile.hidden_size and profile.hidden_layers:
+        sizes = {"parameters_total": profile.parameters_total, "parameters_b": round(profile.parameters_total / 1e9, 2),
+                 "hidden_size": profile.hidden_size, "num_layers": profile.hidden_layers}
+    sizes.update({key: value for key in ("moe", "tie_word_embeddings")
+                  if (value := getattr(profile, key)) is not None})
     return {"id": profile.repo_id, "template": profile.template, "architecture": profile.architecture,
             "max_length": profile.max_length, "gated": profile.gated, "gpu_verified": False,
             "verification_scope": "HF metadata checked; this model/revision has not been GPU verified",
             "supported_stages": list(stages), "methods": list(methods), "source": "huggingface",
-            "registration": profile.model_dump(), "text_only": True}
+            "registration": profile.model_dump(), "text_only": True, **sizes}
 
 
 def register_model(root, profile):
@@ -161,17 +189,25 @@ class ModelHub:
         # Machine-readable lower-case reasons are useful to clients without exposing HTTP request details.
         reasons = [reason.replace("Unsupported", "unsupported").replace("Pre-quantized", "pre-quantized") for reason in reasons]
         text = metadata.get("text_config") or metadata
+        total = (info.get("safetensors") or {}).get("total")
+        facts = {"parameters_total": total if isinstance(total, int) and not isinstance(total, bool) and total > 0
+                 else None,
+                 "hidden_size": text.get("hidden_size"), "moe": bool(text.get("num_experts")),
+                 "tie_word_embeddings": bool(metadata.get("tie_word_embeddings",
+                                                          text.get("tie_word_embeddings", True)))}
         result = {"repo_id": model, "revision": pinned, "architecture": architecture,
                   "supported": not reasons, "reasons": reasons, "profile": None,
                   "model_revision": pinned, "tokenizer_revision": pinned, "metadata_verified": True,
                   "max_length": min(32768, text.get("max_position_embeddings") or 32768),
                   "hidden_layers": text.get("num_hidden_layers"),
-                  "recommended_precision": text.get("torch_dtype", text.get("dtype"))}
+                  "recommended_precision": text.get("torch_dtype", text.get("dtype")), **facts}
         if reasons:
             return result
         template = ARCHITECTURES[architecture][0]
         if architecture in {"qwen3_5", "qwen3_5_moe"} and "qwen3.6" in model.lower():
             template = "qwen3_6"
+        if architecture == "gemma4" and (text.get("hidden_size_per_layer_input") or 0) > 0:
+            template = "gemma4n"   # Gemma 4 E2B/E4B (per-layer inputs 256); 26B-A4B and 31B have 0
         tokenizer = self.get(f"https://huggingface.co/{model}/resolve/{pinned}/tokenizer_config.json", optional=True)
         chat = (tokenizer.json().get("chat_template") or "") if tokenizer else ""
         if architecture in {"qwen2", "llama"} and isinstance(chat, str) and "<｜User｜>" in chat:
@@ -180,7 +216,7 @@ class ModelHub:
                                architecture=architecture, template=template, max_length=result["max_length"],
                                context_length=text.get("max_position_embeddings") or 32768,
                                hidden_layers=result["hidden_layers"], recommended_precision=result["recommended_precision"],
-                               gated=bool(info.get("gated")))
+                               gated=bool(info.get("gated")), **facts)
         return {**result, "template": template, "profile": profile.model_dump(),
                 "supported_stages": imported_model(profile)["supported_stages"],
                 "note": "Metadata only; model weights download at approved training. GPU verification pending."}
