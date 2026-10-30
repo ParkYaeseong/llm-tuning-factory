@@ -63,7 +63,6 @@ from .target_inspection import (
     COMPOSITE_MODEL_TYPES,
     inspect_linear_modules,
     inspect_target_modules,
-    unloaded_prefixes,
     verify_inspected_targets,
 )
 
@@ -478,6 +477,13 @@ def _load_fp32(torch, transformers, path: Path, device):
     return model.to(device).eval()
 
 
+def _unloaded_patterns(model) -> tuple[str, ...]:
+    """The checkpoint keys a loaded transformers model declares it never loads (``_keys_to_ignore_on_load_unexpected``,
+    regexes transformers matches with ``re.search``): Qwen3.5's ``mtp.*`` head, the key/value projections and norms
+    of Gemma 4's KV-shared layers. Never loaded, so never saved; the text models declare none."""
+    return tuple(getattr(model, "_keys_to_ignore_on_load_unexpected", None) or ())
+
+
 def _logits(torch, model, ids, device):
     with torch.no_grad():
         tokens = torch.tensor([list(ids)], dtype=torch.long, device=device)
@@ -794,7 +800,9 @@ def materialize_model(input: StagedLoad, output: Path, *, policy: str = POLICY_F
     base_path = Path(load.base.path).absolute()
     adapter_path = Path(load.adapter.path).absolute()
     checked += _torch_scan(torch, base_path, adapter=False)
-    model = peft.PeftModel.from_pretrained(_load_fp32(torch, transformers, base_path, target), str(adapter_path))
+    loaded = _load_fp32(torch, transformers, base_path, target)
+    unloaded = _unloaded_patterns(loaded)
+    model = peft.PeftModel.from_pretrained(loaded, str(adapter_path))
     model.eval()
     ids = _probe_ids(transformers, base_path, model.get_input_embeddings().weight.shape[0], probe_ids)
     before = _logits(torch, model, ids, target)
@@ -813,7 +821,7 @@ def materialize_model(input: StagedLoad, output: Path, *, policy: str = POLICY_F
         if local_tokenizer_fingerprint(payload) != load.base.tokenizer_fingerprint:
             raise ValueError("tokenizer snapshot fingerprint mismatch")
         checked += _torch_scan(torch, payload, adapter=False)
-        delta_error = _verify_materialized(torch, load.adapter, base_path, payload, tolerance)
+        delta_error = _verify_materialized(torch, load.adapter, base_path, payload, tolerance, unloaded)
         reloaded = _load_fp32(torch, transformers, payload, target)
         ok, logits_error = _close(torch, _logits(torch, reloaded, ids, target), before,
                                   tolerance.logits_atol, tolerance.logits_rtol)
@@ -830,10 +838,11 @@ def materialize_model(input: StagedLoad, output: Path, *, policy: str = POLICY_F
                               finite_tensors_checked=checked, output_files=files)
 
 
-def _verify_materialized(torch, adapter: LocalModel, base_path: Path, payload: Path, tolerance) -> float:
-    skipped = unloaded_prefixes(_read_json(base_path / "config.json"))   # never loaded, so never saved
+def _verify_materialized(torch, adapter: LocalModel, base_path: Path, payload: Path, tolerance,
+                         unloaded: Sequence[str] = ()) -> float:
+    never = re.compile("|".join(f"({pattern})" for pattern in unloaded)) if unloaded else None   # transformers' rule
     base = {name: tensor for name, tensor in _load_tensors(base_path, adapter=False).items()
-            if not name.startswith(skipped)}
+            if never is None or never.search(name) is None}
     result = _load_tensors(payload, adapter=False)
     if set(base) != set(result):
         raise ValueError(DELTA_FAILED)

@@ -1771,7 +1771,7 @@ def test_snapshot_copy_carries_processor_files_without_changing_the_tokenizer_fi
 
 
 def test_resolved_lora_targets_follow_llamafactory_for_text_and_composite_models():
-    from tuning_factory.target_inspection import resolved_lora_targets, target_leaves, unloaded_prefixes
+    from tuning_factory.target_inspection import resolved_lora_targets, target_leaves
     text = ["model.layers.0.self_attn.q_proj", "model.layers.0.self_attn.v_proj", "model.layers.0.mlp.up_proj"]
     assert resolved_lora_targets("all", text) == ("q_proj", "up_proj", "v_proj")
     assert resolved_lora_targets("q_proj,v_proj", text) == ("q_proj", "v_proj")
@@ -1780,7 +1780,6 @@ def test_resolved_lora_targets_follow_llamafactory_for_text_and_composite_models
     assert resolved_lora_targets("q_proj,v_proj", composite) == tuple(composite[1:])
     assert resolved_lora_targets("all", composite) == tuple(sorted(composite))
     assert target_leaves(composite) == ("in_proj_qkv", "q_proj", "v_proj") == target_leaves(("in_proj_qkv", "q_proj", "v_proj"))
-    assert unloaded_prefixes({"model_type": "qwen3_5"}) == ("mtp.",) and unloaded_prefixes({"model_type": "qwen2"}) == ()
 
 
 COMPOSITE_INVENTORY = {
@@ -1850,13 +1849,17 @@ def test_merge_lineage_compares_composite_adapter_targets_by_leaf_name():
     ref = ref_for(adapter)
     lineage = _MergeLineage({}, {}, {(ref.artifact_id, ref.inventory_sha256): NS(descriptor=adapter)})
     recipe = NS(hyperparameters=NS(lora_target="q_proj,v_proj"))
-    assert lineage.candidates(ref) == frozenset({(adapter.effective_base.model_dump_json(),
-                                                  lineage._targets(recipe, adapter.effective_base))})
+    assert lineage._targets(recipe, adapter.effective_base) == ("q_proj", "v_proj")
+    assert lineage.candidates(ref) == frozenset({(adapter.effective_base.model_dump_json(), ("q_proj", "v_proj"))})
 
 
 class FakeLinear:
     def __init__(self, inputs, outputs):
         self.in_features, self.out_features = inputs, outputs
+
+
+class FakeClippableLinear:
+    """Gemma 4's vision wrapper: "Linear" in its class name, but no in_features (its inner .linear has them)."""
 
 
 def test_composite_inspection_uses_the_image_text_class_and_keeps_the_language_model(tmp_path, monkeypatch):
@@ -1865,6 +1868,7 @@ def test_composite_inspection_uses_the_image_text_class_and_keeps_the_language_m
 
     from tuning_factory import runtime_profiles, target_inspection
     modules = [("model.visual.blocks.0.attn.qkv", FakeLinear(16, 48)),
+               ("model.vision_tower.encoder.layers.0.self_attn.q_proj", FakeClippableLinear()),
                ("model.visual.merger.linear_fc1", FakeLinear(64, 64)),
                ("model.language_model.layers.0.linear_attn.in_proj_qkv", FakeLinear(32, 96)),
                ("model.language_model.layers.3.self_attn.q_proj", FakeLinear(32, 64)), ("lm_head", FakeLinear(32, 64))]
@@ -1905,16 +1909,21 @@ def test_materialized_key_set_ignores_only_the_checkpoint_tensors_transformers_n
     monkeypatch.setattr(model_ops, "_expected_deltas", lambda *args: {})
     torch = NS(float32="f32", equal=lambda left, right: left == right)
     adapter = NS(descriptor=NS(adapter=NS(alpha=4, rank=2)))
-    base.mkdir()
-    (base / "config.json").write_text('{"model_type": "qwen3_5"}')
-    assert model_ops._verify_materialized(torch, adapter, base, payload, None) == 0.0
-    (base / "config.json").write_text('{"model_type": "qwen2"}')      # a text model keeps the exact key set
-    with pytest.raises(ValueError, match=model_ops.DELTA_FAILED):
-        model_ops._verify_materialized(torch, adapter, base, payload, None)
-    (base / "config.json").write_text('{"model_type": "qwen3_5"}')
-    stored[payload] = {"model.language_model.norm.weight": Tensor(1), "mtp.fc.weight": Tensor(2)}
+    shared = "model.language_model.layers.2.self_attn.k_proj"      # Gemma 4: a KV-shared layer's projection
+    stored[base].update({shared + ".weight": Tensor(3), "model.language_model.layers.12.self_attn.k_proj.weight": Tensor(4)})
+    stored[payload]["model.language_model.layers.12.self_attn.k_proj.weight"] = Tensor(4)
+    # The loaded model's declarations (transformers' _keys_to_ignore_on_load_unexpected), matched with re.search.
+    qwen = NS(_keys_to_ignore_on_load_unexpected=[r"^mtp.*"])
+    gemma = NS(_keys_to_ignore_on_load_unexpected=[shared])
+    assert model_ops._unloaded_patterns(qwen) == (r"^mtp.*",) and model_ops._unloaded_patterns(NS()) == ()
+    unloaded = model_ops._unloaded_patterns(qwen) + model_ops._unloaded_patterns(gemma)
+    assert model_ops._verify_materialized(torch, adapter, base, payload, None, unloaded) == 0.0
+    for partial in ((), model_ops._unloaded_patterns(qwen), model_ops._unloaded_patterns(gemma)):
+        with pytest.raises(ValueError, match=model_ops.DELTA_FAILED):   # a text model keeps the exact key set
+            model_ops._verify_materialized(torch, adapter, base, payload, None, partial)
+    stored[payload]["mtp.fc.weight"] = Tensor(2)
     with pytest.raises(ValueError, match=model_ops.DELTA_FAILED):     # never loaded, so never saved
-        model_ops._verify_materialized(torch, adapter, base, payload, None)
+        model_ops._verify_materialized(torch, adapter, base, payload, None, unloaded)
 
 
 def test_condensed_peft_suffixes_compare_by_leaf_and_select_the_same_modules():
@@ -1936,3 +1945,49 @@ def test_condensed_peft_suffixes_compare_by_leaf_and_select_the_same_modules():
     module.check_continuation_targets("all", recorded, evidence)
     with pytest.raises(ValueError, match="resolved adapter targets differ from requested targets"):
         module.check_continuation_targets("q_proj,v_proj", recorded, evidence)
+
+
+def gemma4_config(layers=3, shared=1):
+    return {"model_type": "gemma4", "text_config": {"model_type": "gemma4_text", "num_hidden_layers": layers,
+                                                    "num_kv_shared_layers": shared}}
+
+
+def test_unloaded_modules_follow_gemma4_kv_sharing_like_transformers():
+    # Gemma4TextModel drops layers.{i}.self_attn.{k_proj,v_proj,k_norm,v_norm} for i >= layers - shared > 0.
+    from tuning_factory.target_inspection import unloaded_modules
+    assert unloaded_modules(gemma4_config()) == frozenset(
+        f"model.language_model.layers.2.self_attn.{name}" for name in ("k_proj", "v_proj", "k_norm", "v_norm"))
+    assert len(unloaded_modules(gemma4_config(35, 20))) == 4 * 20
+    for config in (gemma4_config(3, 0), gemma4_config(3, 3), {"model_type": "gemma4", "text_config": {}},
+                   {"model_type": "qwen3_5", "text_config": {"num_hidden_layers": 4, "num_kv_shared_layers": 1}},
+                   {"model_type": "qwen2", "num_hidden_layers": 2}):
+        assert unloaded_modules(config) == frozenset()
+    for config in (gemma4_config("3", 1), gemma4_config(3, True), {"model_type": "gemma4", "text_config": [3]}):
+        with pytest.raises(ValueError, match="invalid Gemma 4 text_config"):
+            unloaded_modules(config)
+
+
+def test_verify_inspected_targets_drops_kv_shared_modules_of_a_raw_gemma4_checkpoint_given_its_config():
+    from tuning_factory.graph_planner import ModelTargetEvidence, TargetModuleEvidence
+    module = api()
+    inventory = {"model.language_model.embed_tokens.weight": (32, 16), "model.vision_tower.q_proj.linear.weight": (16, 8)}
+    for index in range(3):
+        for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            inventory[f"model.language_model.layers.{index}.self_attn.{name}.weight"] = (16, 16)
+        inventory[f"model.language_model.layers.{index}.self_attn.k_norm.weight"] = (16,)
+    descriptor = full_descriptor(inventory)        # raw checkpoint: layer 2 still holds its k/v tensors
+    ref = ref_for(descriptor)
+
+    def evidence(skip=()):
+        names = sorted(name[:-len(".weight")] for name in inventory if "_proj." in name and "vision" not in name)
+        return ModelTargetEvidence(base=ref, modules=tuple(
+            TargetModuleEvidence(name=name, input_dimension=16, output_dimension=16) for name in names
+            if name not in skip))
+
+    meta = evidence(skip=("model.language_model.layers.2.self_attn.k_proj", "model.language_model.layers.2.self_attn.v_proj"))
+    assert module.verify_inspected_targets(meta, descriptor, ref, config=gemma4_config()) == meta
+    with pytest.raises(ValueError, match="inspected target modules differ from verified tensor inventory"):
+        module.verify_inspected_targets(meta, descriptor, ref)
+    with pytest.raises(ValueError, match="inspected base dimensions differ from verified tensor inventory"):
+        module.verify_inspected_targets(evidence(), descriptor, ref, config=gemma4_config())   # phantom modules
+    assert module.verify_inspected_targets(evidence(), descriptor, ref) == evidence()   # no sharing: as before

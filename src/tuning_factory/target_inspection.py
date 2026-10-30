@@ -20,12 +20,27 @@ if TYPE_CHECKING:
 # their full names; every one of them lies under the language model.
 COMPOSITE_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_moe", "gemma4"})
 LANGUAGE_MODEL_PREFIX = "model.language_model."
-# Checkpoint tensors transformers 5.6.0 never loads for these model types (Qwen3.5's multi-token-prediction head).
-UNLOADED_PREFIXES = {"qwen3_5": ("mtp.",), "qwen3_5_moe": ("mtp.",)}
+KV_SHARED_MODULES = ("k_proj", "v_proj", "k_norm", "v_norm")
 
 
-def unloaded_prefixes(config) -> tuple:
-    return UNLOADED_PREFIXES.get(config.get("model_type"), ())
+def unloaded_modules(config) -> frozenset:
+    """Language-model modules a checkpoint may hold that transformers 5.6.0 never builds for ``config``, so never
+    loads or saves: the key/value projections and norms of Gemma 4's KV-shared layers (layer ``i`` shares when
+    ``i >= num_hidden_layers - num_kv_shared_layers > 0``; ``Gemma4TextModel._keys_to_ignore_on_load_unexpected``).
+    Gemma 4 E2B keeps them for 20 of its 35 layers. The other tensors transformers skips (Qwen3.5's ``mtp.*``, the
+    vision and audio towers) lie outside the language model, which is all composite target evidence reads."""
+    if not isinstance(config, dict) or config.get("model_type") != "gemma4":
+        return frozenset()
+    text = config.get("text_config", {})
+    if not isinstance(text, dict):
+        raise ValueError("invalid Gemma 4 text_config")
+    layers, shared = text.get("num_hidden_layers"), text.get("num_kv_shared_layers") or 0
+    if type(shared) is not int or shared < 0 or (shared and (type(layers) is not int or layers < 1)):
+        raise ValueError("invalid Gemma 4 text_config")
+    if not shared or layers - shared <= 0:
+        return frozenset()
+    return frozenset(f"{LANGUAGE_MODEL_PREFIX}layers.{index}.self_attn.{name}"
+                     for index in range(layers - shared, layers) for name in KV_SHARED_MODULES)
 
 
 def is_composite_inventory(names) -> bool:
@@ -56,8 +71,13 @@ def _not_a_target(name: str) -> bool:
             or any("embed" in part or "norm" in part for part in module.split(".")))
 
 
-def verify_inspected_targets(evidence, descriptor: ModelDescriptor, ref: ModelArtifactRef) -> ModelTargetEvidence:
-    """Accept inspector evidence only if it is the complete linear inventory of the verified full model."""
+def verify_inspected_targets(evidence, descriptor: ModelDescriptor, ref: ModelArtifactRef, *,
+                             config=None) -> ModelTargetEvidence:
+    """Accept inspector evidence only if it is the complete linear inventory of the verified full model.
+
+    ``config`` (the model's config.json) is needed only for an inventory that still holds raw checkpoint tensors
+    transformers never loads (``unloaded_modules``); the app's full-model artifacts are transformers saves, which
+    never do."""
     from .graph_planner import ModelTargetEvidence
     evidence = ModelTargetEvidence.model_validate(evidence)
     descriptor = ModelDescriptor.model_validate(descriptor)
@@ -68,7 +88,9 @@ def verify_inspected_targets(evidence, descriptor: ModelDescriptor, ref: ModelAr
         raise ValueError("inspected target descriptor differs from the artifact identity")
     if descriptor.storage_kind != "full_model":
         raise ValueError("inspected targets require a full-model inventory")
-    weights = {tensor.name: tensor.shape for tensor in descriptor.tensors}
+    unloaded = unloaded_modules(config) if config is not None else frozenset()
+    weights = {tensor.name: tensor.shape for tensor in descriptor.tensors
+               if tensor.name.rsplit(".", 1)[0] not in unloaded}
     for module in evidence.modules:
         if weights.get(module.name + ".weight") != (module.output_dimension, module.input_dimension):
             raise ValueError("inspected base dimensions differ from verified tensor inventory")
@@ -76,7 +98,8 @@ def verify_inspected_targets(evidence, descriptor: ModelDescriptor, ref: ModelAr
                 if name.endswith(".weight") and len(shape) == 2 and not _not_a_target(name)}
     names = {module.name for module in evidence.modules}
     # Composite models: vision/audio towers, projectors and mtp.* are never adapted. Evidence that lists modules
-    # outside the language model (gemma3's, inspected through its text-and-vision class) keeps the full rule.
+    # outside the language model (gemma3's, inspected through its text-and-vision class) keeps the full rule; for
+    # qwen3_5/gemma4 such evidence can only be refused, since their inspector reports language-model modules only.
     if is_composite_inventory(weights) and all(name.startswith(LANGUAGE_MODEL_PREFIX) for name in names):
         expected = {name for name in expected if name.startswith(LANGUAGE_MODEL_PREFIX)}
     if expected != names:
@@ -116,7 +139,8 @@ def inspect_linear_modules(model_dir: Path) -> tuple:
         excluded.add("output_layer")
     elif config.model_type == "internlm2":
         excluded.add("output")
-    # The prefix comes first: Gemma 4's vision Gemma4ClippableLinear wrappers have no in_features.
+    # Composite models keep language-model modules only, which also skips Gemma 4's vision Gemma4ClippableLinear
+    # wrappers: "Linear" is in their class name, but only their inner .linear has in_features.
     modules = sorted(
         (TargetModuleEvidence(name=name, input_dimension=module.in_features, output_dimension=module.out_features)
          for name, module in model.named_modules()
