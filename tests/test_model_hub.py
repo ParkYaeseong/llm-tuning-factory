@@ -100,6 +100,43 @@ def test_hub_profile_records_sizes_and_the_gemma4_template(per_layer, experts, t
     assert model['supported_stages'] == ['pt', 'sft', 'dpo', 'kto'] and 'oft' not in model['methods']
 
 
+@pytest.mark.parametrize('bad', [True, '1536', 0, -1, 10 ** 12, 1.5, [1], {'n': 1}])
+def test_one_malformed_hub_fact_never_blocks_the_import(bad):
+    service, _ = hub('gemma4', {'tie_word_embeddings': 'yes', 'text_config': {
+        'max_position_embeddings': bad, 'num_hidden_layers': bad, 'hidden_size': bad,
+        'hidden_size_per_layer_input': bad, 'num_experts': bad, 'tie_word_embeddings': False, 'dtype': 'bfloat16'}},
+        info={'safetensors': {'total': 'many'}})
+    result = service.inspect('google/gemma-4-E2B-it')
+    assert result['supported'] and result['profile'] is not None
+    profile = result['profile']
+    assert (profile['template'], profile['max_length'], profile['context_length'], profile['hidden_layers'],
+            profile['moe'], profile['tie_word_embeddings']) == ('gemma4', 32768, 32768, None, False, False)
+    assert 'parameters_total' not in profile and 'hidden_size' not in profile
+    assert result['max_length'] == 32768 and result['hidden_layers'] is None and result['hidden_size'] is None
+
+
+@pytest.mark.parametrize('safetensors', ['5123178051', [5123178051], 5123178051, None])
+def test_a_safetensors_summary_that_is_not_an_object_is_ignored(safetensors):
+    service, _ = hub(info={'safetensors': safetensors})
+    profile = service.inspect('Qwen/Qwen3.5-0.8B')['profile']
+    assert 'parameters_total' not in profile and profile['hidden_layers'] == 24
+
+
+@pytest.mark.parametrize('total', [True, '873438784', 0, -5, 1.5, 10 ** 16])
+def test_hub_parameter_totals_must_be_positive_integers(total):
+    service, _ = hub(info={'safetensors': {'total': total}})
+    assert 'parameters_total' not in service.inspect('Qwen/Qwen3.5-0.8B')['profile']
+
+
+def test_imported_model_lists_sizes_only_with_a_parameter_total():
+    profile = ModelProfile(repo_id='someone/model', revision=REVISION, config_sha256='c' * 64, architecture='qwen3_5',
+                           template='qwen3_5_nothink', hidden_layers=24, hidden_size=1024, moe=True,
+                           tie_word_embeddings=True)
+    model = imported_model(profile)
+    assert not {'parameters_total', 'parameters_b', 'hidden_size', 'num_layers', 'text_parameters'} & set(model)
+    assert (model['moe'], model['tie_word_embeddings']) == (True, True)
+
+
 def test_profiles_without_size_facts_keep_their_exact_bytes():
     old = {'repo_id': 'Qwen/Qwen3.5-0.8B', 'revision': REVISION, 'config_sha256': 'c' * 64,
            'architecture': 'qwen3_5', 'template': 'qwen3_5_nothink', 'max_length': 32768,

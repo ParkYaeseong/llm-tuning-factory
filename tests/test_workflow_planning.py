@@ -1309,7 +1309,9 @@ class KeyErrorHub(FakeHub):
 
 
 @pytest.mark.parametrize("config, error", [
-    (canonical({"model_type": "qwen2", "max_position_embeddings": "big"}), "TypeError"),
+    # A malformed optional fact (max_position_embeddings "big") is now dropped by the inspection; an unhashable
+    # model_type still raises inside it.
+    (canonical({"model_type": ["qwen2"]}), "TypeError"),
     (canonical([{"model_type": "qwen2"}]), "AttributeError"),
     (None, "KeyError")])
 def test_snapshot_errors_stay_in_the_issue_envelope(tmp_path, monkeypatch, config, error):

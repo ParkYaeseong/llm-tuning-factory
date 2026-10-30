@@ -36,6 +36,20 @@ ARCHITECTURES = {
 }
 
 
+def _count(value, high, low=1):
+    """A config or API count within [low, high]; anything else (bool, text, float, out of range) is unknown (None),
+    so one malformed optional fact never blocks an import."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high else None
+
+
+def _tied(metadata, text):
+    """tie_word_embeddings: the top level, then text_config (booleans only), then transformers' default (True)."""
+    for level in (metadata, text):
+        if isinstance(level.get("tie_word_embeddings"), bool):
+            return level["tie_word_embeddings"]
+    return True
+
+
 def repository_id(value):
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}/[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", value):
         raise ValueError("Hugging Face repository must be an exact publisher/model ID")
@@ -188,25 +202,24 @@ class ModelHub:
             reasons.append("Pre-quantized inference checkpoints require a separate training adapter; choose original weights")
         # Machine-readable lower-case reasons are useful to clients without exposing HTTP request details.
         reasons = [reason.replace("Unsupported", "unsupported").replace("Pre-quantized", "pre-quantized") for reason in reasons]
-        text = metadata.get("text_config") or metadata
-        total = (info.get("safetensors") or {}).get("total")
-        facts = {"parameters_total": total if isinstance(total, int) and not isinstance(total, bool) and total > 0
-                 else None,
-                 "hidden_size": text.get("hidden_size"), "moe": bool(text.get("num_experts")),
-                 "tie_word_embeddings": bool(metadata.get("tie_word_embeddings",
-                                                          text.get("tie_word_embeddings", True)))}
+        text = metadata.get("text_config") if isinstance(metadata.get("text_config"), dict) else metadata
+        summary = info.get("safetensors")
+        facts = {"parameters_total": _count(summary.get("total"), 10 ** 15) if isinstance(summary, dict) else None,
+                 "hidden_size": _count(text.get("hidden_size"), 1_000_000),
+                 "moe": _count(text.get("num_experts"), 1_000_000) is not None,
+                 "tie_word_embeddings": _tied(metadata, text)}
+        positions = _count(text.get("max_position_embeddings"), 10_000_000, low=64) or 32768
         result = {"repo_id": model, "revision": pinned, "architecture": architecture,
                   "supported": not reasons, "reasons": reasons, "profile": None,
                   "model_revision": pinned, "tokenizer_revision": pinned, "metadata_verified": True,
-                  "max_length": min(32768, text.get("max_position_embeddings") or 32768),
-                  "hidden_layers": text.get("num_hidden_layers"),
+                  "max_length": min(32768, positions), "hidden_layers": _count(text.get("num_hidden_layers"), 10000),
                   "recommended_precision": text.get("torch_dtype", text.get("dtype")), **facts}
         if reasons:
             return result
         template = ARCHITECTURES[architecture][0]
         if architecture in {"qwen3_5", "qwen3_5_moe"} and "qwen3.6" in model.lower():
             template = "qwen3_6"
-        if architecture == "gemma4" and (text.get("hidden_size_per_layer_input") or 0) > 0:
+        if architecture == "gemma4" and _count(text.get("hidden_size_per_layer_input"), 1_000_000):
             template = "gemma4n"   # Gemma 4 E2B/E4B (per-layer inputs 256); 26B-A4B and 31B have 0
         tokenizer = self.get(f"https://huggingface.co/{model}/resolve/{pinned}/tokenizer_config.json", optional=True)
         chat = (tokenizer.json().get("chat_template") or "") if tokenizer else ""
@@ -214,7 +227,7 @@ class ModelHub:
             template = "deepseek3"
         profile = ModelProfile(repo_id=model, revision=pinned, config_sha256=digest(response.content),
                                architecture=architecture, template=template, max_length=result["max_length"],
-                               context_length=text.get("max_position_embeddings") or 32768,
+                               context_length=positions,
                                hidden_layers=result["hidden_layers"], recommended_precision=result["recommended_precision"],
                                gated=bool(info.get("gated")), **facts)
         return {**result, "template": template, "profile": profile.model_dump(),
