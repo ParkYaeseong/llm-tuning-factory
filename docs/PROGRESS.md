@@ -1,3 +1,13 @@
+# 2단계 GPU 인수 시험(A40) — 승인 범위, 2026-10-30
+
+사용자 지시(2026-10-30): "2단계 및 후속 과제도 내 허락 받지 않고 계속 다 테스트해가면서 구현해줘". 이에 따른 유료 시험 범위:
+
+- 공장 소유 Pod만 만든다(`ManagedPods`, 정책: GPU 1개, 실행당 $5, 최대 4시간, 다이제스트 고정 이미지). A40 1대, CA-MTL-1, 시간당 $0.59.
+  볼륨 `cys1ne5znp`(80 GB)를 쓴다. 같은 볼륨의 사용자 Pod `amdva0lurw9rv1`은 EXITED로 두고 건드리지 않는다.
+- 데이터는 결정적으로 만든 합성 데이터(32행)만 쓰고 MLflow는 끈다. 엔진은 `claude/phase2-models`에서 빌드한 `dist/factory-bridge.exe`.
+- 사례: Qwen3.5-0.8B SFT LoRA(평가 포함)·QLoRA·DPO·KTO·PT·full·freeze, gemma-4-E2B-it SFT LoRA, Qwen3.5-9B SFT LoRA, RM 시험(앱 밖),
+  0.8B 어댑터의 대상·확정 확인. 끝나면 Pod를 멈추고 EXITED를 확인한다. 드라이버는 저장소 밖 `%TEMP%\gpu_accept\run_phase2.py`.
+
 # Qwen3.5·Gemma 4 텍스트 학습 (2단계) — Task 13–14 대상 규칙·병합·확정과 CPU 수치 검증, 2026-10-30
 
 [설계](superpowers/specs/2026-10-30-phase2-latest-models-design.md) · [계획](superpowers/plans/2026-10-30-phase2-latest-models.md) ·
