@@ -17,7 +17,9 @@ The evidence follows exactly the full-model artifact rule of ``target_inspection
 are not plain 2D weights are refused, never guessed: only reviewed dense text architectures are inspected, every
 tensor must sit under the causal LM's own names (``model.`` or ``lm_head.``, the ``base_model_prefix`` of all of
 them), and any tensor of three or more dimensions, any expert tensor, any quantized storage, a zero dimension or no
-target weight at all refuses the root. The evidence is
+target weight at all refuses the root. Composite models (``qwen3_5``, ``gemma4``) contribute only their language
+model (``model.language_model.``, ``lm_head.``): vision and audio towers, projectors and ``mtp.*`` are ignored, and
+the hybrid linear attention's 3D ``conv1d`` kernel (never a target) is allowed. The evidence is
 stored immutably beside the root index (``workflow_planning.save_root_targets``); ``graph_plan`` passes it as
 ``ExecutionChoices.base_targets``, which lifts D15 for that root.
 
@@ -45,7 +47,7 @@ from .desktop_workflows import (
 from .graph_planner import ModelTargetEvidence, TargetModuleEvidence
 from .model_artifacts import HFRootRef, TensorMetadata, _json, _relative, header_tensors
 from .registry import canonical, digest
-from .target_inspection import _not_a_target
+from .target_inspection import LANGUAGE_MODEL_PREFIX, _not_a_target, is_composite_inventory
 from .workflow_planning import (
     HF_CONNECTION,
     HF_ORIGIN,
@@ -72,7 +74,11 @@ MAX_REDIRECTS = 5
 # own module name (phi3's fused qkv_proj and gate_up_proj are such layers). Mixture-of-experts, hybrid
 # linear-attention, multimodal and MLA architectures are refused: the pinned runtime fuses or renames their
 # checkpoint tensors at load, so their headers do not give the module inventory.
-HEADER_TARGET_ARCHITECTURES = frozenset({"qwen2", "qwen3", "llama", "mistral", "gemma2", "gemma3_text", "phi3"})
+# Composite models: only their language model (vision, audio, projectors and mtp.* are frozen or unloaded); hybrid
+# linear attention keeps its 3-D conv1d kernel, which is never a target. Their MoE variants stay refused (fused 3-D
+# experts).
+HEADER_TARGET_ARCHITECTURES = frozenset({"qwen2", "qwen3", "llama", "mistral", "gemma2", "gemma3_text", "phi3",
+                                         "qwen3_5", "gemma4"})
 FLOAT_DTYPES = frozenset({"F16", "BF16", "F32", "F64"})
 QUANTIZED_SUFFIXES = (".qweight", ".weight_packed")       # packed storage beside or instead of ``.weight``
 # The names a causal LM's checkpoint uses at runtime: transformers 5.6 adds ``model.`` to a bare ``XModel`` save
@@ -265,8 +271,12 @@ def target_evidence(root: HFRootRef, tensors) -> ModelTargetEvidence:
     modules are not plain 2D floating-point weights."""
     unsupported = _Refused("architecture_unsupported", ARCHITECTURE_UNSUPPORTED)
     modules = []
+    composite = is_composite_inventory(tensor.name for tensor in tensors)
     for tensor in tensors:
-        if (not tensor.name.startswith(CAUSAL_LM_PREFIXES) or len(tensor.shape) >= 3
+        if composite and not tensor.name.startswith((LANGUAGE_MODEL_PREFIX, "lm_head.")):
+            continue
+        kernel = composite and len(tensor.shape) == 3 and tensor.name.endswith(".linear_attn.conv1d.weight")
+        if (not tensor.name.startswith(CAUSAL_LM_PREFIXES) or (len(tensor.shape) >= 3 and not kernel)
                 or "experts" in tensor.name.split(".") or tensor.name.endswith(QUANTIZED_SUFFIXES)):
             raise unsupported
         if tensor.name.endswith(".weight") and len(tensor.shape) == 2 and not _not_a_target(tensor.name):

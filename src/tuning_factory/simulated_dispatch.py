@@ -95,6 +95,7 @@ from .operation_runner import (
 from .operations import EvaluateOperation, MaterializeOperation, MergeOperation, TrainOperation
 from .registry import canonical, digest, file_digest
 from .runtime_profiles import operation_profile
+from .target_inspection import resolved_lora_targets
 from .training import OFT_UNFREEZABLE, CanceledError, LlamaFactoryBackend
 from .worker_protocol import COMMAND, OperationResult, WorkerRequest
 
@@ -423,10 +424,11 @@ class SimulatedWorker:
             if evidence is None:
                 raise ValueError(TARGETS_REQUIRED.format(kind=operation.kind))
             targets = tuple(sorted(verifier.verify(model_input.policy.adapter).adapter.target_modules))
-        elif config.hyperparameters.lora_target == "all":   # LLaMA-Factory expands to every inspected Linear module
-            if evidence is None:
-                raise ValueError(TARGETS_REQUIRED.format(kind=operation.kind))
-            targets = tuple(sorted({item.name.rsplit(".", 1)[-1] for item in evidence.modules}))
+        elif evidence is not None:   # LLaMA-Factory: leaf names, or full language-model names for composite models
+            targets = resolved_lora_targets(config.hyperparameters.lora_target,
+                                            [item.name for item in evidence.modules])
+        elif config.hyperparameters.lora_target == "all":
+            raise ValueError(TARGETS_REQUIRED.format(kind=operation.kind))
         else:
             targets = tuple(sorted(config.hyperparameters.lora_target.split(",")))
         if evidence is None:
@@ -437,7 +439,8 @@ class SimulatedWorker:
 
         modules = tuple((item.name, item.input_dimension, item.output_dimension)
                         for item in sorted(evidence.modules, key=lambda item: item.name) if targeted(item.name))
-        if any(not any(name == target or name.endswith("." + target) for name, _, _ in modules) for target in targets):
+        if not modules or any(not any(name == target or name.endswith("." + target) for name, _, _ in modules)
+                              for target in targets):
             raise ValueError("simulated adapter target is absent from the inspected base modules")
         return targets, modules
 

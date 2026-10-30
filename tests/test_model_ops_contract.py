@@ -1768,3 +1768,87 @@ def test_snapshot_copy_carries_processor_files_without_changing_the_tokenizer_fi
         "video_preprocessor_config.json"]
     (source / "processor_config.json").unlink()
     assert tokenizer_fingerprint(source) == before
+
+
+def test_resolved_lora_targets_follow_llamafactory_for_text_and_composite_models():
+    from tuning_factory.target_inspection import resolved_lora_targets, target_leaves, unloaded_prefixes
+    text = ["model.layers.0.self_attn.q_proj", "model.layers.0.self_attn.v_proj", "model.layers.0.mlp.up_proj"]
+    assert resolved_lora_targets("all", text) == ("q_proj", "up_proj", "v_proj")
+    assert resolved_lora_targets("q_proj,v_proj", text) == ("q_proj", "v_proj")
+    composite = ["model.language_model.layers.0.linear_attn.in_proj_qkv",
+                 "model.language_model.layers.3.self_attn.q_proj", "model.language_model.layers.3.self_attn.v_proj"]
+    assert resolved_lora_targets("q_proj,v_proj", composite) == tuple(composite[1:])
+    assert resolved_lora_targets("all", composite) == tuple(sorted(composite))
+    assert target_leaves(composite) == ("in_proj_qkv", "q_proj", "v_proj") == target_leaves(("in_proj_qkv", "q_proj", "v_proj"))
+    assert unloaded_prefixes({"model_type": "qwen3_5"}) == ("mtp.",) and unloaded_prefixes({"model_type": "qwen2"}) == ()
+
+
+COMPOSITE_INVENTORY = {
+    "model.language_model.embed_tokens.weight": (32, 16), "model.language_model.norm.weight": (16,),
+    "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": (48, 16),
+    "model.language_model.layers.0.linear_attn.conv1d.weight": (48, 1, 4),
+    "model.language_model.layers.3.self_attn.q_proj.weight": (32, 16),
+    "model.language_model.layers.3.self_attn.v_proj.weight": (8, 16),
+    "model.visual.blocks.0.attn.qkv.weight": (24, 8), "model.visual.merger.linear_fc1.weight": (16, 16),
+    "mtp.fc.weight": (16, 32), "lm_head.weight": (32, 16)}
+
+
+def test_composite_inventories_verify_language_model_evidence_and_keep_the_full_rule_otherwise():
+    from tuning_factory.graph_planner import ModelTargetEvidence, TargetModuleEvidence
+    module = api()
+    descriptor = full_descriptor(COMPOSITE_INVENTORY)
+    ref = ref_for(descriptor)
+
+    def evidence(*names):
+        return ModelTargetEvidence(base=ref, modules=tuple(
+            TargetModuleEvidence(name=name, input_dimension=COMPOSITE_INVENTORY[name + ".weight"][1],
+                                 output_dimension=COMPOSITE_INVENTORY[name + ".weight"][0]) for name in names))
+
+    language = ("model.language_model.layers.0.linear_attn.in_proj_qkv",
+                "model.language_model.layers.3.self_attn.q_proj", "model.language_model.layers.3.self_attn.v_proj")
+    assert module.verify_inspected_targets(evidence(*language), descriptor, ref).modules == evidence(*language).modules
+    # gemma3's inspector evidence lists its vision tower too: the complete inventory is still accepted.
+    everything = (*language, "model.visual.blocks.0.attn.qkv", "model.visual.merger.linear_fc1", "mtp.fc")
+    assert module.verify_inspected_targets(evidence(*everything), descriptor, ref) == evidence(*everything)
+    for partial in (language[1:], (*language, "model.visual.blocks.0.attn.qkv")):
+        with pytest.raises(ValueError, match="inspected target modules differ from verified tensor inventory"):
+            module.verify_inspected_targets(evidence(*partial), descriptor, ref)
+
+
+def test_simulated_composite_adapters_record_full_language_model_names():
+    from types import SimpleNamespace as NS
+
+    from tuning_factory.simulated_dispatch import SimulatedWorker
+    evidence = NS(modules=tuple(NS(name=name, input_dimension=16, output_dimension=out) for name, out in (
+        ("model.language_model.layers.0.linear_attn.in_proj_qkv", 48),
+        ("model.language_model.layers.3.self_attn.q_proj", 32), ("model.language_model.layers.3.self_attn.v_proj", 8))))
+
+    def operation(lora_target):
+        return NS(kind="train", model_input=NS(initialization="new_adapter"),
+                  config=NS(hyperparameters=NS(lora_target=lora_target)))
+
+    targets, modules = SimulatedWorker._adapter_modules(operation("q_proj,v_proj"), evidence, None)
+    assert targets == ("model.language_model.layers.3.self_attn.q_proj",
+                       "model.language_model.layers.3.self_attn.v_proj")
+    assert modules == (("model.language_model.layers.3.self_attn.q_proj", 16, 32),
+                       ("model.language_model.layers.3.self_attn.v_proj", 16, 8))
+    assert SimulatedWorker._adapter_modules(operation("all"), evidence, None)[0] == tuple(
+        sorted(item.name for item in evidence.modules))
+    linear_only = NS(modules=evidence.modules[:1])   # no q_proj/v_proj anywhere: nothing would be adapted
+    with pytest.raises(ValueError, match="simulated adapter target is absent from the inspected base modules"):
+        SimulatedWorker._adapter_modules(operation("q_proj,v_proj"), linear_only, None)
+
+
+def test_merge_lineage_compares_composite_adapter_targets_by_leaf_name():
+    from types import SimpleNamespace as NS
+
+    from tuning_factory.graph_planner import _MergeLineage
+    adapter = lora_descriptor(targets=("model.language_model.layers.3.self_attn.q_proj",
+                                       "model.language_model.layers.3.self_attn.v_proj"),
+                              modules=("model.language_model.layers.3.self_attn.q_proj",
+                                       "model.language_model.layers.3.self_attn.v_proj"))
+    ref = ref_for(adapter)
+    lineage = _MergeLineage({}, {}, {(ref.artifact_id, ref.inventory_sha256): NS(descriptor=adapter)})
+    recipe = NS(hyperparameters=NS(lora_target="q_proj,v_proj"))
+    assert lineage.candidates(ref) == frozenset({(adapter.effective_base.model_dump_json(),
+                                                  lineage._targets(recipe, adapter.effective_base))})

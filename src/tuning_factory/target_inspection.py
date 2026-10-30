@@ -15,6 +15,37 @@ from .registry import canonical, digest
 if TYPE_CHECKING:
     from .graph_planner import ModelTargetEvidence
 
+# Composite (vision/audio + text) model types the app trains on text only. LLaMA-Factory 0.9.5 loads them with
+# AutoModelForImageTextToText, keeps the vision/audio towers and projectors frozen and records the adapted modules by
+# their full names; every one of them lies under the language model.
+COMPOSITE_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_moe", "gemma4"})
+LANGUAGE_MODEL_PREFIX = "model.language_model."
+# Checkpoint tensors transformers 5.6.0 never loads for these model types (Qwen3.5's multi-token-prediction head).
+UNLOADED_PREFIXES = {"qwen3_5": ("mtp.",), "qwen3_5_moe": ("mtp.",)}
+
+
+def unloaded_prefixes(config) -> tuple:
+    return UNLOADED_PREFIXES.get(config.get("model_type"), ())
+
+
+def is_composite_inventory(names) -> bool:
+    return any(name.startswith(LANGUAGE_MODEL_PREFIX) for name in names)
+
+
+def target_leaves(targets) -> tuple:
+    """The leaf names of adapter targets: how planned and recorded target sets are compared."""
+    return tuple(sorted({target.rsplit(".", 1)[-1] for target in targets}))
+
+
+def resolved_lora_targets(lora_target: str, module_names) -> tuple:
+    """The ``target_modules`` LLaMA-Factory 0.9.5 writes for ``lora_target`` over a base's inspected Linear modules:
+    leaf names for text models, full language-model module names for composite models (``patch_target_modules``)."""
+    names = tuple(module_names)
+    wanted = set(target_leaves(names)) if lora_target == "all" else set(lora_target.split(","))
+    if not is_composite_inventory(names):
+        return tuple(sorted(wanted))
+    return tuple(sorted(name for name in names if name.rsplit(".", 1)[-1] in wanted))
+
 
 def _not_a_target(name: str) -> bool:
     module = name[:-len(".weight")]
@@ -40,7 +71,12 @@ def verify_inspected_targets(evidence, descriptor: ModelDescriptor, ref: ModelAr
             raise ValueError("inspected base dimensions differ from verified tensor inventory")
     expected = {name[:-len(".weight")] for name, shape in weights.items()
                 if name.endswith(".weight") and len(shape) == 2 and not _not_a_target(name)}
-    if expected != {module.name for module in evidence.modules}:
+    names = {module.name for module in evidence.modules}
+    # Composite models: vision/audio towers, projectors and mtp.* are never adapted. Evidence that lists modules
+    # outside the language model (gemma3's, inspected through its text-and-vision class) keeps the full rule.
+    if is_composite_inventory(weights) and all(name.startswith(LANGUAGE_MODEL_PREFIX) for name in names):
+        expected = {name for name in expected if name.startswith(LANGUAGE_MODEL_PREFIX)}
+    if expected != names:
         raise ValueError("inspected target modules differ from verified tensor inventory")
     return evidence
 
