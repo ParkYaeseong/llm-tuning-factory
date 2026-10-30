@@ -1566,3 +1566,14 @@ def test_cli_server_runtime_exit_code_follows_readiness(tmp_path, monkeypatch, r
     result = CliRunner().invoke(cli.app, ["--state-dir", str(tmp_path / "state"), "server-runtime", str(path)])
     assert result.exit_code == code, result.output
     assert json.loads(result.stdout)["ready"] is ready
+
+
+@pytest.mark.parametrize("saved,price", [
+    ({"server_total_hourly_cost_usd": "1.5"}, 1.5), ({"server_total_hourly_cost_usd": " 0 "}, 0.0),
+    ({"server_total_hourly_cost_usd": ""}, None), ({"server_total_hourly_cost_usd": "abc"}, None),
+    ({"server_total_hourly_cost_usd": "-1"}, None), ({"server_total_hourly_cost_usd": "nan"}, None),
+    ({"server_ssh_host": "gpu.example"}, None), ({"total_hourly_cost_usd": 2}, 2.0),
+    ({"total_hourly_cost_usd": True}, None)])
+def test_server_hourly_cost_reads_only_the_saved_price_offline(saved, price):
+    from tuning_factory.gpu_servers import server_hourly_cost
+    assert server_hourly_cost({"provider": "ssh_server", **saved}) == {"hourly_cost_usd": price}

@@ -6,6 +6,7 @@ contain keys, key paths, arbitrary commands, or provider-shaped stand-ins.
 import csv
 import io
 import json
+import math
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -113,6 +114,21 @@ def server_settings(settings):
     if isinstance(values.get("total_hourly_cost_usd"), str) and not values["total_hourly_cost_usd"].strip():
         raise ValueError("explicit operator hourly cost required; enter 0 for internal cost")
     return SSHServerSettings.model_validate(values)
+
+
+def server_hourly_cost(settings):
+    """Offline {"hourly_cost_usd": float | None} of the saved server price; never raises (None = unknown).
+
+    Only the price field is read, so an unrelated invalid field (host, key, pin) is not reported as a price problem."""
+    native = any(key.startswith("server_") for key in settings)
+    value = settings.get("server_total_hourly_cost_usd" if native else "total_hourly_cost_usd")
+    if isinstance(value, str):
+        value = value.strip() or None
+    try:
+        price = None if value is None or isinstance(value, bool) else float(value)
+    except (TypeError, ValueError):
+        price = None
+    return {"hourly_cost_usd": price if price is not None and math.isfinite(price) and price >= 0 else None}
 
 
 class GPUDevice(StrictModel):

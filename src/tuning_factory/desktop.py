@@ -161,10 +161,15 @@ class DesktopService:
     def compatibility(self, config, observation, stage):
         """gpu_compat findings for one job config; catalog sizes feed the memory estimate."""
         from .gpu_compat import evaluate
+        from .gpu_servers import server_hourly_cost
         from .runtime_profiles import runtime_capabilities
         profile = engine_profile(config.get("training_stage", "sft"))["profile"]
         model = next((item for item in model_catalog() if item["id"] == config.get("base_model")), None)
-        return evaluate(config, observation, runtime_capabilities(profile), model, stage=stage)
+        try:
+            server = server_hourly_cost(self.settings) if self.is_server() else None
+        except ValueError:   # an unsupported provider is reported by the connection screen, not by this judgement
+            server = None
+        return evaluate(config, observation, runtime_capabilities(profile), model, stage=stage, server=server)
 
     def plan_compatibility(self, config):
         """Offline: the plan judges the last stored GPU observation of the saved destination."""
@@ -421,11 +426,16 @@ class DesktopService:
             receipt = None
             if server:
                 from .desktop_runtime import plan_server_destination
-                # Offline refusals first; the price check needs the observed server facts below.
+                from .gpu_compat import refusal
+                # Offline refusals first; the observed server facts are checked again below.
                 for dataset in filter(None, (manifest["dataset"], manifest.get("validation_dataset"))):
                     self.factory.policy.check(config, dataset)
                     if not dataset.get("export_allowed"):
                         raise ValueError("dataset export has not been authorized in registry")
+                # Price and other offline blocks in Korean before the read-only server observation opens SSH.
+                message = refusal(self.compatibility(manifest["config"], None, "execute"))
+                if message:
+                    raise ValueError(message)
                 # Read-only observation; the receipt freezes the approved destination for this job.
                 receipt = plan_server_destination(self.settings, manifest)
             facts = receipt.facts if receipt else None

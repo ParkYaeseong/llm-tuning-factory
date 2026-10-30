@@ -102,16 +102,33 @@ GPU_FACTS_UNKNOWN = ("GPU 정보를 읽지 못해 세대·드라이버·메모�
                      "학습 직전 환경 검사가 대신 확인합니다.")
 POD_FACTS_UNKNOWN = "RunPod에서 Pod의 GPU 종류·개수를 확인하지 못했습니다. 잠시 후 '환경 확인'을 다시 누르세요."
 PRICE_UNKNOWN = "RunPod에서 Pod의 현재 시간당 요금을 확인하지 못했습니다. 잠시 후 다시 시도하세요."
+SERVER_PRICE_UNKNOWN = ("GPU 서버의 시간당 비용이 비어 있거나 올바르지 않습니다. 연결 설정에서 0 이상의 숫자를 입력하세요"
+                        "(내부 서버는 0).")
 
 
 def _finding(level, code, message):
     return {"level": level, "code": code, "message": message}
 
 
-def evaluate(config, observation, capabilities, model, *, stage, now=None):
+def _price_findings(price, resource, *, allow_zero, unknown):
+    """PRICE_UNKNOWN or PRICE_OVER_BUDGET for one destination's hourly price against the job's per-GPU budget x GPUs.
+    A server may cost 0 (internal hardware); a RunPod price of 0 means the API gave no price."""
+    if (isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price) or price < 0
+            or (price == 0 and not allow_zero)):
+        return [_finding("block", "PRICE_UNKNOWN", unknown)]
+    limit = float(resource.get("hourly_cost_usd", 0)) * int(resource.get("gpu_count", 1))
+    if price > limit:
+        return [_finding("block", "PRICE_OVER_BUDGET",
+                         f"현재 시간당 요금 ${price:.3f}가 학습 설정의 한도 ${limit:.3f}를 넘습니다.")]
+    return []
+
+
+def evaluate(config, observation, capabilities, model, *, stage, now=None, server=None):
     """Block/warn findings for one job config against one observed destination.
 
-    ``stage`` is "plan" (a stored observation; missing or stale facts are reported) or "execute" (live facts)."""
+    ``stage`` is "plan" (a stored observation; missing or stale facts are reported) or "execute" (live facts).
+    ``server`` is ``{"hourly_cost_usd": float | None}`` for an SSH server destination (judged even without an
+    observation)."""
     if stage not in {"plan", "execute"}:
         raise ValueError("unsupported compatibility stage")
     findings = []
@@ -119,6 +136,9 @@ def evaluate(config, observation, capabilities, model, *, stage, now=None):
         findings.append(_finding("warn", "MEMORY_UNKNOWN", MEMORY_UNKNOWN))
     if model is None or not model.get("gpu_verified"):
         findings.append(_finding("warn", "MODEL_UNVERIFIED", MODEL_UNVERIFIED))
+    if server is not None:
+        findings += _price_findings(server.get("hourly_cost_usd"), config.get("resource_profile") or {},
+                                    allow_zero=True, unknown=SERVER_PRICE_UNKNOWN)
     if observation is None:
         if stage == "plan":
             findings.append(_finding("warn", "OBSERVATION_MISSING", OBSERVATION_MISSING))
@@ -177,15 +197,7 @@ def evaluate(config, observation, capabilities, model, *, stage, now=None):
             findings.append(_finding("block", "GPU_COUNT_MISMATCH",
                                      f"학습 설정의 GPU 수({count})가 연결된 GPU 수({observed_count})와 다릅니다."))
     if pod is not None:
-        price = pod.get("hourly_cost_usd")
-        if (isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price)
-                or price <= 0):
-            findings.append(_finding("block", "PRICE_UNKNOWN", PRICE_UNKNOWN))
-        else:
-            limit = float(resource.get("hourly_cost_usd", 0)) * int(resource.get("gpu_count", 1))
-            if price > limit:
-                findings.append(_finding("block", "PRICE_OVER_BUDGET",
-                                         f"현재 시간당 요금 ${price:.3f}가 학습 설정의 한도 ${limit:.3f}를 넘습니다."))
+        findings += _price_findings(pod.get("hourly_cost_usd"), resource, allow_zero=False, unknown=PRICE_UNKNOWN)
     if gpu is not None and model is not None:
         estimate = estimate_memory(model, config)
         vram = gpu["memory_mib"] / 1024

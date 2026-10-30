@@ -244,3 +244,17 @@ def test_memory_messages_name_their_thresholds():
     tight["hyperparameters"].update(cutoff_len=8192, per_device_train_batch_size=4)
     findings = gpu_compat.evaluate(tight, observed(), CAPS, qwen7, stage="execute")
     assert "의 90%를 넘어 부족할 수 있습니다" in next(i for i in findings if i["code"] == "MEMORY_TIGHT")["message"]
+
+
+@pytest.mark.parametrize("price,code", [(0.6, None), (0, None), (0.61, "PRICE_OVER_BUDGET"), (None, "PRICE_UNKNOWN"),
+                                        (float("nan"), "PRICE_UNKNOWN"), (-1, "PRICE_UNKNOWN"), (True, "PRICE_UNKNOWN")])
+def test_a_server_price_is_judged_like_a_pod_price_but_zero_is_allowed(price, code):
+    for observation in (observed(pod=None), None):   # judged before the missing-observation return
+        findings = gpu_compat.evaluate(job(), observation, CAPS, QWEN05, stage="execute",
+                                       server={"hourly_cost_usd": price})
+        assert {item["code"] for item in findings if item["level"] == "block"} == ({code} if code else set())
+
+
+def test_an_unknown_server_price_points_to_the_connection_settings():
+    findings = gpu_compat.evaluate(job(), None, CAPS, QWEN05, stage="plan", server={"hourly_cost_usd": None})
+    assert gpu_compat.SERVER_PRICE_UNKNOWN in gpu_compat.refusal(findings)

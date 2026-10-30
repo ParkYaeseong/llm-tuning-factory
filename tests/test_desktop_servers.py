@@ -199,6 +199,18 @@ def test_submit_runs_offline_refusals_before_observing_the_server(tmp_path, monk
     assert app.dispatch("jobs", {}) == []
 
 
+def test_a_server_price_over_the_job_budget_is_refused_in_korean_before_ssh(tmp_path, monkeypatch):
+    offline(monkeypatch)
+    app = desktop.DesktopService(tmp_path, native(server_total_hourly_cost_usd="1.5"))
+    config = zero_cost_config(app)
+    findings = app.dispatch("plan", {"config": config})["compatibility"]["findings"]
+    assert ("block", "PRICE_OVER_BUDGET") in {(item["level"], item["code"]) for item in findings}
+    planned, _ = app.server_destination()
+    with pytest.raises(ValueError, match=r"^실행할 수 없습니다\. 현재 시간당 요금 \$1\.500"):
+        app.dispatch("submit", {"approved": True, "config": config, "destination_sha256": planned})
+    assert app.dispatch("jobs", {}) == []
+
+
 def sidecar_error(tmp_path, monkeypatch, capsys, settings_value, error):
     """Run desktop.main() over stdin/stdout with a dispatch that raises the given exception."""
     import io
