@@ -129,7 +129,8 @@ def test_import_registration_persists_only_checked_metadata(tmp_path, monkeypatc
                                               'config_sha256': inspected['profile']['config_sha256']})
     assert registered['model']['id'] == 'Qwen/Qwen3.5-0.8B'
     loaded = DesktopService(tmp_path).dispatch('catalog', {})['models']
-    assert any(item['id'] == 'Qwen/Qwen3.5-0.8B' for item in loaded)
+    entry = next(item for item in loaded if item['id'] == 'Qwen/Qwen3.5-0.8B')
+    assert entry.get('source') != 'huggingface' and entry['template'] == 'qwen3_5_nothink'
     assert 'secret' not in json.dumps(list((tmp_path / 'model-profiles').glob('*.json')), default=str)
 
 

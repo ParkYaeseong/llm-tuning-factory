@@ -5,7 +5,7 @@ Keep these rules independent of credentials and infrastructure discovery.
 """
 from copy import deepcopy
 
-from .model_hub import ModelProfile, imported_model
+from .model_hub import ARCHITECTURES, ModelProfile, imported_model
 
 STAGES = {
     "pt": ("Pre-training", "text"), "sft": ("Supervised fine-tuning", "instruction"),
@@ -13,6 +13,30 @@ STAGES = {
     "dpo": ("DPO / ORPO / SimPO", "preference"), "kto": ("KTO", "kto"),
 }
 METHODS = ["lora", "qlora", "full", "freeze", "oft"]
+# Qwen3.5 and Gemma 4 (vision/audio + text, trained on text only). Per row: repositories, architecture, template,
+# safetensors total (vision/audio included), language model + lm_head parameters (from the safetensors headers),
+# text_config hidden_size and num_hidden_layers, tied embeddings, MoE. Read 2026-10-30.
+COMPOSITE_MODELS = [
+    (("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-0.8B-Base"), "qwen3_5", "qwen3_5_nothink",
+     873_438_784, 752_393_024, 1024, 24, True, False),
+    (("Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-2B-Base"), "qwen3_5", "qwen3_5_nothink",
+     2_274_069_824, 1_881_825_088, 2048, 24, True, False),
+    (("Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-4B-Base"), "qwen3_5", "qwen3_5_nothink",
+     4_659_865_088, 4_205_751_296, 2560, 32, True, False),
+    (("Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-9B-Base"), "qwen3_5", "qwen3_5_nothink",
+     9_653_104_368, 8_953_803_264, 4096, 32, False, False),
+    (("Qwen/Qwen3.5-27B",), "qwen3_5", "qwen3_5_nothink", 27_781_427_952, 26_895_998_464, 5120, 64, False, False),
+    (("Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.5-35B-A3B-Base"), "qwen3_5_moe", "qwen3_5_nothink",
+     35_951_822_704, 34_660_610_688, 2048, 40, False, True),
+    (("google/gemma-4-E2B-it", "google/gemma-4-E2B"), "gemma4", "gemma4n",
+     5_123_178_051, 4_647_449_891, 1536, 35, True, False),
+    (("google/gemma-4-E4B-it", "google/gemma-4-E4B"), "gemma4", "gemma4n",
+     7_996_156_490, 7_518_069_034, 2560, 42, True, False),
+    (("google/gemma-4-26B-A4B-it", "google/gemma-4-26B-A4B"), "gemma4", "gemma4",
+     25_805_936_206, 25_233_141_790, 2816, 30, True, True),
+    (("google/gemma-4-31B-it", "google/gemma-4-31B"), "gemma4", "gemma4",
+     31_273_088_876, 30_697_345_340, 5376, 60, True, False),
+]
 
 
 def model_catalog():
@@ -46,6 +70,15 @@ def model_catalog():
                                                   "synthetic A40, H100, RTX PRO 4000 Blackwell"
                                                   if model_id == "Qwen/Qwen2.5-0.5B-Instruct"
                                                   else "architecture profile; GPU verification pending")})
+    for ids, architecture, template, total, text, hidden, layers, tied, moe in COMPOSITE_MODELS:
+        _, stages, methods = ARCHITECTURES[architecture]
+        for model_id in ids:
+            models.append({"id": model_id, "template": template, "architecture": architecture, "max_length": 32768,
+                           "parameters_b": round(total / 1e9, 2), "parameters_total": total, "text_parameters": text,
+                           "hidden_size": hidden, "num_layers": layers, "tie_word_embeddings": tied, "moe": moe,
+                           "gated": False, "gpu_verified": False, "verified_capabilities": [],
+                           "verification_scope": "text data only; vision/audio frozen; GPU verification pending",
+                           "supported_stages": list(stages), "methods": list(methods)})
     return models
 
 

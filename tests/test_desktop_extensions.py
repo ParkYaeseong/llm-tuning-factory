@@ -81,6 +81,17 @@ def test_model_revision_rejects_architecture_mismatch(monkeypatch, tmp_path):
         DesktopService(tmp_path).dispatch('model_revision', {'model': 'Qwen/Qwen2.5-0.5B-Instruct'})
 
 
+def test_model_revision_reads_the_text_config_of_a_composite_model(monkeypatch, tmp_path):
+    import httpx
+    def response(url, **kwargs):
+        payload = {'sha': 'a' * 40} if '/api/models/' in url else {'model_type': 'qwen3_5', 'text_config': {
+            'max_position_embeddings': 262144, 'num_hidden_layers': 24, 'dtype': 'bfloat16'}}
+        return httpx.Response(200, json=payload, request=httpx.Request('GET', url))
+    monkeypatch.setattr(httpx, 'get', response)
+    result = DesktopService(tmp_path).dispatch('model_revision', {'model': 'Qwen/Qwen3.5-0.8B'})
+    assert (result['template'], result['max_length'], result['hidden_layers']) == ('qwen3_5_nothink', 32768, 24)
+
+
 def test_reward_metrics_require_matching_validation_provenance(tmp_path):
     from tuning_factory.config import AIConfig
     from tuning_factory.runner import Factory

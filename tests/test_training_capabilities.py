@@ -290,3 +290,23 @@ def test_catalog_lists_the_verified_gpu_generations():
     assert "0.5.0" in qwen["verification_scope"] and "A40" in qwen["verification_scope"]
     assert all(model["verified_capabilities"] == [] for name, model in models.items()
                if name != "Qwen/Qwen2.5-0.5B-Instruct")
+
+
+def test_catalog_lists_qwen35_and_gemma4_with_sizes_and_text_scope():
+    from tuning_factory.capabilities import model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    composite = [m for m in models.values() if m["architecture"] in {"qwen3_5", "qwen3_5_moe", "gemma4"}]
+    assert len(composite) == 19 and "Qwen/Qwen3.5-27B-Base" not in models
+    assert all(not m["gated"] and not m["gpu_verified"] and m["verified_capabilities"] == []
+               and 0 < m["text_parameters"] < m["parameters_total"] and m["max_length"] == 32768
+               and m["supported_stages"] == ["pt", "sft", "dpo", "kto"] and "oft" not in m["methods"]
+               for m in composite)
+    small = models["Qwen/Qwen3.5-0.8B"]
+    assert (small["template"], small["parameters_total"], small["text_parameters"], small["hidden_size"],
+            small["num_layers"], small["tie_word_embeddings"], small["moe"]) == (
+        "qwen3_5_nothink", 873_438_784, 752_393_024, 1024, 24, True, False)
+    assert models["Qwen/Qwen3.5-35B-A3B-Base"]["architecture"] == "qwen3_5_moe" and models["Qwen/Qwen3.5-35B-A3B"]["moe"]
+    assert not models["Qwen/Qwen3.5-9B"]["tie_word_embeddings"]
+    assert {models["google/gemma-4-" + n]["template"] for n in ("E2B", "E2B-it", "E4B", "E4B-it")} == {"gemma4n"}
+    assert {models["google/gemma-4-" + n]["template"] for n in ("26B-A4B", "26B-A4B-it", "31B", "31B-it")} == {"gemma4"}
+    assert models["google/gemma-4-26B-A4B-it"]["moe"] and models["google/gemma-4-31B"]["parameters_b"] == 31.27

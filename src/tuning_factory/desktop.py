@@ -265,8 +265,9 @@ class DesktopService:
             profiles = [json.loads(p.read_bytes()) for p in sorted((self.root / "profiles").glob("*.json"))]
             datasets = [json.loads(p.read_bytes()) for p in sorted(
                 (self.factory.registry.root / "datasets").glob("*/*.json"))]
+            # A reviewed catalog entry wins over a hub registration of the same repository.
             models = {model["id"]: model for model in model_catalog()}
-            models.update({model["id"]: model for model in registered_models(self.root)})
+            models.update({model["id"]: model for model in registered_models(self.root) if model["id"] not in models})
             return {"templates": templates, "profiles": profiles, "datasets": datasets,
                     "models": list(models.values()), "training_stages": training_stages()}
         if action == "model_search":
@@ -325,11 +326,12 @@ class DesktopService:
             metadata = response.json()
             if metadata.get("model_type") != profile["architecture"]:
                 raise ValueError("model architecture differs from the reviewed compatibility profile")
+            text = metadata.get("text_config") or metadata   # composite configs nest the text model
             return {"model_revision": revision, "tokenizer_revision": revision,
                     "template": profile["template"], "architecture": profile["architecture"],
-                    "max_length": min(profile["max_length"], metadata.get("max_position_embeddings") or profile["max_length"]),
+                    "max_length": min(profile["max_length"], text.get("max_position_embeddings") or profile["max_length"]),
                     "recommended_precision": metadata.get("torch_dtype", metadata.get("dtype")),
-                    "hidden_layers": metadata.get("num_hidden_layers"), "metadata_verified": True}
+                    "hidden_layers": text.get("num_hidden_layers"), "metadata_verified": True}
         if action == "save_profile":
             config = AIConfig.model_validate(data["config"])
             directory = self.root / "profiles"
