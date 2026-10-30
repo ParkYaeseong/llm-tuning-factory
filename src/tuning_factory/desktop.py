@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from .capabilities import compatibility, model_catalog, model_entry, training_stages
+from .capabilities import compatibility, model_catalog, reviewed_model_entry, training_stages
 from .config import AIConfig
 from .connections import ENV_SETTINGS
 from .desktop_inspection import inspect_dataset, parameter_changes, parse_progress
@@ -159,12 +159,13 @@ class DesktopService:
             raise ValueError("GPU 서버 연결을 선택한 경우에만 사용할 수 있습니다.")
 
     def compatibility(self, config, observation, stage):
-        """gpu_compat findings for one job config; the model entry's sizes feed the memory estimate."""
+        """gpu_compat findings for one job config; the model entry's sizes feed the memory estimate. A reviewed catalog
+        entry wins over a hub registration of the same repository and architecture (spec 4.5)."""
         from .gpu_compat import evaluate
         from .gpu_servers import server_hourly_cost
         from .runtime_profiles import runtime_capabilities
         profile = engine_profile(config.get("training_stage", "sft"))["profile"]
-        model = model_entry(config)
+        model = reviewed_model_entry(config)
         try:
             server = server_hourly_cost(self.settings) if self.is_server() else None
         except ValueError:   # an unsupported provider is reported by the connection screen, not by this judgement

@@ -94,12 +94,18 @@ def model_catalog():
     return models
 
 
-def with_catalog_sizes(entry):
-    """A hub model entry whose profile was registered before profiles carried size facts: the facts it lacks come
-    from the reviewed catalog entry of the same repository and architecture, so its memory can still be estimated."""
+def _reviewed(entry):
+    """The reviewed catalog entry of the same repository and architecture as a model entry, or None."""
     reviewed = next((m for m in model_catalog() if m["id"] == entry["id"]), None)
-    if (reviewed is None or reviewed["architecture"] != entry["architecture"]
-            or all(entry.get(key) for key in ("parameters_b", "hidden_size", "num_layers"))):
+    return reviewed if reviewed is not None and reviewed["architecture"] == entry["architecture"] else None
+
+
+def with_catalog_sizes(entry):
+    """A hub model entry with every size fact it lacks taken from the reviewed catalog entry of the same repository
+    and architecture (profiles registered before they carried sizes; text parameters, which the hub never gives);
+    the entry's own values win."""
+    reviewed = _reviewed(entry)
+    if reviewed is None:
         return entry
     return {**{key: reviewed[key] for key in SIZE_FACTS if key in reviewed}, **entry}
 
@@ -114,6 +120,16 @@ def model_entry(config):
         except ValueError:
             return None
     return next((m for m in model_catalog() if m["id"] == config.get("base_model")), None)
+
+
+def reviewed_model_entry(config):
+    """The model entry the GPU compatibility check judges: the reviewed catalog entry (with its GPU verification) when
+    the config's registered profile names a catalog repository with the same architecture, else model_entry(config).
+    """
+    entry = model_entry(config)
+    if entry is not None and entry.get("source") == "huggingface":
+        return _reviewed(entry) or entry
+    return entry
 
 
 def training_stages():

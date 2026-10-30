@@ -243,6 +243,9 @@ CPU forward가 된다(2026-10-30 확인).
 - 활성값은 `text_config`의 `hidden_size`·`num_layers`로 계산한다(1단계 식).
 - MoE는 `moe: true`로 표시만 한다. 모든 전문가 가중치가 GPU에 올라가므로 가중치는 전체 매개변수다.
 - `DesktopService.compatibility`는 기본 목록에 없으면 설정의 `model_profile`로 만든 항목(`imported_model`)을 쓴다.
+  허브 프로필이 기본 목록과 같은 저장소·같은 구조이면 기본 목록 항목(`gpu_verified`·`verified_capabilities` 포함)을
+  쓴다(`capabilities.reviewed_model_entry`). 그 밖의 허브 항목도 기본 목록에 같은 저장소·구조가 있으면 없는 크기
+  사실(텍스트 매개변수 등)을 거기서 채운다(`with_catalog_sizes`, 허브 값이 이긴다).
   크기 정보가 있으면 `MEMORY_UNKNOWN` 대신 추정한다. `MEMORY_UNKNOWN` 문구는 "모델 크기 정보가 없어"로 바꾼다.
 
 ### 4.6 학습 단계·방법 제한 — `capabilities.compatibility`

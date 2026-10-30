@@ -244,6 +244,56 @@ def test_a_hub_registration_without_size_facts_uses_the_catalog_sizes_of_the_sam
     assert ("warn", "MEMORY_UNKNOWN") in found and ("block", "MEMORY_WEIGHTS_EXCEED") not in found
 
 
+def judged_model(tmp_path, monkeypatch, config):
+    """The model entry DesktopService.compatibility hands gpu_compat.evaluate for ``config``."""
+    from tuning_factory import gpu_compat
+    seen = []
+    monkeypatch.setattr(gpu_compat, "evaluate", lambda config, observation, capabilities, model, **kw: seen.append(
+        model) or [])
+    desktop.DesktopService(tmp_path).compatibility(config, None, "plan")
+    return seen[0]
+
+
+def test_a_hub_registration_of_the_verified_catalog_model_keeps_its_gpu_verification(tmp_path):
+    from tuning_factory.gpu_compat import make_observation
+    config = hub_job(repo_id="Qwen/Qwen2.5-0.5B-Instruct", architecture="qwen2", template="qwen", hidden_layers=24)
+    app = desktop.DesktopService(tmp_path)
+    found = finding_codes(app.compatibility(config, make_observation("runpod-x", [BLACKWELL]), "execute"))
+    assert ("warn", "MODEL_UNVERIFIED") not in found   # 12.0 is a verified generation of the catalog entry
+    a100 = {**BLACKWELL, "name": "NVIDIA A100", "capability": "8.0", "memory_mib": 81920}
+    config["resource_profile"]["gpu_type"] = "NVIDIA A100"
+    findings = app.compatibility(config, make_observation("runpod-x", [a100]), "execute")
+    assert [item["message"] for item in findings if item["code"] == "MODEL_UNVERIFIED"] == [
+        "이 모델은 이 GPU 세대(compute capability 8.0)에서 아직 검증되지 않았습니다."]
+
+
+def test_a_sized_hub_registration_of_a_catalog_composite_is_judged_with_the_catalog_entry(tmp_path, monkeypatch):
+    from tuning_factory.capabilities import model_catalog
+    reviewed = next(m for m in model_catalog() if m["id"] == "Qwen/Qwen3.5-27B")
+    config = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3_5", template="qwen3_5_nothink", hidden_layers=64,
+                     hidden_size=5120, parameters_total=27_781_427_952, moe=False, tie_word_embeddings=False)
+    assert judged_model(tmp_path, monkeypatch, config) == reviewed
+    other = hub_job(repo_id="someone/Qwen3.5-27B-sft", architecture="qwen3_5", template="qwen3_5_nothink",
+                    hidden_layers=64, hidden_size=5120, parameters_total=27_781_427_952)
+    model = judged_model(tmp_path, monkeypatch, other)
+    assert model["source"] == "huggingface" and "text_parameters" not in model
+    # Another architecture under a catalog name is not the reviewed model: its own profile is judged.
+    renamed = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3", template="qwen3_nothink", hidden_layers=64)
+    assert judged_model(tmp_path, monkeypatch, renamed)["source"] == "huggingface"
+
+
+def test_catalog_sizes_fill_every_size_fact_a_hub_entry_lacks_and_the_entry_values_win():
+    from tuning_factory.capabilities import with_catalog_sizes
+    from tuning_factory.model_hub import ModelProfile, imported_model
+    profile = ModelProfile(repo_id="Qwen/Qwen3.5-27B", revision="a" * 40, config_sha256="c" * 64,
+                           architecture="qwen3_5", template="qwen3_5_nothink", hidden_layers=64, hidden_size=5120,
+                           parameters_total=27_000_000_000, tie_word_embeddings=False)
+    entry = with_catalog_sizes(imported_model(profile))
+    assert entry["text_parameters"] == 26_895_998_464 and entry["moe"] is False   # filled from the catalog
+    assert (entry["parameters_total"], entry["parameters_b"]) == (27_000_000_000, 27.0)   # the hub's own values
+    assert entry["source"] == "huggingface" and not entry["gpu_verified"]
+
+
 def test_plan_reports_gpu_compatibility_from_the_stored_observation(tmp_path):
     from tuning_factory.gpu_compat import make_observation, save_observation
     app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
