@@ -23,6 +23,15 @@ from .registry import canonical, digest, file_digest
 from .remote_model_cache import CachedTransfer, ensure_cached, remote_exists  # CachedTransfer is re-exported
 from .worker_protocol import COMMAND, RESULT, START_MARKER, OperationResult, WorkerRequest, is_v2_directory
 
+SSH_KEEPALIVE_SECONDS = 30   # long silent probes (up to 900 s) and result polls must survive idle NAT/proxy timeouts
+
+
+def keep_alive(client):
+    """Ask paramiko to send SSH keepalives on a connected client; a client without a transport is left alone."""
+    transport = client.get_transport()
+    if transport is not None:
+        transport.set_keepalive(SSH_KEEPALIVE_SECONDS)
+
 
 class CapacityUnavailable(RuntimeError):
     pass
@@ -309,6 +318,7 @@ class SSHExecutor(ExecutionBackend):
             self.client.set_missing_host_key_policy(paramiko.RejectPolicy())
             self.client.connect(host, port=port, username=username, key_filename=str(key_file), timeout=20,
                                 allow_agent=False, look_for_keys=False)
+            keep_alive(self.client)
         self.root = remote_root
         self.pod = pod
         self.server_profile = server_profile

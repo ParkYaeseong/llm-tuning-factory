@@ -11,7 +11,7 @@ from pathlib import Path
 
 import paramiko
 
-from .execution import ExecutionUncertain, RunPodController, SSHExecutor
+from .execution import ExecutionUncertain, RunPodController, SSHExecutor, keep_alive
 from .gpu_servers import (
     ServerApprovalReceipt,
     SSHServerFacts,
@@ -128,6 +128,7 @@ def connection(settings, *, inspection_only=False, recovery=False):
             client.connect(config.ssh_host, port=config.ssh_port, username=config.ssh_username,
                            key_filename=key_file, allow_agent=False, look_for_keys=False,
                            timeout=20, banner_timeout=20, auth_timeout=20)
+            keep_alive(client)
             if recovery:
                 facts = probe_server_identity(client, config, command)
             elif inspection_only:
@@ -151,6 +152,7 @@ def connection(settings, *, inspection_only=False, recovery=False):
         client.connect(pod["publicIp"], port=int(pod["portMappings"]["22"]), username="root",
                        key_filename=settings["ssh_key_file"], allow_agent=False, look_for_keys=False,
                        timeout=20, banner_timeout=20, auth_timeout=20)
+        keep_alive(client)
         yield pod, client
     finally:
         client.close()

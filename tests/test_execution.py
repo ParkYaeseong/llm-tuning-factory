@@ -49,3 +49,13 @@ def test_capacity_unavailable_is_retryable():
     client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(503)))
     with pytest.raises(CapacityUnavailable):
         RunPodController("test", client=client).status("pod1")
+
+
+def test_keep_alive_sets_a_30_second_ssh_keepalive():
+    from types import SimpleNamespace
+
+    from tuning_factory.execution import SSH_KEEPALIVE_SECONDS, keep_alive
+    calls = []
+    keep_alive(SimpleNamespace(get_transport=lambda: SimpleNamespace(set_keepalive=calls.append)))
+    keep_alive(SimpleNamespace(get_transport=lambda: None))   # no transport: nothing to configure
+    assert SSH_KEEPALIVE_SECONDS == 30 and calls == [30]

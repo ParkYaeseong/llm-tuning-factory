@@ -22,6 +22,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import test_graph_readiness as readiness
@@ -730,9 +731,14 @@ def test_tracking_scope_is_applied_once_and_never_per_profile(tmp_path, monkeypa
         def status(self, pod_id):
             return {**LIVE_POD, "id": pod_id}
 
+    keepalives = []
+
     class SSH:
         def set_missing_host_key_policy(self, policy):
             pass
+
+        def get_transport(self):
+            return SimpleNamespace(set_keepalive=keepalives.append)
 
         def connect(self, *args, **kwargs):
             pass
@@ -758,6 +764,7 @@ def test_tracking_scope_is_applied_once_and_never_per_profile(tmp_path, monkeypa
                 assert resolved.executor.pod["id"] == pod_id and resolved.profile == public
                 assert dict(os.environ) == before
         assert keys == [RUNPOD_KEY, RUNPOD_KEY_B] and dict(os.environ) == before
+        assert keepalives == [30, 30]   # one per resolved profile connection
     finally:
         controller.pool.shutdown()
     for text in (repr(usable), repr(controller.provider), json.dumps(controller.provider.status())):

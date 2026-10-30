@@ -1596,6 +1596,9 @@ def test_v2_methods_require_a_validated_injected_connection(tmp_path, monkeypatc
         def set_missing_host_key_policy(self, policy):
             pass
 
+        def get_transport(self):
+            return SimpleNamespace(set_keepalive=lambda seconds: None)
+
         def connect(self, *args, **kwargs):
             pass
 
