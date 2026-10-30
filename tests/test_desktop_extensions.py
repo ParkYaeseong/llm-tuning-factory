@@ -92,6 +92,43 @@ def test_model_revision_reads_the_text_config_of_a_composite_model(monkeypatch, 
     assert (result['template'], result['max_length'], result['hidden_layers']) == ('qwen3_5_nothink', 32768, 24)
 
 
+def test_model_revision_keeps_the_reviewed_catalog_entry_of_a_hub_registered_catalog_model(monkeypatch, tmp_path):
+    import httpx
+
+    from tuning_factory.model_hub import ModelProfile, register_model
+
+    def registration(repo_id):
+        return ModelProfile(repo_id=repo_id, revision='b' * 40, config_sha256='c' * 64, architecture='qwen3_5',
+                            template='qwen3_6', hidden_layers=24).model_dump()
+
+    class Hub:   # the hub path re-inspects and returns a hub profile, which the screen would store in the config
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def inspect(self, model, revision=None):
+            return {'supported': True, 'profile': registration(model), 'model_revision': 'b' * 40,
+                    'tokenizer_revision': 'b' * 40, 'template': 'qwen3_6'}
+
+    def response(url, **kwargs):
+        payload = {'sha': 'a' * 40} if '/api/models/' in url else {'model_type': 'qwen3_5', 'text_config': {
+            'max_position_embeddings': 262144, 'num_hidden_layers': 24, 'dtype': 'bfloat16'}}
+        return httpx.Response(200, json=payload, request=httpx.Request('GET', url))
+    monkeypatch.setattr(httpx, 'get', response)
+    app = DesktopService(tmp_path)
+    monkeypatch.setattr(app, 'hub', Hub, raising=False)
+    register_model(tmp_path, registration('Qwen/Qwen3.5-0.8B'))
+    result = app.dispatch('model_revision', {'model': 'Qwen/Qwen3.5-0.8B'})
+    assert 'model_profile' not in result
+    assert (result['model_revision'], result['template'], result['architecture']) == ('a' * 40, 'qwen3_5_nothink',
+                                                                                      'qwen3_5')
+    register_model(tmp_path, registration('someone/Qwen3.5-0.8B-sft'))   # not in the catalog: the hub path
+    custom = app.dispatch('model_revision', {'model': 'someone/Qwen3.5-0.8B-sft'})
+    assert custom['model_profile']['repo_id'] == 'someone/Qwen3.5-0.8B-sft' and custom['template'] == 'qwen3_6'
+
+
 @pytest.mark.parametrize('config,precision', [
     ({'text_config': {'dtype': 'bfloat16'}}, 'bfloat16'),
     ({'torch_dtype': 'float32', 'text_config': {'dtype': 'bfloat16'}}, 'bfloat16'),

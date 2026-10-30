@@ -304,7 +304,10 @@ class DesktopService:
         if action == "model_revision":
             import httpx
             model = data["model"]
-            custom = next((m for m in registered_models(self.root) if m["id"] == model), None)
+            # A reviewed catalog entry wins over a hub registration of the same repository (as in "catalog"): the
+            # screen stores a returned model_profile in the config, which would replace the reviewed facts.
+            profile = next((m for m in model_catalog() if m["id"] == model), None)
+            custom = None if profile else next((m for m in registered_models(self.root) if m["id"] == model), None)
             if custom:
                 with self.hub() as hub:
                     result = hub.inspect(model)
@@ -312,7 +315,6 @@ class DesktopService:
                     raise ValueError("; ".join(result["reasons"]))
                 register_model(self.root, result["profile"])
                 return {**result, "model_profile": result["profile"]}
-            profile = next((m for m in model_catalog() if m["id"] == model), None)
             if not profile:
                 raise ValueError("supported model required")
             response = httpx.get("https://huggingface.co/api/models/" + model + "/revision/main", timeout=20)
