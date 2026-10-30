@@ -820,7 +820,7 @@ SELFTEST_BRIDGE = r"""(() => {
   const gpu = { name: "NVIDIA A40", capability: "8.6", memory_mib: 46068, driver: "550.127.05" };
   const warn = { level: "warn", message: "self-test warning finding" };
   const models = [{ id: "Qwen/Qwen2.5-0.5B-Instruct", template: "qwen", architecture: "qwen2", gpu_verified: true },
-    { id: "Qwen/Qwen3.5-0.8B", template: "qwen3_5_nothink", architecture: "qwen3_5", gpu_verified: false }];
+    { id: "Qwen/Qwen3.5-0.8B", template: "qwen3_5", architecture: "qwen3_5", gpu_verified: false }];
   const stages = [{ id: "pt", label: "PT", dataset_kind: "text" }, { id: "sft", label: "SFT", dataset_kind: "instruction" },
     { id: "dpo", label: "DPO", dataset_kind: "preference" }, { id: "kto", label: "KTO", dataset_kind: "kto" }];
   let datasets = [{ dataset_id: "dummy", version: "1", rows: 3, synthetic: true, export_allowed: true }];
@@ -856,7 +856,7 @@ SELFTEST_BRIDGE = r"""(() => {
       return record;
     }
     if (action === "model_revision") return { model_revision: "a".repeat(40), tokenizer_revision: "a".repeat(40),
-      template: "qwen3_5_nothink", architecture: "qwen3_5", max_length: 32768, recommended_precision: "bf16",
+      template: "qwen3_5", architecture: "qwen3_5", max_length: 32768, recommended_precision: "bf16",
       hidden_layers: 24, metadata_verified: true };
     if (action === "plan") {
       const r = data.config.resource_profile;

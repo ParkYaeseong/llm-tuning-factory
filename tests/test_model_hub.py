@@ -31,7 +31,7 @@ def test_search_and_inspect_modern_model_without_weight_download():
     result = service.inspect('Qwen/Qwen3.5-0.8B')
     assert result['supported'] and result['architecture'] == 'qwen3_5'
     profile = ModelProfile.model_validate(result['profile'])
-    assert profile.template == 'qwen3_5_nothink' and profile.revision == REVISION
+    assert profile.template == 'qwen3_5' and profile.revision == REVISION
     assert len(profile.config_sha256) == 64
     model = imported_model(profile)
     assert model['id'] == 'Qwen/Qwen3.5-0.8B' and not model['gpu_verified']
@@ -163,7 +163,7 @@ def test_hub_parameter_totals_must_be_positive_integers(total):
 
 def test_imported_model_lists_sizes_only_with_a_parameter_total():
     profile = ModelProfile(repo_id='someone/model', revision=REVISION, config_sha256='c' * 64, architecture='qwen3_5',
-                           template='qwen3_5_nothink', hidden_layers=24, hidden_size=1024, moe=True,
+                           template='qwen3_5', hidden_layers=24, hidden_size=1024, moe=True,
                            tie_word_embeddings=True)
     model = imported_model(profile)
     assert not {'parameters_total', 'parameters_b', 'hidden_size', 'num_layers', 'text_parameters'} & set(model)
@@ -172,7 +172,7 @@ def test_imported_model_lists_sizes_only_with_a_parameter_total():
 
 def test_profiles_without_size_facts_keep_their_exact_bytes():
     old = {'repo_id': 'Qwen/Qwen3.5-0.8B', 'revision': REVISION, 'config_sha256': 'c' * 64,
-           'architecture': 'qwen3_5', 'template': 'qwen3_5_nothink', 'max_length': 32768,
+           'architecture': 'qwen3_5', 'template': 'qwen3_5', 'max_length': 32768,
            'context_length': 262144, 'hidden_layers': 24, 'recommended_precision': 'bfloat16', 'gated': False}
     profile = ModelProfile.model_validate(old)
     assert profile.model_dump() == old and profile.model_dump_json() == json.dumps(old, separators=(',', ':'))
@@ -200,7 +200,7 @@ def test_import_registration_persists_only_checked_metadata(tmp_path, monkeypatc
     assert registered['model']['id'] == 'Qwen/Qwen3.5-0.8B'
     loaded = DesktopService(tmp_path).dispatch('catalog', {})['models']
     entry = next(item for item in loaded if item['id'] == 'Qwen/Qwen3.5-0.8B')
-    assert entry.get('source') != 'huggingface' and entry['template'] == 'qwen3_5_nothink'
+    assert entry.get('source') != 'huggingface' and entry['template'] == 'qwen3_5'
     assert 'secret' not in json.dumps(list((tmp_path / 'model-profiles').glob('*.json')), default=str)
 
 

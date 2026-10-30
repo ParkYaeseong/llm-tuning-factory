@@ -334,6 +334,7 @@ Hopper(H100·H200), Blackwell(B200·RTX PRO 4000/6000)입니다. Turing(T4·RTX 
 - **단계와 방법**: SFT·DPO·KTO·PT를 지원합니다. RM은 GPU 인수 시험의 결과로 정하며 그 전에는 막아 두고, PPO는 지원하지 않습니다.
   freeze 방식에서 Qwen3.5는 학습 모듈로 'Attention'과 'Attention + MLP'를 고를 수 없고, 입력·출력 임베딩을 공유하는 모델은
   'LM head'를 따로 학습할 수 없습니다.
+- **Qwen3.5 템플릿**: 기본값은 `qwen3_5`(+`enable_thinking: false`)입니다. 일반 템플릿 `qwen3_5_nothink`로 학습하면 모델이 답마다 빈 `<think>` 블록을 스스로 생성하므로 기본으로 쓰지 않으며, 저장된 설정에서는 계속 허용됩니다.
 - **추론 템플릿**: 추론형 템플릿(qwen3_5, qwen3_6, gemma4, gemma4n)에는 `enable_thinking: false`가 더해집니다. 허브에서 등록한
   `gemma4_text` 모델의 기존 작업도 이 설정이 바뀝니다.
 - **메모리 추정**: 가중치는 비전·오디오를 포함한 전체 매개변수로, 학습 상태는 텍스트 매개변수로 계산합니다. QLoRA는 임베딩 표

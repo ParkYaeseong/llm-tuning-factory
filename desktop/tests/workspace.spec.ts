@@ -51,7 +51,7 @@ test('HF model search imports an immutable modern profile and disables unsupport
     const original = native.invoke;
     let registered: any = null;
     const profile = { repo_id: 'Qwen/Qwen3.5-0.8B', revision: 'c'.repeat(40), config_sha256: 'd'.repeat(64),
-      architecture: 'qwen3_5', template: 'qwen3_5_nothink', max_length: 32768, context_length: 262144,
+      architecture: 'qwen3_5', template: 'qwen3_5', max_length: 32768, context_length: 262144,
       hidden_layers: 24, recommended_precision: 'bfloat16', gated: false };
     native.invoke = async (command: string, args: any) => {
       if (command === 'factory_action') {

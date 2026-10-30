@@ -102,7 +102,7 @@ def test_model_revision_reads_the_text_config_of_a_composite_model(monkeypatch, 
         return httpx.Response(200, json=payload, request=httpx.Request('GET', url))
     monkeypatch.setattr(httpx, 'get', response)
     result = DesktopService(tmp_path).dispatch('model_revision', {'model': 'Qwen/Qwen3.5-0.8B'})
-    assert (result['template'], result['max_length'], result['hidden_layers']) == ('qwen3_5_nothink', 32768, 24)
+    assert (result['template'], result['max_length'], result['hidden_layers']) == ('qwen3_5', 32768, 24)
 
 
 def test_model_revision_keeps_the_reviewed_catalog_entry_of_a_hub_registered_catalog_model(monkeypatch, tmp_path):
@@ -135,7 +135,7 @@ def test_model_revision_keeps_the_reviewed_catalog_entry_of_a_hub_registered_cat
     register_model(tmp_path, registration('Qwen/Qwen3.5-0.8B'))
     result = app.dispatch('model_revision', {'model': 'Qwen/Qwen3.5-0.8B'})
     assert 'model_profile' not in result
-    assert (result['model_revision'], result['template'], result['architecture']) == ('a' * 40, 'qwen3_5_nothink',
+    assert (result['model_revision'], result['template'], result['architecture']) == ('a' * 40, 'qwen3_5',
                                                                                       'qwen3_5')
     register_model(tmp_path, registration('someone/Qwen3.5-0.8B-sft'))   # not in the catalog: the hub path
     custom = app.dispatch('model_revision', {'model': 'someone/Qwen3.5-0.8B-sft'})

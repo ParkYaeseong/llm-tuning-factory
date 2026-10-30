@@ -116,7 +116,7 @@ CPU forward가 된다(2026-10-30 확인).
 | 출시 | 데스크톱 앱 0.6.0. Python 패키지 버전은 그대로 |
 | 작업 순서 | 작고 독립적인 F2 → F3 → F1, 그다음 2단계 엔진 작업, 버전·문서, 빌드·전체 검증, GPU 인수, 검증 결과 반영, 화면 끝까지 시험, 최종 빌드·재설치·PR |
 | 모델 목록 | 1.1의 저장소를 모두 넣는다(지시형과 Base, Qwen3.5-27B-Base 제외). `gpu_verified: false`, `verified_capabilities: []`로 시작하고 GPU 인수 결과로만 바꾼다 |
-| 템플릿 | Qwen3.5 → `qwen3_5_nothink`. Gemma 4 E2B·E4B → `gemma4n`, 26B-A4B·31B → `gemma4`. Base 모델도 같은 계열 템플릿 |
+| 템플릿 | Qwen3.5 → `qwen3_5`(추론 템플릿) + `enable_thinking: false`. 일반 템플릿 `qwen3_5_nothink`는 프롬프트가 assistant 헤더 줄로 끝나는데, Qwen3.5는 사고 끄기에서 그 자리에 `<think></think>(빈 줄 포함)`을 보도록 학습돼 있어 SFT 뒤 모델이 답마다 빈 사고 블록을 스스로 생성했다(A40 실측, json_validity 0.0). `qwen3_5`는 `enable_thinking: false`일 때 빈 사고 블록을 프롬프트(손실 없음)에 붙이므로 공식 채팅 템플릿과 같고 학습 라벨에는 사고가 없다. `qwen3_5_nothink`는 저장된 설정을 위해 허용만 한다. Gemma 4 E2B·E4B → `gemma4n`, 26B-A4B·31B → `gemma4`. Base 모델도 같은 계열 템플릿 |
 | 복합 구조 동결 | `qwen3_5`·`qwen3_5_moe`·`gemma4` 학습 설정에 `freeze_vision_tower: true`, `freeze_multi_modal_projector: true`, `freeze_language_model: false`를 쓴다 |
 | 추론 템플릿 | `qwen3_5`·`qwen3_6`·`gemma4`·`gemma4n`이면 학습·예측·평가 설정에 `enable_thinking: false`를 쓴다 |
 | 기존 구조 | 설정 변환 결과가 바이트 단위로 같다. `tests/test_model_inputs.py`의 고정 다이제스트를 바꾸지 않는다 |

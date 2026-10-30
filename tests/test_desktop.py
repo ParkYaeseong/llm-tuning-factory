@@ -234,22 +234,22 @@ def test_compatibility_estimates_memory_for_a_registered_hub_model(tmp_path):
 def test_a_hub_registration_without_size_facts_uses_the_catalog_sizes_of_the_same_model(tmp_path):
     from tuning_factory.gpu_compat import make_observation
     # Registered from the hub before profiles carried sizes: only the layer count was stored.
-    config = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3_5", template="qwen3_5_nothink", hidden_layers=64)
+    config = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3_5", template="qwen3_5", hidden_layers=64)
     app = desktop.DesktopService(tmp_path)
     found = finding_codes(app.compatibility(config, make_observation("runpod-x", [BLACKWELL]), "execute"))
     assert ("block", "MEMORY_WEIGHTS_EXCEED") in found and ("warn", "MEMORY_UNKNOWN") not in found
-    unknown = hub_job(repo_id="someone/Qwen3.5-27B-sft", architecture="qwen3_5", template="qwen3_5_nothink",
+    unknown = hub_job(repo_id="someone/Qwen3.5-27B-sft", architecture="qwen3_5", template="qwen3_5",
                       hidden_layers=64)
     found = finding_codes(app.compatibility(unknown, make_observation("runpod-x", [BLACKWELL]), "execute"))
     assert ("warn", "MEMORY_UNKNOWN") in found and ("block", "MEMORY_WEIGHTS_EXCEED") not in found
 
 
 def test_plan_warns_that_memory_is_unknown_for_a_hub_model_without_sizes_before_any_observation(tmp_path):
-    config = hub_job(repo_id="someone/Qwen3.5-27B-sft", architecture="qwen3_5", template="qwen3_5_nothink",
+    config = hub_job(repo_id="someone/Qwen3.5-27B-sft", architecture="qwen3_5", template="qwen3_5",
                      hidden_layers=64)
     found = finding_codes(desktop.DesktopService(tmp_path).plan_compatibility(config)["findings"])
     assert {("warn", "MEMORY_UNKNOWN"), ("warn", "OBSERVATION_MISSING")} <= found
-    sized = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3_5", template="qwen3_5_nothink", hidden_layers=64)
+    sized = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3_5", template="qwen3_5", hidden_layers=64)
     assert ("warn", "MEMORY_UNKNOWN") not in finding_codes(
         desktop.DesktopService(tmp_path).plan_compatibility(sized)["findings"])   # the catalog knows its sizes
 
@@ -280,10 +280,10 @@ def test_a_hub_registration_of_the_verified_catalog_model_keeps_its_gpu_verifica
 def test_a_sized_hub_registration_of_a_catalog_composite_is_judged_with_the_catalog_entry(tmp_path, monkeypatch):
     from tuning_factory.capabilities import model_catalog
     reviewed = next(m for m in model_catalog() if m["id"] == "Qwen/Qwen3.5-27B")
-    config = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3_5", template="qwen3_5_nothink", hidden_layers=64,
+    config = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3_5", template="qwen3_5", hidden_layers=64,
                      hidden_size=5120, parameters_total=27_781_427_952, moe=False, tie_word_embeddings=False)
     assert judged_model(tmp_path, monkeypatch, config) == reviewed
-    other = hub_job(repo_id="someone/Qwen3.5-27B-sft", architecture="qwen3_5", template="qwen3_5_nothink",
+    other = hub_job(repo_id="someone/Qwen3.5-27B-sft", architecture="qwen3_5", template="qwen3_5",
                     hidden_layers=64, hidden_size=5120, parameters_total=27_781_427_952)
     model = judged_model(tmp_path, monkeypatch, other)
     assert model["source"] == "huggingface" and "text_parameters" not in model
@@ -296,7 +296,7 @@ def test_catalog_sizes_fill_every_size_fact_a_hub_entry_lacks_and_the_entry_valu
     from tuning_factory.capabilities import with_catalog_sizes
     from tuning_factory.model_hub import ModelProfile, imported_model
     profile = ModelProfile(repo_id="Qwen/Qwen3.5-27B", revision="a" * 40, config_sha256="c" * 64,
-                           architecture="qwen3_5", template="qwen3_5_nothink", hidden_layers=64, hidden_size=5120,
+                           architecture="qwen3_5", template="qwen3_5", hidden_layers=64, hidden_size=5120,
                            parameters_total=27_000_000_000, tie_word_embeddings=False)
     entry = with_catalog_sizes(imported_model(profile))
     assert entry["text_parameters"] == 26_895_998_464 and entry["moe"] is False   # filled from the catalog

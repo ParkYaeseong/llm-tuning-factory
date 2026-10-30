@@ -22,8 +22,8 @@ ARCHITECTURES = {
     "qwen3": ("qwen3_nothink", [x for x in ALL_STAGES if x != "ppo"], ALL_METHODS),
     "qwen3_moe": ("qwen3_nothink", [x for x in ALL_STAGES if x != "ppo"], ALL_METHODS),
     "qwen3_next": ("qwen3_nothink", [x for x in ALL_STAGES if x != "ppo"], ALL_METHODS),
-    "qwen3_5": ("qwen3_5_nothink", COMPOSITE_STAGES, COMPOSITE_METHODS),
-    "qwen3_5_moe": ("qwen3_5_nothink", COMPOSITE_STAGES, COMPOSITE_METHODS),
+    "qwen3_5": ("qwen3_5", COMPOSITE_STAGES, COMPOSITE_METHODS),
+    "qwen3_5_moe": ("qwen3_5", COMPOSITE_STAGES, COMPOSITE_METHODS),
     "llama": ("llama3", ALL_STAGES, ALL_METHODS),
     "mistral": ("mistral", ALL_STAGES, ALL_METHODS),
     "gemma2": ("gemma", ALL_STAGES, ALL_METHODS),
@@ -95,7 +95,7 @@ class ModelProfile(BaseModel):
         if self.architecture in {"qwen2", "llama"}:
             templates.add("deepseek3")
         if self.architecture in {"qwen3_5", "qwen3_5_moe"}:
-            templates.update({"qwen3_5", "qwen3_6"})
+            templates.update({"qwen3_5", "qwen3_5_nothink", "qwen3_6"})
         if self.architecture == "gemma4":
             templates.add("gemma4n")
         if self.template not in templates:

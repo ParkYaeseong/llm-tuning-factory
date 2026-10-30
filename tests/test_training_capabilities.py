@@ -304,7 +304,7 @@ def test_catalog_lists_qwen35_and_gemma4_with_sizes_and_text_scope():
     small = models["Qwen/Qwen3.5-0.8B"]
     assert (small["template"], small["parameters_total"], small["text_parameters"], small["hidden_size"],
             small["num_layers"], small["tie_word_embeddings"], small["moe"]) == (
-        "qwen3_5_nothink", 873_438_784, 752_393_024, 1024, 24, True, False)
+        "qwen3_5", 873_438_784, 752_393_024, 1024, 24, True, False)
     assert models["Qwen/Qwen3.5-35B-A3B-Base"]["architecture"] == "qwen3_5_moe" and models["Qwen/Qwen3.5-35B-A3B"]["moe"]
     assert not models["Qwen/Qwen3.5-9B"]["tie_word_embeddings"]
     assert {models["google/gemma-4-" + n]["template"] for n in ("E2B", "E2B-it", "E4B", "E4B-it")} == {"gemma4n"}
@@ -330,7 +330,7 @@ def test_composite_catalog_entries_count_the_embedding_tables_bitsandbytes_leave
     assert all("embedding_parameters" not in m for m in models.values() if m not in composite)
 
 
-QWEN35 = {"base_model": "Qwen/Qwen3.5-0.8B", "template": "qwen3_5_nothink"}
+QWEN35 = {"base_model": "Qwen/Qwen3.5-0.8B", "template": "qwen3_5"}
 
 
 @pytest.mark.parametrize("change,message", [
@@ -358,7 +358,7 @@ def test_composite_models_allow_existing_freeze_modules():
     from tuning_factory.capabilities import compatibility
     assert compatibility({**QWEN35, "training_method": "freeze", "finetuning_options": {
         "freeze_trainable_modules": "mlp", "freeze_extra_modules": "embed_tokens"}})["valid"]
-    assert compatibility({"base_model": "Qwen/Qwen3.5-9B", "template": "qwen3_5_nothink", "training_method": "freeze",
+    assert compatibility({"base_model": "Qwen/Qwen3.5-9B", "template": "qwen3_5", "training_method": "freeze",
                           "finetuning_options": {"freeze_extra_modules": "lm_head"}})["valid"]   # untied
     assert compatibility({"base_model": "google/gemma-4-E2B-it", "template": "gemma4n", "training_method": "freeze",
                           "finetuning_options": {"freeze_trainable_modules": "self_attn"}})["valid"]
@@ -376,7 +376,7 @@ def test_a_hub_registration_without_size_facts_still_refuses_a_tied_lm_head():
     from tuning_factory.model_hub import ModelProfile
     # Registered from the hub before profiles carried tie_word_embeddings: the reviewed catalog knows it is tied.
     profile = ModelProfile(repo_id="Qwen/Qwen3.5-0.8B", revision="a" * 40, config_sha256="c" * 64,
-                           architecture="qwen3_5", template="qwen3_5_nothink", hidden_layers=24).model_dump()
+                           architecture="qwen3_5", template="qwen3_5", hidden_layers=24).model_dump()
     config = {**QWEN35, "model_revision": "a" * 40, "model_profile": profile, "training_method": "freeze",
               "finetuning_options": {"freeze_extra_modules": "lm_head"}}
     result = compatibility(config)
@@ -387,8 +387,9 @@ FROZEN = ("freeze_vision_tower", "freeze_multi_modal_projector", "freeze_languag
 
 
 def test_composite_training_freezes_vision_and_reasoning_templates_turn_thinking_off():
-    qwen = LlamaFactoryBackend.translate(configuration(base_model="Qwen/Qwen3.5-0.8B", template="qwen3_5_nothink"))
-    assert tuple(qwen[key] for key in FROZEN) == (True, True, False) and "enable_thinking" not in qwen
+    qwen = LlamaFactoryBackend.translate(configuration(base_model="Qwen/Qwen3.5-0.8B", template="qwen3_5"))
+    assert tuple(qwen[key] for key in FROZEN) == (True, True, False)
+    assert qwen["template"] == "qwen3_5" and qwen["enable_thinking"] is False and qwen["stage"] == "sft"
     gemma = LlamaFactoryBackend.translate(configuration(base_model="google/gemma-4-E2B-it", template="gemma4n"))
     assert gemma["enable_thinking"] is False and gemma["freeze_vision_tower"] is True
     legacy = LlamaFactoryBackend.translate(load_config("configs/ai/paper_extraction.yaml"))
@@ -401,7 +402,16 @@ def test_prediction_plans_turn_thinking_off_only_for_reasoning_templates():
                                     template=template, max_new_tokens=8, cutoff_len=64, seed=1, quantization_bit=None)
         return LlamaFactoryBackend.prediction_plan(benchmark, model_path="/m", adapter_path=None, max_samples=1)
     assert all(plan(name)["enable_thinking"] is False for name in ("qwen3_5", "qwen3_6", "gemma4", "gemma4n"))
-    assert "enable_thinking" not in plan("qwen") and "enable_thinking" not in plan("qwen3_5_nothink")
+    assert "enable_thinking" not in plan("qwen")
+
+
+def test_qwen35_catalog_defaults_to_the_reasoning_template_and_keeps_the_legacy_name_valid():
+    from tuning_factory.capabilities import COMPOSITE_MODELS
+    from tuning_factory.model_hub import ARCHITECTURES, ModelProfile
+    assert {row[2] for row in COMPOSITE_MODELS if row[1] in {"qwen3_5", "qwen3_5_moe"}} == {"qwen3_5"}
+    assert ARCHITECTURES["qwen3_5"][0] == ARCHITECTURES["qwen3_5_moe"][0] == "qwen3_5"
+    ModelProfile(repo_id="Qwen/Qwen3.5-0.8B", revision="a" * 40, config_sha256="c" * 64, architecture="qwen3_5",
+                 template="qwen3_5_nothink", hidden_layers=24)
 
 
 def test_native_prediction_of_a_reasoning_template_turns_thinking_off(tmp_path):
