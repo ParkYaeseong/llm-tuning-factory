@@ -310,3 +310,42 @@ def test_catalog_lists_qwen35_and_gemma4_with_sizes_and_text_scope():
     assert {models["google/gemma-4-" + n]["template"] for n in ("E2B", "E2B-it", "E4B", "E4B-it")} == {"gemma4n"}
     assert {models["google/gemma-4-" + n]["template"] for n in ("26B-A4B", "26B-A4B-it", "31B", "31B-it")} == {"gemma4"}
     assert models["google/gemma-4-26B-A4B-it"]["moe"] and models["google/gemma-4-31B"]["parameters_b"] == 31.27
+
+
+QWEN35 = {"base_model": "Qwen/Qwen3.5-0.8B", "template": "qwen3_5_nothink"}
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"training_stage": "rm"}, "값 헤드"), ({"training_stage": "ppo"}, "PPO 전용 학습 환경"),
+    ({"training_method": "freeze", "finetuning_options": {"freeze_trainable_modules": "self_attn"}}, "linear_attn"),
+    ({"training_method": "freeze", "finetuning_options": {"freeze_trainable_modules": "self_attn,mlp"}}, "linear_attn"),
+    ({"training_method": "freeze", "finetuning_options": {"freeze_extra_modules": "embed_tokens,lm_head"}}, "lm_head"),
+    ({"training_method": "oft"}, "oft is unavailable")])
+def test_composite_models_refuse_unverified_stages_and_missing_modules(change, message):
+    from tuning_factory.capabilities import compatibility
+    result = compatibility({**QWEN35, **change})
+    assert not result["valid"] and any(message in error for error in result["errors"])
+
+
+@pytest.mark.parametrize("stage", ["pt", "sft", "dpo", "kto"])
+def test_composite_models_allow_text_stages_and_existing_freeze_modules(stage):
+    from tuning_factory.capabilities import compatibility
+    assert compatibility({**QWEN35, "training_stage": stage})["valid"]
+    assert compatibility({**QWEN35, "training_method": "freeze", "finetuning_options": {
+        "freeze_trainable_modules": "mlp", "freeze_extra_modules": "embed_tokens"}})["valid"]
+    assert compatibility({"base_model": "Qwen/Qwen3.5-9B", "template": "qwen3_5_nothink", "training_method": "freeze",
+                          "finetuning_options": {"freeze_extra_modules": "lm_head"}})["valid"]   # untied
+    assert compatibility({"base_model": "google/gemma-4-E2B-it", "template": "gemma4n", "training_method": "freeze",
+                          "finetuning_options": {"freeze_trainable_modules": "self_attn"}})["valid"]
+
+
+def test_a_hub_registration_without_size_facts_still_refuses_a_tied_lm_head():
+    from tuning_factory.capabilities import compatibility
+    from tuning_factory.model_hub import ModelProfile
+    # Registered from the hub before profiles carried tie_word_embeddings: the reviewed catalog knows it is tied.
+    profile = ModelProfile(repo_id="Qwen/Qwen3.5-0.8B", revision="a" * 40, config_sha256="c" * 64,
+                           architecture="qwen3_5", template="qwen3_5_nothink", hidden_layers=24).model_dump()
+    config = {**QWEN35, "model_revision": "a" * 40, "model_profile": profile, "training_method": "freeze",
+              "finetuning_options": {"freeze_extra_modules": "lm_head"}}
+    result = compatibility(config)
+    assert not result["valid"] and any("lm_head" in error for error in result["errors"])

@@ -5,7 +5,7 @@ Keep these rules independent of credentials and infrastructure discovery.
 """
 from copy import deepcopy
 
-from .model_hub import ARCHITECTURES, ModelProfile, imported_model
+from .model_hub import ARCHITECTURES, COMPOSITE_ARCHITECTURES, ModelProfile, imported_model
 
 STAGES = {
     "pt": ("Pre-training", "text"), "sft": ("Supervised fine-tuning", "instruction"),
@@ -16,6 +16,15 @@ METHODS = ["lora", "qlora", "full", "freeze", "oft"]
 # Size facts of a model entry, under the same keys in the catalog and model_hub.imported_model.
 SIZE_FACTS = ("parameters_total", "parameters_b", "text_parameters", "hidden_size", "num_layers", "moe",
               "tie_word_embeddings")
+COMPOSITE_STAGE_REFUSALS = {
+    "rm": ("Qwen3.5·Gemma 4의 보상 모델(RM) 학습은 아직 GPU에서 값 헤드를 검증하지 않아 막아 두었습니다. "
+           "SFT·DPO·KTO·PT를 쓰세요."),
+    "ppo": "Qwen3.5·Gemma 4는 PPO 전용 학습 환경(transformers 4.52.4)이 지원하지 않습니다.",
+}
+FREEZE_SELF_ATTN = ("Qwen3.5는 층마다 linear_attn과 self_attn이 섞여 있어 freeze 학습 모듈로 'self_attn'을 고를 수 없습니다. "
+                    "'all' 또는 'mlp'를 고르세요.")
+FREEZE_TIED_LM_HEAD = ("이 모델은 입력 임베딩과 lm_head를 공유해 lm_head를 따로 학습할 수 없습니다. 추가 학습 모듈에서 "
+                       "lm_head를 빼세요(embed_tokens를 고르면 공유된 가중치가 함께 학습됩니다).")
 # Qwen3.5 and Gemma 4 (vision/audio + text, trained on text only). Per row: repositories, architecture, template,
 # safetensors total (vision/audio included), language model + lm_head parameters (from the safetensors headers),
 # text_config hidden_size and num_hidden_layers, tied embeddings, MoE. Read 2026-10-30.
@@ -126,7 +135,7 @@ def compatibility(config, *, graph_reward_binding=False):
             profile = ModelProfile.model_validate(config["model_profile"])
             if profile.repo_id != config.get("base_model") or profile.revision != config.get("model_revision"):
                 errors.append("registered model identity/revision differs; inspect the model again")
-            model = imported_model(profile)
+            model = with_catalog_sizes(imported_model(profile))
         except ValueError:
             errors.append("registered model profile is invalid; inspect the model again")
     stage, method = config.get("training_stage", "sft"), config.get("training_method", "lora")
@@ -177,9 +186,17 @@ def compatibility(config, *, graph_reward_binding=False):
             errors.append("OFT generation evaluation is blocked by the pinned engine adapter parser")
     if model:
         if stage not in model.get("supported_stages", STAGES):
-            errors.append(f"{stage} is unavailable for this architecture/runtime profile; choose a supported stage")
+            errors.append(COMPOSITE_STAGE_REFUSALS[stage]
+                          if model["architecture"] in COMPOSITE_ARCHITECTURES and stage in COMPOSITE_STAGE_REFUSALS
+                          else f"{stage} is unavailable for this architecture/runtime profile; choose a supported stage")
         if method not in model.get("methods", METHODS):
             errors.append(f"{method} is unavailable for this architecture profile")
+        if method == "freeze":
+            modules = str(options.get("freeze_trainable_modules", "all")).split(",")
+            if model["architecture"] in {"qwen3_5", "qwen3_5_moe"} and "self_attn" in modules:
+                errors.append(FREEZE_SELF_ATTN)   # layer 0 is linear_attn: LLaMA-Factory finds no self_attn there
+            if model.get("tie_word_embeddings") and "lm_head" in str(options.get("freeze_extra_modules") or "").split(","):
+                errors.append(FREEZE_TIED_LM_HEAD)   # a tied lm_head is not a separate parameter
         if model.get("source") == "huggingface":
             warnings.append("Imported HF model: metadata verified, actual GPU validation pending; text data only")
         if model["gated"]:
