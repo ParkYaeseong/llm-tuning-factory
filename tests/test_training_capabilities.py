@@ -349,3 +349,39 @@ def test_a_hub_registration_without_size_facts_still_refuses_a_tied_lm_head():
               "finetuning_options": {"freeze_extra_modules": "lm_head"}}
     result = compatibility(config)
     assert not result["valid"] and any("lm_head" in error for error in result["errors"])
+
+
+FROZEN = ("freeze_vision_tower", "freeze_multi_modal_projector", "freeze_language_model")
+
+
+def test_composite_training_freezes_vision_and_reasoning_templates_turn_thinking_off():
+    qwen = LlamaFactoryBackend.translate(configuration(base_model="Qwen/Qwen3.5-0.8B", template="qwen3_5_nothink"))
+    assert tuple(qwen[key] for key in FROZEN) == (True, True, False) and "enable_thinking" not in qwen
+    gemma = LlamaFactoryBackend.translate(configuration(base_model="google/gemma-4-E2B-it", template="gemma4n"))
+    assert gemma["enable_thinking"] is False and gemma["freeze_vision_tower"] is True
+    legacy = LlamaFactoryBackend.translate(load_config("configs/ai/paper_extraction.yaml"))
+    assert not {*FROZEN, "enable_thinking"} & set(legacy)
+
+
+def test_prediction_plans_turn_thinking_off_only_for_reasoning_templates():
+    def plan(template):
+        benchmark = SimpleNamespace(semantic_model_kind="causal_lm", generation_mode="greedy", precision="bf16",
+                                    template=template, max_new_tokens=8, cutoff_len=64, seed=1, quantization_bit=None)
+        return LlamaFactoryBackend.prediction_plan(benchmark, model_path="/m", adapter_path=None, max_samples=1)
+    assert all(plan(name)["enable_thinking"] is False for name in ("qwen3_5", "qwen3_6", "gemma4", "gemma4n"))
+    assert "enable_thinking" not in plan("qwen") and "enable_thinking" not in plan("qwen3_5_nothink")
+
+
+def test_native_prediction_of_a_reasoning_template_turns_thinking_off(tmp_path):
+    config = configuration(base_model="google/gemma-4-E2B-it", template="gemma4n")
+    plans = []
+
+    class Backend(LlamaFactoryBackend):
+        def run_config(self, directory, timeout, canceled, filename, log_name):
+            plans.append(yaml.safe_load((directory / filename).read_text()))
+            (directory / "prediction").mkdir()
+            (directory / "prediction/generated_predictions.jsonl").write_text('{"predict":"a","label":"a"}\n')
+    backend = Backend()
+    backend.prepare(config, tmp_path, b'[{"instruction":"a","output":"b"}]')
+    backend.predict(config, tmp_path, "abc", 1)
+    assert plans[-1]["enable_thinking"] is False and "freeze_vision_tower" not in plans[-1]
