@@ -304,6 +304,106 @@ def observe(client, settings, state_root, pod):
     return observation
 
 
+# Fixed source run by the preparation script under this runtime's prepare.lock. The only arguments are the validated
+# remote root and the current 16-hex source hash, each separately quoted. It removes old app-version runtimes that no
+# worker holds (`flock -s in-use.lock`), that no preparation holds and that no live attempt references; it never
+# follows a link, never touches uv-cache/, python/, hf-cache/, model-cache/ or jobs/, and with any doubt it removes
+# nothing.
+PRUNE_SOURCE = r'''import json,os,re,shutil,sys,time
+from pathlib import Path
+try:
+    import fcntl
+except ImportError:
+    fcntl=None
+root,current=Path(sys.argv[1]),sys.argv[2]
+runtime,jobs=root/'runtime',root/'jobs'
+report=dict(removed=[],kept_in_use=[],free_before=None,free_after=None)
+def size(path):
+    total=0
+    for base,dirs,files in os.walk(path):
+        for name in files:
+            try:
+                total+=os.lstat(os.path.join(base,name)).st_size
+            except OSError:
+                pass
+    return total
+def live():
+    found=set()
+    for attempt in jobs.glob('*/*'):
+        if attempt.is_symlink() or not attempt.is_dir() or not (attempt/'worker.log').exists() or (attempt/'result.json').exists():
+            continue
+        try:
+            manifest=json.loads((attempt/'manifest.json').read_text())
+            timeout=(manifest.get('config') or {}).get('resource_profile',{}).get('timeout_seconds') or (manifest.get('operation') or {}).get('resources',{}).get('timeout_seconds')
+            if time.time()<attempt.stat().st_mtime+int(timeout)+3600:
+                found.add(str(manifest['source_sha256'])[:16])
+        except Exception:
+            raise ValueError('unreadable manifest of an unfinished attempt; nothing removed') from None
+    return found
+def hold(path):
+    if fcntl is None:
+        return []
+    handles=[]
+    try:
+        for name in ('in-use.lock','prepare.lock'):
+            handles.append(os.open(path/name,os.O_RDONLY|os.O_CREAT|os.O_NOFOLLOW|os.O_CLOEXEC,0o666))
+            fcntl.flock(handles[-1],fcntl.LOCK_EX|fcntl.LOCK_NB)
+        return handles
+    except OSError:
+        for handle in handles:
+            os.close(handle)
+        return None
+try:
+    if not re.fullmatch('[0-9a-f]{16}',current):
+        raise ValueError('invalid current runtime')
+    report['free_before']=shutil.disk_usage(root).free
+    referenced=live()
+    for path in sorted(runtime.iterdir()) if runtime.is_dir() and not runtime.is_symlink() else ():
+        name=path.name
+        if path.is_symlink() or not path.is_dir():
+            continue
+        if name.startswith('.trash-'):
+            shutil.rmtree(path,ignore_errors=True)
+            continue
+        if not re.fullmatch('[0-9a-f]{16}(-ppo)?',name) or name[:16]==current:
+            continue
+        handles=None if name[:16] in referenced else hold(path)
+        if handles is None:
+            report['kept_in_use'].append(name)
+            continue
+        try:
+            removed=dict(name=name,bytes=size(path))
+            trash=runtime/('.trash-%s-%d'%(name,os.getpid()))
+            path.rename(trash)
+        finally:
+            for handle in handles:
+                os.close(handle)
+        shutil.rmtree(trash)
+        report['removed'].append(removed)
+except Exception as error:
+    report['cleanup_error']=(type(error).__name__+': '+str(error))[:300]
+try:
+    report['free_after']=shutil.disk_usage(root).free
+except OSError:
+    pass
+print('TF_PRUNE '+json.dumps(report,sort_keys=True))
+'''
+
+
+def prune_report(output):
+    """The TF_PRUNE report of a preparation; a missing or unreadable report is a cleanup error, never fatal."""
+    for line in reversed(output.splitlines()):
+        if line.startswith("TF_PRUNE "):
+            try:
+                report = json.loads(line[len("TF_PRUNE "):])
+            except ValueError:
+                break
+            if isinstance(report, dict):
+                return report
+            break
+    return {"removed": [], "kept_in_use": [], "cleanup_error": "cleanup report missing"}
+
+
 def install_runtime(client, training_stage, remote_root, pod, preparation):
     """Upload the pinned lock and worker wheel, then install the private runtime below ``remote_root``.
 
@@ -330,6 +430,7 @@ def install_runtime(client, training_stage, remote_root, pod, preparation):
         "set -eu\n"
         "command -v flock >/dev/null\n"
         f"exec 9>{shlex.quote(root + '/prepare.lock')}\nflock -n 9 || {{ echo TF_PREPARE_BUSY; exit 75; }}\n"
+        f"python3 -c {shlex.quote(PRUNE_SOURCE)} {shlex.quote(remote_root)} {source_hash()[:16]} || true\n"
         f"export UV_PYTHON_INSTALL_DIR={shlex.quote(remote_root + '/python')}\n"
         f"export UV_CACHE_DIR={shlex.quote(remote_root + '/uv-cache')}\n"
         f"python3 -m pip install --disable-pip-version-check --no-cache-dir "
@@ -343,13 +444,14 @@ def install_runtime(client, training_stage, remote_root, pod, preparation):
     )
     preparation["started"] = True
     try:
-        command(client, ["sh", "-c", script], timeout=1800)
+        output = command(client, ["sh", "-c", script], timeout=1800)
     except RemoteCommandFailed as error:
         preparation["stopped"] = True
         if "TF_PREPARE_BUSY" in str(error):
             raise ValueError(PREPARATION_BUSY) from None
         raise
     preparation["stopped"] = True
+    preparation["cleanup"] = prune_report(output)
 
 
 def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspection=None):
@@ -379,6 +481,7 @@ def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspec
                 prerequisites(client)
                 bootstrap_prerequisites(client)
                 install_runtime(client, training_stage, remote_root, pod, preparation)
+                cleanup = preparation.get("cleanup")
                 try:
                     result = check(client, training_stage, remote_root, selected)
                 except (RuntimeMissing, RuntimeMismatch):
@@ -396,6 +499,8 @@ def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspec
                 result, state = {}, "unavailable"
         report = {"ready": state == "ready", "runtime_state": state, "observation": observation,
                   "profile": profile["profile"], **result}
+        if prepare:
+            report["cleanup"] = cleanup   # what the preparation pruned; a check never prunes
         if generic:
             return {**report, "provider": "ssh_server", "facts": pod.model_dump(mode="json"),
                     "runtime": runtime_path(training_stage, remote_root)}

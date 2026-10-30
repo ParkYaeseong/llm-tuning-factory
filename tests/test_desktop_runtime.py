@@ -1,6 +1,9 @@
 import base64
 import hashlib
 import json
+import os
+import sys
+import time
 
 import paramiko
 import pytest
@@ -500,7 +503,8 @@ def test_runtime_check_reports_a_missing_runtime_with_gpu_facts(tmp_path, monkey
     assert ready["ready"] is True and ready["runtime_state"] == "ready" and ready["source"] == "fixture"
 
 
-def test_install_runtime_uses_the_cu128_backend(tmp_path, monkeypatch):
+def install_fixture(tmp_path, monkeypatch):
+    """Packaged assets and a fake GPU host for install_runtime."""
     from test_remote_worker import FakeSSH
 
     from tuning_factory import desktop
@@ -514,11 +518,17 @@ def test_install_runtime_uses_the_cu128_backend(tmp_path, monkeypatch):
     monkeypatch.setattr(desktop, "assets_root", lambda: assets)
     client = FakeSSH(tmp_path / "remote")
     client.sftp.root.mkdir()
+    return runtime, client
+
+
+def test_install_runtime_uses_the_cu128_backend(tmp_path, monkeypatch):
+    runtime, client = install_fixture(tmp_path, monkeypatch)
     scripts = []
     monkeypatch.setattr(runtime, "command", lambda _, argv, **kw: scripts.append(argv[2]) or "")
     preparation = {"started": False, "stopped": False}
     runtime.install_runtime(client, "sft", runtime.REMOTE, POD, preparation)
-    assert preparation == {"started": True, "stopped": True}
+    assert preparation == {"started": True, "stopped": True, "cleanup": {
+        "removed": [], "kept_in_use": [], "cleanup_error": "cleanup report missing"}}
     assert "--require-hashes --torch-backend cu128 " in scripts[0]
     assert " venv --python 3.12 --clear " in scripts[0] and "--allow-existing" not in scripts[0]
 
@@ -844,3 +854,101 @@ def test_prerequisites_require_flock_and_a_c_compiler(monkeypatch):
     runtime.prerequisites(None)
     assert len(scripts) == 1 and scripts[0][:2] == ["sh", "-c"]
     assert "command -v flock" in scripts[0][2] and "flock (util-linux) required" in scripts[0][2]
+
+
+CURRENT, OLD, OLDER = "a" * 16, "b" * 16, "c" * 16
+
+
+def prune_tree(root):
+    """A remote root: current runtimes, two old ones, a non-runtime folder, a leftover trash folder and the caches."""
+    for name in (CURRENT, CURRENT + "-ppo", OLD, OLDER + "-ppo", "notahash", ".trash-dead-1"):
+        (root / "runtime" / name / "venv").mkdir(parents=True)
+    (root / "runtime" / OLD / "venv" / "lib").write_bytes(b"x" * 10)
+    for name in ("uv-cache", "python", "hf-cache", "model-cache", "jobs"):
+        (root / name).mkdir()
+    return root
+
+
+def attempt(root, source, *, manifest=None, finished=False, age=0):
+    directory = root / "jobs" / "j" / source[:4]
+    directory.mkdir(parents=True)
+    (directory / "worker.log").write_text("started")
+    if finished:
+        (directory / "result.json").write_text("{}")
+    (directory / "manifest.json").write_text(manifest if manifest is not None else json.dumps(
+        {"source_sha256": source * 4, "config": {"resource_profile": {"timeout_seconds": 60}}}))
+    os.utime(directory, (time.time() - age, time.time() - age))
+
+
+def prune(root):
+    import subprocess
+
+    from tuning_factory import desktop_runtime as runtime
+    done = subprocess.run([sys.executable, "-I", "-c", runtime.PRUNE_SOURCE, str(root), CURRENT],
+                          capture_output=True, text=True, timeout=120, check=True)
+    return runtime.prune_report(done.stdout)
+
+
+def test_prune_removes_only_old_idle_runtimes(tmp_path):
+    root = prune_tree(tmp_path)
+    attempt(root, OLD, finished=True)
+    report = prune(root)
+    assert sorted(item["name"] for item in report["removed"]) == [OLD, OLDER + "-ppo"]
+    assert next(item["bytes"] for item in report["removed"] if item["name"] == OLD) == 10
+    assert sorted(path.name for path in (root / "runtime").iterdir()) == sorted([CURRENT, CURRENT + "-ppo", "notahash"])
+    assert all((root / name).is_dir() for name in ("uv-cache", "python", "hf-cache", "model-cache", "jobs"))
+    assert "cleanup_error" not in report and report["free_before"] > 0 and report["free_after"] > 0
+
+
+def test_prune_keeps_the_runtime_of_a_live_attempt_and_forgets_expired_ones(tmp_path):
+    root = prune_tree(tmp_path)
+    attempt(root, OLD)                                    # unfinished, within its deadline
+    attempt(root, OLDER, age=60 + 3600 + 5, manifest=json.dumps(
+        {"source_sha256": OLDER * 4, "operation": {"resources": {"timeout_seconds": 60}}}))   # v2, expired
+    report = prune(root)
+    assert report["kept_in_use"] == [OLD] and [item["name"] for item in report["removed"]] == [OLDER + "-ppo"]
+
+
+def test_prune_deletes_nothing_when_an_unfinished_manifest_is_unreadable(tmp_path):
+    root = prune_tree(tmp_path)
+    attempt(root, OLD, manifest="{")
+    report = prune(root)
+    assert report["removed"] == [] and "unreadable" in report["cleanup_error"]
+    assert (root / "runtime" / OLD).is_dir() and (root / "runtime" / (OLDER + "-ppo")).is_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fcntl locks and symlinks are exercised on Linux only")
+def test_prune_keeps_locked_runtimes_and_never_follows_symlinks(tmp_path):
+    import fcntl
+    root = prune_tree(tmp_path)
+    (root / "runtime" / ("d" * 16)).symlink_to(root / "hf-cache", target_is_directory=True)
+    with open(root / "runtime" / OLD / "in-use.lock", "a") as held:
+        fcntl.flock(held, fcntl.LOCK_SH)                  # a running worker's `flock -s`
+        report = prune(root)
+    assert report["kept_in_use"] == [OLD] and [item["name"] for item in report["removed"]] == [OLDER + "-ppo"]
+    assert (root / "runtime" / ("d" * 16)).is_symlink() and (root / "hf-cache").is_dir()
+
+
+def test_preparation_prunes_under_its_prepare_lock_and_keeps_the_report(tmp_path, monkeypatch):
+    import shlex
+    runtime, client = install_fixture(tmp_path, monkeypatch)
+    cleanup = {"removed": [{"name": OLD, "bytes": 10}], "kept_in_use": [], "free_before": 1, "free_after": 11}
+    scripts = []
+    monkeypatch.setattr(runtime, "command",
+                        lambda _, argv, **kw: scripts.append(argv[2]) or "pip ok\nTF_PRUNE " + json.dumps(cleanup))
+    preparation = {"started": False, "stopped": False}
+    runtime.install_runtime(client, "sft", runtime.REMOTE, POD, preparation)
+    script = scripts[0]
+    assert script.index("TF_PREPARE_BUSY") < script.index(shlex.quote(runtime.PRUNE_SOURCE)) < script.index(" venv ")
+    assert f"{shlex.quote(runtime.REMOTE)} {runtime.source_hash()[:16]} || true" in script
+    assert preparation == {"started": True, "stopped": True, "cleanup": cleanup}
+
+
+def test_a_prepared_runtime_reports_its_cleanup(tmp_path, monkeypatch):
+    events = []
+    runtime = runpod_executor_fixture(monkeypatch, ["ready", "ready"], events)
+    cleanup = {"removed": [], "kept_in_use": [OLD], "free_before": 1, "free_after": 1}
+    monkeypatch.setattr(runtime, "install_runtime",
+                        lambda client, stage, root, pod, preparation: preparation.update(cleanup=cleanup))
+    assert runtime.runtime({"pod_id": "borrowed"}, tmp_path, prepare=True)["cleanup"] == cleanup
+    assert "cleanup" not in runtime.runtime({"pod_id": "borrowed"}, tmp_path)   # a check never prunes
