@@ -71,8 +71,17 @@ MLflow는 껐다. Ampere와 Hopper를 모두 시험했다.
   프로그램을 `/S /D=%LOCALAPPDATA%\LLM Tuning Factory`로 같은 위치에 설치했다(종료 코드 0). 설치된 `factory-bridge.exe`의 SHA-256
   `73c3522dbea4fec9472be1d50f8c859e64eea169948ad12764c30b85de400e71`이 영수증의 `bridge_sha256`과 같고, 앱 설정 파일은 바뀌지 않았다.
 
+- 사용자 요청 "ssh 키 옮기고 새 pod도 api key로 해줘"(2026-10-30): 키 쌍을 `%USERPROFILE%\.ssh\id_ed25519_runpod(.pub)`로 옮겼다(내용 해시 동일
+  확인 후 메신저 임시 폴더의 원본 삭제). 상속 권한을 끊고 본인 계정과 SYSTEM만 남겨 Windows OpenSSH도 키를 받아들인다.
+  새 사용자 Pod `amdva0lurw9rv1`(이름 `llm-tuning-factory`, A40 48 GB, CA-MTL-1, 시간당 $0.59, 볼륨 `cys1ne5znp`)를 공장 소유 기록 없이 만들었다.
+  Blackwell은 EU-RO-1 재고가 Low이고 시험 중 생성이 여러 번 실패해 A40을 골랐다. 앱이 빌린 Pod로 다루므로 자동으로 멈추지 않는다.
+  SSH 서버 지문 `SHA256:GVLJvq8jBbwib7RXw4CYjUlm3oO+71UyQ+S3Pwidd+M`은 공인 IP와 RunPod 프록시에서 같았다. 앱이 꺼진 상태에서 앱 설정의
+  `pod_id`·`ssh_fingerprint`·`ssh_key_file`만 바꿨다(다른 항목 동일, 이전 설정은 백업). 설치된 앱의 엔진으로 `runtime_check`(앱 저장소)를 실행해
+  SSH 접속과 GPU 확인(A40, 8.6, 46,068 MiB, 드라이버 595.91.07, 점검 항목 없음)을 확인했다. `runtime_state`는 `missing`이다. 설치된 빌드의 소스 해시가
+  인수 시험 빌드와 달라 첫 학습 실행이 승인 창 안에서 환경을 준비한다.
+
 **남은 일:**
-- 앱 설정의 SSH 개인 키 경로(`ssh_key_file`)가 사라진 바탕화면 파일을 가리킨다. 사용자가 키를 권한이 제한된 위치로 옮기고 연결 설정에서 다시 지정해야 한다.
+- 앱의 이전 대기 작업 `76986bce`는 삭제된 Pod를 대상으로 한다. 사용자가 앱에서 취소한다.
 - 볼륨의 런타임 정리: 앱 소스가 바뀔 때마다 새 런타임(5–12 GB)이 생기고 지우지 않는다(`ls9ua5ymse`에 4벌). 사용자 볼륨이 차는 원인이다.
 - 긴 probe 동안 SSH keepalive, GPU 서버(SSH) 연결의 요금은 점검이 판단하지 않는 점, 2단계(Qwen3.5·Gemma 4).
 
