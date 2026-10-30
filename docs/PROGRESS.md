@@ -1,3 +1,50 @@
+# 2단계 GPU 인수 시험(A40) — 결과, 2026-10-31
+
+공장 소유 Pod `r0d9wiystzwx0m`(A40 48 GB, compute capability 8.6, 드라이버 595.91.07, CA-MTL-1, 볼륨 `cys1ne5znp`)에서
+2026-10-30 23:05–10-31 06:03(약 6.95시간, 약 $4.10) 시험했다. 합성 데이터 32행, MLflow 끔. 앱 엔진은 `dist/factory-bridge.exe`로,
+1차는 `560a2b4` 빌드, 2차는 `bc020b0` 빌드(아래 템플릿·허용 오차·단계 수정 포함). SSH 지문은 공인 IP와 RunPod 프록시에서 같았다
+(공인 IP 쪽은 `provision.py`의 스캔이 비어 Git Bash에서 다시 읽었다). 끝난 뒤 `ManagedPods.stop`으로 EXITED를 확인했다.
+
+| 사례 | 결과 | train_loss | 최대 GPU 메모리(MiB) |
+|---|---|---|---|
+| Qwen3.5-0.8B SFT LoRA(평가, 1차 `qwen3_5_nothink`) | COMPLETED, 실행 승인 안 환경 준비·이전 환경 1개 정리 | 0.148 | 3,107 |
+| 〃 SFT QLoRA 4비트 | COMPLETED | 0.148 | 2,287 |
+| 〃 DPO / PT | COMPLETED / COMPLETED | 0.192 / 0.449 | 5,271 / 5,683 |
+| 〃 KTO | FAILED(엔진: M-RoPE `mm_token_type_ids` 없음) → 앱에서 거부 | — | — |
+| 〃 SFT full / freeze(mlp) | COMPLETED / COMPLETED(Pod의 `result.json`) | 2.728 / 0.337 | 16,481 / 3,143 |
+| 〃 SFT LoRA(평가, 2차 `qwen3_5`) | COMPLETED(Pod의 `result.json`) | 0.123 | — |
+| gemma-4-E2B-it SFT LoRA(평가) | COMPLETED, 2차 환경 준비·이전 환경 1개 정리, json_validity 0.84 | 1.115 | 12,761 |
+| 〃 DPO / PT | COMPLETED / COMPLETED | 0.221 / 1.169 | 18,711 / 14,823 |
+| 〃 KTO | FAILED(엔진: `pixel_position_ids` bool) → 앱에서 거부 | — | — |
+| Qwen3.5-9B SFT LoRA | COMPLETED | 0.184 | 19,825 |
+| RM(앱 밖, 런타임의 `llamafactory-cli`) Qwen3.5-0.8B / gemma-4-E2B-it | 통과: `value_head.safetensors`, eval_accuracy 1.0, eval_loss 0.0 / 0.0033 | 0.191 / 0.162 | — |
+
+- 대상·확정(`q08-sft-lora` 어댑터, Pod에서): `inspect_linear_modules` 186개 = `resolved_lora_targets("all")` 186개(linear
+  attention 5종 18개씩, MLP 3종 24개씩, full attention 4종 6개씩), 어댑터 `target_modules`는 잎 이름 12개로 줄어 기록됐고 PEFT의
+  접미사 규칙을 전체 534개 모듈(비전 포함)에 적용해도 정확히 186개만 고른다. 텐서 372개 모두 `model.language_model.` 아래.
+  1차 런타임(v1 허용 오차)에서는 확정이 로짓 비교로 거부됐고(아래), `bc020b0` 런타임에서 CUDA 확정이 발행됐다: `model-ops-f32-v2`,
+  델타 2.84e-8, 로짓 최대 절대 오차 1.79e-5(한계 1.91e-3), 상대 L2 9.8e-7(한계 1e-5), 출력 473개 = 기본 488개 − `mtp.*` 15개,
+  `model.visual.*` 153개 그대로, 토크나이저·processor 파일 7개 바이트 동일. 확정 결과를 LLaMA-Factory 예측(`finetuning_type: full`,
+  `qwen3_5`, 생각 끔)으로 불러 4행 생성(생각 블록 없음).
+- 시험에서 찾아 고친 결함(각각 시험을 먼저 작성): Qwen3.5 기본 템플릿 `qwen3_5_nothink` → `qwen3_5`(`2c932b9`; 1차 예측이
+  모두 `<think>\n\n</think>\n\n`으로 시작해 json_validity 0.0, LLaMA-Factory `qwen3_5`는 생각 끔일 때 빈 생각 블록을 프롬프트에 넣는다),
+  확정 로짓 허용 오차 `model-ops-f32-v2`(`382409d`), 단계 정책(`bbc40ca`·`1cd33be`: 두 계열 모두 pt·sft·rm·dpo, KTO 거부),
+  MoE 전문가 가중치의 QLoRA 추정(`bc020b0`), 검증 표시와 로짓 메모리 항(`5bce65c`·`df0011f`), 최종 검토 수정(`63d4f67`:
+  저장된 `qwen3_5_nothink` 설정에 한국어 경고, 템플릿 불일치 오류 한국어화, RM 로짓 계수 2, 허브 프로필 `vocab_size`,
+  v1 영수증 수거 허용, Qwen3.6 이름).
+- 2차 `qwen3_5` 평가: 32개 예측 모두 `<think>` 없이 JSON으로 시작했지만, JSON 뒤에 `\n</think>\n\n`과 같은 JSON을 한 번 더 내
+  원시 JSON 유효성은 1/32였다. 32행·8단계 학습으로 끝맺음(`<|im_end|>`)을 배우지 못한 것과 합성 정답의 끝 줄바꿈 때문으로
+  보지만 확인하지 않았다(같은 조건의 gemma-4-E2B-it는 0.84). 실제 데이터와 더 긴 학습으로 다시 볼 일이다.
+- 운영 기록: (1) `provision.py`를 PowerShell `Start-Process`로 부를 때 인자 "NVIDIA A40"이 갈라져 첫 시도가 실패했다(Pod 없음).
+  (2) 삭제한 1단계 시험 Pod 7개의 소유 기록이 남아 `ManagedPods.create`가 HTTP 404로 멈췄다 — 404를 확인한 기록과 요청만
+  `managed-pods/deleted-20261030/`으로 옮겼다. (3) full 결과(체크포인트 포함 12 GB)를 받는 데 약 2시간 걸렸고, freeze 결과(3.5 GB)는
+  네트워크가 초당 약 37 KB로 떨어져 받지 않고 멈췄다(Pod에서 결과 확인). (4) 묶음 실행 스크립트가 full 사례 뒤 이유를 알 수 없이
+  끝나 freeze·gemma 사례가 2차로 밀렸다. (5) 앱이 올린 `train.yaml`은 CRLF다(LLaMA-Factory는 문제없이 읽음). (6) 시험 엔진
+  저장소 `phase2-a40/engine`에는 중단된 freeze 작업이 RUNNING으로 남아 2차 `qwen3_5` 평가는 같은 Pod에 새 저장소(`phase2-a40b`)로 했다.
+- 남은 일: full·freeze 결과에 옵티마이저 상태가 든 체크포인트까지 내려받는 문제(`save_only_model: false`; 0.8B full이 12 GB),
+  느린 결과 내려받기, 긴 행의 메모리 측정, 복합 구조 KTO(엔진 수정 대기), 2차 평가의 반복 출력 원인, 볼륨 `cys1ne5znp`에 남은
+  시험 작업·HF 캐시(약 30 GB)·`target-check-20261031`·`rm-trial-*` 폴더 정리.
+
 # Qwen3.5·Gemma 4 A40 결과 반영 — 단계 정책, 검증 표시, 로짓 메모리 항, 2026-10-31
 
 - 단계: Gemma 4도 Qwen3.5처럼 pt·sft·rm·dpo(`model_hub.COMPOSITE_STAGES` 하나로 합침). Gemma 4 RM은 엔진 수준 시험
@@ -45,8 +92,8 @@
 - CPU 수치 검증(`.factory/model-ops-cpu-venv`, 영수증은 임시 폴더): 종료 코드 0, **35/35 통과**, `stopped_after` null, 모든 영수증의
   `policy_id`가 `model-ops-f32-v2`. 로짓 오차(최대 절대 / 상대 L2): 텍스트 병합 3.4e-8 / 1.2e-7, 확정 3.0e-8 / 1.3e-7;
   `qwen3_5` 병합 2.0e-7 / 5.1e-7, 확정 8.9e-8 / 2.2e-7; `gemma4` 병합 7.1e-7 / 1.0e-6, 확정 6.9e-7 / 8.3e-7.
-- 남은 일(GPU): 이 수정 전에 빌드한 엔진으로는 0.8B 확정이 계속 거부된다. 이 커밋으로 다시 빌드한 엔진으로 0.8B 확정(과 병합)을
-  재시험하고 영수증의 최대 절대 오차를 기록한다. 실제 모델의 상대 L2 오차는 아직 재지 않았다.
+- GPU 재시험(2026-10-31, `bc020b0` 런타임): 0.8B 확정이 발행됐다. 로짓 최대 절대 오차 1.79e-5, 상대 L2 9.8e-7(위 결과 절).
+  병합은 Pod에서 다시 재지 않았다.
 
 # 2단계 GPU 인수 시험(A40) — 승인 범위, 2026-10-30
 
