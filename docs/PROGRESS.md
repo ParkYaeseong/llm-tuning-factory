@@ -1,3 +1,22 @@
+# Task 16 GPU 인수 시험 — 승인 범위와 결과, 2026-10-30
+
+사용자 승인(2026-10-30): Blackwell Pod `yuft63rjggvh5z`(1 × RTX PRO 4000 Blackwell, 시간당 $0.57, 이미 실행 중)에서 먼저 시험하고,
+이후 사용자가 알려 줄 Ampere 또는 Hopper Pod에서 회귀 시험한다. 데이터는 합성 데이터(32행, 이전 GPU 인수 시험의
+`desktop_gpu_train` 원본)만 쓴다. 이 PC의 앱은 기존 위치에 0.5.0으로 업그레이드한다.
+
+- 범위: Pod의 `/workspace/factory-desktop` 아래 학습 환경 설치, Qwen2.5-0.5B-Instruct SFT LoRA 1회, GPU 메모리 관측.
+- 제외: 실제 MLflow 서버 기록(별도 승인 대상이므로 시험 설정에서 MLflow를 끈다), 실제 연구 데이터 전송.
+- 빌린 Pod는 멈추거나 지우지 않는다. 시험 상태는 `state/gpu-acceptance-20261030/`(git 제외)에 둔다.
+
+**시도 결과(2026-10-30):** 시작하지 못했다. 첫 단계(환경 확인)에서 RunPod API가 Pod `yuft63rjggvh5z`에 HTTP 404를 돌려주었다.
+같은 키로 보이는 Pod 55개(실행·정지 포함) 목록에도 없고, 전날 주소의 SSH도 거부되어 Pod가 삭제된 것으로 본다.
+원격 접속 전에 멈췄으므로 설치·데이터 전송·학습은 없었다. 다른 사람의 실행 중 Pod는 쓰지 않았다.
+엔진은 최종 코드 `0163b8a`로 빌드한 `dist/factory-bridge.exe`(설치 파일에 들어간 것과 바이트 동일)로 실행했고,
+이 PC의 설치된 앱은 실행 중이라 이번에는 업그레이드하지 않았다.
+
+**남은 일:** 새 Blackwell Pod와 Ampere 또는 Hopper Pod(각각 Pod 주인의 `/workspace` 사용 동의)를 받으면 같은 순서로 다시 시험한다.
+연결 설정의 Pod ID와 SSH 서버 지문(새 Pod에서 다시 확인)을 바꿔야 한다.
+
 # GPU 호환성 점검과 CUDA 12.8 학습 환경 (1단계) — 소프트웨어 완료, GPU 인수 대기
 
 [설계](superpowers/specs/2026-10-29-gpu-compat-runtime-design.md) · [계획](superpowers/plans/2026-10-29-gpu-compat-runtime.md) ·
