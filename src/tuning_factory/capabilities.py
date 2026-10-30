@@ -13,6 +13,9 @@ STAGES = {
     "dpo": ("DPO / ORPO / SimPO", "preference"), "kto": ("KTO", "kto"),
 }
 METHODS = ["lora", "qlora", "full", "freeze", "oft"]
+# Size facts of a model entry, under the same keys in the catalog and model_hub.imported_model.
+SIZE_FACTS = ("parameters_total", "parameters_b", "text_parameters", "hidden_size", "num_layers", "moe",
+              "tie_word_embeddings")
 # Qwen3.5 and Gemma 4 (vision/audio + text, trained on text only). Per row: repositories, architecture, template,
 # safetensors total (vision/audio included), language model + lm_head parameters (from the safetensors headers),
 # text_config hidden_size and num_hidden_layers, tied embeddings, MoE. Read 2026-10-30.
@@ -80,6 +83,28 @@ def model_catalog():
                            "verification_scope": "text data only; vision/audio frozen; GPU verification pending",
                            "supported_stages": list(stages), "methods": list(methods)})
     return models
+
+
+def with_catalog_sizes(entry):
+    """A hub model entry whose profile was registered before profiles carried size facts: the facts it lacks come
+    from the reviewed catalog entry of the same repository and architecture, so its memory can still be estimated."""
+    reviewed = next((m for m in model_catalog() if m["id"] == entry["id"]), None)
+    if (reviewed is None or reviewed["architecture"] != entry["architecture"]
+            or all(entry.get(key) for key in ("parameters_b", "hidden_size", "num_layers"))):
+        return entry
+    return {**{key: reviewed[key] for key in SIZE_FACTS if key in reviewed}, **entry}
+
+
+def model_entry(config):
+    """The model entry of a (partial) config: its registered HF profile first, else the reviewed catalog; or None."""
+    if hasattr(config, "model_dump"):
+        config = config.model_dump()
+    if config.get("model_profile"):
+        try:
+            return with_catalog_sizes(imported_model(ModelProfile.model_validate(config["model_profile"])))
+        except ValueError:
+            return None
+    return next((m for m in model_catalog() if m["id"] == config.get("base_model")), None)
 
 
 def training_stages():

@@ -63,12 +63,15 @@ ADAPTER_FRACTION, ADAPTER_STATE_BYTES = 0.01, 16.0   # adapter weight, gradient 
 
 
 def estimate_memory(model, config):
-    """Rough single-GPU training memory in GiB with gradient checkpointing; None without catalog sizes.
+    """Rough single-GPU training memory in GiB with gradient checkpointing; None without model sizes.
 
-    {"weights_gib": weights alone, "total_gib": weights + training state + activations + overhead}."""
-    if not model or not all(model.get(key) for key in ("parameters_b", "hidden_size", "num_layers")):
+    {"weights_gib": weights alone, "total_gib": weights + training state + activations + overhead}.
+    weights: every tensor (vision/audio and Gemma per-layer embeddings included); training state: the text model."""
+    if not model or not (model.get("parameters_total") or model.get("parameters_b")) or not all(
+            model.get(key) for key in ("hidden_size", "num_layers")):
         return None
-    parameters = float(model["parameters_b"]) * 1e9
+    parameters = float(model.get("parameters_total") or float(model["parameters_b"]) * 1e9)   # every tensor on the GPU
+    trainable = float(model.get("text_parameters") or parameters)   # vision/audio stay frozen; unknown: all of them
     layers = int(model["num_layers"])
     method = config.get("training_method", "lora")
     hyper = config.get("hyperparameters") or {}
@@ -78,12 +81,12 @@ def estimate_memory(model, config):
         per_parameter = BYTES_PER_PARAMETER[hyper.get("precision", "bf16")]
     weights = parameters * per_parameter
     if method == "full":
-        state = parameters * FULL_STATE_BYTES
+        state = trainable * FULL_STATE_BYTES
     elif method == "freeze":
-        trainable = min(abs(int((config.get("finetuning_options") or {}).get("freeze_trainable_layers", 2))), layers)
-        state = parameters * trainable / layers * FULL_STATE_BYTES
+        selected = min(abs(int((config.get("finetuning_options") or {}).get("freeze_trainable_layers", 2))), layers)
+        state = trainable * selected / layers * FULL_STATE_BYTES
     else:   # lora, qlora, oft
-        state = parameters * ADAPTER_FRACTION * ADAPTER_STATE_BYTES
+        state = trainable * ADAPTER_FRACTION * ADAPTER_STATE_BYTES
     activations = (int(hyper.get("per_device_train_batch_size", 1)) * int(hyper.get("cutoff_len", 1024))
                    * int(model["hidden_size"]) * (2 * layers + 34))
     return {"weights_gib": weights / GIB, "total_gib": (weights + state + activations) / GIB + OVERHEAD_GIB}
@@ -93,7 +96,7 @@ STALE_SECONDS = 24 * 3600
 WEIGHTS_BLOCK_RATIO, TOTAL_WARN_RATIO = 0.95, 0.90
 OBSERVATION_KEY = re.compile(r"(runpod|server)-[A-Za-z0-9_-]{1,64}")
 
-MEMORY_UNKNOWN = "앱 기본 목록에 없는 모델이라 메모리 요구량을 추정하지 못했습니다."
+MEMORY_UNKNOWN = "모델 크기 정보가 없어 메모리 요구량을 추정하지 못했습니다."
 MODEL_UNVERIFIED = "이 모델은 아직 GPU에서 검증되지 않았습니다."
 OBSERVATION_MISSING = ("저장된 GPU 정보가 없습니다. 연결 설정의 '환경 확인'을 누르면 실행 전에 GPU를 미리 "
                        "점검할 수 있습니다.")

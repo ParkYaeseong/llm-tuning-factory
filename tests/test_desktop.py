@@ -214,6 +214,36 @@ def finding_codes(findings):
     return {(item["level"], item["code"]) for item in findings}
 
 
+def hub_job(**profile):
+    from tuning_factory.model_hub import ModelProfile
+    profile = ModelProfile(revision="a" * 40, config_sha256="c" * 64, **profile).model_dump()
+    return {**A4000_JOB, "base_model": profile["repo_id"], "model_profile": profile,
+            "resource_profile": {**A4000_JOB["resource_profile"], "gpu_type": BLACKWELL["name"]}}
+
+
+def test_compatibility_estimates_memory_for_a_registered_hub_model(tmp_path):
+    from tuning_factory.gpu_compat import make_observation
+    config = hub_job(repo_id="someone/gemma-4-31B-text-sft", architecture="gemma4", template="gemma4",
+                     hidden_layers=60, hidden_size=5376, parameters_total=31_273_088_876)
+    findings = desktop.DesktopService(tmp_path).compatibility(config, make_observation("runpod-x", [BLACKWELL]),
+                                                              "execute")
+    found = finding_codes(findings)
+    assert ("block", "MEMORY_WEIGHTS_EXCEED") in found and ("warn", "MEMORY_UNKNOWN") not in found
+
+
+def test_a_hub_registration_without_size_facts_uses_the_catalog_sizes_of_the_same_model(tmp_path):
+    from tuning_factory.gpu_compat import make_observation
+    # Registered from the hub before profiles carried sizes: only the layer count was stored.
+    config = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3_5", template="qwen3_5_nothink", hidden_layers=64)
+    app = desktop.DesktopService(tmp_path)
+    found = finding_codes(app.compatibility(config, make_observation("runpod-x", [BLACKWELL]), "execute"))
+    assert ("block", "MEMORY_WEIGHTS_EXCEED") in found and ("warn", "MEMORY_UNKNOWN") not in found
+    unknown = hub_job(repo_id="someone/Qwen3.5-27B-sft", architecture="qwen3_5", template="qwen3_5_nothink",
+                      hidden_layers=64)
+    found = finding_codes(app.compatibility(unknown, make_observation("runpod-x", [BLACKWELL]), "execute"))
+    assert ("warn", "MEMORY_UNKNOWN") in found and ("block", "MEMORY_WEIGHTS_EXCEED") not in found
+
+
 def test_plan_reports_gpu_compatibility_from_the_stored_observation(tmp_path):
     from tuning_factory.gpu_compat import make_observation, save_observation
     app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})

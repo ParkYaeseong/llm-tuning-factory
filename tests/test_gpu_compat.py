@@ -82,7 +82,25 @@ def test_memory_estimate_needs_catalog_sizes():
     assert gpu_compat.estimate_memory({"parameters_b": 7}, training()) is None
 
 
-CAPS = {"torch_cuda": "12.8", "sass": SASS, "ptx": [], "bf16_min_capability": "8.0",
+QWEN35_08 = {"id": "Qwen/Qwen3.5-0.8B", "parameters_b": 0.87, "parameters_total": 873_438_784,
+             "text_parameters": 752_393_024, "hidden_size": 1024, "num_layers": 24, "gpu_verified": False}
+QWEN35_27 = {"id": "Qwen/Qwen3.5-27B", "parameters_total": 27_781_427_952, "text_parameters": 26_895_998_464,
+             "hidden_size": 5120, "num_layers": 64}
+GEMMA4_31 = {"id": "google/gemma-4-31B-it", "parameters_total": 31_273_088_876, "text_parameters": 30_697_345_340,
+             "hidden_size": 5376, "num_layers": 60}
+
+
+def test_composite_weights_count_every_tensor_and_training_state_only_the_text_model():
+    small = gpu_compat.estimate_memory(QWEN35_08, training())
+    assert 1.62 < small["weights_gib"] < 1.63 and 3.2 < small["total_gib"] < 3.4
+    assert gpu_compat.estimate_memory({**QWEN35_08, "text_parameters": None}, training())["total_gib"] > small["total_gib"]
+    assert 12.9 < gpu_compat.estimate_memory(QWEN35_08, training("full"))["total_gib"] < 13.2
+    assert gpu_compat.estimate_memory(QWEN35_27, training())["weights_gib"] > 51.5
+    qlora = gpu_compat.estimate_memory(GEMMA4_31, training("qlora"))
+    assert 15.9 < qlora["weights_gib"] < 16.1 and 22.5 < qlora["total_gib"] < 23.5
+
+
+CAPS ={"torch_cuda": "12.8", "sass": SASS, "ptx": [], "bf16_min_capability": "8.0",
         "min_driver": "525.60.13", "recommended_driver": "570.26"}
 BLACKWELL = gpu_compat.parse_gpu_facts(SMI)[0]
 POD = {"gpu_id": "NVIDIA RTX PRO 4000 Blackwell", "gpu_display_name": None, "gpu_count": 1, "hourly_cost_usd": 0.57}
@@ -146,6 +164,13 @@ def test_memory_blocks_on_weights_and_warns_when_tight():
     tight["hyperparameters"].update(cutoff_len=8192, per_device_train_batch_size=4)
     assert codes(gpu_compat.evaluate(tight, observed(), CAPS, qwen7, stage="execute")) == {
         ("warn", "MEMORY_TIGHT"), ("warn", "MODEL_UNVERIFIED")}
+
+
+def test_a_27b_bf16_lora_is_refused_on_a_48gb_gpu():
+    a40 = {**BLACKWELL, "name": "NVIDIA A40", "capability": "8.6", "memory_mib": 46068}
+    config = job(gpu_type="NVIDIA A40")
+    findings = gpu_compat.evaluate(config, observed(gpus=(a40,), pod=None), CAPS, QWEN35_27, stage="execute")
+    assert ("block", "MEMORY_WEIGHTS_EXCEED") in codes(findings)
 
 
 def test_unknown_models_and_unreadable_gpu_facts_warn():
