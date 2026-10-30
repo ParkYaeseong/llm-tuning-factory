@@ -335,9 +335,12 @@ QWEN35 = {"base_model": "Qwen/Qwen3.5-0.8B", "template": "qwen3_5_nothink"}
 
 @pytest.mark.parametrize("change,message", [
     ({"training_stage": "rm"}, "값 헤드"), ({"training_stage": "ppo"}, "PPO 전용 학습 환경"),
-    ({"training_method": "freeze", "finetuning_options": {"freeze_trainable_modules": "self_attn"}}, "linear_attn"),
-    ({"training_method": "freeze", "finetuning_options": {"freeze_trainable_modules": "self_attn,mlp"}}, "linear_attn"),
-    ({"training_method": "freeze", "finetuning_options": {"freeze_extra_modules": "embed_tokens,lm_head"}}, "lm_head"),
+    ({"training_method": "freeze", "finetuning_options": {"freeze_trainable_modules": "self_attn"}},
+     "'학습할 모듈'로 'Attention'·'Attention + MLP'를 고를 수 없습니다. '전체' 또는 'MLP'를 고르세요."),
+    ({"training_method": "freeze", "finetuning_options": {"freeze_trainable_modules": "self_attn,mlp"}},
+     "층에 따라 linear_attn 또는 self_attn을 써서"),
+    ({"training_method": "freeze", "finetuning_options": {"freeze_extra_modules": "embed_tokens,lm_head"}},
+     "'추가 학습 모듈'로 'LM head'·'Embedding + LM head' 대신 'Embedding' 또는 '추가 없음'을 고르세요"),
     ({"training_method": "oft"}, "oft is unavailable")])
 def test_composite_models_refuse_unverified_stages_and_missing_modules(change, message):
     from tuning_factory.capabilities import compatibility
@@ -357,6 +360,13 @@ def test_composite_models_allow_text_stages_and_existing_freeze_modules(stage):
                           "finetuning_options": {"freeze_trainable_modules": "self_attn"}})["valid"]
 
 
+def test_freeze_refusals_name_the_screen_labels_rather_than_raw_module_ids():
+    from tuning_factory.capabilities import FREEZE_SELF_ATTN, FREEZE_TIED_LM_HEAD
+    for raw in ("'self_attn'", "'all'", "'mlp'", "'lm_head'", "'embed_tokens'", "lm_head", "embed_tokens"):
+        assert raw not in FREEZE_TIED_LM_HEAD and (raw == "'self_attn'" or raw not in FREEZE_SELF_ATTN), raw
+    assert FREEZE_SELF_ATTN.endswith("고르세요.") and FREEZE_TIED_LM_HEAD.endswith("함께 학습됩니다).")
+
+
 def test_a_hub_registration_without_size_facts_still_refuses_a_tied_lm_head():
     from tuning_factory.capabilities import compatibility
     from tuning_factory.model_hub import ModelProfile
@@ -366,7 +376,7 @@ def test_a_hub_registration_without_size_facts_still_refuses_a_tied_lm_head():
     config = {**QWEN35, "model_revision": "a" * 40, "model_profile": profile, "training_method": "freeze",
               "finetuning_options": {"freeze_extra_modules": "lm_head"}}
     result = compatibility(config)
-    assert not result["valid"] and any("lm_head" in error for error in result["errors"])
+    assert not result["valid"] and any("LM head" in error for error in result["errors"])
 
 
 FROZEN = ("freeze_vision_tower", "freeze_multi_modal_projector", "freeze_language_model")

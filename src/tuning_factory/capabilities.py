@@ -21,10 +21,12 @@ COMPOSITE_STAGE_REFUSALS = {
            "SFT·DPO·KTO·PT를 쓰세요."),
     "ppo": "Qwen3.5·Gemma 4는 PPO 전용 학습 환경(transformers 4.52.4)이 지원하지 않습니다.",
 }
-FREEZE_SELF_ATTN = ("Qwen3.5는 층마다 linear_attn과 self_attn이 섞여 있어 freeze 학습 모듈로 'self_attn'을 고를 수 없습니다. "
-                    "'all' 또는 'mlp'를 고르세요.")
-FREEZE_TIED_LM_HEAD = ("이 모델은 입력 임베딩과 lm_head를 공유해 lm_head를 따로 학습할 수 없습니다. 추가 학습 모듈에서 "
-                       "lm_head를 빼세요(embed_tokens를 고르면 공유된 가중치가 함께 학습됩니다).")
+# Option labels as the training screen shows them (desktop/src/components/recipe-fields.ts, freeze fields).
+FREEZE_SELF_ATTN = ("Qwen3.5는 층에 따라 linear_attn 또는 self_attn을 써서 '학습할 모듈'로 'Attention'·'Attention + MLP'를 "
+                    "고를 수 없습니다. '전체' 또는 'MLP'를 고르세요.")
+FREEZE_TIED_LM_HEAD = ("이 모델은 입력 임베딩과 LM head가 가중치를 공유해 LM head만 따로 학습할 수 없습니다. "
+                       "'추가 학습 모듈'로 'LM head'·'Embedding + LM head' 대신 'Embedding' 또는 '추가 없음'을 고르세요"
+                       "('Embedding'을 고르면 공유된 가중치가 함께 학습됩니다).")
 # Qwen3.5 and Gemma 4 (vision/audio + text, trained on text only). Per row: repositories, architecture, template,
 # safetensors total (vision/audio included), language model + lm_head parameters (from the safetensors headers),
 # text_config hidden_size and num_hidden_layers, tied embeddings, MoE. Read 2026-10-30.
