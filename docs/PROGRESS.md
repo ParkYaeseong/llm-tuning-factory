@@ -1,3 +1,28 @@
+# 0.6.0 최종 빌드·설치와 실제 앱 화면 끝까지 시험, 2026-10-31
+
+- 최종 검증(`63d4f67`, 2026-10-31 06:03–06:25): `uv run pytest` 2245 passed, 2 skipped(492초); `uv run ruff check src tests scripts` 통과;
+  `desktop`의 `npm run build` 통과, `npm test` 284 passed; `cargo test --manifest-path src-tauri/Cargo.toml --locked` 54 passed;
+  `.factory/model-ops-cpu-venv`의 `scripts/verify_model_ops_cpu.py --receipt dist/model-ops-cpu-0.6.0.json` 통과(`stopped_after` null,
+  모든 영수증 `model-ops-f32-v2`).
+- 설치 프로그램(`63d4f67`): `desktop/src-tauri/target/release/bundle/nsis/LLM Tuning Factory_0.6.0_x64-setup.exe`, 48,355,092 바이트,
+  SHA-256 `9be9862efbf9dfbe63deeabdf140d66e71287e79b082511556a99049966d5005`. 영수증 `dist/verify-0.6.0.json`: bridge_mode frozen,
+  source_commit `63d4f67526916e506e7187dacb2ca22555da0786`, 모든 검사 true, gpu_started false, bridge_sha256 `9c0f6741…d865a`.
+  앱이 꺼진 상태에서 `/S /D=%LOCALAPPDATA%\LLM Tuning Factory`로 같은 위치에 설치했다(0.6.0, 설치된 엔진 해시가 영수증과 같음).
+- 사용자 Pod: `amdva0lurw9rv1`은 다시 켜기가 HTTP 500(용량 부족)으로 6번 모두 실패해 EXITED로 남겼다. 같은 볼륨 `cys1ne5znp`에 새
+  사용자 Pod `mqpnial878ja1o`(이름 `llm-tuning-factory`, A40, CA-MTL-1, 시간당 $0.59, 공장 소유 기록 없음)를 만들고 SSH 지문
+  `SHA256:HQVYDR33XaVZ5SJLF+YyLDmb47QO7q91RzcQE9wZNbI`을 공인 IP와 프록시에서 확인한 뒤, 앱 설정의 `pod_id`·`ssh_fingerprint`만 바꿨다.
+- 실제 앱 화면 시험(`scripts/desktop_gui_acceptance.py`, Playwright 1.64.0, WebView2 원격 디버깅 포트 9223): 읽기 전용 예행 통과 후
+  `--confirm-paid-run --max-cost 2`로 실행했다. 연결 검사(MLflow 기관 인증 확인, Pod RUNNING) → 환경 확인(A40 8.6, 45.0 GiB,
+  드라이버 595.91.07, 환경 없음) → 합성 데이터 32건 등록(합성·전송 허용) → GPU 정보 적용 → Qwen3.5-0.8B SFT LoRA, 버전 고정 →
+  실행 계획(예상 $0.59, 점검 항목 없음) → 승인 창(학습 환경 설치 안내와 이전 환경 정리 문구 포함) → 제출 → 대기 → 학습 중.
+  학습은 Pod에서 COMPLETED(학습 환경 `0a8f737acf2ab5fd` 새로 준비, 이전 환경 정리), train_loss 1.3593, 학습 103초. 이 PC와
+  CA-MTL-1 사이 네트워크가 초당 15–40 KB로 느려(같은 파일의 `scp`도 초당 약 31 KB) 결과 122 MB를 받는 데 08:22까지 걸렸고,
+  스크립트는 45분 제한에 걸려 실패로 끝났다(작업 진행 중이라 앱은 열어 둠). 작업이 완료된 뒤 같은 포트로 다시 붙어 실행 관리에서
+  "완료"와 학습 로그(train_loss 1.3593)를 확인했다. 이 실행의 기록은 승인 창 문구대로 공용 MLflow에 저장된다. 예전 작업
+  `76986bce`는 "취소" 상태다. 끝난 뒤 Pod `mqpnial878ja1o`를 멈췄다(EXITED). 시험이 띄운 앱 창은 Claude Code 권한 검사가 종료를
+  막아 열려 있으며 사용자가 닫는다.
+- 남은 일: 화면 시험 스크립트의 작업 대기 제한(45분)이 느린 결과 내려받기보다 짧다. 위 GPU 시험의 남은 일과 함께 처리한다.
+
 # 2단계 GPU 인수 시험(A40) — 결과, 2026-10-31
 
 공장 소유 Pod `r0d9wiystzwx0m`(A40 48 GB, compute capability 8.6, 드라이버 595.91.07, CA-MTL-1, 볼륨 `cys1ne5znp`)에서
