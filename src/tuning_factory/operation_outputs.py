@@ -44,7 +44,7 @@ from .model_artifacts import (
     tensor_header,
 )
 from .model_ops import (
-    POLICY_F32_V1,
+    CURRENT_POLICY,
     MaterializeReceipt,
     MergeReceipt,
     adapter_metadata_from_config,
@@ -256,7 +256,7 @@ def operation_receipt(result: OperationResult, launch_dir: Path, operation) -> d
     model = MergeReceipt if isinstance(operation, MergeOperation) else MaterializeReceipt
     inner = model.model_validate(receipt.get("receipt") if isinstance(receipt, Mapping) else None)
     if (receipt.get("schema_version"), receipt.get("kind"), receipt.get("output"), inner.policy_id) != (
-            1, operation.kind, f"{MODEL_OP_PARENT}/output", POLICY_F32_V1):
+            1, operation.kind, f"{MODEL_OP_PARENT}/output", CURRENT_POLICY):
         raise ValueError("operation receipt differs from this operation")
     return {**receipt, "receipt": inner}
 

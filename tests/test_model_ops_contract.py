@@ -215,8 +215,9 @@ def test_model_ops_import_is_lightweight(monkeypatch):
     for name in ("safetensors_scan", "target_inspection", "runtime_profiles"):
         importlib.reload(importlib.import_module(f"tuning_factory.{name}"))
     reloaded = importlib.reload(module)
-    assert reloaded.POLICY_F32_V1 == "model-ops-f32-v1"
-    assert set(reloaded.TOLERANCE_POLICIES) == {"model-ops-f32-v1"}
+    assert (reloaded.POLICY_F32_V1, reloaded.POLICY_F32_V2) == ("model-ops-f32-v1", "model-ops-f32-v2")
+    assert reloaded.CURRENT_POLICY == "model-ops-f32-v2"   # every new merge/materialize; v1 only reads older receipts
+    assert set(reloaded.TOLERANCE_POLICIES) == {"model-ops-f32-v1", "model-ops-f32-v2"}
     assert reloaded.scan_finite_safetensors.__module__ == "tuning_factory.safetensors_scan"
     assert reloaded.inspect_target_modules.__module__ == "tuning_factory.target_inspection"
     assert reloaded.verify_inspected_targets.__module__ == "tuning_factory.target_inspection"
@@ -549,7 +550,7 @@ def test_policy_refuses_base_tensors_without_exact_f32_upcast(tmp_path, monkeypa
     tensors = {**base_tensors(), "model.layers.0.extra.weight": (dtype, (2,), encode(dtype, values))}
     inputs, base = valid_merge(tmp_path, hf_base_on_disk(tmp_path, tensors=tensors))
     block_heavy_imports(monkeypatch)
-    message = f"{operation} requires F16, BF16 or F32 tensors under policy model-ops-f32-v1"
+    message = f"{operation} requires F16, BF16 or F32 tensors under policy model-ops-f32-v2"
     with pytest.raises(ValueError, match=message):
         if operation == "merge":
             module.merge_adapters(inputs, (0.25, 0.75), tmp_path / "out", base=base, require_real=False)
@@ -766,10 +767,25 @@ def test_only_f32_tolerance_policy_is_accepted(tmp_path, monkeypatch):
     policy = module.TolerancePolicy()
     assert (policy.storage_dtype, policy.delta_atol, policy.delta_rtol, policy.logits_atol, policy.logits_rtol) == (
         "F32", 1e-6, 1e-5, 1e-5, 1e-4)
+    assert (policy.logits_rule, policy.logits_relative_l2, policy.logits_max_abs_scale) == ("allclose", None, None)
+    # v2 keeps v1's storage and delta rule; only the logits rule differs.
+    v2 = module.TOLERANCE_POLICIES[module.POLICY_F32_V2]
+    assert (v2.policy_id, v2.storage_dtype, v2.delta_atol, v2.delta_rtol, v2.logits_rule, v2.logits_relative_l2,
+            v2.logits_max_abs_scale, v2.logits_atol, v2.logits_rtol) == (
+        "model-ops-f32-v2", "F32", 1e-6, 1e-5, "relative-l2-and-scaled-max", 1e-5, 1e-4, None, None)
     with pytest.raises(ValidationError):
         module.TolerancePolicy(policy_id="model-ops-bf16-v1")
     with pytest.raises(ValidationError):
         module.TolerancePolicy(storage_dtype="BF16")
+    # A policy id names exactly one logits rule and only that rule's thresholds.
+    scaled = {"logits_rule": "relative-l2-and-scaled-max", "logits_atol": None, "logits_rtol": None,
+              "logits_relative_l2": 1e-5, "logits_max_abs_scale": 1e-4}
+    for fields in ({"policy_id": "model-ops-f32-v2"}, scaled, {**v2.model_dump(), "logits_atol": 1e-5},
+                   {**v2.model_dump(), "logits_relative_l2": None}, {"logits_relative_l2": 1e-5},
+                   {"logits_rtol": None}):
+        with pytest.raises(ValidationError):
+            module.TolerancePolicy(**fields)
+    assert module.TolerancePolicy(policy_id="model-ops-f32-v2", **scaled) == v2
     block_heavy_imports(monkeypatch)
     refs, descriptors = two_adapters()
     inputs = tuple(local(tmp_path, ref, descriptor) for ref, descriptor in zip(refs, descriptors))
@@ -779,6 +795,139 @@ def test_only_f32_tolerance_policy_is_accepted(tmp_path, monkeypatch):
     load = module.StagedLoad(base=hf_base_on_disk(tmp_path, "base2"), adapter=inputs[0])
     with pytest.raises(ValueError, match="unsupported tolerance policy"):
         module.materialize_model(load, tmp_path / "full", policy="model-ops-bf16-v1")
+
+
+def test_new_operations_default_to_the_current_policy_and_receipts_read_both():
+    import inspect
+    module = api()
+    for function in (module.merge_adapters, module.materialize_model):
+        assert inspect.signature(function).parameters["policy"].default == module.CURRENT_POLICY == "model-ops-f32-v2"
+    base, ref = root_ref(), ref_for(lora_descriptor())
+    for policy_id in ("model-ops-f32-v1", "model-ops-f32-v2"):   # older receipts stay readable
+        assert module.MergeReceipt(policy_id=policy_id, inputs=(ref,), normalized_weights=(1.0,), output_rank=2,
+                                   max_abs_delta_error=0.0, max_abs_logits_error=0.0, finite_tensors_checked=1,
+                                   output_files=()).policy_id == policy_id
+        assert module.MaterializeReceipt(policy_id=policy_id, base=base, adapter=ref, max_abs_delta_error=0.0,
+                                         max_abs_logits_error=0.0, non_target_tensors_identical=True,
+                                         tokenizer_fingerprint="0" * 64, finite_tensors_checked=1,
+                                         output_files=()).policy_id == policy_id
+
+
+def test_only_model_ops_names_the_v1_policy():
+    """New operations, their acceptance checks, the simulated dispatcher and the CPU acceptance use CURRENT_POLICY."""
+    sources = [*sorted((ROOT / "src" / "tuning_factory").glob("*.py")), SCRIPT]
+    named = sorted(path.name for path in sources if "POLICY_F32_V1" in path.read_text(encoding="utf-8"))
+    assert named == ["model_ops.py"]
+    assert "CURRENT_POLICY" in SCRIPT.read_text(encoding="utf-8")
+
+
+# -- logits tolerance rules (pure Python stand-ins for the torch calls) ----------------------------
+
+class FakeTensor:
+    """The few tensor operations the logits rules use, over a flat list of Python floats."""
+
+    def __init__(self, values, shape=None):
+        self.values = [float(value) for value in values]
+        self.shape = tuple(shape) if shape is not None else (1, len(self.values))
+
+    def __sub__(self, other):
+        return FakeTensor([a - b for a, b in zip(self.values, other.values, strict=True)], self.shape)
+
+    def abs(self):
+        return FakeTensor([abs(value) for value in self.values], self.shape)
+
+    def max(self):
+        return max(self.values)
+
+
+class FakeTorch:
+    class linalg:
+        @staticmethod
+        def vector_norm(tensor):
+            return math.sqrt(math.fsum(value * value for value in tensor.values))
+
+    @staticmethod
+    def allclose(actual, expected, atol, rtol):   # torch.allclose: |a - e| <= atol + rtol * |e| everywhere
+        return all(abs(a - e) <= atol + rtol * abs(e) for a, e in zip(actual.values, expected.values, strict=True))
+
+
+def measured_logits(vocab=4096, seed=17):
+    """Logits shaped like the A40 Qwen3.5-0.8B materialization (5 probe tokens, largest |logit| 19.1) with the merged
+    model's FP32 rounding: mean abs error ~1.9e-6 and a max abs error of 2.24e-5 on logits near zero, where v1's
+    allclose has no rtol headroom."""
+    import random
+    generator = random.Random(seed)
+    expected = [generator.gauss(0.0, 3.0) for _ in range(5 * vocab)]
+    expected[123] = 19.1
+    errors = [generator.gauss(0.0, 2.4e-6) for _ in expected]
+    for index in [index for index, value in enumerate(expected) if abs(value) < 0.05][:4]:
+        errors[index] = 2.24e-5
+    shape = (1, 5, vocab)
+    return (FakeTensor([value + error for value, error in zip(expected, errors)], shape),
+            FakeTensor(expected, shape), errors)
+
+
+def test_v2_accepts_real_fp32_merge_rounding_that_v1_refused():
+    module = api()
+    actual, expected, errors = measured_logits()
+    assert 1.7e-6 < math.fsum(abs(error) for error in errors) / len(errors) < 2.1e-6   # the fixture is measurement-like
+    v1, v2 = (module.TOLERANCE_POLICIES[policy] for policy in (module.POLICY_F32_V1, module.POLICY_F32_V2))
+    ok, error = module._logits_close(FakeTorch, actual, expected, v1)
+    assert not ok and error == pytest.approx(2.24e-5, rel=1e-6)   # the A40 refusal, reproduced
+    assert (ok, error) == module._close(FakeTorch, actual, expected, 1e-5, 1e-4)   # v1 is exactly the old rule
+    ok, error = module._logits_close(FakeTorch, actual, expected, v2)
+    assert ok and error == pytest.approx(2.24e-5, rel=1e-6)
+
+
+def test_v2_refuses_genuinely_wrong_logits():
+    import random
+    module = api()
+    v2 = module.TOLERANCE_POLICIES[module.POLICY_F32_V2]
+    actual, expected, _ = measured_logits()
+    one_off = list(actual.values)
+    one_off[500] += 1e-2
+    ok, error = module._logits_close(FakeTorch, FakeTensor(one_off, expected.shape), expected, v2)
+    assert not ok and error == pytest.approx(1e-2, rel=1e-3)
+    # relative L2 error 1e-4 spread thinly: every value is inside the max-abs clause, the L2 clause refuses it
+    generator = random.Random(3)
+    scale = 1e-4 * math.sqrt(math.fsum(value * value for value in expected.values) / len(expected.values))
+    spread = FakeTensor([value + generator.gauss(0.0, scale) for value in expected.values], expected.shape)
+    relative = FakeTorch.linalg.vector_norm(spread - expected) / FakeTorch.linalg.vector_norm(expected)
+    ok, error = module._logits_close(FakeTorch, spread, expected, v2)
+    assert not ok and 0.9e-4 < relative < 1.1e-4 and error < 1e-4 * 19.1
+    # other shapes are never compared by broadcasting
+    ok, _ = module._logits_close(FakeTorch, FakeTensor(expected.values, (5, 4096)), expected, v2)
+    assert not ok
+
+
+def test_scale_aware_rule_clauses_bounds_and_non_finite_values():
+    module = api()
+    v2 = module.TOLERANCE_POLICIES[module.POLICY_F32_V2]
+
+    def ok(max_abs_error, max_abs_expected, l2_error, l2_expected):
+        return module.scale_aware_logits_ok(v2, max_abs_error=max_abs_error, max_abs_expected=max_abs_expected,
+                                            l2_error=l2_error, l2_expected=l2_expected)
+
+    count = 5 * 248_320                                     # the real probe: 5 tokens x Qwen3.5 vocabulary
+    l2_expected, l2_rounding = 3.0 * math.sqrt(count), 2.4e-6 * math.sqrt(count)
+    assert ok(2.24e-5, 19.1, l2_rounding, l2_expected)       # the measured materialization
+    # one logit off by 1e-2 hides in the L2 norm of 1.24M values; the max-abs clause refuses it
+    l2_one_off = math.hypot(l2_rounding, 1e-2)
+    assert l2_one_off / l2_expected <= 1e-5 and not ok(1e-2, 19.1, l2_one_off, l2_expected)
+    assert not ok(1.5e-3, 19.1, 1e-4 * l2_expected, l2_expected)   # relative L2 1e-4: the L2 clause refuses it
+    # both bounds are inclusive; the max-abs bound never shrinks below 1e-4 for small logits
+    assert ok(1e-4, 0.5, 1e-5, 1.0) and ok(1e-4 * 19.1, 19.1, 0.0, 1.0)
+    assert not ok(math.nextafter(1e-4, 1.0), 0.5, 0.0, 1.0)
+    assert not ok(0.0, 0.5, math.nextafter(1e-5, 1.0), 1.0)
+    assert ok(0.0, 0.0, 0.0, 0.0) and not ok(1e-30, 0.0, 1e-30, 0.0)   # an all-zero expectation
+    for bad in (math.nan, math.inf):
+        for index in range(4):
+            values = [2.24e-5, 19.1, l2_rounding, l2_expected]
+            values[index] = bad
+            assert not ok(*values)
+    with pytest.raises(ValueError, match="scale-aware logits rule"):
+        module.scale_aware_logits_ok(module.TOLERANCE_POLICIES[module.POLICY_F32_V1], max_abs_error=0.0,
+                                     max_abs_expected=0.0, l2_error=0.0, l2_expected=0.0)
 
 
 # -- 17. inspected target evidence ---------------------------------------------------------------
@@ -1335,7 +1484,7 @@ def test_execute_operation_dispatches_merge_and_materialize_to_model_ops(tmp_pat
     assert [Path(model.path).as_posix() for model in received] == [inputs.cache_path(store, ref)
                                                                     for ref in (first_ref, second_ref)]
     assert [model.descriptor for model in received] == [store.verify(ref) for ref in (first_ref, second_ref)]
-    assert (weights, policy, device, require_real) == ((0.25, 0.75), "model-ops-f32-v1", "cpu", True)
+    assert (weights, policy, device, require_real) == ((0.25, 0.75), "model-ops-f32-v2", "cpu", True)
     assert base.identity == base_ref and Path(base.path).as_posix() == inputs.cache_path(store, base_ref)
     assert output == directory / "model-op" / "output"
     assert (result.status, result.kind, result.launch_id) == ("COMPLETED", "merge", directory.name)
@@ -1359,7 +1508,7 @@ def test_execute_operation_dispatches_merge_and_materialize_to_model_ops(tmp_pat
     _, load, output, policy, device = ops.calls[1]
     assert (load.base.identity, load.adapter.identity) == (base_ref, first_ref)
     assert Path(load.adapter.path).as_posix() == inputs.cache_path(store, first_ref)
-    assert (output, policy, device) == (directory / "model-op" / "output", "model-ops-f32-v1", "cpu")
+    assert (output, policy, device) == (directory / "model-op" / "output", "model-ops-f32-v2", "cpu")
     assert ops.calls[2] == ("inspect", output)
     inventory = json.loads((directory / "target-inventory.json").read_bytes())
     assert inventory == {"schema_version": 1, "modules": [
@@ -1427,6 +1576,7 @@ def test_model_operation_owns_an_exclusive_output_parent(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("changes", [{"output_files": ("model.safetensors",)}, {"policy_id": "other"},
+                                     {"policy_id": "model-ops-f32-v1"},   # new operations run under the current policy
                                      {"output_files": ("config.json", "model.safetensors", "model.safetensors")}])
 def test_model_operation_receipt_must_describe_this_operation_and_output(tmp_path, monkeypatch, changes):
     store, materialize, directory = materialize_launch(tmp_path, monkeypatch)

@@ -1,3 +1,27 @@
+# 모델 작업 로짓 허용 오차 `model-ops-f32-v2`, 2026-10-31
+
+- 결함(A40 GPU 인수에서 발견): 실제 Qwen3.5-0.8B LoRA 어댑터의 올바른 확정을 `materialize_model`이
+  `reloaded logits differ beyond tolerance policy`로 거부했다. Pod에서 잰 값: 확정 모델과 병합 전 PEFT 모델의 FP32 로짓
+  (5토큰 × 어휘 248,320) 최대 절대 오차 CPU 2.24e-5(1,241,600개 중 33개가 v1 경계 atol 1e-5 + rtol 1e-4 × 기대값의 절댓값을
+  넘음, 최대 1.35배), CUDA 1.79e-5(4개, 1.13배), 평균 약 1.9e-6, 로짓 최대 절댓값 19.1. 메모리 안 병합 모델과 저장 후 다시 불러온
+  모델은 비트 단위로 같았고 델타는 2.8e-8로 통과했다. v1의 원소별 allclose는 0 근처 로짓에 rtol 여유가 없어 24층의 FP32 반올림을
+  견디지 못한다(v1의 CPU 시험은 작은 모델만 썼다).
+- 수정: 새 정책 `model-ops-f32-v2`(`model_ops.CURRENT_POLICY`). 저장(F32)과 델타 규칙은 v1과 같고, 로짓은 상대 L2 오차 ≤ 1e-5와
+  최대 절대 오차 ≤ 1e-4 × max(1, 기대 로짓의 최대 절댓값)을 모두 만족해야 한다(모두 유한). v1은 `TOLERANCE_POLICIES`에 뜻 그대로
+  남아 이전 영수증을 읽는다. `merge_adapters`·`materialize_model`의 기본값, `operation_dispatch`(호출과 영수증 검사),
+  `operation_outputs`(접수 검사), `simulated_dispatch`, `scripts/verify_model_ops_cpu.py`가 `CURRENT_POLICY`를 쓴다. 판정은 torch
+  없는 `scale_aware_logits_ok`(통계 4개)로 분리했고, CPU 시험 스크립트는 같은 규칙을 따로 구현해 상대 L2 오차도 기록한다.
+  dtype 거부 문구는 `... under policy model-ops-f32-v2`가 된다.
+- 검증(2026-10-31): 시험을 먼저 고쳐 17개 실패를 확인한 뒤 구현했다. 측정값 모양의 합성 로짓(5 × 4096, 최대 절댓값 19.1, 평균
+  절대 오차 약 1.9e-6, 0 근처 4개에 2.24e-5)은 v1에서 거부되고 v2에서 통과하며, 값 하나가 1e-2 틀린 로짓과 상대 L2 오차 1e-4인
+  로짓은 v2에서 거부된다. 실제 크기(1,241,600개) 통계로는 값 하나의 1e-2 오류가 L2 조건을 통과하고 최대 절대 오차 조건에서
+  거부된다. `uv run pytest` 2204 passed, 2 skipped, `uv run ruff check src tests scripts` 통과.
+- CPU 수치 검증(`.factory/model-ops-cpu-venv`, 영수증은 임시 폴더): 종료 코드 0, **35/35 통과**, `stopped_after` null, 모든 영수증의
+  `policy_id`가 `model-ops-f32-v2`. 로짓 오차(최대 절대 / 상대 L2): 텍스트 병합 3.4e-8 / 1.2e-7, 확정 3.0e-8 / 1.3e-7;
+  `qwen3_5` 병합 2.0e-7 / 5.1e-7, 확정 8.9e-8 / 2.2e-7; `gemma4` 병합 7.1e-7 / 1.0e-6, 확정 6.9e-7 / 8.3e-7.
+- 남은 일(GPU): 이 수정 전에 빌드한 엔진으로는 0.8B 확정이 계속 거부된다. 이 커밋으로 다시 빌드한 엔진으로 0.8B 확정(과 병합)을
+  재시험하고 영수증의 최대 절대 오차를 기록한다. 실제 모델의 상대 L2 오차는 아직 재지 않았다.
+
 # 2단계 GPU 인수 시험(A40) — 승인 범위, 2026-10-30
 
 사용자 지시(2026-10-30): "2단계 및 후속 과제도 내 허락 받지 않고 계속 다 테스트해가면서 구현해줘". 이에 따른 유료 시험 범위:

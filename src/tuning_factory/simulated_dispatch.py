@@ -68,7 +68,7 @@ from .model_artifacts import (
     list_files,
 )
 from .model_ops import (
-    POLICY_F32_V1,
+    CURRENT_POLICY,
     MaterializeReceipt,
     MergeReceipt,
     local_config_sha256,
@@ -461,7 +461,7 @@ class SimulatedWorker:
             "target_modules": list(plan.target_modules), "bias": "none", "fan_in_fan_out": False,
             "task_type": "CAUSAL_LM", "inference_mode": True, "base_model_name_or_path": first.root.repo_id})),
                  (f"{prefix}/adapter_model.safetensors", _Tensors(shapes)), *_snapshot_files(directory, prefix)]
-        receipt = MergeReceipt(policy_id=POLICY_F32_V1, inputs=plan.inputs, normalized_weights=plan.normalized_weights,
+        receipt = MergeReceipt(policy_id=CURRENT_POLICY, inputs=plan.inputs, normalized_weights=plan.normalized_weights,
                                output_rank=rank, max_abs_delta_error=0.0, max_abs_logits_error=0.0,
                                finite_tensors_checked=len(shapes), output_files=_output_files(files, prefix))
         return _Layout(files=tuple(files), receipt=receipt)
@@ -476,7 +476,7 @@ class SimulatedWorker:
             raise ValueError(TARGETS_REQUIRED.format(kind=operation.kind))
         prefix = f"{MODEL_OP_PARENT}/output"
         files = [(f"{prefix}/model.safetensors", _full_weights(evidence)), *_snapshot_files(directory, prefix)]
-        receipt = MaterializeReceipt(policy_id=POLICY_F32_V1, base=base, adapter=operation.model,
+        receipt = MaterializeReceipt(policy_id=CURRENT_POLICY, base=base, adapter=operation.model,
                                      max_abs_delta_error=0.0, max_abs_logits_error=0.0,
                                      non_target_tensors_identical=True,
                                      tokenizer_fingerprint=adapter.tokenizer_fingerprint,

@@ -4,8 +4,9 @@ Importing this module touches only the standard library, pydantic and local cont
 PEFT, Transformers and safetensors are imported inside the numerical functions, after every input
 refusal and after the stdlib finite scan of the (small) adapter inputs. The scanner lives in
 ``safetensors_scan`` and the target-module inspector/verifier in ``target_inspection``; both are
-re-exported here. Policy ``model-ops-f32-v1`` computes in FP32 from an exact upcast of
-the inputs and stores every output tensor as F32. Inputs are ``LocalModel`` directories that the
+re-exported here. Every tolerance policy computes in FP32 from an exact upcast of
+the inputs and stores every output tensor as F32; new operations run under ``CURRENT_POLICY``
+(``model-ops-f32-v2``, see ``TolerancePolicy``). Inputs are ``LocalModel`` directories that the
 caller has already verified against their identity; the checks here repeat the cheap ones. The
 adapter conversion rules are graph_planner's public ``check_*`` rules, so planning and the worker agree.
 Outputs are staged in ``.model-op-*`` under the output's parent (the worker gives each attempt its own
@@ -24,6 +25,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -32,7 +34,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
 
-from pydantic import ValidationError
+from pydantic import ValidationError, model_validator
 
 from .config import StrictModel
 from .model_artifacts import (
@@ -67,16 +69,23 @@ from .target_inspection import (
 )
 
 __all__ = [
-    "CONTINUATION_REFUSAL", "EXPORT_ONLY_ADAPTER_FIELDS", "POLICY_F32_V1", "TOLERANCE_POLICIES", "LocalModel",
-    "MaterializeReceipt", "MergePlan", "MergeReceipt", "StagedLoad", "TolerancePolicy",
-    "adapter_metadata_from_config", "check_continuation", "check_continuation_targets",
+    "CONTINUATION_REFUSAL", "CURRENT_POLICY", "EXPORT_ONLY_ADAPTER_FIELDS", "POLICY_F32_V1", "POLICY_F32_V2",
+    "TOLERANCE_POLICIES", "LocalModel", "MaterializeReceipt", "MergePlan", "MergeReceipt", "StagedLoad",
+    "TolerancePolicy", "adapter_metadata_from_config", "check_continuation", "check_continuation_targets",
     "check_full_model_directory", "continuation_mismatches", "expected_continuation_adapter",
     "inspect_linear_modules", "inspect_target_modules", "local_config_sha256", "local_tokenizer_fingerprint",
-    "materialize_model", "merge_adapters", "normalize_json_newlines", "publish_output", "scan_finite_safetensors",
-    "validate_materialize_input", "validate_merge_inputs", "verify_inspected_targets", "write_adapter_config",
+    "materialize_model", "merge_adapters", "normalize_json_newlines", "publish_output", "scale_aware_logits_ok",
+    "scan_finite_safetensors", "validate_materialize_input", "validate_merge_inputs", "verify_inspected_targets",
+    "write_adapter_config",
 ]
 
-POLICY_F32_V1 = "model-ops-f32-v1"
+POLICY_F32_V1 = "model-ops-f32-v1"   # elementwise allclose logits; kept so older receipts still read
+POLICY_F32_V2 = "model-ops-f32-v2"   # scale-aware logits (relative L2 and scaled max abs error)
+CURRENT_POLICY = POLICY_F32_V2       # the policy every new merge/materialize runs and is accepted under
+LOGITS_ALLCLOSE = "allclose"
+LOGITS_SCALE_AWARE = "relative-l2-and-scaled-max"
+# Smallest normal float64: the relative-L2 denominator of an all-zero expectation (0/tiny = 0, anything else fails).
+L2_FLOOR = sys.float_info.min
 PEFT_PREFIX = "base_model.model."
 PROBE_TEXT = "factory model operations numerical probe"
 VARIANT = "unsupported adapter conversion variant"
@@ -99,19 +108,49 @@ def _quantized(operation: str) -> str:
 
 
 def _dtype_refusal(operation: str) -> str:
-    return f"{operation} requires F16, BF16 or F32 tensors under policy {POLICY_F32_V1}"
+    return f"{operation} requires F16, BF16 or F32 tensors under policy {CURRENT_POLICY}"
+
+
+_LOGITS_RULES = {POLICY_F32_V1: LOGITS_ALLCLOSE, POLICY_F32_V2: LOGITS_SCALE_AWARE}
 
 
 class TolerancePolicy(StrictModel):
-    policy_id: Literal["model-ops-f32-v1"] = POLICY_F32_V1
+    """FP32 numerics, F32 storage and the elementwise delta rule are the same in every policy; the logits rule is
+    versioned, and a policy id names exactly one rule and only that rule's thresholds.
+
+    - v1 ``allclose``: ``|a - e| <= logits_atol + logits_rtol * |e|`` for every logit. On real models FP32 rounding
+      across many layers exceeds it on logits near zero (no rtol headroom): a correct Qwen3.5-0.8B materialization on
+      the A40 Pod had max abs error 2.24e-5 on CPU and 1.79e-5 on CUDA, mean ~1.9e-6, largest |logit| 19.1.
+    - v2 ``relative-l2-and-scaled-max``: ``||a - e||_2 / max(||e||_2, tiny) <= logits_relative_l2`` and
+      ``max|a - e| <= logits_max_abs_scale * max(1, max|e|)``, every statistic finite. The first bounds the error over
+      all logits, the second catches a single wrong logit that a long vocabulary hides in the L2 norm.
+    """
+    policy_id: Literal["model-ops-f32-v1", "model-ops-f32-v2"] = POLICY_F32_V1
     storage_dtype: Literal["F32"] = "F32"   # every merge/materialize output tensor is stored F32
     delta_atol: float = 1e-6
     delta_rtol: float = 1e-5
-    logits_atol: float = 1e-5
-    logits_rtol: float = 1e-4
+    logits_rule: Literal["allclose", "relative-l2-and-scaled-max"] = LOGITS_ALLCLOSE
+    logits_atol: float | None = 1e-5
+    logits_rtol: float | None = 1e-4
+    logits_relative_l2: float | None = None
+    logits_max_abs_scale: float | None = None
+
+    @model_validator(mode="after")
+    def _one_logits_rule(self):
+        allclose = (self.logits_atol, self.logits_rtol)
+        scaled = (self.logits_relative_l2, self.logits_max_abs_scale)
+        used, unused = (allclose, scaled) if self.logits_rule == LOGITS_ALLCLOSE else (scaled, allclose)
+        if (self.logits_rule != _LOGITS_RULES[self.policy_id] or any(value is None for value in used)
+                or any(value is not None for value in unused)):
+            raise ValueError("tolerance policy fields differ from its logits rule")
+        return self
 
 
-TOLERANCE_POLICIES: Mapping[str, TolerancePolicy] = MappingProxyType({POLICY_F32_V1: TolerancePolicy()})
+TOLERANCE_POLICIES: Mapping[str, TolerancePolicy] = MappingProxyType({
+    POLICY_F32_V1: TolerancePolicy(),
+    POLICY_F32_V2: TolerancePolicy(policy_id=POLICY_F32_V2, logits_rule=LOGITS_SCALE_AWARE, logits_atol=None,
+                                   logits_rtol=None, logits_relative_l2=1e-5, logits_max_abs_scale=1e-4),
+})
 
 
 @dataclass(frozen=True)
@@ -533,6 +572,31 @@ def _close(torch, actual, expected, atol: float, rtol: float) -> tuple[bool, flo
     return bool(torch.allclose(actual, expected, atol=atol, rtol=rtol)) and math.isfinite(error), error
 
 
+def scale_aware_logits_ok(policy: TolerancePolicy, *, max_abs_error: float, max_abs_expected: float,
+                          l2_error: float, l2_expected: float) -> bool:
+    """The v2 logits rule on four statistics of ``actual - expected`` and ``expected`` (pure; no torch)."""
+    if policy.logits_rule != LOGITS_SCALE_AWARE:
+        raise ValueError(f"policy {policy.policy_id} does not use the scale-aware logits rule")
+    if not all(math.isfinite(value) for value in (max_abs_error, max_abs_expected, l2_error, l2_expected)):
+        return False
+    return (l2_error / max(l2_expected, L2_FLOOR) <= policy.logits_relative_l2
+            and max_abs_error <= policy.logits_max_abs_scale * max(1.0, max_abs_expected))
+
+
+def _logits_close(torch, actual, expected, tolerance: TolerancePolicy) -> tuple[bool, float]:
+    """The policy's logits rule: (accepted, max abs error), as ``_close`` returns."""
+    if tolerance.logits_rule == LOGITS_ALLCLOSE:
+        return _close(torch, actual, expected, tolerance.logits_atol, tolerance.logits_rtol)
+    if tuple(actual.shape) != tuple(expected.shape):   # never compared by broadcasting
+        return False, math.inf
+    difference = actual - expected
+    error = float(difference.abs().max())
+    return scale_aware_logits_ok(
+        tolerance, max_abs_error=error, max_abs_expected=float(expected.abs().max()),
+        l2_error=float(torch.linalg.vector_norm(difference)),
+        l2_expected=float(torch.linalg.vector_norm(expected))), error
+
+
 def _require_f32(directory: Path, *, adapter: bool) -> None:
     if any(tensor.dtype != "F32" for tensor in _header_inventory(directory, adapter=adapter).values()):
         raise ValueError("model-operation output tensors must be stored as F32")
@@ -692,7 +756,7 @@ def _expected_deltas(torch, models, weights, scales) -> dict:
 
 
 def merge_adapters(inputs: Sequence[LocalModel], weights: Sequence[float], output: Path, *,
-                   base: LocalModel, policy: str = POLICY_F32_V1, device: str = "cpu",
+                   base: LocalModel, policy: str = CURRENT_POLICY, device: str = "cpu",
                    require_real: bool = True, probe_ids: Sequence[int] | None = None) -> MergeReceipt:
     """FP32 PEFT ``cat`` merge of compatible LoRA adapters into a new rank-sum adapter."""
     tolerance = _policy(policy)
@@ -779,14 +843,13 @@ def _verify_merge(torch, peft, transformers, inputs, plan, base_path, payload, d
     wanted_logits = _logits(torch, reference, ids, device)
     del reference
     reloaded = peft.PeftModel.from_pretrained(_load_fp32(torch, transformers, base_path, device), str(payload))
-    ok, logits_error = _close(torch, _logits(torch, reloaded.eval(), ids, device), wanted_logits,
-                              tolerance.logits_atol, tolerance.logits_rtol)
+    ok, logits_error = _logits_close(torch, _logits(torch, reloaded.eval(), ids, device), wanted_logits, tolerance)
     if not ok:
         raise ValueError(LOGITS_FAILED)
     return delta_error, logits_error
 
 
-def materialize_model(input: StagedLoad, output: Path, *, policy: str = POLICY_F32_V1,
+def materialize_model(input: StagedLoad, output: Path, *, policy: str = CURRENT_POLICY,
                       device: str = "cpu", probe_ids: Sequence[int] | None = None) -> MaterializeReceipt:
     """Merge one LoRA/QLoRA adapter into its exact unquantized effective base; store F32."""
     tolerance = _policy(policy)
@@ -823,8 +886,7 @@ def materialize_model(input: StagedLoad, output: Path, *, policy: str = POLICY_F
         checked += _torch_scan(torch, payload, adapter=False)
         delta_error = _verify_materialized(torch, load.adapter, base_path, payload, tolerance, unloaded)
         reloaded = _load_fp32(torch, transformers, payload, target)
-        ok, logits_error = _close(torch, _logits(torch, reloaded, ids, target), before,
-                                  tolerance.logits_atol, tolerance.logits_rtol)
+        ok, logits_error = _logits_close(torch, _logits(torch, reloaded, ids, target), before, tolerance)
         del reloaded
         if not ok:
             raise ValueError(LOGITS_FAILED)

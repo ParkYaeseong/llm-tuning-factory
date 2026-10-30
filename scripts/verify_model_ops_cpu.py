@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import importlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -145,7 +146,7 @@ class Acceptance:
         self.LoraConfig, self.PeftModel, self.get_peft_model = LoraConfig, PeftModel, get_peft_model
         self.load_file, self.save_file = load_file, save_file
         self.artifacts, self.ops = model_artifacts, model_ops
-        self.policy = model_ops.TOLERANCE_POLICIES[model_ops.POLICY_F32_V1]
+        self.policy = model_ops.TOLERANCE_POLICIES[model_ops.CURRENT_POLICY]
         self.work = work
         self.store = model_artifacts.ModelArtifactStore(work / "store")
         self.checks: dict[str, dict] = {}
@@ -199,10 +200,27 @@ class Acceptance:
         return tuple(tensors)
 
     def close(self, actual, expected, kind):
-        atol, rtol = ((self.policy.delta_atol, self.policy.delta_rtol) if kind == "delta"
-                      else (self.policy.logits_atol, self.policy.logits_rtol))
+        if kind == "logits":
+            ok, error, _ = self.logits_close(actual, expected)
+            return ok, error
         error = float((actual - expected).abs().max())
-        return bool(self.torch.allclose(actual, expected, atol=atol, rtol=rtol)), error
+        return bool(self.torch.allclose(actual, expected, atol=self.policy.delta_atol,
+                                        rtol=self.policy.delta_rtol)), error
+
+    def logits_close(self, actual, expected):
+        """The policy's scale-aware logits rule, written here independently of model_ops:
+        (accepted, max abs error, relative L2 error)."""
+        torch, policy = self.torch, self.policy
+        assert policy.logits_rule == "relative-l2-and-scaled-max", policy.policy_id
+        if actual.shape != expected.shape:
+            return False, math.inf, math.inf
+        error = float((actual - expected).abs().max())
+        relative = float(torch.linalg.vector_norm(actual - expected)) / max(
+            float(torch.linalg.vector_norm(expected)), sys.float_info.min)
+        bound = policy.logits_max_abs_scale * max(1.0, float(expected.abs().max()))
+        ok = (math.isfinite(error) and math.isfinite(relative) and relative <= policy.logits_relative_l2
+              and error <= bound)
+        return ok, error, relative
 
     def lora_delta(self, directory, scale):
         """Per-module LoRA delta scale·B@A in float64, keyed by the base module name."""
@@ -343,8 +361,9 @@ class Acceptance:
                     weight = independent.get_submodule(module).weight
                     weight.copy_((weight.to(torch.float64) + value).to(torch.float32))
             reloaded = self.PeftModel.from_pretrained(self.load(self.base_dir), str(merged_dir)).eval()
-            ok, error = self.close(self.logits(reloaded), self.logits(independent), "logits")
-            return {"passed": ok, "max_abs_error": error, "receipt_max_abs_error": receipt.max_abs_logits_error}
+            ok, error, relative = self.logits_close(self.logits(reloaded), self.logits(independent))
+            return {"passed": ok, "max_abs_error": error, "relative_l2_error": relative,
+                    "receipt_max_abs_error": receipt.max_abs_logits_error}
 
         def freezes():
             adapter = ops.adapter_metadata_from_config(config, method="lora")
@@ -393,8 +412,9 @@ class Acceptance:
 
         def logits():
             before = self.PeftModel.from_pretrained(self.load(self.base_dir), str(self.a1.path)).eval()
-            ok, error = self.close(self.logits(self.load(out)), self.logits(before), "logits")
-            return {"passed": ok, "max_abs_error": error, "receipt_max_abs_error": receipt.max_abs_logits_error}
+            ok, error, relative = self.logits_close(self.logits(self.load(out)), self.logits(before))
+            return {"passed": ok, "max_abs_error": error, "relative_l2_error": relative,
+                    "receipt_max_abs_error": receipt.max_abs_logits_error}
 
         def finite():
             return {"passed": all(tensor.dtype == torch.float32 and bool(torch.isfinite(tensor).all())
@@ -779,7 +799,7 @@ class Acceptance:
         actual = self.lora_delta(out, config["lora_alpha"] / config["r"])
         delta = [self.close(actual[module], expected[module], "delta") for module in expected if module in actual]
         reloaded = self.PeftModel.from_pretrained(self.load(base), str(out)).eval()
-        ok, error = self.close(self.logits(reloaded), self.logits(self.with_deltas(base, expected)), "logits")
+        ok, error, relative = self.logits_close(self.logits(reloaded), self.logits(self.with_deltas(base, expected)))
         frozen = self.store.verify(self.store.freeze(out, self.descriptor(
             out, marker=out.name, storage_kind="adapter", effective_base=root,
             parents=tuple(model.identity for model in adapters),
@@ -798,7 +818,7 @@ class Acceptance:
             "failed_conditions": sorted(name for name, value in conditions.items() if not value),
             "targets": len(wanted), "recorded_target_modules": len(recorded),
             "max_abs_delta_error": max(error for _, error in delta), "max_abs_logits_error": error,
-            "receipt_max_abs_delta_error": receipt.max_abs_delta_error,
+            "logits_relative_l2_error": relative, "receipt_max_abs_delta_error": receipt.max_abs_delta_error,
             "receipt_max_abs_logits_error": receipt.max_abs_logits_error}
 
     def composite_materialized(self, kind, base, root, local, adapter, wanted, out):
@@ -817,9 +837,9 @@ class Acceptance:
         frozen = sorted(name for name in before if name.startswith(frozen_prefixes))
         others = sorted(loaded - set(targets))
         merged = self.load(out)
-        ok, error = self.close(self.logits(merged), self.logits(self.with_deltas(base, deltas)), "logits")
+        ok, error, relative = self.logits_close(self.logits(merged), self.logits(self.with_deltas(base, deltas)))
         unmerged = self.PeftModel.from_pretrained(self.load(base), str(adapter.path)).eval()
-        peft_ok, peft_error = self.close(self.logits(merged), self.logits(unmerged), "logits")
+        peft_ok, peft_error, peft_relative = self.logits_close(self.logits(merged), self.logits(unmerged))
         config = json.loads((out / "config.json").read_text(encoding="utf-8"))
         full_ref = self.store.freeze(out, self.descriptor(out, marker=out.name, storage_kind="full_model",
                                                           effective_base=root, parents=(adapter.identity,), root=root))
@@ -847,7 +867,9 @@ class Acceptance:
             "frozen_tensors_identical": len(frozen), "other_tensors_identical": len(others) - len(frozen),
             "output_tensors": len(result), "base_tensors": len(before), "architectures": config.get("architectures"),
             "max_abs_delta_error": max(error for _, error in delta), "max_abs_logits_error": error,
-            "max_abs_logits_error_vs_unmerged": peft_error, "receipt_max_abs_delta_error": receipt.max_abs_delta_error,
+            "logits_relative_l2_error": relative, "max_abs_logits_error_vs_unmerged": peft_error,
+            "logits_relative_l2_error_vs_unmerged": peft_relative,
+            "receipt_max_abs_delta_error": receipt.max_abs_delta_error,
             "receipt_max_abs_logits_error": receipt.max_abs_logits_error, "copied_files": copied}
 
     def check_composite_kind(self, kind):
@@ -913,6 +935,7 @@ class Acceptance:
                     and details["all"]["targets"] == module_count,
                     "max_abs_error": max(item["max_abs_delta_error"] for item in details.values()),
                     "max_abs_logits_error": max(item["max_abs_logits_error"] for item in details.values()),
+                    "logits_relative_l2_error": max(item["logits_relative_l2_error"] for item in details.values()),
                     "merges": details}
 
         def materialize():
@@ -927,6 +950,7 @@ class Acceptance:
                     and details["all"]["targets"] == module_count,
                     "max_abs_error": max(item["max_abs_delta_error"] for item in details.values()),
                     "max_abs_logits_error": max(item["max_abs_logits_error"] for item in details.values()),
+                    "logits_relative_l2_error": max(item["logits_relative_l2_error"] for item in details.values()),
                     "adapters": details}
 
         self.record(f"composite_{kind}_targets", targets)

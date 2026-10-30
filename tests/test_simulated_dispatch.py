@@ -497,6 +497,9 @@ def test_simulated_outputs_chain_through_compile_node(tmp_path):
     assert descriptors["merge"].adapter.rank == 5 and descriptors["merge"].effective_base == w.refs.base
     assert set(descriptors["merge"].parents) == {w.refs.first, w.refs.second, w.refs.base}
     assert descriptors["full"].storage_kind == "full_model" and models["merge"] in descriptors["full"].parents
+    for node_id in ("merge", "full"):   # simulated receipts carry the policy real operations run under
+        receipt = json.loads((launch_dir(w, outcomes[node_id][0]) / "operation-receipt.json").read_bytes())
+        assert receipt["receipt"]["policy_id"] == "model-ops-f32-v2" and receipt["simulated"] is True
     targets = outcomes["full"][1].inspected_targets
     assert [item.base for item in targets] == [models["full"]]
     ledger = {evidence.node_id: saved for evidence, saved in store.ledger(w.run_id)}
