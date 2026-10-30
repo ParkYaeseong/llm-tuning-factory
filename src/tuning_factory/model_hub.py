@@ -52,6 +52,17 @@ def _tied(metadata, text, architecture):
     return True if str(architecture).startswith("gemma") else None
 
 
+def recommended_precision(metadata):
+    """The checkpoint dtype of a config.json: text_config first (composite models nest the text model), then the top
+    level; torch_dtype before its newer name dtype; text values only."""
+    text = metadata.get("text_config")
+    for level in (text if isinstance(text, dict) else {}, metadata):
+        for key in ("torch_dtype", "dtype"):
+            if isinstance(level.get(key), str):
+                return level[key]
+    return None
+
+
 def repository_id(value):
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}/[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", value):
         raise ValueError("Hugging Face repository must be an exact publisher/model ID")
@@ -215,7 +226,7 @@ class ModelHub:
                   "supported": not reasons, "reasons": reasons, "profile": None,
                   "model_revision": pinned, "tokenizer_revision": pinned, "metadata_verified": True,
                   "max_length": min(32768, positions), "hidden_layers": _count(text.get("num_hidden_layers"), 10000),
-                  "recommended_precision": text.get("torch_dtype", text.get("dtype")), **facts}
+                  "recommended_precision": recommended_precision(metadata), **facts}
         if reasons:
             return result
         template = ARCHITECTURES[architecture][0]

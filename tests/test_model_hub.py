@@ -138,7 +138,17 @@ def test_an_untied_hub_model_without_a_tie_fact_may_train_its_lm_head():
     assert result['valid'], result['errors']
 
 
-@pytest.mark.parametrize('safetensors',['5123178051', [5123178051], 5123178051, None])
+@pytest.mark.parametrize('top,text,precision', [
+    ({'torch_dtype': 'bfloat16'}, {}, 'bfloat16'), ({'torch_dtype': 'bfloat16'}, {'dtype': 'float16'}, 'float16'),
+    ({}, {'torch_dtype': 'float32', 'dtype': 'float16'}, 'float32'), ({'dtype': 'bfloat16'}, {'dtype': 5}, 'bfloat16'),
+    ({'dtype': ['bf16']}, {}, None)])
+def test_recommended_precision_reads_text_config_then_the_top_level(top, text, precision):
+    service, _ = hub(extra={**top, 'text_config': {'max_position_embeddings': 32768, 'num_hidden_layers': 24, **text}})
+    result = service.inspect('Qwen/Qwen3.5-0.8B')
+    assert result['recommended_precision'] == precision and result['profile']['recommended_precision'] == precision
+
+
+@pytest.mark.parametrize('safetensors', ['5123178051', [5123178051], 5123178051, None])
 def test_a_safetensors_summary_that_is_not_an_object_is_ignored(safetensors):
     service, _ = hub(info={'safetensors': safetensors})
     profile = service.inspect('Qwen/Qwen3.5-0.8B')['profile']

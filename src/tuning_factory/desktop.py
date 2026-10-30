@@ -18,7 +18,7 @@ from .desktop_inspection import inspect_dataset, parameter_changes, parse_progre
 from .execution import ExecutionUncertain, Policy, RunPodController
 from .gpu_servers import ServerApprovalReceipt, SSHServerInspection, server_settings
 from .manifest import resolve, source_hash
-from .model_hub import ModelHub, register_model, registered_models
+from .model_hub import ModelHub, recommended_precision, register_model, registered_models
 from .registry import canonical, digest, parse_dataset, safe_name
 from .runner import Factory
 from .runtime_profiles import engine_profile
@@ -330,7 +330,7 @@ class DesktopService:
             return {"model_revision": revision, "tokenizer_revision": revision,
                     "template": profile["template"], "architecture": profile["architecture"],
                     "max_length": min(profile["max_length"], text.get("max_position_embeddings") or profile["max_length"]),
-                    "recommended_precision": metadata.get("torch_dtype", metadata.get("dtype")),
+                    "recommended_precision": recommended_precision(metadata),
                     "hidden_layers": text.get("num_hidden_layers"), "metadata_verified": True}
         if action == "save_profile":
             config = AIConfig.model_validate(data["config"])
