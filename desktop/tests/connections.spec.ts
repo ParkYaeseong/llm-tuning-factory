@@ -324,7 +324,7 @@ test("server runtime preparation inspects first, cancels cleanly and sends the e
   await page.getByRole("button", { name: "돌아가기", exact: true }).click();
   expect(await calls(page, "runtime_prepare")).toEqual([]);
   await page.evaluate(() => (window as any).__mock.prepareReport = { prepared: true,
-    cleanup: { removed: [{ name: "b".repeat(16), bytes: 5 * 1024 ** 3 }], kept_in_use: [] } });
+    cleanup: { removed: ["b".repeat(16)], kept_in_use: [], errors: [], free_before: 10 * 1024 ** 3, free_after: 15 * 1024 ** 3 } });
   await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
   await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
   await expect(page.locator(".notice")).toContainText("학습 환경");

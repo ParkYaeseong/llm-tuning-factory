@@ -316,14 +316,31 @@ test("PPO runtime preparation explicitly confirms and carries selected stage", a
 });
 
 test("RunPod runtime preparation names the cleanup and reports what it freed or skipped", async ({ page }) => {
+  // Freed space is the free-space delta of the volume: removed venvs share hard-linked files with uv-cache.
   const report = { ready: true, runtime_state: "ready", pod_id: "borrowed",
-    cleanup: { removed: [{ name: "b".repeat(16), bytes: 3 * 1024 ** 3 }, { name: "c".repeat(16) + "-ppo", bytes: 1024 ** 3 / 2 }], kept_in_use: ["d".repeat(16)] } };
+    cleanup: { removed: ["b".repeat(16), "c".repeat(16) + "-ppo"], kept_in_use: ["d".repeat(16)], errors: [],
+      free_before: 20 * 1024 ** 3, free_after: 23.5 * 1024 ** 3 } };
   await overrideActions(page, { runtime_prepare: report });
   await page.locator('nav [data-action="nav:connections"]').click();
   await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
   await expect(page.getByRole("dialog")).toContainText("이전 앱 버전의 학습 환경 중 쓰지 않는 것을 지웁니다");
   await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
   await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 2개를 지워 3.5GB를 확보했습니다.");
+  await expect(page.locator(".notice")).not.toContainText("지우지 못했습니다");
+  // Some removed, one failed and the time budget ran out: what was removed still shows, with short notes.
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: ["b".repeat(16)], kept_in_use: [],
+    errors: ["c".repeat(16)], incomplete: true, free_before: 20 * 1024 ** 3, free_after: 21 * 1024 ** 3 } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 1개를 지워 1.0GB를 확보했습니다.");
+  await expect(page.locator(".notice")).toContainText("일부 이전 학습 환경은 지우지 못했습니다(학습 환경 준비에는 영향이 없습니다).");
+  await expect(page.locator(".notice")).toContainText("남은 이전 학습 환경은 다음 학습 환경 준비 때 정리합니다.");
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: ["b".repeat(16)], kept_in_use: [],
+    cleanup_error: "ValueError: unreadable manifest", free_before: 20 * 1024 ** 3, free_after: 19 * 1024 ** 3 } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 1개를 지워 0.0GB를 확보했습니다.");
+  await expect(page.locator(".notice")).toContainText("일부 이전 학습 환경은 지우지 못했습니다");
   await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: [], kept_in_use: [], cleanup_error: "cleanup report missing" } } });
   await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
   await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
@@ -474,6 +491,17 @@ const startRun = async (page: import("@playwright/test").Page) => {
 };
 const calledActions = (page: import("@playwright/test").Page) => page.evaluate(() => [
   ...(window as any).__testCalls.map((c: any) => c.args?.action), ...(window as any).__overridden.map((a: any) => a.action)]);
+
+test("a preparation in the run approval reports what it pruned with the result", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { ready: false, runtime_state: "missing", findings: [] },
+    execute: { id: "c".repeat(32), status: "COMPLETED", runtime_cleanup: { removed: ["b".repeat(16)], kept_in_use: [],
+      errors: [], free_before: 10 * 1024 ** 3, free_after: 12 * 1024 ** 3 } } });
+  await startRun(page);
+  await expect(page.getByRole("dialog")).toContainText("이전 앱 버전의 학습 환경 중 쓰지 않는 것을 지웁니다");
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("학습 처리가 끝났습니다.");
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 1개를 지워 2.0GB를 확보했습니다.");
+});
 
 test("a ready environment is approved without preparing the runtime", async ({ page }) => {
   await overrideActions(page, { runtime_check: { ready: true, runtime_state: "ready", findings: [] }, execute: null });

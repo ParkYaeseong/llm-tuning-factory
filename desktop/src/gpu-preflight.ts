@@ -48,15 +48,21 @@ export function preflightOutcome(report: Obj | null | undefined, server: boolean
     + (warns.length ? "\n\n주의 항목\n" + warns.join("\n") : "") };
 }
 
-/** The cleanup line after a preparation: removed old runtimes and the space they freed, or nothing. */
+/** The cleanup lines after a preparation: how many old runtimes it removed and the free space it gained (removed
+ * venvs share hard-linked files with uv-cache, so the volume's free-space delta, not their size), a short note
+ * when some could not be removed, and one when its time budget left the rest for the next preparation. */
 export function cleanupSummary(report: Obj | null | undefined): string {
   const cleanup = report?.cleanup;
   if (!cleanup) return "";
-  if (cleanup.cleanup_error) return "\n이전 학습 환경 정리는 건너뛰었습니다(학습 환경 준비에는 영향이 없습니다).";
-  const removed: Obj[] = cleanup.removed ?? [];
-  if (!removed.length) return "";
-  const bytes = removed.reduce((sum, item) => sum + (Number(item.bytes) || 0), 0);
-  return `\n이전 앱 버전의 학습 환경 ${removed.length}개를 지워 ${(bytes / 1024 ** 3).toFixed(1)}GB를 확보했습니다.`;
+  const removed = (cleanup.removed ?? []).length;
+  const freed = Math.max(0, Number(cleanup.free_after) - Number(cleanup.free_before)) || 0;
+  const lines: string[] = [];
+  if (removed) lines.push(`이전 앱 버전의 학습 환경 ${removed}개를 지워 ${(freed / 1024 ** 3).toFixed(1)}GB를 확보했습니다.`);
+  if (cleanup.cleanup_error || cleanup.errors?.length)
+    lines.push(removed ? "일부 이전 학습 환경은 지우지 못했습니다(학습 환경 준비에는 영향이 없습니다)."
+      : "이전 학습 환경 정리는 건너뛰었습니다(학습 환경 준비에는 영향이 없습니다).");
+  if (cleanup.incomplete) lines.push("남은 이전 학습 환경은 다음 학습 환경 준비 때 정리합니다.");
+  return lines.map(line => "\n" + line).join("");
 }
 
 /** The notice after 환경 확인 or 학습 환경 준비, with the observed GPU when there is one. */
