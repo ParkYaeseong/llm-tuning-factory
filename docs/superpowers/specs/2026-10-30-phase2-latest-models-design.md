@@ -183,9 +183,13 @@ CPU forward가 된다(2026-10-30 확인).
 
 **정리.** 고정 Python 소스 `desktop_runtime.PRUNE_SOURCE`를 실행한다(`gpu_servers._LINUX_PROBE`와 같은 방식, 인자는 따로 인용한
 검증된 원격 루트와 현재 16자리 소스 해시뿐).
-- 별도 SSH 명령이 아니라 `install_runtime`의 설치 스크립트 안에서 실행한다. 이번 학습 환경의 `prepare.lock`(`flock -n 9`)을 잡은
-  직후다. prepare 잠금은 그 스크립트가 도는 동안만 유지되기 때문이다.
-- 스크립트 출력의 `TF_PRUNE` 줄은 `prune_report(output)`이 읽는다.
+- 별도 SSH 명령이 아니라 `install_runtime`의 설치 스크립트 안에서 실행한다. 이번 학습 환경의 `prepare.lock`(`flock -n 9`)과
+  `in-use.lock`(배타, `flock -x -n 8`)을 잡은 직후다. 두 잠금은 그 스크립트가 끝날 때까지 유지된다.
+- **venv 재구성 보호.** 준비는 venv를 늘 `--clear`로 다시 만든다. 이 앱 버전의 학습 환경을 쓰는 작업자가 공유 `in-use.lock`을
+  쥐고 있으면 배타 잠금을 잡지 못해 스크립트가 `TF_RUNTIME_IN_USE`로 멈추고(정리도 하지 않는다), 앱은 `RUNTIME_IN_USE`
+  ("이 앱 버전의 학습 환경을 쓰는 작업이 실행 중이라 학습 환경을 다시 준비할 수 없습니다. 작업이 끝난 뒤 다시 시도하세요.")를 보여 준다.
+- 스크립트 출력의 `TF_PRUNE` 줄은 `prune_report(output)`이 읽는다. uv 출력 뒤 마지막에 찍으므로 `command()`가 남기는 출력 꼬리에
+  늘 들어 있다.
 - 후보: `<root>/runtime/` 아래에서 이름이 `^[0-9a-f]{16}(-ppo)?$`이고 심볼릭 링크가 아닌 실제 디렉터리.
   현재 소스 해시의 `<h16>`·`<h16>-ppo`는 후보가 아니다.
 - 다음을 모두 만족할 때만 지운다.
@@ -194,15 +198,29 @@ CPU forward가 된다(2026-10-30 확인).
   - `jobs/*/*` 아래에 그 학습 환경을 쓰는 살아 있는 시도가 없다. 살아 있는 시도는 `worker.log`가 있고 `result.json`이 없으며,
     `manifest.json`의 `source_sha256[:16]`이 후보 해시와 같고, 지금 < 시도 디렉터리 수정 시각 + 제한 시간 + 3600초인 시도다.
     제한 시간은 v1 `config.resource_profile.timeout_seconds`, v2 `operation.resources.timeout_seconds`다.
-    잠금 표시가 없던 이전 앱 버전의 실행 중 작업도 이 검사로 보호한다.
-  - 끝나지 않은 시도의 `manifest.json`을 읽을 수 없으면 **아무것도 지우지 않는다.**
+    잠금 표시가 없던 이전 앱 버전의 실행 중 작업도 이 검사로 보호한다. 이 검사는 처음 한 번, 그리고 후보의 잠금을 잡은 뒤
+    이름 바꾸기 직전에 다시 한다.
+  - 끝나지 않은 시도의 `manifest.json`을 읽을 수 없으면 그때부터 **아무것도 지우지 않는다**(`cleanup_error`; 처음 검사에서 걸리면
+    하나도 지우지 않는다).
 - 지우는 방법: `runtime/.trash-<이름>-<pid>`로 이름을 바꾼 뒤 `shutil.rmtree`. 남은 `.trash-*`도 지운다.
+  한 후보를 지우다 실패하면(`OSError`) 그 이름을 `errors`에 넣고 다음 후보로 넘어간다.
+- **시간 한도.** 시작한 지 300초(`BUDGET`)가 지나면 새 후보를 지우지 않고 `incomplete: true`를 남긴다. 나머지는 다음 준비 때 지운다.
 - `uv-cache/`, `python/`, `hf-cache/`, `model-cache/`, `jobs/`는 절대 건드리지 않는다.
-- 결과를 한 줄 `TF_PRUNE {"removed": [{"name", "bytes"}], "kept_in_use": [...], "free_before", "free_after"}`로 출력한다
-  (`shutil.disk_usage`, POSIX에서 statvfs).
-  실패는 준비를 멈추지 않는다(`cleanup_error`). 결과는 `preparation["cleanup"]`과 `runtime()` 보고의 `cleanup`에 넣는다.
+- 결과를 한 줄 `TF_PRUNE {"removed": [이름…], "kept_in_use": [이름…], "errors": [이름…], "free_before", "free_after"}`로
+  출력한다. 시간 한도에 걸리면 `"incomplete": true`, 예외가 나면 `"cleanup_error"`가 더 붙는다.
+  - 확보한 용량은 `free_after − free_before`, 즉 볼륨 남은 공간의 차이다(`shutil.disk_usage`, POSIX에서 statvfs). 지운 venv는
+    uv-cache와 하드 링크로 파일을 나눠 쓰므로 파일 크기의 합이 아니다.
+  - 실패는 준비를 멈추지 않는다(`cleanup_error`). 보고가 없거나 읽을 수 없으면
+    `{"removed": [], "kept_in_use": [], "cleanup_error": "cleanup report missing"}`이다.
+  - 결과는 `preparation["cleanup"]`, `runtime()` 보고의 `cleanup`, 그리고 실행 승인에서 함께 준비했으면 실행 결과의
+    `runtime_cleanup`에 넣는다.
+  - 정리 뒤 설치 단계가 실패하면 스크립트가 멈춰 보고가 나오지 않는다. 화면에는 설치 실패만 보이고, 이미 지운 이전 학습 환경은
+    알리지 않는다(받아들인 한계).
 - 승인·안내 문구(RunPod "학습 환경 준비", 실행 승인의 설치 안내, GPU 서버 `prepareApproval`, 준비 중 안내)에
-  정리 사실을 적고, 준비가 끝나면 지운 개수·확보한 용량을 보여 준다.
+  정리 사실을 적는다. 준비가 끝나면 지운 개수와 확보한 용량(0.1GB 미만이면 개수만)을 보여 준다. 일부를 지우지 못했으면
+  "일부 이전 학습 환경은 지우지 못했습니다", 하나도 지우지 못했으면 "이전 학습 환경을 지우지 못했습니다", 지운 것 없이
+  `cleanup_error`만 있으면 "이전 학습 환경 정리는 건너뛰었습니다"를 더한다(모두 "(학습 환경 준비에는 영향이 없습니다)."로 끝난다).
+  `incomplete`이면 "남은 이전 학습 환경은 다음 학습 환경 준비 때 정리합니다."를 더한다.
 
 ### 4.4 모델 목록과 허브 프로필
 
