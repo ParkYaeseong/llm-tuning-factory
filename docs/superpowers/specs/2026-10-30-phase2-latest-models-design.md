@@ -217,8 +217,11 @@ CPU forward가 된다(2026-10-30 확인).
 - 허브 조회가 채운다.
   - `parameters_total`: 모델 API의 `safetensors.total`.
   - `hidden_size`·`hidden_layers`: `text_config`(없으면 최상위).
-  - `moe`: `text_config.num_experts`가 참이면 참(Gemma 4는 MoE가 아니어도 키가 null로 있다).
-  - `tie_word_embeddings`: 최상위 → `text_config` → transformers 기본값 참.
+  - `moe`: `text_config.num_experts`가 양의 정수이면 참(Gemma 4는 MoE가 아니어도 키가 null로 있다).
+  - `tie_word_embeddings`: 최상위 → `text_config`(불리언 값만) → 둘 다 없으면 Gemma 계열(`gemma*`)은 참(transformers
+    기본값), 그 밖의 구조는 모름(`None`, 직렬화에서 빠진다). 모름이면 tied lm_head 거부(4.6)를 하지 않는다.
+  - 값이 형식에 맞지 않으면(불리언·문자열·소수, 0 이하, 범위 밖, `safetensors`가 객체가 아님) 그 값만 모름으로 두고
+    등록은 막지 않는다.
   - 텍스트 매개변수는 허브 조회로 얻지 못한다(가중치 헤더를 읽지 않는다). 그래서 허브 모델의 추정은 학습 상태에도 전체 매개변수를 쓴다.
 - `imported_model()`은 이 값을 목록 항목 키(`parameters_total`, `parameters_b`, `hidden_size`, `num_layers`, `moe`,
   `tie_word_embeddings`)로 옮긴다.

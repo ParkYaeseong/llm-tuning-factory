@@ -42,12 +42,14 @@ def _count(value, high, low=1):
     return value if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high else None
 
 
-def _tied(metadata, text):
-    """tie_word_embeddings: the top level, then text_config (booleans only), then transformers' default (True)."""
+def _tied(metadata, text, architecture):
+    """tie_word_embeddings: the top level, then text_config (booleans only), then the architecture's transformers
+    default when it is known to be tied (Gemma configs default to True); otherwise unknown (None), so the tied
+    lm_head refusal (capabilities.FREEZE_TIED_LM_HEAD) never refuses a model that may be untied."""
     for level in (metadata, text):
         if isinstance(level.get("tie_word_embeddings"), bool):
             return level["tie_word_embeddings"]
-    return True
+    return True if str(architecture).startswith("gemma") else None
 
 
 def repository_id(value):
@@ -207,7 +209,7 @@ class ModelHub:
         facts = {"parameters_total": _count(summary.get("total"), 10 ** 15) if isinstance(summary, dict) else None,
                  "hidden_size": _count(text.get("hidden_size"), 1_000_000),
                  "moe": _count(text.get("num_experts"), 1_000_000) is not None,
-                 "tie_word_embeddings": _tied(metadata, text)}
+                 "tie_word_embeddings": _tied(metadata, text, architecture)}
         positions = _count(text.get("max_position_embeddings"), 10_000_000, low=64) or 32768
         result = {"repo_id": model, "revision": pinned, "architecture": architecture,
                   "supported": not reasons, "reasons": reasons, "profile": None,

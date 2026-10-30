@@ -115,7 +115,30 @@ def test_one_malformed_hub_fact_never_blocks_the_import(bad):
     assert result['max_length'] == 32768 and result['hidden_layers'] is None and result['hidden_size'] is None
 
 
-@pytest.mark.parametrize('safetensors', ['5123178051', [5123178051], 5123178051, None])
+@pytest.mark.parametrize('model_type,top,text,tied', [
+    ('qwen3_5', True, False, True), ('qwen3_5', None, False, False), ('qwen3_5', None, True, True),
+    ('qwen3_5', 'yes', None, None), ('qwen3_5', None, None, None), ('qwen3', None, None, None),
+    ('gemma4', None, None, True), ('gemma4_text', None, None, True), ('gemma4', None, False, False)])
+def test_tied_embeddings_fall_back_from_the_top_level_to_text_config_to_the_architecture(model_type, top, text, tied):
+    config = {'max_position_embeddings': 32768, 'num_hidden_layers': 24}
+    extra = {'text_config': {**config, **({} if text is None else {'tie_word_embeddings': text})},
+             **({} if top is None else {'tie_word_embeddings': top})}
+    service, _ = hub(model_type, extra)
+    profile = service.inspect('someone/model')['profile']
+    assert profile.get('tie_word_embeddings') == tied and ('tie_word_embeddings' in profile) == (tied is not None)
+
+
+def test_an_untied_hub_model_without_a_tie_fact_may_train_its_lm_head():
+    from tuning_factory.capabilities import compatibility
+    service, _ = hub('qwen3', {'text_config': {'max_position_embeddings': 32768, 'num_hidden_layers': 28}})
+    profile = service.inspect('someone/qwen3-untied')['profile']
+    result = compatibility({'base_model': profile['repo_id'], 'model_revision': REVISION, 'model_profile': profile,
+                            'template': profile['template'], 'training_method': 'freeze',
+                            'finetuning_options': {'freeze_extra_modules': 'lm_head'}})
+    assert result['valid'], result['errors']
+
+
+@pytest.mark.parametrize('safetensors',['5123178051', [5123178051], 5123178051, None])
 def test_a_safetensors_summary_that_is_not_an_object_is_ignored(safetensors):
     service, _ = hub(info={'safetensors': safetensors})
     profile = service.inspect('Qwen/Qwen3.5-0.8B')['profile']
