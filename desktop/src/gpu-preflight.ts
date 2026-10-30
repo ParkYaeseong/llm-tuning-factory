@@ -49,18 +49,21 @@ export function preflightOutcome(report: Obj | null | undefined, server: boolean
 }
 
 /** The cleanup lines after a preparation: how many old runtimes it removed and the free space it gained (removed
- * venvs share hard-linked files with uv-cache, so the volume's free-space delta, not their size), a short note
- * when some could not be removed, and one when its time budget left the rest for the next preparation. */
+ * venvs share hard-linked files with uv-cache, so the volume's free-space delta, not their size; under 0.1 GB the
+ * count alone), a short note when some or all could not be removed or the cleanup was skipped, and one when its
+ * time budget left the rest for the next preparation. */
 export function cleanupSummary(report: Obj | null | undefined): string {
   const cleanup = report?.cleanup;
   if (!cleanup) return "";
   const removed = (cleanup.removed ?? []).length;
-  const freed = Math.max(0, Number(cleanup.free_after) - Number(cleanup.free_before)) || 0;
+  const freed = (Math.max(0, Number(cleanup.free_after) - Number(cleanup.free_before)) || 0) / 1024 ** 3;
+  const unaffected = "(학습 환경 준비에는 영향이 없습니다).";
   const lines: string[] = [];
-  if (removed) lines.push(`이전 앱 버전의 학습 환경 ${removed}개를 지워 ${(freed / 1024 ** 3).toFixed(1)}GB를 확보했습니다.`);
-  if (cleanup.cleanup_error || cleanup.errors?.length)
-    lines.push(removed ? "일부 이전 학습 환경은 지우지 못했습니다(학습 환경 준비에는 영향이 없습니다)."
-      : "이전 학습 환경 정리는 건너뛰었습니다(학습 환경 준비에는 영향이 없습니다).");
+  if (removed) lines.push(`이전 앱 버전의 학습 환경 ${removed}개를 `
+    + (freed >= 0.1 ? `지워 ${freed.toFixed(1)}GB를 확보했습니다.` : "지웠습니다."));
+  if (removed && (cleanup.cleanup_error || cleanup.errors?.length)) lines.push("일부 이전 학습 환경은 지우지 못했습니다" + unaffected);
+  else if (cleanup.errors?.length) lines.push("이전 학습 환경을 지우지 못했습니다" + unaffected);   // every removal failed
+  else if (cleanup.cleanup_error) lines.push("이전 학습 환경 정리는 건너뛰었습니다" + unaffected);
   if (cleanup.incomplete) lines.push("남은 이전 학습 환경은 다음 학습 환경 준비 때 정리합니다.");
   return lines.map(line => "\n" + line).join("");
 }
