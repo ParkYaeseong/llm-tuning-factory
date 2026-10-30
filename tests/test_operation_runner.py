@@ -765,6 +765,14 @@ def test_engine_tokenizer_check_compares_real_vocabulary_facts(tmp_path):
     assert original["tokenizer_config.json"] == [("0", "<unk>", True)]
 
 
+def test_vocabulary_size_is_read_from_text_config_for_composite_configs():
+    from tuning_factory.operation_outputs import _vocab_size
+    assert _vocab_size({"text_config": {"vocab_size": 248320}}) == 248320
+    assert _vocab_size({"vocab_size": 151936}) == 151936
+    assert _vocab_size({"text_config": {"vocab_size": 1}, "vocab_size": 2}) == 1
+    assert _vocab_size({"text_config": {}}) is None
+
+
 def test_remote_failure_is_final_and_releases_the_lock(tmp_path, monkeypatch):
     w = world(tmp_path, monkeypatch, fail="engine exited with status 1")
     before = artifact_entries(w.store)

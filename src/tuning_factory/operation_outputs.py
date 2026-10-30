@@ -159,6 +159,14 @@ def check_engine_tokenizer(output: Path, base: Path) -> None:
         raise ValueError(VOCABULARY_CHANGED)
 
 
+def _vocab_size(config):
+    """A model config's vocabulary size; composite (vision/audio + text) configs keep it only in text_config."""
+    text = config.get("text_config")
+    if isinstance(text, Mapping) and "vocab_size" in text:
+        return text["vocab_size"]
+    return config.get("vocab_size")
+
+
 def _base_identity(base, verifier) -> tuple[str, str]:
     if isinstance(base, HFRootRef):
         return base.config_sha256, base.tokenizer_fingerprint
@@ -226,7 +234,7 @@ def _train_output(operation: TrainOperation, result, launch_dir: Path, verifier,
             loraplus_lr_ratio=options.loraplus_lr_ratio, loraplus_lr_embedding=options.loraplus_lr_embedding)
     else:
         trained, original = read_json(workspace / "config.json"), read_json(snapshot / "config.json")
-        if not isinstance(trained, Mapping) or trained.get("vocab_size") != original.get("vocab_size"):
+        if not isinstance(trained, Mapping) or _vocab_size(trained) != _vocab_size(original):
             raise ValueError(VOCABULARY_CHANGED)
     root = policy.base if isinstance(policy.base, HFRootRef) else verifier.verify(policy.base).root
     loads = [load for load in (policy, model_input.frozen_reference, model_input.reward_model) if load]
