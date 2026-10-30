@@ -244,6 +244,16 @@ def test_a_hub_registration_without_size_facts_uses_the_catalog_sizes_of_the_sam
     assert ("warn", "MEMORY_UNKNOWN") in found and ("block", "MEMORY_WEIGHTS_EXCEED") not in found
 
 
+def test_plan_warns_that_memory_is_unknown_for_a_hub_model_without_sizes_before_any_observation(tmp_path):
+    config = hub_job(repo_id="someone/Qwen3.5-27B-sft", architecture="qwen3_5", template="qwen3_5_nothink",
+                     hidden_layers=64)
+    found = finding_codes(desktop.DesktopService(tmp_path).plan_compatibility(config)["findings"])
+    assert {("warn", "MEMORY_UNKNOWN"), ("warn", "OBSERVATION_MISSING")} <= found
+    sized = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3_5", template="qwen3_5_nothink", hidden_layers=64)
+    assert ("warn", "MEMORY_UNKNOWN") not in finding_codes(
+        desktop.DesktopService(tmp_path).plan_compatibility(sized)["findings"])   # the catalog knows its sizes
+
+
 def judged_model(tmp_path, monkeypatch, config):
     """The model entry DesktopService.compatibility hands gpu_compat.evaluate for ``config``."""
     from tuning_factory import gpu_compat

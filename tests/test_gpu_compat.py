@@ -179,6 +179,17 @@ def test_unknown_models_and_unreadable_gpu_facts_warn():
                                ("warn", "GPU_FACTS_UNKNOWN")}
 
 
+def test_a_model_without_sizes_warns_memory_unknown_once_without_an_observation_too():
+    unsized = {"id": "someone/model", "hidden_size": 2048, "gpu_verified": False}   # no parameter count
+    assert codes(gpu_compat.evaluate(job(), None, CAPS, unsized, stage="plan")) == {
+        ("warn", "MEMORY_UNKNOWN"), ("warn", "MODEL_UNVERIFIED"), ("warn", "OBSERVATION_MISSING")}
+    for observation, stage in ((None, "plan"), (observed(), "plan"), (observed(), "execute"),
+                               (observed(gpus=[]), "execute")):
+        for model in (unsized, None):
+            found = [item["code"] for item in gpu_compat.evaluate(job(), observation, CAPS, model, stage=stage)]
+            assert found.count("MEMORY_UNKNOWN") == 1, (observation, stage, model)
+
+
 def test_plan_reports_missing_and_stale_observations_only():
     assert codes(gpu_compat.evaluate(job(), None, CAPS, QWEN05, stage="plan")) == {("warn", "OBSERVATION_MISSING")}
     stale = gpu_compat.evaluate(job(), observed(at=0.0), CAPS, QWEN05, stage="plan",

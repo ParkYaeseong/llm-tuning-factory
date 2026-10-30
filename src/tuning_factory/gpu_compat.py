@@ -135,7 +135,8 @@ def evaluate(config, observation, capabilities, model, *, stage, now=None, serve
     if stage not in {"plan", "execute"}:
         raise ValueError("unsupported compatibility stage")
     findings = []
-    if model is None:
+    estimate = estimate_memory(model, config)   # None for an unknown model or one without size facts
+    if estimate is None:   # judged without an observation too: the plan can say so before any GPU was observed
         findings.append(_finding("warn", "MEMORY_UNKNOWN", MEMORY_UNKNOWN))
     if model is None or not model.get("gpu_verified"):
         findings.append(_finding("warn", "MODEL_UNVERIFIED", MODEL_UNVERIFIED))
@@ -201,12 +202,9 @@ def evaluate(config, observation, capabilities, model, *, stage, now=None, serve
                                      f"학습 설정의 GPU 수({count})가 연결된 GPU 수({observed_count})와 다릅니다."))
     if pod is not None:
         findings += _price_findings(pod.get("hourly_cost_usd"), resource, allow_zero=False, unknown=PRICE_UNKNOWN)
-    if gpu is not None and model is not None:
-        estimate = estimate_memory(model, config)
+    if gpu is not None and estimate is not None:
         vram = gpu["memory_mib"] / 1024
-        if estimate is None:
-            findings.append(_finding("warn", "MEMORY_UNKNOWN", MEMORY_UNKNOWN))
-        elif estimate["weights_gib"] > vram * WEIGHTS_BLOCK_RATIO:
+        if estimate["weights_gib"] > vram * WEIGHTS_BLOCK_RATIO:
             findings.append(_finding("block", "MEMORY_WEIGHTS_EXCEED",
                                      f"모델 가중치만 약 {estimate['weights_gib']:.0f}GiB로 GPU 메모리 {vram:.0f}GiB의 "
                                      "95%를 넘습니다. 4비트 QLoRA, 더 작은 모델 또는 더 큰 GPU를 선택하세요."))
