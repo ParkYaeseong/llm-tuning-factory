@@ -187,7 +187,10 @@ def runtime_path(training_stage="sft", remote_root=REMOTE):
 
 def prerequisites(client):
     # Triton's CUDA driver helper compiles C even when torch reports CUDA available.
-    command(client, ["sh", "-c", 'compiler="${CC:-cc}"; '
+    # flock marks a runtime in use (`flock -s in-use.lock`) for the old-runtime cleanup of PRUNE_SOURCE.
+    command(client, ["sh", "-c", 'command -v flock >/dev/null || { printf "%s\\n" "flock (util-linux) required to mark '
+                    'runtimes in use; ask its administrator to install util-linux." >&2; exit 1; }; '
+                    'compiler="${CC:-cc}"; '
                     'command -v "$compiler" >/dev/null && "$compiler" --version >/dev/null || '
                     '{ printf "%s\\n" "C compiler required for Triton; use a CUDA devel Pod image "'
                     '"or ask its administrator to install a C toolchain before preparing training." >&2; exit 1; }'])
@@ -530,7 +533,8 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
                                    server_facts=pod,
                                    remote_root=config.remote_root + "/jobs", remote_python=root + "/venv/bin/python",
                                    worker_lock_file=root + "/" + lock_name, hf_home=config.remote_root + "/hf-cache",
-                                   model_cache_root=config.remote_root + "/model-cache")
+                                   model_cache_root=config.remote_root + "/model-cache",
+                                   runtime_lock_file=root + "/in-use.lock")
             yield executor
             return
         if preflight:
@@ -554,7 +558,7 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
         executor = SSHExecutor("", 22, "root", "", client=client, pod=pod,
                                remote_root=REMOTE + "/jobs", remote_python=root + "/venv/bin/python",
                                worker_lock_file=root + "/" + lock_name, hf_home=REMOTE + "/hf-cache",
-                               model_cache_root=REMOTE + "/model-cache")
+                               model_cache_root=REMOTE + "/model-cache", runtime_lock_file=root + "/in-use.lock")
         yield executor
 
 

@@ -584,7 +584,7 @@ def test_executor_for_gates_first_and_prepares_only_when_approved(tmp_path, monk
     events.clear()
     runtime = runpod_executor_fixture(monkeypatch, ["missing", "ready"], events)
     with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=gate, prepare_runtime=True) as executor:
-        assert executor.pod == POD
+        assert executor.pod == POD and executor.runtime_lock_file == runtime.runtime_path("sft") + "/in-use.lock"
     assert events == [("gate", "12.0"), "check", "prerequisites", "bootstrap", "install", "check"]
 
 
@@ -835,3 +835,12 @@ def test_runtime_preparation_that_fails_its_check_gets_the_fixed_message(tmp_pat
     with pytest.raises(ValueError) as caught:
         runtime.runtime({"pod_id": "borrowed"}, tmp_path, prepare=True)
     assert str(caught.value) == runtime.POST_PREPARATION_FAILED
+
+
+def test_prerequisites_require_flock_and_a_c_compiler(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+    scripts = []
+    monkeypatch.setattr(runtime, "command", lambda _, argv, **kw: scripts.append(argv) or "")
+    runtime.prerequisites(None)
+    assert len(scripts) == 1 and scripts[0][:2] == ["sh", "-c"]
+    assert "command -v flock" in scripts[0][2] and "flock (util-linux) required" in scripts[0][2]

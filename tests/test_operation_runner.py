@@ -320,7 +320,8 @@ def gpu_host(tmp_path, monkeypatch, calls, *, server=None, **engine):
     destination = dict(server_profile=server[0], server_facts=server[1]) if server else dict(pod=dict(POD))
     executor = SSHExecutor("test-host", 22, "root", "unused", client=host, remote_root=base + "/jobs",
                            remote_python=base + "/runtime/venv/bin/python", worker_lock_file=lock,
-                           hf_home=base + "/hf-cache", model_cache_root=base + "/model-cache", **destination)
+                           hf_home=base + "/hf-cache", model_cache_root=base + "/model-cache",
+                           runtime_lock_file=base + "/runtime/in-use.lock", **destination)
     pinned_runtime(monkeypatch)
     monkeypatch.setattr(worker, "LlamaFactoryBackend", engine_fixture(calls, **engine))
     monkeypatch.setattr(worker, "runtime_preflight_bound",
