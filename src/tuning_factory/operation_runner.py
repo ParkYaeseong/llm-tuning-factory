@@ -44,6 +44,7 @@ from pydantic import Field, TypeAdapter, model_validator
 
 from .config import StrictModel
 from .model_artifacts import (
+    PROCESSOR_FILES,
     TOKENIZER_FILES,
     ArtifactVerifier,
     BaseRef,
@@ -71,8 +72,9 @@ ModelRole = Literal["policy_base", "policy_adapter", "reference_base", "referenc
 MODEL_INPUTS = "model-inputs.json"
 HF_ROOTS = "factory-roots"   # under HF_HOME: one link-free local_dir per <owner>/<name>/<revision>
 # Loader files only: no custom code (trust_remote_code is False), no pickled weights, no consolidated copies.
-HF_ALLOW_PATTERNS = ("config.json", "generation_config.json", *sorted(TOKENIZER_FILES), "chat_templates/*",
-                     "model.safetensors", "model.safetensors.index.json", "model-*.safetensors")
+HF_ALLOW_PATTERNS = ("config.json", "generation_config.json", *sorted(TOKENIZER_FILES), *sorted(PROCESSOR_FILES),
+                     "chat_templates/*", "model.safetensors", "model.safetensors.index.json", "model-*.safetensors",
+                     "model.safetensors-*.safetensors")   # Qwen3.5 names its shards model.safetensors-0000N-of-0000M
 # TRL's ValueHead (Linear(hidden, 1)) as LLaMA-Factory loads it from the reward path.
 VALUE_HEAD_TENSORS = frozenset({"v_head.summary.weight", "v_head.summary.bias"})
 RELATIVE_PATHS = MappingProxyType({"dataset_dir": "./data", "output_dir": "./output"})

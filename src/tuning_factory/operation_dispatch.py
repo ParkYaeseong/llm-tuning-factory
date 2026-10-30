@@ -23,7 +23,7 @@ import yaml
 
 from . import model_ops as default_model_ops
 from .capabilities import STAGES
-from .model_artifacts import check_link_free, directory_inventory_sha256, is_tokenizer_file
+from .model_artifacts import check_link_free, directory_inventory_sha256, is_processor_file, is_tokenizer_file
 from .model_ops import (
     POLICY_F32_V1,
     LocalModel,
@@ -175,11 +175,12 @@ def _write_target_inventory(directory: Path, output: Path, ops) -> None:
 
 
 def _write_base_snapshot(directory: Path, base: Path) -> list[str]:
-    """Copy the bound policy base's config.json and tokenizer files (never weights) to ``base-snapshot/``."""
+    """Copy the bound policy base's config.json, tokenizer and processor files (never weights) to ``base-snapshot/``."""
     names = []
     for path in sorted(base.rglob("*")):
         relative = path.relative_to(base).as_posix()
-        if path.is_file() and (relative == "config.json" or is_tokenizer_file(relative)):
+        if path.is_file() and (relative == "config.json" or is_tokenizer_file(relative)
+                               or is_processor_file(relative)):
             check_link_free(path)   # verified link-free already; tokenizer.json may exceed the small-file limit
             target = directory / BASE_SNAPSHOT / relative
             target.parent.mkdir(parents=True, exist_ok=True)

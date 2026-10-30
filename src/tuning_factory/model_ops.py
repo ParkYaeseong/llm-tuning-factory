@@ -54,6 +54,7 @@ from .model_artifacts import (
     _tokenizer_hash,
     _validate_adapter,
     fsync_directory,
+    is_processor_file,
     is_tokenizer_file,
 )
 from .runtime_profiles import model_ops_runtime
@@ -650,9 +651,9 @@ def publish_output(payload: Path, output: Path) -> None:
 
 
 def _copy_snapshot_files(source: Path, target: Path, *, config: bool) -> None:
-    """Copy tokenizer files (and the adapter's config.json) byte-for-byte from the effective base."""
+    """Copy tokenizer and processor files (and the adapter's config.json) byte-for-byte from the effective base."""
     for relative, file in _files(source):
-        if is_tokenizer_file(relative) or config and relative == "config.json":
+        if is_tokenizer_file(relative) or is_processor_file(relative) or config and relative == "config.json":
             destination = target / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.unlink(missing_ok=True)

@@ -38,6 +38,11 @@ TOKENIZER_FILES = frozenset({
     "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json",
     "tokenizer.model", "spiece.model", "vocab.json", "merges.txt", "vocab.txt", "chat_template.jinja",
 })
+# Processor files of composite (vision/audio + text) models. LLaMA-Factory's multimodal plugin loads them even for
+# text-only data. They travel beside the tokenizer but are not part of tokenizer_fingerprint, so existing roots and
+# artifacts keep their fingerprints.
+PROCESSOR_FILES = frozenset({"preprocessor_config.json", "video_preprocessor_config.json", "processor_config.json",
+                             "chat_template.json"})
 
 
 class ArtifactModel(BaseModel):
@@ -327,6 +332,11 @@ _read_json = read_json
 def is_tokenizer_file(relative: str) -> bool:
     """A file of the tokenizer snapshot: fingerprinted, and copied byte-for-byte into derived models."""
     return relative in TOKENIZER_FILES or relative.startswith("chat_templates/")
+
+
+def is_processor_file(relative: str) -> bool:
+    """A processor file of the base snapshot: copied byte-for-byte into derived models, never fingerprinted."""
+    return relative in PROCESSOR_FILES
 
 
 def _tokenizer_hash(inventory) -> str:

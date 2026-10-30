@@ -63,6 +63,7 @@ from .model_artifacts import (
     ModelArtifactStore,
     check_link_free,
     directory_inventory_sha256,
+    is_processor_file,
     is_tokenizer_file,
     list_files,
 )
@@ -279,7 +280,7 @@ def _base_directory(base, verifier, roots) -> Path:
 
 def _snapshot_files(directory: Path, prefix: str) -> list:
     return [(f"{prefix}/{relative}", file.read_bytes()) for relative, file in list_files(directory)
-            if relative == "config.json" or is_tokenizer_file(relative)]
+            if relative == "config.json" or is_tokenizer_file(relative) or is_processor_file(relative)]
 
 
 def _evidence_for(base, target_evidence, verifier) -> ModelTargetEvidence | None:

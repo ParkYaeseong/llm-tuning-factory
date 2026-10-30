@@ -101,6 +101,7 @@ from .model_artifacts import (
     ModelInput,
     ModelLoadRef,
     _relative,
+    is_processor_file,
     is_tokenizer_file,
     tokenizer_fingerprint,
 )
@@ -892,7 +893,8 @@ def _hub(token: str | None, *, transport: httpx.BaseTransport | None = None) -> 
 
 
 def _selected_files(info) -> tuple[str, ...]:
-    """config.json plus every tokenizer file the revision lists; anything weight-like or unsafe refuses all."""
+    """config.json plus every tokenizer and processor file the revision lists; anything weight-like or unsafe
+    refuses all."""
     siblings = info.get("siblings") if isinstance(info, dict) else None
     if not isinstance(siblings, list):
         raise _Refused("snapshot_refused", SNAPSHOT_REFUSED)
@@ -901,7 +903,7 @@ def _selected_files(info) -> tuple[str, ...]:
         name = item.get("rfilename") if isinstance(item, dict) else None
         if not isinstance(name, str):
             raise _Refused("snapshot_refused", SNAPSHOT_REFUSED)
-        if name != "config.json" and not is_tokenizer_file(name):
+        if name != "config.json" and not is_tokenizer_file(name) and not is_processor_file(name):
             continue
         try:
             _relative(name)

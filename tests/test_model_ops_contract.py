@@ -1750,3 +1750,21 @@ def test_worker_protocol_dispatch_and_staging_are_layered():
                                                "training"}
     for name in ("operation_runner", "operation_dispatch", "worker_protocol"):
         assert len((package / f"{name}.py").read_text(encoding="utf-8").splitlines()) < 700, name
+
+
+def test_snapshot_copy_carries_processor_files_without_changing_the_tokenizer_fingerprint(tmp_path):
+    from tuning_factory import model_ops
+    from tuning_factory.model_artifacts import tokenizer_fingerprint
+    source, target = tmp_path / "base", tmp_path / "out"
+    source.mkdir()
+    target.mkdir()
+    for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "preprocessor_config.json",
+                 "video_preprocessor_config.json", "processor_config.json", "model.safetensors"):
+        (source / name).write_text("{}")
+    before = tokenizer_fingerprint(source)
+    model_ops._copy_snapshot_files(source, target, config=False)
+    assert sorted(path.name for path in target.iterdir()) == [
+        "preprocessor_config.json", "processor_config.json", "tokenizer.json", "tokenizer_config.json",
+        "video_preprocessor_config.json"]
+    (source / "processor_config.json").unlink()
+    assert tokenizer_fingerprint(source) == before

@@ -1560,3 +1560,16 @@ def test_a_long_or_odd_path_that_open_could_reach_stays_content(monkeypatch, err
     monkeypatch.setattr(execution, "_stat", stat or (lambda path: None))
     assert api().local_transient(error) is False
     assert execution.transient_error(error) is False
+
+
+def test_base_snapshot_carries_processor_files_beside_config_and_tokenizer(tmp_path):
+    from tuning_factory.operation_dispatch import BASE_SNAPSHOT
+    base, directory = tmp_path / "base", tmp_path / "launch"
+    base.mkdir()
+    directory.mkdir()
+    for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "preprocessor_config.json",
+                 "model.safetensors"):
+        (base / name).write_text("{}")
+    names = operation_dispatch._write_base_snapshot(directory, base)
+    assert sorted(names) == [f"{BASE_SNAPSHOT}/{name}" for name in (
+        "config.json", "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json")]

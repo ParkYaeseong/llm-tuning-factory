@@ -37,6 +37,7 @@ from .model_artifacts import (
     ModelDescriptor,
     check_link_free,
     directory_inventory_sha256,
+    is_processor_file,
     is_tokenizer_file,
     list_files,
     read_json,
@@ -166,11 +167,11 @@ def _base_identity(base, verifier) -> tuple[str, str]:
 
 
 def _base_snapshot(launch_dir: Path, result: OperationResult, identity: tuple[str, str]) -> Path:
-    """``base-snapshot/``: exactly config.json and tokenizer files, each in the evidence, with the base's
-    config hash and tokenizer fingerprint."""
+    """``base-snapshot/``: exactly config.json, tokenizer and processor files, each in the evidence, with the
+    base's config hash and tokenizer fingerprint."""
     snapshot = Path(launch_dir) / BASE_SNAPSHOT
     names = {relative for relative, _ in list_files(snapshot)}
-    if any(not (name == "config.json" or is_tokenizer_file(name)) for name in names) or any(
+    if any(not (name == "config.json" or is_tokenizer_file(name) or is_processor_file(name)) for name in names) or any(
             f"{BASE_SNAPSHOT}/{name}" not in result.evidence for name in names):
         raise ValueError("base snapshot holds files outside the accepted config/tokenizer evidence")
     if (local_config_sha256(snapshot), local_tokenizer_fingerprint(snapshot)) != identity:
@@ -214,7 +215,7 @@ def _train_output(operation: TrainOperation, result, launch_dir: Path, verifier,
     for name in payload:
         _place(output / name, workspace / name)
     for relative, file in list_files(snapshot):
-        if is_tokenizer_file(relative) or adapter and relative == "config.json":
+        if is_tokenizer_file(relative) or is_processor_file(relative) or adapter and relative == "config.json":
             _place(file, workspace / relative)
     metadata = None
     if adapter:
@@ -258,7 +259,8 @@ def _model_op_output(operation, result, launch_dir: Path, verifier, ids: dict) -
     merge = isinstance(operation, MergeOperation)
     names = [relative for relative, _ in list_files(output)]
     if sorted(inner.output_files) != names or any(
-            not (_payload_name(name, adapter=merge) or is_tokenizer_file(name) or name == "config.json")
+            not (_payload_name(name, adapter=merge) or is_tokenizer_file(name) or is_processor_file(name)
+                 or name == "config.json")
             for name in names):
         raise ValueError("model-operation output differs from its receipt or the artifact file allowlist")
     if merge:

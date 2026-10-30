@@ -481,6 +481,18 @@ def test_hf_root_resolves_to_a_link_free_verified_local_directory(tmp_path, stor
     assert bound.plan["model_name_or_path"] == path.as_posix()
 
 
+def test_hf_download_includes_processor_files_and_qwen35_shard_names():
+    from fnmatch import fnmatch
+
+    from tuning_factory.model_artifacts import PROCESSOR_FILES
+    from tuning_factory.operation_runner import HF_ALLOW_PATTERNS
+    for name in (*PROCESSOR_FILES, "chat_template.jinja", "model.safetensors-00001-of-00002.safetensors",
+                 "model-00001-of-00002.safetensors"):
+        assert any(fnmatch(name, pattern) for pattern in HF_ALLOW_PATTERNS), name
+    assert not any(fnmatch(name, pattern) for pattern in HF_ALLOW_PATTERNS
+                   for name in ("pytorch_model.bin", "model.py", "consolidated.safetensors"))
+
+
 @pytest.mark.parametrize("problem,message", [
     ("config", "model config snapshot fingerprint mismatch"),
     ("tokenizer", "tokenizer snapshot fingerprint mismatch"),
