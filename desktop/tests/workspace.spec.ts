@@ -347,6 +347,7 @@ test("RunPod runtime preparation names the cleanup and reports what it freed or 
     errors: [], free_before: 20 * 1024 ** 3, free_after: 20.05 * 1024 ** 3 } } });
   await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
   await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).not.toContainText("지우지 못했습니다");   // this preparation's notice
   await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 1개를 지웠습니다.");
   await expect(page.locator(".notice")).not.toContainText("GB를 확보");
   // Nothing removed because every removal failed: not a skipped cleanup.
