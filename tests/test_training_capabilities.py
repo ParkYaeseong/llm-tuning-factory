@@ -26,7 +26,7 @@ def test_stage_method_translation(stage, method):
     assert plan["finetuning_type"] == ("lora" if method == "qlora" else method)
     assert ("quantization_bit" in plan) == (method == "qlora")
     assert ("lora_rank" in plan) == (method in {"lora", "qlora"})
-    assert plan["save_safetensors"] is True
+    assert "save_safetensors" not in plan
 
 
 def test_capabilities_explain_model_rules_and_engine_runtime_limits():

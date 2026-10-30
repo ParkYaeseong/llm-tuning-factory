@@ -157,7 +157,8 @@ class LlamaFactoryBackend(TrainingBackend):
                 "template": config.template,
                 "dataset": "factory_dataset", "dataset_dir": "./data", "output_dir": "./output",
                 "overwrite_output_dir": False, "report_to": "none", "logging_steps": 1,
-                "save_only_model": False, "save_safetensors": True,
+                # transformers 5 removed save_safetensors (always safetensors); 4.52.4 (PPO) defaults to True.
+                "save_only_model": False,
                 "fp16": config.hyperparameters.precision == "fp16",
                 "bf16": config.hyperparameters.precision == "bf16",
                 **config.hyperparameters.model_dump(exclude={"precision", "lora_rank", "lora_target"})}
