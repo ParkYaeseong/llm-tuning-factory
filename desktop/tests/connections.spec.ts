@@ -34,7 +34,7 @@ async function open(page: Page, settings: Record<string, unknown> = {}) {
     const saved = sessionStorage.getItem("mock-settings");
     const stored: Record<string, any> = saved ? JSON.parse(saved) : { ...settings };
     const mock: any = (window as any).__mock = { inspection, facts: null, connection: {}, jobs: [], reservations: [],
-      prepareError: "", gate: null, destination: { destination_sha256: "d".repeat(64), destination_issue: null } };
+      prepareError: "", prepareReport: { prepared: true }, gate: null, destination: { destination_sha256: "d".repeat(64), destination_issue: null } };
     (window as any).__testCalls = calls;
     (window as any).__TAURI_INTERNALS__ = { invoke: async (command: string, args: any) => {
       calls.push({ command, args: args === undefined ? undefined : structuredClone(args) });
@@ -64,7 +64,7 @@ async function open(page: Page, settings: Record<string, unknown> = {}) {
         note: "계획만 확인했습니다.", ...(stored.provider === "ssh_server" ? mock.destination : {}) };
       if (action === "submit") return { id: "c".repeat(32), status: "QUEUED", attempts: 0, manifest: { config: data.config, simulation: false } };
       if (action === "execute") return null;
-      if (action === "runtime_prepare") { if (mock.gate) await mock.gate; if (mock.prepareError) throw mock.prepareError; return { prepared: true }; }
+      if (action === "runtime_prepare") { if (mock.gate) await mock.gate; if (mock.prepareError) throw mock.prepareError; return structuredClone(mock.prepareReport); }
       if (action === "runtime_reservations") return structuredClone(mock.reservations);
       if (action === "history") return data.experiment_id ? { runs: structuredClone(mock.runs || []), next_page_token: null } : { experiments: [] };
       if (action === "runtime_release") { mock.reservations = mock.reservations.filter((r: any) => r.reservation_id !== data.reservation_id); return { released: data.reservation_id }; }
@@ -319,12 +319,16 @@ test("server runtime preparation inspects first, cancels cleanly and sends the e
   await expect(dialog).toContainText("/home/researcher/factory");
   await expect(dialog).toContainText(GPU_A);
   await expect(dialog).toContainText("NVIDIA A100-SXM4-80GB");
+  await expect(dialog).toContainText("이전 앱 버전의 학습 환경 중 쓰지 않는 것을 지웁니다");
   expect(await calls(page, "server_inspect")).toHaveLength(1);
   await page.getByRole("button", { name: "돌아가기", exact: true }).click();
   expect(await calls(page, "runtime_prepare")).toEqual([]);
+  await page.evaluate(() => (window as any).__mock.prepareReport = { prepared: true,
+    cleanup: { removed: [{ name: "b".repeat(16), bytes: 5 * 1024 ** 3 }], kept_in_use: [] } });
   await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
   await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
   await expect(page.locator(".notice")).toContainText("학습 환경");
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 1개를 지워 5.0GB를 확보했습니다.");
   expect((await calls(page, "runtime_prepare")).at(-1)).toEqual({ approved: true, inspection, training_stage: "sft" });
 
   await page.evaluate(() => {

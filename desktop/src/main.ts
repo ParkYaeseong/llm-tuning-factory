@@ -9,7 +9,7 @@ import { viewById, views as workflowViews } from "./view-registry";
 import type { Catalog, View, ViewContext } from "./view-types";
 import { createTutorial, rememberTutorial, tutorialSeen } from "./tutorial";
 import { TUTORIAL_DATASET } from "./tutorial-steps";
-import { gpuCompatibilityView, preflightOutcome, runtimeNotice } from "./gpu-preflight";
+import { cleanupSummary, gpuCompatibilityView, preflightOutcome, RUNTIME_CLEANUP_NOTICE, runtimeNotice } from "./gpu-preflight";
 import { connectionResult, destinationChange, GPU_POLICY_MESSAGE, inventoryTable, isServer, jobDestination, jobDestinationIssue,
   MAX_GPUS_PER_JOB, prepareApproval, prepareIssue, puttyKeyPath, releaseApproval, reservationMatches, reservationTable, resourcesFromFacts,
   sameSelection, selectedGpus, selectionPolicyIssue, serverAddress, serverBridge, serverConfigured, settingsRoute, shortIdentifier,
@@ -715,7 +715,7 @@ async function execute(job: Obj, prepareRuntime = false) {
   // The job's task may have run while the user typed on another page, which this switch to 실행 관리 replaces.
   captureDrafts();
   state.active = job.id; state.jobCapabilities = null; state.page = "jobs"; await refresh(); render();
-  if (prepareRuntime) { state.notice = "Pod에 학습 환경을 준비한 뒤 학습을 시작합니다. 최대 30분 걸릴 수 있습니다."; render(); }
+  if (prepareRuntime) { state.notice = "Pod에 학습 환경을 준비한 뒤 학습을 시작합니다. 최대 30분 걸릴 수 있으며, 쓰지 않는 이전 앱 버전 학습 환경을 정리합니다."; render(); }
   // Deliberately do not block navigation: a separate bridge process owns this attempt.
   api("execute", { job_id: job.id, approved: true, prepare_runtime: prepareRuntime }).then(async result => {
     await refresh();
@@ -850,7 +850,7 @@ async function prepareServer() {
       state.reservations = await gpuServer.runtimeReservations().catch(() => state.reservations);
       throw error;
     }
-    state.notice = "GPU 서버 작업 폴더에 학습 환경을 준비하고 CUDA를 확인했습니다.";
+    state.notice = "GPU 서버 작업 폴더에 학습 환경을 준비하고 CUDA를 확인했습니다." + cleanupSummary(state.runtimeReport);
   });
 }
 async function releaseReservation(reservation: Obj | undefined) {
@@ -958,7 +958,7 @@ async function action(name: string) {
   const policy = isServer(state.settings) && ["runtime_check", "runtime_prepare", "apply-pod"].includes(name) && selectionPolicyIssue(state.settings);
   if (policy) { state.error = policy; render(); return; }
   if (name === "runtime_prepare" && isServer(state.settings)) { await prepareServer(); return; }
-  if (name === "runtime_prepare" && !await approve("GPU 학습 환경 준비", "저장된 연결의 현재 실행 중인 Pod에 앱 전용 학습 환경을 설치합니다. 의존성과 모델 실행 도구를 다운로드하며 GPU 요금은 계속 발생합니다. 사용자 데이터는 전송하지 않습니다.")) return;
+  if (name === "runtime_prepare" && !await approve("GPU 학습 환경 준비", "저장된 연결의 현재 실행 중인 Pod에 앱 전용 학습 환경을 설치합니다. 의존성과 모델 실행 도구를 다운로드하며 GPU 요금은 계속 발생합니다. 사용자 데이터는 전송하지 않습니다. " + RUNTIME_CLEANUP_NOTICE)) return;
   if (name === "resume" && state.jobCapabilities?.resume_supported === false) { state.error = "이 학습 단계·방식은 체크포인트 재개를 지원하지 않습니다."; render(); return; }
   let prepareRuntime = false, approvedJob: Obj | null = null;
   if (["start", "execute", "resume"].includes(name)) {
@@ -1031,7 +1031,8 @@ async function action(name: string) {
         else state.notice = "저장된 인증값을 삭제했습니다.";
       }
     }
-    else if (name === "runtime_check" || name === "runtime_prepare") { state.runtimeReport = await api(name, { approved: name === "runtime_prepare", training_stage: state.config?.training_stage || "sft" }); const message = runtimeNotice(state.runtimeReport, isServer(state.settings));
+    else if (name === "runtime_check" || name === "runtime_prepare") { state.runtimeReport = await api(name, { approved: name === "runtime_prepare", training_stage: state.config?.training_stage || "sft" }); const message = runtimeNotice(state.runtimeReport, isServer(state.settings))
+        + cleanupSummary(state.runtimeReport);   // a check never prunes, so it has no cleanup
       if (state.runtimeReport?.ready === false && ["incompatible", "unavailable"].includes(state.runtimeReport.runtime_state)) state.error = message; else state.notice = message; }
     else if (name === "server-inspect") { state.serverInspection = null; state.gpuDraft = null; state.serverInspection = await gpuServer.serverInspect(); }
     else if (name === "server-select") {

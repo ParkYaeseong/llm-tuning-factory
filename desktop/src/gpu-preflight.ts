@@ -3,9 +3,11 @@ import { escapeHtml as esc, formatDate } from "./workbench";
 
 type Obj = Record<string, any>;
 
+export const RUNTIME_CLEANUP_NOTICE = "준비 전에 같은 작업 폴더에서 이전 앱 버전의 학습 환경 중 쓰지 않는 것을 지웁니다"
+  + "(실행 중인 작업의 환경, 모델·데이터 캐시, 작업 기록은 지우지 않습니다).";
 export const RUNTIME_PREPARATION_NOTICE = "Pod에 이 앱 버전의 학습 환경이 없어 학습 전에 먼저 설치합니다. "
   + "/workspace/factory-desktop 아래에 수 GB를 내려받으며 최대 30분 걸릴 수 있고, 그동안에도 GPU 요금이 발생합니다. "
-  + "빌린 Pod라면 Pod 주인의 동의를 받은 뒤 진행하세요.";
+  + "빌린 Pod라면 Pod 주인의 동의를 받은 뒤 진행하세요. " + RUNTIME_CLEANUP_NOTICE;
 export const SERVER_RUNTIME_REQUIRED = "GPU 서버에 이 앱 버전의 학습 환경이 없습니다. "
   + "연결 설정에서 GPU 목록을 조회한 뒤 '학습 환경 준비'를 먼저 누르세요.";
 export const GPU_INCOMPATIBLE = "이 GPU에서 앱 학습 환경의 CUDA 연산이 실행되지 않습니다. 지원하는 GPU 세대인지 확인하세요.";
@@ -44,6 +46,17 @@ export function preflightOutcome(report: Obj | null | undefined, server: boolean
   const warns = findings.filter(item => item.level !== "block").map(item => "· " + item.message);
   return { prepare: missing, extra: (missing ? "\n\n" + RUNTIME_PREPARATION_NOTICE : "")
     + (warns.length ? "\n\n주의 항목\n" + warns.join("\n") : "") };
+}
+
+/** The cleanup line after a preparation: removed old runtimes and the space they freed, or nothing. */
+export function cleanupSummary(report: Obj | null | undefined): string {
+  const cleanup = report?.cleanup;
+  if (!cleanup) return "";
+  if (cleanup.cleanup_error) return "\n이전 학습 환경 정리는 건너뛰었습니다(학습 환경 준비에는 영향이 없습니다).";
+  const removed: Obj[] = cleanup.removed ?? [];
+  if (!removed.length) return "";
+  const bytes = removed.reduce((sum, item) => sum + (Number(item.bytes) || 0), 0);
+  return `\n이전 앱 버전의 학습 환경 ${removed.length}개를 지워 ${(bytes / 1024 ** 3).toFixed(1)}GB를 확보했습니다.`;
 }
 
 /** The notice after 환경 확인 or 학습 환경 준비, with the observed GPU when there is one. */
