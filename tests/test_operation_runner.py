@@ -773,6 +773,37 @@ def test_vocabulary_size_is_read_from_text_config_for_composite_configs():
     assert _vocab_size({"text_config": {}}) is None
 
 
+COMPOSITE_CONFIG = {"model_type": "qwen3_5", "text_config": {"model_type": "qwen3_5_text", "hidden_size": 2,
+                                                             "vocab_size": 248320}}
+
+
+@pytest.mark.parametrize("vocabulary,status", [(248320, "COMPLETED"), (248321, "FAILED")])
+def test_full_training_of_a_composite_compares_its_text_config_vocabulary(tmp_path, monkeypatch, vocabulary, status):
+    """Composite configs keep vocab_size only in text_config: a changed text vocabulary is refused, an equal one
+    (beside a top level without vocab_size) is accepted."""
+    full_model, peft_adapter, engine_output = inputs.full_model, inputs.peft_adapter, write_engine_output
+
+    def composite_output(output, tokenizer, method="lora"):
+        engine_output(output, tokenizer, method)
+        text = {**COMPOSITE_CONFIG["text_config"], "vocab_size": vocabulary}
+        (output / "config.json").write_bytes(canonical({**COMPOSITE_CONFIG, "text_config": text,
+                                                        "torch_dtype": "bfloat16"}))
+
+    # The plan's base artifact (and the adapters frozen on it) carries the composite config.
+    monkeypatch.setattr(inputs, "full_model", lambda *a, **kw: full_model(*a, config=canonical(COMPOSITE_CONFIG), **kw))
+    monkeypatch.setattr(inputs, "peft_adapter",
+                        lambda *a, **kw: peft_adapter(*a, config=canonical(COMPOSITE_CONFIG), **kw))
+    monkeypatch.setitem(globals(), "write_engine_output", composite_output)
+    w = world(tmp_path, monkeypatch, ("full_train",), method="full")
+    outcome = run(w)
+    assert outcome.status == status, outcome.error
+    if status == "FAILED":
+        assert outcome.error.endswith(outputs_api().VOCABULARY_CHANGED) and outcome.outputs is None
+    else:
+        files = w.store.artifacts.path(outcome.outputs.model.model)
+        assert json.loads((files / "config.json").read_bytes())["text_config"]["vocab_size"] == 248320
+
+
 def test_remote_failure_is_final_and_releases_the_lock(tmp_path, monkeypatch):
     w = world(tmp_path, monkeypatch, fail="engine exited with status 1")
     before = artifact_entries(w.store)

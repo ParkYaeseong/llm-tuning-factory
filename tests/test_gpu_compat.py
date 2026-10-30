@@ -116,7 +116,7 @@ def test_qlora_keeps_embedding_tables_at_bf16_and_quantizes_the_rest():
             {key: value for key, value in e2b.items() if key != "embedding_parameters"}, training(method))
 
 
-CAPS ={"torch_cuda": "12.8", "sass": SASS, "ptx": [], "bf16_min_capability": "8.0",
+CAPS = {"torch_cuda": "12.8", "sass": SASS, "ptx": [], "bf16_min_capability": "8.0",
         "min_driver": "525.60.13", "recommended_driver": "570.26"}
 BLACKWELL = gpu_compat.parse_gpu_facts(SMI)[0]
 POD = {"gpu_id": "NVIDIA RTX PRO 4000 Blackwell", "gpu_display_name": None, "gpu_count": 1, "hourly_cost_usd": 0.57}

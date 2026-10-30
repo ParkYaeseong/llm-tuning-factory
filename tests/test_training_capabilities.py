@@ -349,9 +349,13 @@ def test_composite_models_refuse_unverified_stages_and_missing_modules(change, m
 
 
 @pytest.mark.parametrize("stage", ["pt", "sft", "dpo", "kto"])
-def test_composite_models_allow_text_stages_and_existing_freeze_modules(stage):
+def test_composite_models_allow_text_stages(stage):
     from tuning_factory.capabilities import compatibility
     assert compatibility({**QWEN35, "training_stage": stage})["valid"]
+
+
+def test_composite_models_allow_existing_freeze_modules():
+    from tuning_factory.capabilities import compatibility
     assert compatibility({**QWEN35, "training_method": "freeze", "finetuning_options": {
         "freeze_trainable_modules": "mlp", "freeze_extra_modules": "embed_tokens"}})["valid"]
     assert compatibility({"base_model": "Qwen/Qwen3.5-9B", "template": "qwen3_5_nothink", "training_method": "freeze",
@@ -413,3 +417,40 @@ def test_native_prediction_of_a_reasoning_template_turns_thinking_off(tmp_path):
     backend.prepare(config, tmp_path, b'[{"instruction":"a","output":"b"}]')
     backend.predict(config, tmp_path, "abc", 1)
     assert plans[-1]["enable_thinking"] is False and "freeze_vision_tower" not in plans[-1]
+
+
+def hub_registered(architecture, template, repo_id):
+    """Config fields of a model registered from the hub (no catalog entry: the profile path of model_entry)."""
+    from tuning_factory.model_hub import ModelProfile
+    profile = ModelProfile(repo_id=repo_id, revision="a" * 40, config_sha256="c" * 64, architecture=architecture,
+                           template=template, hidden_layers=24)
+    return {"base_model": repo_id, "model_profile": profile, "model_revision": "a" * 40,
+            "tokenizer_revision": "a" * 40, "template": template}
+
+
+def graph_plan(**changes):
+    """The v2 logical template (translate(config, model_input)) of a new adapter on the config's HF root."""
+    from tuning_factory.config import GraphTrainingConfig
+    from tuning_factory.model_artifacts import HFRootRef, ModelInput, ModelLoadRef
+    config = GraphTrainingConfig.model_validate(configuration(**changes).model_dump() | {"evaluation_profile": {}})
+    root = HFRootRef(repo_id=config.base_model, revision=config.model_revision, config_sha256="c" * 64,
+                     tokenizer_fingerprint="d" * 64)
+    return LlamaFactoryBackend.translate(config, ModelInput(policy=ModelLoadRef(base=root),
+                                                            initialization="new_adapter"))
+
+
+def test_hub_registered_composites_freeze_vision_on_the_legacy_and_graph_paths():
+    hub = hub_registered("qwen3_5", "qwen3_5", "someone/Qwen3.5-0.8B-sft")
+    for plan in (LlamaFactoryBackend.translate(configuration(**hub)), graph_plan(**hub)):
+        assert tuple(plan[key] for key in FROZEN) == (True, True, False) and plan["enable_thinking"] is False
+    graph = graph_plan(base_model="google/gemma-4-E2B-it", template="gemma4n")   # the catalog path
+    assert tuple(graph[key] for key in FROZEN) == (True, True, False) and graph["enable_thinking"] is False
+    assert graph["model_name_or_path"].endswith("policy_base")
+    legacy = graph_plan()
+    assert not {*FROZEN, "enable_thinking"} & set(legacy)
+
+
+def test_gemma4_text_turns_thinking_off_without_freezing_a_vision_tower():
+    plan = LlamaFactoryBackend.translate(configuration(**hub_registered("gemma4_text", "gemma4",
+                                                                        "someone/gemma-4-text-only")))
+    assert plan["enable_thinking"] is False and not set(FROZEN) & set(plan)
