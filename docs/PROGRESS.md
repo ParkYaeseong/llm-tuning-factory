@@ -80,7 +80,12 @@ MLflow는 껐다. Ampere와 Hopper를 모두 시험했다.
   SSH 접속과 GPU 확인(A40, 8.6, 46,068 MiB, 드라이버 595.91.07, 점검 항목 없음)을 확인했다. `runtime_state`는 `missing`이다. 설치된 빌드의 소스 해시가
   인수 시험 빌드와 달라 첫 학습 실행이 승인 창 안에서 환경을 준비한다.
 
+- 사용자 요청으로 Pod `amdva0lurw9rv1`을 멈췄다(EXITED). 공장 소유가 아니라 `RunPodController.stop`의 안전장치 대신 RunPod REST stop을 직접 불렀다.
+  다시 켜면 공인 IP·포트와 SSH 서버 지문이 바뀔 수 있어 연결 설정의 지문을 다시 확인해야 한다. 볼륨 `ls9ua5ymse` 삭제는 사용자가 승인했지만
+  Claude Code 권한 검사가 되돌릴 수 없는 삭제로 막아 남아 있다.
+
 **남은 일:**
+- 볼륨 `ls9ua5ymse`(EU-RO-1, 80 GB, 사용하는 Pod 없음) 삭제: RunPod 콘솔에서 사용자가 직접 지운다.
 - 앱의 이전 대기 작업 `76986bce`는 삭제된 Pod를 대상으로 한다. 사용자가 앱에서 취소한다.
 - 볼륨의 런타임 정리: 앱 소스가 바뀔 때마다 새 런타임(5–12 GB)이 생기고 지우지 않는다(`ls9ua5ymse`에 4벌). 사용자 볼륨이 차는 원인이다.
 - 긴 probe 동안 SSH keepalive, GPU 서버(SSH) 연결의 요금은 점검이 판단하지 않는 점, 2단계(Qwen3.5·Gemma 4).
