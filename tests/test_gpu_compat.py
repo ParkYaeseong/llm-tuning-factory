@@ -100,6 +100,22 @@ def test_composite_weights_count_every_tensor_and_training_state_only_the_text_m
     assert 15.9 < qlora["weights_gib"] < 16.1 and 22.5 < qlora["total_gib"] < 23.5
 
 
+def test_qlora_keeps_embedding_tables_at_bf16_and_quantizes_the_rest():
+    gib = 1024 ** 3
+    e2b = {"id": "google/gemma-4-E2B-it", "parameters_total": 5_123_178_051, "text_parameters": 4_647_449_891,
+           "embedding_parameters": 2_751_463_424, "hidden_size": 1536, "num_layers": 35}
+    rest = 5_123_178_051 - 2_751_463_424
+    four = gpu_compat.estimate_memory(e2b, training("qlora"))["weights_gib"]
+    assert four == pytest.approx((2_751_463_424 * 2.0 + rest * 0.55) / gib) and 6.33 < four < 6.35
+    eight = gpu_compat.estimate_memory(e2b, {**training("qlora"), "quantization_bit": 8})["weights_gib"]
+    assert eight == pytest.approx((2_751_463_424 * 2.0 + rest * 1.0) / gib)
+    gemma31 = gpu_compat.estimate_memory({**GEMMA4_31, "embedding_parameters": 1_409_286_144}, training("qlora"))
+    assert 17.9 < gemma31["weights_gib"] < 17.95   # 16.02 GiB if the embedding were 4-bit too
+    for method in ("lora", "full", "freeze"):   # every weight is bf16 already: the fact changes nothing
+        assert gpu_compat.estimate_memory(e2b, training(method)) == gpu_compat.estimate_memory(
+            {key: value for key, value in e2b.items() if key != "embedding_parameters"}, training(method))
+
+
 CAPS ={"torch_cuda": "12.8", "sass": SASS, "ptx": [], "bf16_min_capability": "8.0",
         "min_driver": "525.60.13", "recommended_driver": "570.26"}
 BLACKWELL = gpu_compat.parse_gpu_facts(SMI)[0]

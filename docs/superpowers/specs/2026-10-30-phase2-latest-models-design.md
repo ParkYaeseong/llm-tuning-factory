@@ -237,7 +237,11 @@ CPU forward가 된다(2026-10-30 확인).
 ### 4.5 메모리 추정
 
 `estimate_memory(model, config)`:
-- 전체 매개변수 `P = parameters_total`(없으면 `parameters_b × 1e9`). 가중치 `W = P × b`(비전·오디오 포함; QLoRA도 같은 계수).
+- 전체 매개변수 `P = parameters_total`(없으면 `parameters_b × 1e9`). 가중치 `W = P × b`(비전·오디오 포함).
+- QLoRA: bitsandbytes는 선형층만 양자화하고 `nn.Embedding`과 lm_head는 bf16으로 둔다. 항목에 `embedding_parameters`
+  `E`가 있으면 `W = E × 2 + (P − E) × b(4/8비트)`다. `E`는 복합 기본 목록 항목에만 있고, 1.1 표에서 계산한다:
+  vocab × hidden(입력 임베딩) + untied이면 vocab × hidden(lm_head) + Gemma 4 E2B·E4B는 vocab × 층 × 256(층별 임베딩).
+  vocab은 Qwen3.5 248320, Gemma 4 262144다. `E`가 없는 모델(기존 목록·허브 모델)은 전처럼 `P × b`이고, 다른 방법은 그대로다.
 - 학습 매개변수 기준 `Pt = text_parameters`(없으면 `P`). 학습 상태는 1단계 식에 `Pt`를 넣는다.
   - 전체 학습 `Pt × 14`, freeze는 학습 층 비율 × `Pt × 14`, LoRA·QLoRA·OFT는 `Pt × 0.01 × 16`.
 - 활성값은 `text_config`의 `hidden_size`·`num_layers`로 계산한다(1단계 식).
@@ -375,6 +379,9 @@ CPU forward가 된다(2026-10-30 확인).
 - **정리의 동시성.** 네트워크 볼륨을 여러 Pod가 함께 쓰면 `flock`이 Pod 사이에서 보장되지 않을 수 있다.
   살아 있는 시도 검사가 두 번째 안전장치다. 확신이 없으면 지우지 않는다.
 - **메모리 추정.** 허브 모델은 텍스트 매개변수를 몰라 학습 상태를 크게 잡는다(안전한 쪽). Gemma E 모델의 층별 임베딩은 가중치에 포함된다.
+  QLoRA에서 양자화되지 않는 임베딩은 복합 기본 목록 항목만 따로 센다(Gemma E 모델은 층별 임베딩이 커서 차이가 크다:
+  E2B 4비트 가중치가 약 2.6GiB가 아니라 6.3GiB). `embedding_parameters`가 없는 기존 목록·허브 모델의 QLoRA 가중치는
+  임베딩까지 4/8비트로 세어 작게 잡힌다(위험한 쪽이다. 그때는 실제 학습의 메모리 부족 오류로 드러난다).
 - **화면 끝까지 시험.** 사용자 Pod를 켜면 지문·IP가 바뀔 수 있고, 같은 볼륨의 GPU가 없으면 켜지지 않는다. 그때는 기록하고 멈춘다.
 
 ## 7. 이후

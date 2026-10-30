@@ -66,7 +66,9 @@ def estimate_memory(model, config):
     """Rough single-GPU training memory in GiB with gradient checkpointing; None without model sizes.
 
     {"weights_gib": weights alone, "total_gib": weights + training state + activations + overhead}.
-    weights: every tensor (vision/audio and Gemma per-layer embeddings included); training state: the text model."""
+    weights: every tensor (vision/audio and Gemma per-layer embeddings included); training state: the text model.
+    QLoRA quantizes linear layers only: a model's ``embedding_parameters`` (embedding tables and an untied lm_head,
+    which bitsandbytes keeps in bf16) count at 2 bytes; without the fact every weight counts at the 4/8-bit rate."""
     if not model or not (model.get("parameters_total") or model.get("parameters_b")) or not all(
             model.get(key) for key in ("hidden_size", "num_layers")):
         return None
@@ -75,11 +77,13 @@ def estimate_memory(model, config):
     layers = int(model["num_layers"])
     method = config.get("training_method", "lora")
     hyper = config.get("hyperparameters") or {}
+    unquantized = BYTES_PER_PARAMETER[hyper.get("precision", "bf16")]
     if method == "qlora":
-        per_parameter = BYTES_PER_PARAMETER[int(config.get("quantization_bit", 4))]
+        embedding = min(float(model.get("embedding_parameters") or 0), parameters)
+        weights = (embedding * unquantized
+                   + (parameters - embedding) * BYTES_PER_PARAMETER[int(config.get("quantization_bit", 4))])
     else:
-        per_parameter = BYTES_PER_PARAMETER[hyper.get("precision", "bf16")]
-    weights = parameters * per_parameter
+        weights = parameters * unquantized
     if method == "full":
         state = trainable * FULL_STATE_BYTES
     elif method == "freeze":

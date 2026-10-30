@@ -312,6 +312,24 @@ def test_catalog_lists_qwen35_and_gemma4_with_sizes_and_text_scope():
     assert models["google/gemma-4-26B-A4B-it"]["moe"] and models["google/gemma-4-31B"]["parameters_b"] == 31.27
 
 
+def test_composite_catalog_entries_count_the_embedding_tables_bitsandbytes_leaves_unquantized():
+    from tuning_factory.capabilities import model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    # vocab x hidden for the input embedding, again for an untied lm_head, and vocab x layers x 256 for the per-layer
+    # embedding table of Gemma 4 E2B/E4B (Qwen3.5 vocab 248320, Gemma 4 vocab 262144).
+    assert {name: models[name]["embedding_parameters"] for name in (
+        "Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B-Base", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-27B",
+        "Qwen/Qwen3.5-35B-A3B", "google/gemma-4-E2B-it", "google/gemma-4-E4B", "google/gemma-4-26B-A4B-it",
+        "google/gemma-4-31B")} == {
+        "Qwen/Qwen3.5-0.8B": 254_279_680, "Qwen/Qwen3.5-2B-Base": 508_559_360, "Qwen/Qwen3.5-4B": 635_699_200,
+        "Qwen/Qwen3.5-9B": 2_034_237_440, "Qwen/Qwen3.5-27B": 2_542_796_800, "Qwen/Qwen3.5-35B-A3B": 1_017_118_720,
+        "google/gemma-4-E2B-it": 2_751_463_424, "google/gemma-4-E4B": 3_489_660_928,
+        "google/gemma-4-26B-A4B-it": 738_197_504, "google/gemma-4-31B": 1_409_286_144}
+    composite = [m for m in models.values() if m["architecture"] in {"qwen3_5", "qwen3_5_moe", "gemma4"}]
+    assert all(0 < m["embedding_parameters"] < m["text_parameters"] for m in composite)
+    assert all("embedding_parameters" not in m for m in models.values() if m not in composite)
+
+
 QWEN35 = {"base_model": "Qwen/Qwen3.5-0.8B", "template": "qwen3_5_nothink"}
 
 

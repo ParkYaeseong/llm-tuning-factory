@@ -14,8 +14,8 @@ STAGES = {
 }
 METHODS = ["lora", "qlora", "full", "freeze", "oft"]
 # Size facts of a model entry, under the same keys in the catalog and model_hub.imported_model.
-SIZE_FACTS = ("parameters_total", "parameters_b", "text_parameters", "hidden_size", "num_layers", "moe",
-              "tie_word_embeddings")
+SIZE_FACTS = ("parameters_total", "parameters_b", "text_parameters", "embedding_parameters", "hidden_size", "num_layers",
+              "moe", "tie_word_embeddings")
 COMPOSITE_STAGE_REFUSALS = {
     "rm": ("Qwen3.5·Gemma 4의 보상 모델(RM) 학습은 아직 GPU에서 값 헤드를 검증하지 않아 막아 두었습니다. "
            "SFT·DPO·KTO·PT를 쓰세요."),
@@ -49,6 +49,11 @@ COMPOSITE_MODELS = [
     (("google/gemma-4-31B-it", "google/gemma-4-31B"), "gemma4", "gemma4",
      31_273_088_876, 30_697_345_340, 5376, 60, True, False),
 ]
+# Embedding tables, which bitsandbytes leaves unquantized under QLoRA (nn.Embedding and lm_head stay bf16): vocab x
+# hidden for the input embedding, again for an untied lm_head, and vocab x layers x 256 for the per-layer embedding
+# table of Gemma 4 E2B/E4B (template gemma4n, text_config.hidden_size_per_layer_input 256).
+COMPOSITE_VOCABULARY = {"qwen3_5": 248_320, "qwen3_5_moe": 248_320, "gemma4": 262_144}
+PER_LAYER_INPUT = 256
 
 
 def model_catalog():
@@ -84,10 +89,13 @@ def model_catalog():
                                                   else "architecture profile; GPU verification pending")})
     for ids, architecture, template, total, text, hidden, layers, tied, moe in COMPOSITE_MODELS:
         _, stages, methods = ARCHITECTURES[architecture]
+        vocabulary = COMPOSITE_VOCABULARY[architecture]
+        embedding = (vocabulary * hidden * (1 if tied else 2)
+                     + (vocabulary * layers * PER_LAYER_INPUT if template == "gemma4n" else 0))
         for model_id in ids:
             models.append({"id": model_id, "template": template, "architecture": architecture, "max_length": 32768,
                            "parameters_b": round(total / 1e9, 2), "parameters_total": total, "text_parameters": text,
-                           "hidden_size": hidden, "num_layers": layers, "tie_word_embeddings": tied, "moe": moe,
+                           "embedding_parameters": embedding, "hidden_size": hidden, "num_layers": layers, "tie_word_embeddings": tied, "moe": moe,
                            "gated": False, "gpu_verified": False, "verified_capabilities": [],
                            "verification_scope": "text data only; vision/audio frozen; GPU verification pending",
                            "supported_stages": list(stages), "methods": list(methods)})
