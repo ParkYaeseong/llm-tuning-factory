@@ -1,3 +1,29 @@
+# Qwen3.5·Gemma 4 A40 결과 반영 — 단계 정책, 검증 표시, 로짓 메모리 항, 2026-10-31
+
+- 단계: Gemma 4도 Qwen3.5처럼 pt·sft·rm·dpo(`model_hub.COMPOSITE_STAGES` 하나로 합침). Gemma 4 RM은 엔진 수준 시험
+  (`value_head.safetensors`, eval_accuracy 1.0, eval_loss 0.0033)으로 허용하고 값 헤드 거부를 지웠다. Gemma 4 KTO는 A40에서
+  `AttributeError: 'bool' object has no attribute 'all'`(transformers `modeling_gemma4.py:1999`의
+  `(pixel_position_ids == -1).all(dim=-1)`; LLaMA-Factory KTO의 KL 배치가 텐서가 아닌 멀티모달 입력을 넘김)로 실패해
+  "Gemma 4의 KTO 학습은 현재 학습 엔진(...)에서 KL 배치의 멀티모달 입력 처리 오류로 실패하므로 지원하지 않습니다."로 거부한다.
+- 검증 표시: `capabilities.VERIFIED_COMPOSITE`로 `Qwen/Qwen3.5-0.8B`("0.6.0 SFT LoRA/QLoRA/full/freeze, DPO, PT, RM (engine-level),
+  materialize synthetic A40"), `Qwen/Qwen3.5-9B`("0.6.0 SFT LoRA synthetic A40"), `google/gemma-4-E2B-it`("0.6.0 SFT LoRA, DPO, PT,
+  RM (engine-level) synthetic A40")에 `gpu_verified: true`, `verified_capabilities: ["8.6"]`. Base와 다른 크기는 미검증이고,
+  검증된 세 모델도 8.6이 아닌 세대(예: H100 9.0)에서는 세대 주의가 나온다.
+- 메모리: 복합 기본 목록 항목에 `vocab_size`(Qwen3.5 248320, Gemma 4 262144, `SIZE_FACTS` 포함)를 두고 `estimate_memory`에 LM head
+  로짓 `배치 × cutoff_len × vocab_size × 11바이트 × (dpo·kto 3) × (full 2)`를 더했다. A40 nvidia-smi 최대치(배치 1, cutoff_len 1024,
+  합성 데이터, SFT·DPO 행은 약 60–100토큰, PT만 cutoff_len까지 채움) 대 추정(GiB, 보정 전 → 후): Qwen3.5-0.8B SFT LoRA 3.03 대
+  3.32 → 5.92(1.95배), QLoRA 2.23 대 2.48 → 5.09, DPO 5.15 대 3.32 → 11.13, PT 5.55 대 3.32 → 5.92, full 16.09 대 13.02 → 18.23,
+  freeze 3.07 대 4.02 → 6.63; gemma-4-E2B-it SFT LoRA 12.46 대 11.89 → 14.64(1.17배), DPO 18.27 대 11.89 → 20.14, PT 14.48 대
+  11.89 → 14.64; Qwen3.5-9B SFT LoRA 19.36 대 21.20 → 23.80(1.23배). 모든 실측이 추정 이하, SFT LoRA는 2배 이하. 근거와 규칙은
+  설계 4.5. `vocab_size`가 없는 모델은 기본 목록 모든 모델 × 방법 5 × 단계 6 × 크기 2(1,020개)에서 보정 전과 비트 단위로 같고,
+  가중치 추정은 2,160개 모두 같다.
+- 검증(2026-10-31): 시험을 먼저 고쳐 실패를 확인했다(단계 9개, 검증 표시 3개, 메모리 9개 실패 → 구현 후 통과).
+  `uv run pytest` 2229 passed, 2 skipped, `uv run ruff check src tests scripts` 통과.
+- 남은 일: cutoff_len까지 채운 긴 행의 SFT·DPO와 full, RM의 최대 메모리 측정. full 초과분(짧은 행에서 약 3GiB)은 로짓보다 fp32
+  학습 가중치·옵티마이저 임시 버퍼(학습 매개변수당 약 4바이트)로 보여 `FULL_STATE_BYTES` 재보정이 맞지만, 모든 모델의 추정이
+  바뀌므로 이번에는 로짓 항 2배로 덮었다. 기본 목록 밖의 허브 모델은 `vocab_size`를 기록하지 않아 로짓 항이 없다. 복합 구조 KTO는
+  엔진 수정을 기다린다.
+
 # 모델 작업 로짓 허용 오차 `model-ops-f32-v2`, 2026-10-31
 
 - 결함(A40 GPU 인수에서 발견): 실제 Qwen3.5-0.8B LoRA 어댑터의 올바른 확정을 `materialize_model`이

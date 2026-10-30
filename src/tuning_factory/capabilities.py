@@ -15,7 +15,7 @@ STAGES = {
 METHODS = ["lora", "qlora", "full", "freeze", "oft"]
 # Size facts of a model entry, under the same keys in the catalog and model_hub.imported_model.
 SIZE_FACTS = ("parameters_total", "parameters_b", "text_parameters", "embedding_parameters", "expert_parameters", "hidden_size", "num_layers",
-              "moe", "tie_word_embeddings")
+              "moe", "tie_word_embeddings", "vocab_size")
 COMPOSITE_STAGE_REFUSALS = {
     ("qwen3_5", "kto"): ("Qwen3.5의 KTO 학습은 현재 학습 엔진(LLaMA-Factory 0.9.5·transformers 5.6.0)에서 멀티모달 위치 "
                          "계산 오류로 실패하므로 지원하지 않습니다. SFT·DPO·RM·PT를 쓰세요."),
@@ -55,7 +55,8 @@ COMPOSITE_MODELS = [
 ]
 # Embedding tables, which bitsandbytes leaves unquantized under QLoRA (nn.Embedding and lm_head stay bf16): vocab x
 # hidden for the input embedding, again for an untied lm_head, and vocab x layers x 256 for the per-layer embedding
-# table of Gemma 4 E2B/E4B (template gemma4n, text_config.hidden_size_per_layer_input 256).
+# table of Gemma 4 E2B/E4B (template gemma4n, text_config.hidden_size_per_layer_input 256). The entry's vocab_size also
+# sizes the LM-head logits of the memory estimate (gpu_compat.LOGITS_BYTES).
 COMPOSITE_VOCABULARY = {"qwen3_5": 248_320, "qwen3_5_moe": 248_320, "gemma4": 262_144}
 PER_LAYER_INPUT = 256
 # MoE expert weights are 3-D nn.Parameters, not nn.Linear, so bitsandbytes leaves them bf16 too: experts x 3 (gate, up,
@@ -113,7 +114,7 @@ def model_catalog():
             models.append({"id": model_id, "template": template, "architecture": architecture, "max_length": 32768,
                            "parameters_b": round(total / 1e9, 2), "parameters_total": total, "text_parameters": text,
                            "embedding_parameters": embedding, "hidden_size": hidden, "num_layers": layers,
-                           "tie_word_embeddings": tied, "moe": moe,
+                           "tie_word_embeddings": tied, "moe": moe, "vocab_size": vocabulary,
                            **({"expert_parameters": experts[0] * 3 * hidden * experts[1] * layers} if experts else {}),
                            "gated": False, "gpu_verified": model_id in VERIFIED_COMPOSITE,
                            "verified_capabilities": ["8.6"] if model_id in VERIFIED_COMPOSITE else [],

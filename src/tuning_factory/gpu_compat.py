@@ -60,16 +60,27 @@ OVERHEAD_GIB = 1.5                  # CUDA context and framework buffers
 BYTES_PER_PARAMETER = {"bf16": 2.0, "fp16": 2.0, 8: 1.0, 4: 0.55}   # 4-bit includes quantization constants
 FULL_STATE_BYTES = 14.0             # bf16 gradient 2 + Adam fp32 moments 8 + fp32 master 4, beside the weight
 ADAPTER_FRACTION, ADAPTER_STATE_BYTES = 0.01, 16.0   # adapter weight, gradient and Adam states (generous)
+# LM-head logits of a model with a known ``vocab_size`` (the Qwen3.5/Gemma 4 catalog entries; 248k/262k vocabularies):
+# batch x cutoff_len x vocab_size x LOGITS_BYTES, which the activation term ignores. Per element: the bf16 logits, their
+# fp32 copy for the loss and its fp32/bf16 gradients (10-12 bytes). Calibrated on the 0.6.0 A40 peaks (spec 4.5): 11
+# lies between the 10.4 Gemma 4 E2B PT (packed to cutoff_len) needs and the 11.6 that keeps Qwen3.5-0.8B SFT LoRA
+# within twice its peak. dpo/kto x3: chosen + rejected, and the measured peaks hold about one more set (likely the
+# reference pass, adapters disabled); x2 would still miss Gemma 4 E2B DPO. full x2: covers the measured full peak, whose surplus
+# is mostly fp32 weights and optimizer temporaries rather than logits (FULL_STATE_BYTES is shared with every model).
+LOGITS_BYTES = 11.0
+LOGITS_STAGE_FACTOR = {"dpo": 3, "kto": 3}
+LOGITS_FULL_FACTOR = 2
 
 
 def estimate_memory(model, config):
     """Rough single-GPU training memory in GiB with gradient checkpointing; None without model sizes.
 
-    {"weights_gib": weights alone, "total_gib": weights + training state + activations + overhead}.
+    {"weights_gib": weights alone, "total_gib": weights + training state + activations + logits + overhead}.
     weights: every tensor (vision/audio and Gemma per-layer embeddings included); training state: the text model.
     QLoRA quantizes linear layers only: a model's ``embedding_parameters`` (embedding tables and an untied lm_head,
     which bitsandbytes keeps in bf16) and ``expert_parameters`` (MoE experts, 3-D nn.Parameters it cannot quantize) count at
-    the bf16 rate; without the facts every weight counts at the 4/8-bit rate."""
+    the bf16 rate; without the facts every weight counts at the 4/8-bit rate. logits: only with a ``vocab_size``
+    (LOGITS_BYTES), so a model without one keeps its stage-independent estimate."""
     if not model or not (model.get("parameters_total") or model.get("parameters_b")) or not all(
             model.get(key) for key in ("hidden_size", "num_layers")):
         return None
@@ -93,9 +104,12 @@ def estimate_memory(model, config):
         state = trainable * selected / layers * FULL_STATE_BYTES
     else:   # lora, qlora, oft
         state = trainable * ADAPTER_FRACTION * ADAPTER_STATE_BYTES
-    activations = (int(hyper.get("per_device_train_batch_size", 1)) * int(hyper.get("cutoff_len", 1024))
-                   * int(model["hidden_size"]) * (2 * layers + 34))
-    return {"weights_gib": weights / GIB, "total_gib": (weights + state + activations) / GIB + OVERHEAD_GIB}
+    tokens = int(hyper.get("per_device_train_batch_size", 1)) * int(hyper.get("cutoff_len", 1024))
+    activations = tokens * int(model["hidden_size"]) * (2 * layers + 34)
+    logits = (tokens * int(model.get("vocab_size") or 0) * LOGITS_BYTES
+              * LOGITS_STAGE_FACTOR.get(config.get("training_stage", "sft"), 1)
+              * (LOGITS_FULL_FACTOR if method == "full" else 1))
+    return {"weights_gib": weights / GIB, "total_gib": (weights + state + activations + logits) / GIB + OVERHEAD_GIB}
 
 
 STALE_SECONDS = 24 * 3600

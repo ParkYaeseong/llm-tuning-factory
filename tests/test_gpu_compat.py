@@ -131,6 +131,61 @@ def test_qlora_keeps_moe_expert_weights_at_bf16_so_a_35b_moe_no_longer_fits_an_a
         assert gpu_compat.estimate_memory(moe, training(method)) == gpu_compat.estimate_memory(without, training(method))
 
 
+# nvidia-smi peaks of the 0.6.0 GPU acceptance on an A40 (synthetic data; batch 1, cutoff_len 1024, gradient
+# accumulation 4, gradient checkpointing). Rows are short (~60-100 tokens) except PT, which packs text to cutoff_len.
+A40_PEAKS_MIB = [
+    ("Qwen/Qwen3.5-0.8B", "sft", "lora", 3107), ("Qwen/Qwen3.5-0.8B", "sft", "qlora", 2287),
+    ("Qwen/Qwen3.5-0.8B", "dpo", "lora", 5271), ("Qwen/Qwen3.5-0.8B", "pt", "lora", 5683),
+    ("Qwen/Qwen3.5-0.8B", "sft", "full", 16481), ("Qwen/Qwen3.5-0.8B", "sft", "freeze", 3143),
+    ("google/gemma-4-E2B-it", "sft", "lora", 12761), ("google/gemma-4-E2B-it", "dpo", "lora", 18711),
+    ("google/gemma-4-E2B-it", "pt", "lora", 14823), ("Qwen/Qwen3.5-9B", "sft", "lora", 19825)]
+
+
+@pytest.mark.parametrize("name,stage,method,peak_mib", A40_PEAKS_MIB)
+def test_estimates_cover_the_measured_a40_peaks_of_large_vocabulary_models(name, stage, method, peak_mib):
+    from tuning_factory.capabilities import model_catalog
+    model = next(m for m in model_catalog() if m["id"] == name)
+    total = gpu_compat.estimate_memory(model, {**training(method), "training_stage": stage})["total_gib"]
+    assert total >= peak_mib / 1024
+    if (stage, method) == ("sft", "lora"):   # still useful: at most twice the measured peak
+        assert total <= 2 * peak_mib / 1024
+
+
+def test_the_logits_term_scales_with_tokens_and_vocabulary_by_stage_and_method():
+    from tuning_factory.capabilities import model_catalog
+    gib = 1024 ** 3
+    assert gpu_compat.LOGITS_BYTES == 11
+    for name, vocabulary in (("google/gemma-4-E2B-it", 262_144), ("Qwen/Qwen3.5-0.8B", 248_320)):
+        model = next(m for m in model_catalog() if m["id"] == name)
+        without = {key: value for key, value in model.items() if key != "vocab_size"}
+        # chosen + rejected (+ the reference pass) for dpo/kto; full training doubles the term (spec 4.5)
+        for stage, method, factor in (("sft", "lora", 1), ("pt", "lora", 1), ("rm", "lora", 1), ("dpo", "lora", 3),
+                                      ("kto", "lora", 3), ("sft", "qlora", 1), ("sft", "freeze", 1),
+                                      ("sft", "full", 2), ("dpo", "full", 6)):
+            for batch, cutoff in ((1, 1024), (2, 4096)):
+                config = {**training(method, per_device_train_batch_size=batch, cutoff_len=cutoff),
+                          "training_stage": stage}
+                logits, plain = gpu_compat.estimate_memory(model, config), gpu_compat.estimate_memory(without, config)
+                assert logits["weights_gib"] == plain["weights_gib"]
+                assert logits["total_gib"] - plain["total_gib"] == pytest.approx(
+                    batch * cutoff * vocabulary * 11 * factor / gib), (name, stage, method, batch)
+
+
+def test_models_without_a_vocabulary_size_keep_their_stage_independent_estimates():
+    from tuning_factory.capabilities import model_catalog
+    gib = 1024 ** 3
+    text = [m for m in model_catalog() if "vocab_size" not in m]
+    assert {m["architecture"] for m in text} == {"qwen2", "llama", "mistral", "gemma2"}
+    for model in [*text, QWEN05, LLAMA70, QWEN35_08, GEMMA4_31]:
+        for method in ("lora", "qlora", "full", "freeze", "oft"):
+            sft = gpu_compat.estimate_memory(model, training(method))
+            for stage in ("pt", "rm", "ppo", "dpo", "kto"):
+                assert gpu_compat.estimate_memory(model, {**training(method), "training_stage": stage}) == sft
+    # The previous formula: bf16 weights + adapter state + activations + overhead.
+    assert gpu_compat.estimate_memory(QWEN05, training())["total_gib"] == pytest.approx(
+        (0.5e9 * 2 + 0.5e9 * 0.01 * 16 + 1024 * 896 * (2 * 24 + 34)) / gib + 1.5, rel=1e-12)
+
+
 CAPS = {"torch_cuda": "12.8", "sass": SASS, "ptx": [], "bf16_min_capability": "8.0",
         "min_driver": "525.60.13", "recommended_driver": "570.26"}
 BLACKWELL = gpu_compat.parse_gpu_facts(SMI)[0]

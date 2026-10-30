@@ -351,6 +351,24 @@ def test_composite_catalog_entries_count_the_embedding_tables_bitsandbytes_leave
     assert all("embedding_parameters" not in m for m in models.values() if m not in composite)
 
 
+def test_composite_catalog_entries_carry_the_vocabulary_size_of_their_logits():
+    from tuning_factory.capabilities import SIZE_FACTS, model_catalog, with_catalog_sizes
+    from tuning_factory.model_hub import ModelProfile, imported_model
+    models = {model["id"]: model for model in model_catalog()}
+    composite = [m for m in models.values() if m["architecture"] in {"qwen3_5", "qwen3_5_moe", "gemma4"}]
+    assert {m["id"]: m["vocab_size"] for m in composite} == {
+        m["id"]: 262_144 if m["architecture"] == "gemma4" else 248_320 for m in composite}
+    assert all("vocab_size" not in m for m in models.values() if m not in composite)   # estimates unchanged
+    assert "vocab_size" in SIZE_FACTS
+    # A hub registration of a catalog repository takes the size; any other repository has none.
+    reviewed = ModelProfile(repo_id="google/gemma-4-E2B-it", revision="a" * 40, config_sha256="c" * 64,
+                            architecture="gemma4", template="gemma4n", hidden_layers=35)
+    assert with_catalog_sizes(imported_model(reviewed))["vocab_size"] == 262_144
+    other = ModelProfile(repo_id="someone/gemma-4-E2B-sft", revision="a" * 40, config_sha256="c" * 64,
+                         architecture="gemma4", template="gemma4n", hidden_layers=35)
+    assert "vocab_size" not in with_catalog_sizes(imported_model(other))
+
+
 def test_moe_catalog_entries_count_the_three_dimensional_expert_weights_bitsandbytes_leaves_at_bf16():
     from tuning_factory.capabilities import model_catalog
     models = {model["id"]: model for model in model_catalog()}
