@@ -1592,6 +1592,8 @@ def test_v2_methods_require_a_validated_injected_connection(tmp_path, monkeypatc
         unconfigured.publish_cached_artifact(t.transfers[0], launch_id=LAUNCH_ID)
     assert opened == []   # validated before any SFTP session is opened
 
+    keepalives = []
+
     class OwnClient:
         def load_system_host_keys(self):
             pass
@@ -1600,7 +1602,7 @@ def test_v2_methods_require_a_validated_injected_connection(tmp_path, monkeypatc
             pass
 
         def get_transport(self):
-            return SimpleNamespace(set_keepalive=lambda seconds: None)
+            return SimpleNamespace(set_keepalive=keepalives.append)
 
         def connect(self, *args, **kwargs):
             pass
@@ -1611,6 +1613,7 @@ def test_v2_methods_require_a_validated_injected_connection(tmp_path, monkeypatc
     monkeypatch.setattr(execution.paramiko, "SSHClient", OwnClient)
     owned = SSHExecutor("test-host", 22, "root", "unused", remote_root=RUNPOD_ROOT + "/jobs",
                         model_cache_root=RUNPOD_ROOT + "/model-cache")
+    assert keepalives == [30]
     for call in (lambda: owned.run_operation(t.job, t.launch.directory, t.launch.request, t.transfers, lambda: False),
                  lambda: owned.collect_operation_result(t.job, t.launch.directory, t.launch.request),
                  lambda: owned.publish_cached_artifact(t.transfers[0], launch_id=LAUNCH_ID)):

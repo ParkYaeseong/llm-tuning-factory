@@ -1572,6 +1572,7 @@ def test_cli_server_runtime_exit_code_follows_readiness(tmp_path, monkeypatch, r
     ({"server_total_hourly_cost_usd": "1.5"}, 1.5), ({"server_total_hourly_cost_usd": " 0 "}, 0.0),
     ({"server_total_hourly_cost_usd": ""}, None), ({"server_total_hourly_cost_usd": "abc"}, None),
     ({"server_total_hourly_cost_usd": "-1"}, None), ({"server_total_hourly_cost_usd": "nan"}, None),
+    ({"server_total_hourly_cost_usd": "inf"}, None),
     ({"server_ssh_host": "gpu.example"}, None), ({"total_hourly_cost_usd": 2}, 2.0),
     ({"total_hourly_cost_usd": True}, None)])
 def test_server_hourly_cost_reads_only_the_saved_price_offline(saved, price):

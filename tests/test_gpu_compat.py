@@ -247,12 +247,19 @@ def test_memory_messages_name_their_thresholds():
 
 
 @pytest.mark.parametrize("price,code", [(0.6, None), (0, None), (0.61, "PRICE_OVER_BUDGET"), (None, "PRICE_UNKNOWN"),
-                                        (float("nan"), "PRICE_UNKNOWN"), (-1, "PRICE_UNKNOWN"), (True, "PRICE_UNKNOWN")])
+                                        (float("nan"), "PRICE_UNKNOWN"), (float("inf"), "PRICE_UNKNOWN"), (-1, "PRICE_UNKNOWN"), (True, "PRICE_UNKNOWN")])
 def test_a_server_price_is_judged_like_a_pod_price_but_zero_is_allowed(price, code):
     for observation in (observed(pod=None), None):   # judged before the missing-observation return
         findings = gpu_compat.evaluate(job(), observation, CAPS, QWEN05, stage="execute",
                                        server={"hourly_cost_usd": price})
         assert {item["code"] for item in findings if item["level"] == "block"} == ({code} if code else set())
+
+
+@pytest.mark.parametrize("price,code", [(1.2, None), (1.21, "PRICE_OVER_BUDGET")])
+def test_a_server_price_is_judged_against_the_budget_for_all_gpus(price, code):
+    findings = gpu_compat.evaluate(job(gpu_count=2), None, CAPS, QWEN05, stage="execute",
+                                   server={"hourly_cost_usd": price})
+    assert {item["code"] for item in findings if item["level"] == "block"} == ({code} if code else set())
 
 
 def test_an_unknown_server_price_points_to_the_connection_settings():
