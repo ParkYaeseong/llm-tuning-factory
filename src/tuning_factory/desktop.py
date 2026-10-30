@@ -473,8 +473,11 @@ class DesktopService:
                     return result
             with executor_for(self.settings, self.root, training_stage=stage, gate=gate,
                               prepare_runtime=prepare) as executor:
-                return self.factory.work(executor=executor, gpu="existing_runpod:" + self.settings["pod_id"],
-                                         approved_transfer=True, select_mode=True, target_job_id=job_id)
+                result = self.factory.work(executor=executor, gpu="existing_runpod:" + self.settings["pod_id"],
+                                           approved_transfer=True, select_mode=True, target_job_id=job_id)
+            # What a preparation in this run approval pruned (shown with the result); a waiting job stays None.
+            cleanup = getattr(executor, "runtime_cleanup", None)
+            return {**result, "runtime_cleanup": cleanup} if result is not None and cleanup is not None else result
         if action == "jobs":
             jobs = self.factory.store.list()[-200:][::-1]
             destinations = self.server_destinations(jobs)

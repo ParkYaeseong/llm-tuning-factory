@@ -272,6 +272,33 @@ def test_execute_gates_the_job_and_forwards_runtime_preparation(tmp_path, monkey
         server.dispatch("execute", {"approved": True, "job_id": "0" * 32, "prepare_runtime": True})
 
 
+def test_execute_returns_what_its_runtime_preparation_pruned(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    store = app.factory.store
+    job = store.submit({"sha256": "a4000", "simulation": False, "config": A4000_JOB}, "a4000")
+    store.transition(job["id"], "QUEUED")
+    cleanup = {"removed": ["b" * 16], "kept_in_use": [], "free_before": 1, "free_after": 3}
+    prepared = {"value": cleanup}
+
+    @contextmanager
+    def fake_executor(settings, root, **kwargs):
+        yield SimpleNamespace(remote=True, runtime_cleanup=prepared["value"])
+
+    monkeypatch.setattr(desktop_runtime, "executor_for", fake_executor)
+    finished = {"id": job["id"], "status": "COMPLETED"}
+    monkeypatch.setattr(app.factory, "work", lambda **kwargs: dict(finished))
+    request = {"approved": True, "job_id": job["id"], "prepare_runtime": True}
+    assert app.dispatch("execute", request) == {**finished, "runtime_cleanup": cleanup}
+    prepared["value"] = None                              # no preparation: the job record is unchanged
+    assert app.dispatch("execute", request) == finished
+    monkeypatch.setattr(app.factory, "work", lambda **kwargs: None)
+    assert app.dispatch("execute", request) is None       # nothing claimed: still the waiting answer
+
+
 def test_execute_with_preparation_refuses_a_pod_held_by_another_job(tmp_path, monkeypatch):
     from tuning_factory import desktop_runtime
     app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})

@@ -52,6 +52,8 @@ SERVER_RUNTIME_REQUIRED = ("GPU 서버에 이 앱 버전의 학습 환경이 없
 POST_PREPARATION_FAILED = ("학습 환경을 준비했지만 확인을 통과하지 못했습니다. 연결 설정에서 '환경 확인'으로 "
                            "상태를 확인하거나 '학습 환경 준비'를 다시 실행하세요.")
 PREPARATION_BUSY = "다른 학습 환경 준비가 이 GPU에서 진행 중입니다. 끝난 뒤 다시 시도하세요."
+RUNTIME_IN_USE = ("이 앱 버전의 학습 환경을 쓰는 작업이 실행 중이라 학습 환경을 다시 준비할 수 없습니다. "
+                  "작업이 끝난 뒤 다시 시도하세요.")
 PREPARE_IN_EXECUTION_RUNPOD_ONLY = "runtime preparation during execution applies to a RunPod preflight only"
 # The first import of the pinned torch/LLaMA-Factory and CUDA initialisation from a fresh venv on a network volume can take minutes.
 PROBE_TIMEOUT_SECONDS = 900
@@ -304,29 +306,25 @@ def observe(client, settings, state_root, pod):
     return observation
 
 
-# Fixed source run by the preparation script under this runtime's prepare.lock. The only arguments are the validated
-# remote root and the current 16-hex source hash, each separately quoted. It removes old app-version runtimes that no
-# worker holds (`flock -s in-use.lock`), that no preparation holds and that no live attempt references; it never
-# follows a link, never touches uv-cache/, python/, hf-cache/, model-cache/ or jobs/, and with any doubt it removes
-# nothing.
+# Fixed source run by the preparation script under this runtime's prepare.lock and exclusive in-use.lock. The only
+# arguments are the validated remote root and the current 16-hex source hash, each separately quoted. It removes old
+# app-version runtimes that no worker holds (`flock -s in-use.lock`), that no preparation holds and that no live
+# attempt references, checked again under the candidate's locks just before the rename. It never follows a link,
+# never touches uv-cache/, python/, hf-cache/, model-cache/ or jobs/, and with any doubt it removes nothing. A runtime
+# it cannot remove is listed in `errors` and the others go on; after BUDGET seconds it starts no new removal
+# (`incomplete`; the rest waits for the next preparation). Venvs share hard-linked files with uv-cache, so the space a
+# removal frees is the free-space delta (free_after - free_before), never a sum of file sizes.
 PRUNE_SOURCE = r'''import json,os,re,shutil,sys,time
 from pathlib import Path
 try:
     import fcntl
 except ImportError:
     fcntl=None
+BUDGET=300
+deadline=time.monotonic()+BUDGET
 root,current=Path(sys.argv[1]),sys.argv[2]
 runtime,jobs=root/'runtime',root/'jobs'
-report=dict(removed=[],kept_in_use=[],free_before=None,free_after=None)
-def size(path):
-    total=0
-    for base,dirs,files in os.walk(path):
-        for name in files:
-            try:
-                total+=os.lstat(os.path.join(base,name)).st_size
-            except OSError:
-                pass
-    return total
+report=dict(removed=[],kept_in_use=[],errors=[],free_before=None,free_after=None)
 def live():
     found=set()
     for attempt in jobs.glob('*/*'):
@@ -346,7 +344,7 @@ def hold(path):
     handles=[]
     try:
         for name in ('in-use.lock','prepare.lock'):
-            handles.append(os.open(path/name,os.O_RDONLY|os.O_CREAT|os.O_NOFOLLOW|os.O_CLOEXEC,0o666))
+            handles.append(os.open(path/name,os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW|os.O_CLOEXEC,0o666))
             fcntl.flock(handles[-1],fcntl.LOCK_EX|fcntl.LOCK_NB)
         return handles
     except OSError:
@@ -362,24 +360,33 @@ try:
         name=path.name
         if path.is_symlink() or not path.is_dir():
             continue
-        if name.startswith('.trash-'):
-            shutil.rmtree(path,ignore_errors=True)
+        leftover=name.startswith('.trash-')
+        if not leftover and (not re.fullmatch('[0-9a-f]{16}(-ppo)?',name) or name[:16]==current):
             continue
-        if not re.fullmatch('[0-9a-f]{16}(-ppo)?',name) or name[:16]==current:
+        if time.monotonic()>deadline:
+            report['incomplete']=True
+            break
+        if leftover:
+            shutil.rmtree(path,ignore_errors=True)
             continue
         handles=None if name[:16] in referenced else hold(path)
         if handles is None:
             report['kept_in_use'].append(name)
             continue
         try:
-            removed=dict(name=name,bytes=size(path))
-            trash=runtime/('.trash-%s-%d'%(name,os.getpid()))
-            path.rename(trash)
-        finally:
-            for handle in handles:
-                os.close(handle)
-        shutil.rmtree(trash)
-        report['removed'].append(removed)
+            try:
+                if name[:16] in live():
+                    report['kept_in_use'].append(name)
+                    continue
+                trash=runtime/('.trash-%s-%d'%(name,os.getpid()))
+                path.rename(trash)
+            finally:
+                for handle in handles:
+                    os.close(handle)
+            shutil.rmtree(trash)
+            report['removed'].append(name)
+        except OSError:
+            report['errors'].append(name)
 except Exception as error:
     report['cleanup_error']=(type(error).__name__+': '+str(error))[:300]
 try:
@@ -425,12 +432,17 @@ def install_runtime(client, training_stage, remote_root, pod, preparation):
             sftp.put(str(path), root + "/" + path.name)
     # All installs, Python downloads and caches stay below the private root.
     # A preparation always rebuilds the private venv (--clear, under the flock): an interrupted
-    # install can leave packages that uv still reports as installed.
+    # install can leave packages that uv still reports as installed. A worker of this version holds
+    # in-use.lock shared for its whole life, so the rebuild first takes it exclusively (fd 8, held to the end)
+    # and never clears a venv under a running worker. The prune report is printed last, after the uv output,
+    # so the 128 KB output tail that command() keeps always contains it.
     script = (
         "set -eu\n"
         "command -v flock >/dev/null\n"
         f"exec 9>{shlex.quote(root + '/prepare.lock')}\nflock -n 9 || {{ echo TF_PREPARE_BUSY; exit 75; }}\n"
-        f"python3 -c {shlex.quote(PRUNE_SOURCE)} {shlex.quote(remote_root)} {source_hash()[:16]} || true\n"
+        f"exec 8>{shlex.quote(root + '/in-use.lock')}\nflock -x -n 8 || {{ echo TF_RUNTIME_IN_USE; exit 75; }}\n"
+        f"prune=$(python3 -I -c {shlex.quote(PRUNE_SOURCE)} {shlex.quote(remote_root)} {source_hash()[:16]} "
+        "2>&1 || true)\n"
         f"export UV_PYTHON_INSTALL_DIR={shlex.quote(remote_root + '/python')}\n"
         f"export UV_CACHE_DIR={shlex.quote(remote_root + '/uv-cache')}\n"
         f"python3 -m pip install --disable-pip-version-check --no-cache-dir "
@@ -441,6 +453,7 @@ def install_runtime(client, training_stage, remote_root, pod, preparation):
         f"--torch-backend {backend} {shlex.quote(root + '/' + lock_name)}\n"
         f"python3 -m uv pip install --python {shlex.quote(root + '/venv/bin/python')} --no-deps "
         f"{shlex.quote(root + '/' + wheels[0].name)}\n"
+        'printf "%s\\n" "$prune"\n'
     )
     preparation["started"] = True
     try:
@@ -449,6 +462,8 @@ def install_runtime(client, training_stage, remote_root, pod, preparation):
         preparation["stopped"] = True
         if "TF_PREPARE_BUSY" in str(error):
             raise ValueError(PREPARATION_BUSY) from None
+        if "TF_RUNTIME_IN_USE" in str(error):
+            raise ValueError(RUNTIME_IN_USE) from None
         raise
     preparation["stopped"] = True
     preparation["cleanup"] = prune_report(output)
@@ -642,6 +657,7 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
                                    runtime_lock_file=root + "/in-use.lock")
             yield executor
             return
+        cleanup = None
         if preflight:
             try:
                 check(client, training_stage, **pins)
@@ -654,6 +670,7 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
                     prerequisites(client)
                     bootstrap_prerequisites(client)
                     install_runtime(client, training_stage, REMOTE, pod, preparation)
+                cleanup = preparation.get("cleanup")
                 try:
                     check(client, training_stage, **pins)
                 except (RuntimeMissing, RuntimeMismatch):
@@ -664,6 +681,7 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
                                remote_root=REMOTE + "/jobs", remote_python=root + "/venv/bin/python",
                                worker_lock_file=root + "/" + lock_name, hf_home=REMOTE + "/hf-cache",
                                model_cache_root=REMOTE + "/model-cache", runtime_lock_file=root + "/in-use.lock")
+        executor.runtime_cleanup = cleanup   # what a preparation in this run approval pruned; None without one
         yield executor
 
 
