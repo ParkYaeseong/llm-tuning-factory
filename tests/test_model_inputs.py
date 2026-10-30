@@ -299,10 +299,11 @@ def legacy_matrix():
 # Digests of LlamaFactoryBackend.translate(config) computed at HEAD 42064b7, before 7.2 touched training.py
 # (translate is unchanged since cc87170, so this equals the plan's baseline 1c5d2d3). The two example-config
 # digests reproduce plan F18 exactly; the matrix construction is the one above.
-LEGACY_MATRIX_SHA256 = "d488f35a7950c46fe5bba5925fa532d920cad05235938ee24261d32e85343473"
+# Re-pinned when save_safetensors was dropped (transformers 5 rejects it); adding it back reproduces the old digests.
+LEGACY_MATRIX_SHA256 = "cfc98cd0e0a682d41044e3617a29219f08fd01cb9409eaa278e66fc3e405f40b"
 EXAMPLE_SHA256 = {
-    "configs/ai/paper_extraction.yaml": "1630e49b5cda266ac5ced12ee3a92a10f85aad14ac62c33c60f56925b9b57144",
-    "configs/ai/integration_smoke.yaml": "0aa75a3927a7336973574f43bd66a5b139de7f07fc781335330b436ff9c91498",
+    "configs/ai/paper_extraction.yaml": "881cef8b8c3840b53d10f35ab1269618cb8739943ee9424c4331a42728484afb",
+    "configs/ai/integration_smoke.yaml": "83733974b0a80c5f19b1121a02c1917f1a5e946f9c78b6e736aa92c45428cc97",
 }
 
 
