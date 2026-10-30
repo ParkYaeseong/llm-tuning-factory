@@ -97,7 +97,8 @@ def model_catalog():
         for model_id in ids:
             models.append({"id": model_id, "template": template, "architecture": architecture, "max_length": 32768,
                            "parameters_b": round(total / 1e9, 2), "parameters_total": total, "text_parameters": text,
-                           "embedding_parameters": embedding, "hidden_size": hidden, "num_layers": layers, "tie_word_embeddings": tied, "moe": moe,
+                           "embedding_parameters": embedding, "hidden_size": hidden, "num_layers": layers,
+                           "tie_word_embeddings": tied, "moe": moe,
                            "gated": False, "gpu_verified": False, "verified_capabilities": [],
                            "verification_scope": "text data only; vision/audio frozen; GPU verification pending",
                            "supported_stages": list(stages), "methods": list(methods)})
