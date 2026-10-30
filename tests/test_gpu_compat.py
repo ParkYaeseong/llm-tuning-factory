@@ -299,6 +299,24 @@ def test_a_verified_model_warns_on_a_generation_it_was_not_verified_on():
     assert gpu_compat.evaluate(job(), observed(), CAPS, QWEN05, stage="execute") == []
 
 
+def test_the_a40_verified_composite_models_warn_only_on_other_generations():
+    from tuning_factory.capabilities import model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    a40 = {**BLACKWELL, "name": "NVIDIA A40", "capability": "8.6", "memory_mib": 46068}
+    h100 = {**BLACKWELL, "name": "NVIDIA H100 80GB HBM3", "capability": "9.0", "memory_mib": 81559}
+    for name in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-9B", "google/gemma-4-E2B-it"):
+        on_a40 = gpu_compat.evaluate(job(gpu_type="NVIDIA A40"), observed([a40], pod=None), CAPS, models[name],
+                                     stage="execute")
+        assert "MODEL_UNVERIFIED" not in {item["code"] for item in on_a40}, name
+        on_h100 = gpu_compat.evaluate(job(gpu_type="NVIDIA H100 80GB HBM3"), observed([h100], pod=None), CAPS,
+                                      models[name], stage="execute")
+        assert [item["message"] for item in on_h100 if item["code"] == "MODEL_UNVERIFIED"] == [
+            "이 모델은 이 GPU 세대(compute capability 9.0)에서 아직 검증되지 않았습니다."], name
+    base = gpu_compat.evaluate(job(gpu_type="NVIDIA A40"), observed([a40], pod=None), CAPS,
+                               models["Qwen/Qwen3.5-0.8B-Base"], stage="execute")
+    assert [item["message"] for item in base if item["code"] == "MODEL_UNVERIFIED"] == [gpu_compat.MODEL_UNVERIFIED]
+
+
 def test_memory_messages_name_their_thresholds():
     h100 = {**BLACKWELL, "name": "NVIDIA H100 80GB HBM3", "capability": "9.0", "memory_mib": 81559}
     pod = {**POD, "gpu_id": "NVIDIA H100 80GB HBM3", "hourly_cost_usd": 2.0}

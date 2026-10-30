@@ -63,6 +63,13 @@ PER_LAYER_INPUT = 256
 # moe_intermediate_size). Qwen3.5-35B-A3B: 256 experts, 512; Gemma 4 26B-A4B: 128 experts, 704.
 MOE_EXPERTS = {"Qwen/Qwen3.5-35B-A3B": (256, 512), "Qwen/Qwen3.5-35B-A3B-Base": (256, 512),
                "google/gemma-4-26B-A4B": (128, 704), "google/gemma-4-26B-A4B-it": (128, 704)}
+# The 0.6.0 GPU acceptance (A40, compute capability 8.6, synthetic data; docs/PROGRESS.md): what ran on each repository.
+# Base variants and the other sizes stay unverified.
+VERIFIED_COMPOSITE = {
+    "Qwen/Qwen3.5-0.8B": "0.6.0 SFT LoRA/QLoRA/full/freeze, DPO, PT, RM (engine-level), materialize synthetic A40",
+    "Qwen/Qwen3.5-9B": "0.6.0 SFT LoRA synthetic A40",
+    "google/gemma-4-E2B-it": "0.6.0 SFT LoRA, DPO, PT, RM (engine-level) synthetic A40",
+}
 
 
 def model_catalog():
@@ -108,8 +115,10 @@ def model_catalog():
                            "embedding_parameters": embedding, "hidden_size": hidden, "num_layers": layers,
                            "tie_word_embeddings": tied, "moe": moe,
                            **({"expert_parameters": experts[0] * 3 * hidden * experts[1] * layers} if experts else {}),
-                           "gated": False, "gpu_verified": False, "verified_capabilities": [],
-                           "verification_scope": "text data only; vision/audio frozen; GPU verification pending",
+                           "gated": False, "gpu_verified": model_id in VERIFIED_COMPOSITE,
+                           "verified_capabilities": ["8.6"] if model_id in VERIFIED_COMPOSITE else [],
+                           "verification_scope": VERIFIED_COMPOSITE.get(
+                               model_id, "text data only; vision/audio frozen; GPU verification pending"),
                            "supported_stages": list(stages), "methods": list(methods)})
     return models
 

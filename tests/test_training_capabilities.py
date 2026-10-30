@@ -288,8 +288,29 @@ def test_catalog_lists_the_verified_gpu_generations():
     # 0.5.0 GPU acceptance (2026-10-30): SFT LoRA on A40, H100 and RTX PRO 4000 Blackwell.
     assert qwen["verified_capabilities"] == ["8.6", "9.0", "12.0"]
     assert "0.5.0" in qwen["verification_scope"] and "A40" in qwen["verification_scope"]
-    assert all(model["verified_capabilities"] == [] for name, model in models.items()
-               if name != "Qwen/Qwen2.5-0.5B-Instruct")
+    assert all(model["verified_capabilities"] == [] and model["gpu_verified"] is False for name, model in models.items()
+               if name != "Qwen/Qwen2.5-0.5B-Instruct" and name not in VERIFIED_ON_A40)
+
+
+# 0.6.0 GPU acceptance (A40, compute capability 8.6, synthetic data): the composite models and what ran on each.
+VERIFIED_ON_A40 = {
+    "Qwen/Qwen3.5-0.8B": "0.6.0 SFT LoRA/QLoRA/full/freeze, DPO, PT, RM (engine-level), materialize synthetic A40",
+    "Qwen/Qwen3.5-9B": "0.6.0 SFT LoRA synthetic A40",
+    "google/gemma-4-E2B-it": "0.6.0 SFT LoRA, DPO, PT, RM (engine-level) synthetic A40"}
+
+
+def test_a40_verified_composite_models_are_marked():
+    from tuning_factory.capabilities import VERIFIED_COMPOSITE, model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    assert VERIFIED_COMPOSITE == VERIFIED_ON_A40
+    for name, scope in VERIFIED_ON_A40.items():
+        assert (models[name]["gpu_verified"], models[name]["verified_capabilities"],
+                models[name]["verification_scope"]) == (True, ["8.6"], scope)
+    # Base variants and the other sizes ran nowhere: still unverified.
+    for name in ("Qwen/Qwen3.5-0.8B-Base", "Qwen/Qwen3.5-9B-Base", "google/gemma-4-E2B", "Qwen/Qwen3.5-2B",
+                 "google/gemma-4-E4B-it"):
+        assert (models[name]["gpu_verified"], models[name]["verified_capabilities"]) == (False, [])
+        assert "GPU verification pending" in models[name]["verification_scope"]
 
 
 def test_catalog_lists_qwen35_and_gemma4_with_sizes_and_text_scope():
@@ -297,7 +318,7 @@ def test_catalog_lists_qwen35_and_gemma4_with_sizes_and_text_scope():
     models = {model["id"]: model for model in model_catalog()}
     composite = [m for m in models.values() if m["architecture"] in {"qwen3_5", "qwen3_5_moe", "gemma4"}]
     assert len(composite) == 19 and "Qwen/Qwen3.5-27B-Base" not in models
-    assert all(not m["gated"] and not m["gpu_verified"] and m["verified_capabilities"] == []
+    assert all(not m["gated"] and m["gpu_verified"] is (m["id"] in VERIFIED_ON_A40)
                and 0 < m["text_parameters"] < m["parameters_total"] and m["max_length"] == 32768
                and m["supported_stages"] == ["pt", "sft", "rm", "dpo"] and "oft" not in m["methods"]
                for m in composite)
