@@ -1967,6 +1967,13 @@ def test_unloaded_modules_follow_gemma4_kv_sharing_like_transformers():
             unloaded_modules(config)
 
 
+def test_unloaded_modules_refuse_an_unbounded_layer_count_quickly():
+    from tuning_factory.target_inspection import unloaded_modules
+    with pytest.raises(ValueError, match="invalid Gemma 4 text_config"):
+        unloaded_modules(gemma4_config(10 ** 9, 10 ** 9 - 1))
+    assert len(unloaded_modules(gemma4_config(10000, 1))) == 4
+
+
 def test_verify_inspected_targets_drops_kv_shared_modules_of_a_raw_gemma4_checkpoint_given_its_config():
     from tuning_factory.graph_planner import ModelTargetEvidence, TargetModuleEvidence
     module = api()

@@ -769,6 +769,8 @@ class Acceptance:
         """Merge two adapters (made for the ``wanted`` modules) and check the output independently."""
         ops = self.ops
         receipt = ops.merge_adapters(adapters, (0.25, 0.75), out, base=local, require_real=False, probe_ids=PROBE)
+        # one receipt per merge: composite_<kind>_merge_<suffix> (the out directory is composite-<kind>-merged-<suffix>)
+        self.receipts[out.name.replace("-merged-", "_merge_").replace("-", "_")] = receipt.model_dump(mode="json")
         config = json.loads((out / "adapter_config.json").read_text(encoding="utf-8"))
         expected = {}
         for model, weight, scale in zip(adapters, (0.25, 0.75), (4 / 2, 9 / 3)):

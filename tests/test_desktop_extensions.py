@@ -81,6 +81,19 @@ def test_model_revision_rejects_architecture_mismatch(monkeypatch, tmp_path):
         DesktopService(tmp_path).dispatch('model_revision', {'model': 'Qwen/Qwen2.5-0.5B-Instruct'})
 
 
+@pytest.mark.parametrize('text', [{'max_position_embeddings': 'x', 'num_hidden_layers': [1]},
+                                  {'max_position_embeddings': True, 'num_hidden_layers': 10 ** 9},
+                                  {'max_position_embeddings': 8, 'num_hidden_layers': -3}])
+def test_model_revision_turns_malformed_sizes_into_unknown(monkeypatch, tmp_path, text):
+    import httpx
+    def response(url, **kwargs):
+        payload = {'sha': 'a' * 40} if '/api/models/' in url else {'model_type': 'qwen3_5', 'text_config': text}
+        return httpx.Response(200, json=payload, request=httpx.Request('GET', url))
+    monkeypatch.setattr(httpx, 'get', response)
+    result = DesktopService(tmp_path).dispatch('model_revision', {'model': 'Qwen/Qwen3.5-0.8B'})
+    assert (result['max_length'], result['hidden_layers']) == (32768, None)
+
+
 def test_model_revision_reads_the_text_config_of_a_composite_model(monkeypatch, tmp_path):
     import httpx
     def response(url, **kwargs):

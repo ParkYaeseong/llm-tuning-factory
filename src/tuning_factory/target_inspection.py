@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 COMPOSITE_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_moe", "gemma4"})
 LANGUAGE_MODEL_PREFIX = "model.language_model."
 KV_SHARED_MODULES = ("k_proj", "v_proj", "k_norm", "v_norm")
+MAX_HIDDEN_LAYERS = 10000   # the bound ModelProfile.hidden_layers applies
 
 
 def unloaded_modules(config) -> frozenset:
@@ -35,7 +36,7 @@ def unloaded_modules(config) -> frozenset:
     if not isinstance(text, dict):
         raise ValueError("invalid Gemma 4 text_config")
     layers, shared = text.get("num_hidden_layers"), text.get("num_kv_shared_layers") or 0
-    if type(shared) is not int or shared < 0 or (shared and (type(layers) is not int or layers < 1)):
+    if type(shared) is not int or shared < 0 or (shared and (type(layers) is not int or not 1 <= layers <= MAX_HIDDEN_LAYERS)):
         raise ValueError("invalid Gemma 4 text_config")
     if not shared or layers - shared <= 0:
         return frozenset()
