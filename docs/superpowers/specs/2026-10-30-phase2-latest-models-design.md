@@ -120,7 +120,7 @@ CPU forward가 된다(2026-10-30 확인).
 | 복합 구조 동결 | `qwen3_5`·`qwen3_5_moe`·`gemma4` 학습 설정에 `freeze_vision_tower: true`, `freeze_multi_modal_projector: true`, `freeze_language_model: false`를 쓴다 |
 | 추론 템플릿 | `qwen3_5`·`qwen3_6`·`gemma4`·`gemma4n`이면 학습·예측·평가 설정에 `enable_thinking: false`를 쓴다 |
 | 기존 구조 | 설정 변환 결과가 바이트 단위로 같다. `tests/test_model_inputs.py`의 고정 다이제스트를 바꾸지 않는다 |
-| 학습 단계 | 새 구조는 sft·dpo·kto·pt 허용. rm은 GPU 인수에서 값 헤드가 동작함을 보일 때까지 한국어로 거부. ppo는 한국어로 거부 |
+| 학습 단계 | 구조별로 다르다(GPU 인수 결과). Qwen3.5(`qwen3_5`·`qwen3_5_moe`)는 pt·sft·rm·dpo 허용, kto는 멀티모달 위치 계산 오류로 한국어 거부. Gemma 4는 pt·sft·dpo·kto 허용, rm은 값 헤드 검증 전까지 한국어 거부(검증 대기). ppo는 모두 한국어로 거부 |
 | freeze | 구조에 없는 학습 모듈(`qwen3_5*`의 `self_attn`, `self_attn,mlp`)과 임베딩 공유 모델의 `lm_head` 추가 모듈은 한국어로 거부 |
 | 메모리 | 가중치는 전체 매개변수(비전·오디오 포함), 학습 상태·옵티마이저는 텍스트 매개변수, 활성값은 `text_config` 크기로 추정. 허브 모델도 크기를 알면 추정한다 |
 | 결함 수정 | 1.3의 1(샤드 이름 포함), 2, 3, 9를 고치고, 병합·확정·이어 학습에 필요한 만큼 4와 10을 고친다. 5–8은 위 결정으로 고친다 |
@@ -226,7 +226,8 @@ CPU forward가 된다(2026-10-30 확인).
 ### 4.4 모델 목록과 허브 프로필
 
 **구조 정책은 `model_hub.ARCHITECTURES` 한 곳에 둔다.**
-- `qwen3_5`·`qwen3_5_moe`·`gemma4`: 단계 `["pt", "sft", "dpo", "kto"]`, 방법 `["lora", "qlora", "full", "freeze"]`.
+- `qwen3_5`·`qwen3_5_moe`: 단계 `["pt", "sft", "rm", "dpo"]`(`QWEN35_STAGES`). `gemma4`: 단계 `["pt", "sft", "dpo", "kto"]`(`GEMMA4_STAGES`).
+  세 구조 모두 방법 `["lora", "qlora", "full", "freeze"]`.
 - `COMPOSITE_ARCHITECTURES = {"qwen3_5", "qwen3_5_moe", "gemma4"}`.
 - `gemma4` 허용 템플릿은 `{"gemma4", "gemma4n"}`. 허브 조회는 `text_config.hidden_size_per_layer_input`이 0보다 크면(E 모델)
   `gemma4n`을 고른다.
@@ -273,12 +274,17 @@ CPU forward가 된다(2026-10-30 확인).
 
 ### 4.6 학습 단계·방법 제한 — `capabilities.compatibility`
 
-- 복합 구조에서 `rm`은 "Qwen3.5·Gemma 4의 보상 모델(RM) 학습은 아직 GPU에서 값 헤드를 검증하지 않아 막아 두었습니다."로,
-  `ppo`는 "Qwen3.5·Gemma 4는 PPO 전용 학습 환경(transformers 4.52.4)이 지원하지 않습니다."로 거부한다.
+- 거부는 구조별이다(`COMPOSITE_STAGE_REFUSALS[(구조, 단계)]`).
+  - Qwen3.5의 `kto`: "Qwen3.5의 KTO 학습은 현재 학습 엔진(LLaMA-Factory 0.9.5·transformers 5.6.0)에서 멀티모달 위치 계산 오류로 실패하므로
+    지원하지 않습니다. SFT·DPO·RM·PT를 쓰세요." 실제 A40 실행에서 LLaMA-Factory의 KTO 경로가 더미 이미지 격자만 넘기고
+    `mm_token_type_ids`를 넘기지 않아 transformers Qwen3_5의 `compute_3d_position_ids`가 M-RoPE 오류(`ValueError`)를 냈다.
+  - Gemma 4의 `rm`: "Gemma 4의 보상 모델(RM) 학습은 아직 GPU에서 값 헤드를 검증하지 않아 막아 두었습니다."(Gemma 4 단계는 시험 중).
+  - 복합 구조의 `ppo`: "Qwen3.5·Gemma 4는 PPO 전용 학습 환경(transformers 4.52.4)이 지원하지 않습니다."
 - freeze 거부(한국어):
   - `architecture`가 `qwen3_5*`이고 `freeze_trainable_modules`가 `self_attn` 또는 `self_attn,mlp`.
   - 모델 항목이 `tie_word_embeddings: true`이고 `freeze_extra_modules`에 `lm_head`가 있음.
-- rm 허용은 GPU 인수(5.2)의 RM 시험이 값 헤드 저장·평가를 보인 뒤 별도 커밋으로 `ARCHITECTURES`에 `rm`을 더하고 거부를 지운다.
+- Qwen3.5 RM은 앱 밖에서 학습 환경의 `llamafactory-cli`로 직접 시험했다(rm, LoRA, 템플릿 qwen3_5, enable_thinking false, freeze 키).
+  `value_head.safetensors`가 쓰였고 `eval_accuracy`·`eval_loss`가 유한해 허용했다. Gemma 4 RM은 같은 시험 뒤에 정한다.
 
 ### 4.7 설정 변환 — `training.py`
 
@@ -410,5 +416,5 @@ CPU forward가 된다(2026-10-30 확인).
 
 ## 7. 이후
 
-- rm 허용(GPU 인수 결과에 따름), 이미지 데이터 학습, Qwen3.5-27B·35B-A3B·Gemma 4 26B/31B의 큰 GPU 검증,
+- Gemma 4 rm 허용(GPU 인수 결과에 따름), 이미지 데이터 학습, Qwen3.5-27B·35B-A3B·Gemma 4 26B/31B의 큰 GPU 검증,
   fla 커널, 여러 GPU 분산 학습.

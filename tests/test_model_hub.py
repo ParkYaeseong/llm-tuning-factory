@@ -76,6 +76,7 @@ def test_current_qwen36_uses_its_upstream_template():
     service, _ = hub('qwen3_5_moe')
     result = service.inspect('Qwen/Qwen3.6-35B-A3B')
     assert result['supported'] and result['profile']['template'] == 'qwen3_6'
+    assert result['supported_stages'] == ['pt', 'sft', 'rm', 'dpo']
 
 
 def test_gemma4_is_discoverable_with_text_training_scope():

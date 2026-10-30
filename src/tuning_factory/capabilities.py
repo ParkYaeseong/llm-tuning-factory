@@ -17,10 +17,12 @@ METHODS = ["lora", "qlora", "full", "freeze", "oft"]
 SIZE_FACTS = ("parameters_total", "parameters_b", "text_parameters", "embedding_parameters", "hidden_size", "num_layers",
               "moe", "tie_word_embeddings")
 COMPOSITE_STAGE_REFUSALS = {
-    "rm": ("Qwen3.5·Gemma 4의 보상 모델(RM) 학습은 아직 GPU에서 값 헤드를 검증하지 않아 막아 두었습니다. "
-           "SFT·DPO·KTO·PT를 쓰세요."),
-    "ppo": "Qwen3.5·Gemma 4는 PPO 전용 학습 환경(transformers 4.52.4)이 지원하지 않습니다.",
+    ("qwen3_5", "kto"): ("Qwen3.5의 KTO 학습은 현재 학습 엔진(LLaMA-Factory 0.9.5·transformers 5.6.0)에서 멀티모달 위치 "
+                         "계산 오류로 실패하므로 지원하지 않습니다. SFT·DPO·RM·PT를 쓰세요."),
+    ("gemma4", "rm"): ("Gemma 4의 보상 모델(RM) 학습은 아직 GPU에서 값 헤드를 검증하지 않아 막아 두었습니다. "
+                       "SFT·DPO·KTO·PT를 쓰세요."),
 }
+PPO_REFUSAL = "Qwen3.5·Gemma 4는 PPO 전용 학습 환경(transformers 4.52.4)이 지원하지 않습니다."
 # Option labels as the training screen shows them (desktop/src/components/recipe-fields.ts, freeze fields).
 FREEZE_SELF_ATTN = ("Qwen3.5는 층에 따라 linear_attn 또는 self_attn을 써서 '학습할 모듈'로 'Attention'·'Attention + MLP'를 "
                     "고를 수 없습니다. '전체' 또는 'MLP'를 고르세요.")
@@ -213,8 +215,10 @@ def compatibility(config, *, graph_reward_binding=False):
             errors.append("OFT generation evaluation is blocked by the pinned engine adapter parser")
     if model:
         if stage not in model.get("supported_stages", STAGES):
-            errors.append(COMPOSITE_STAGE_REFUSALS[stage]
-                          if model["architecture"] in COMPOSITE_ARCHITECTURES and stage in COMPOSITE_STAGE_REFUSALS
+            family = "qwen3_5" if model["architecture"] == "qwen3_5_moe" else model["architecture"]
+            errors.append(PPO_REFUSAL if model["architecture"] in COMPOSITE_ARCHITECTURES and stage == "ppo"
+                          else COMPOSITE_STAGE_REFUSALS[family, stage]
+                          if model["architecture"] in COMPOSITE_ARCHITECTURES and (family, stage) in COMPOSITE_STAGE_REFUSALS
                           else f"{stage} is unavailable for this architecture/runtime profile; choose a supported stage")
         if method not in model.get("methods", METHODS):
             errors.append(f"{method} is unavailable for this architecture profile")

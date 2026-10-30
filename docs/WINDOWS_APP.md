@@ -331,7 +331,7 @@ Hopper(H100·H200), Blackwell(B200·RTX PRO 4000/6000)입니다. Turing(T4·RTX 
 - **모델**: 기본 목록에 Qwen3.5(0.8B·2B·4B·9B·27B·35B-A3B, Base가 있는 크기는 Base 포함)와 Gemma 4(E2B·E4B·26B-A4B·31B,
   -it와 기본 모델)가 있습니다. 이 모델들은 비전·오디오 겸용 구조이지만 **텍스트 데이터만** 학습하며, 비전·오디오 부분은 항상 동결됩니다.
   GPU에서 검증된 모델이 아닙니다(검증 결과는 [진행 기록](PROGRESS.md) 참고).
-- **단계와 방법**: SFT·DPO·KTO·PT를 지원합니다. RM은 GPU 인수 시험의 결과로 정하며 그 전에는 막아 두고, PPO는 지원하지 않습니다.
+- **단계와 방법**: Qwen3.5는 SFT·DPO·RM·PT를 지원합니다. KTO는 현재 학습 엔진(LLaMA-Factory 0.9.5·transformers 5.6.0)에서 멀티모달 위치 계산 오류로 실패해 지원하지 않습니다. Gemma 4는 SFT·DPO·KTO·PT를 지원하며 GPU 검증이 진행 중이고 RM은 그 결과가 나올 때까지 막아 둡니다. PPO는 지원하지 않습니다.
   freeze 방식에서 Qwen3.5는 학습 모듈로 'Attention'과 'Attention + MLP'를 고를 수 없고, 입력·출력 임베딩을 공유하는 모델은
   'LM head'를 따로 학습할 수 없습니다.
 - **Qwen3.5 템플릿**: 기본값은 `qwen3_5`(+`enable_thinking: false`)입니다. 일반 템플릿 `qwen3_5_nothink`로 학습하면 모델이 답마다 빈 `<think>` 블록을 스스로 생성하므로 기본으로 쓰지 않으며, 저장된 설정에서는 계속 허용됩니다.

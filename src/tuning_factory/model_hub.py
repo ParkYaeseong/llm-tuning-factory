@@ -14,22 +14,25 @@ ALL_METHODS = ["lora", "qlora", "full", "freeze", "oft"]
 # Vision(/audio) + text models trained on text only: LLaMA-Factory loads them with AutoModelForImageTextToText and the
 # app keeps their vision/audio towers and projectors frozen (training.py, target_inspection.py).
 COMPOSITE_ARCHITECTURES = frozenset({"qwen3_5", "qwen3_5_moe", "gemma4"})
-# Reward modeling waits for GPU proof of the value head; the PPO runtime (transformers 4.52.4) lacks these models.
-COMPOSITE_STAGES = [x for x in ALL_STAGES if x not in {"rm", "ppo"}]
+# Per architecture, as the GPU runs showed (Qwen3.5-0.8B on an A40): Qwen3.5 trains pt, sft, rm and dpo, but its KTO
+# fails in transformers' M-RoPE position ids; Gemma 4 keeps pt, sft, dpo and kto while its RM awaits GPU proof of the
+# value head. The PPO runtime (transformers 4.52.4) lacks these models.
+QWEN35_STAGES = ["pt", "sft", "rm", "dpo"]
+GEMMA4_STAGES = ["pt", "sft", "dpo", "kto"]
 COMPOSITE_METHODS = ["lora", "qlora", "full", "freeze"]
 ARCHITECTURES = {
     "qwen2": ("qwen", ALL_STAGES, ALL_METHODS),
     "qwen3": ("qwen3_nothink", [x for x in ALL_STAGES if x != "ppo"], ALL_METHODS),
     "qwen3_moe": ("qwen3_nothink", [x for x in ALL_STAGES if x != "ppo"], ALL_METHODS),
     "qwen3_next": ("qwen3_nothink", [x for x in ALL_STAGES if x != "ppo"], ALL_METHODS),
-    "qwen3_5": ("qwen3_5", COMPOSITE_STAGES, COMPOSITE_METHODS),
-    "qwen3_5_moe": ("qwen3_5", COMPOSITE_STAGES, COMPOSITE_METHODS),
+    "qwen3_5": ("qwen3_5", QWEN35_STAGES, COMPOSITE_METHODS),
+    "qwen3_5_moe": ("qwen3_5", QWEN35_STAGES, COMPOSITE_METHODS),
     "llama": ("llama3", ALL_STAGES, ALL_METHODS),
     "mistral": ("mistral", ALL_STAGES, ALL_METHODS),
     "gemma2": ("gemma", ALL_STAGES, ALL_METHODS),
     "gemma3_text": ("gemma3", ALL_STAGES, ALL_METHODS),
     "gemma3": ("gemma3", ["sft"], ["lora", "qlora", "full", "freeze"]),
-    "gemma4": ("gemma4", COMPOSITE_STAGES, COMPOSITE_METHODS),
+    "gemma4": ("gemma4", GEMMA4_STAGES, COMPOSITE_METHODS),
     "gemma4_text": ("gemma4", ["sft"], ["lora", "qlora", "full", "freeze"]),
     "deepseek_v3": ("deepseek3", [x for x in ALL_STAGES if x != "ppo"], ALL_METHODS),
     "phi3": ("phi", ALL_STAGES, ALL_METHODS),
