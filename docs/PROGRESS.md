@@ -1,3 +1,326 @@
+# 0.6.0 최종 빌드·설치와 실제 앱 화면 끝까지 시험, 2026-10-31
+
+- 최종 검증(`63d4f67`, 2026-10-31 06:03–06:25): `uv run pytest` 2245 passed, 2 skipped(492초); `uv run ruff check src tests scripts` 통과;
+  `desktop`의 `npm run build` 통과, `npm test` 284 passed; `cargo test --manifest-path src-tauri/Cargo.toml --locked` 54 passed;
+  `.factory/model-ops-cpu-venv`의 `scripts/verify_model_ops_cpu.py --receipt dist/model-ops-cpu-0.6.0.json` 통과(`stopped_after` null,
+  모든 영수증 `model-ops-f32-v2`).
+- 설치 프로그램(`63d4f67`): `desktop/src-tauri/target/release/bundle/nsis/LLM Tuning Factory_0.6.0_x64-setup.exe`, 48,355,092 바이트,
+  SHA-256 `9be9862efbf9dfbe63deeabdf140d66e71287e79b082511556a99049966d5005`. 영수증 `dist/verify-0.6.0.json`: bridge_mode frozen,
+  source_commit `63d4f67526916e506e7187dacb2ca22555da0786`, 모든 검사 true, gpu_started false, bridge_sha256 `9c0f6741…d865a`.
+  앱이 꺼진 상태에서 `/S /D=%LOCALAPPDATA%\LLM Tuning Factory`로 같은 위치에 설치했다(0.6.0, 설치된 엔진 해시가 영수증과 같음).
+- 사용자 Pod: `amdva0lurw9rv1`은 다시 켜기가 HTTP 500(용량 부족)으로 6번 모두 실패해 EXITED로 남겼다. 같은 볼륨 `cys1ne5znp`에 새
+  사용자 Pod `mqpnial878ja1o`(이름 `llm-tuning-factory`, A40, CA-MTL-1, 시간당 $0.59, 공장 소유 기록 없음)를 만들고 SSH 지문
+  `SHA256:HQVYDR33XaVZ5SJLF+YyLDmb47QO7q91RzcQE9wZNbI`을 공인 IP와 프록시에서 확인한 뒤, 앱 설정의 `pod_id`·`ssh_fingerprint`만 바꿨다.
+- 실제 앱 화면 시험(`scripts/desktop_gui_acceptance.py`, Playwright 1.64.0, WebView2 원격 디버깅 포트 9223): 읽기 전용 예행 통과 후
+  `--confirm-paid-run --max-cost 2`로 실행했다. 연결 검사(MLflow 기관 인증 확인, Pod RUNNING) → 환경 확인(A40 8.6, 45.0 GiB,
+  드라이버 595.91.07, 환경 없음) → 합성 데이터 32건 등록(합성·전송 허용) → GPU 정보 적용 → Qwen3.5-0.8B SFT LoRA, 버전 고정 →
+  실행 계획(예상 $0.59, 점검 항목 없음) → 승인 창(학습 환경 설치 안내와 이전 환경 정리 문구 포함) → 제출 → 대기 → 학습 중.
+  학습은 Pod에서 COMPLETED(학습 환경 `0a8f737acf2ab5fd` 새로 준비, 이전 환경 정리), train_loss 1.3593, 학습 103초. 이 PC와
+  CA-MTL-1 사이 네트워크가 초당 15–40 KB로 느려(같은 파일의 `scp`도 초당 약 31 KB) 결과 122 MB를 받는 데 08:22까지 걸렸고,
+  스크립트는 45분 제한에 걸려 실패로 끝났다(작업 진행 중이라 앱은 열어 둠). 작업이 완료된 뒤 같은 포트로 다시 붙어 실행 관리에서
+  "완료"와 학습 로그(train_loss 1.3593)를 확인했다. 이 실행의 기록은 승인 창 문구대로 공용 MLflow에 저장된다. 예전 작업
+  `76986bce`는 "취소" 상태다. 끝난 뒤 Pod `mqpnial878ja1o`를 멈췄다(EXITED). 시험이 띄운 앱 창은 Claude Code 권한 검사가 종료를
+  막아 열려 있으며 사용자가 닫는다.
+- 남은 일: 화면 시험 스크립트의 작업 대기 제한(45분)이 느린 결과 내려받기보다 짧다. 위 GPU 시험의 남은 일과 함께 처리한다.
+
+# 2단계 GPU 인수 시험(A40) — 결과, 2026-10-31
+
+공장 소유 Pod `r0d9wiystzwx0m`(A40 48 GB, compute capability 8.6, 드라이버 595.91.07, CA-MTL-1, 볼륨 `cys1ne5znp`)에서
+2026-10-30 23:05–10-31 06:03(약 6.95시간, 약 $4.10) 시험했다. 합성 데이터 32행, MLflow 끔. 앱 엔진은 `dist/factory-bridge.exe`로,
+1차는 `560a2b4` 빌드, 2차는 `bc020b0` 빌드(아래 템플릿·허용 오차·단계 수정 포함). SSH 지문은 공인 IP와 RunPod 프록시에서 같았다
+(공인 IP 쪽은 `provision.py`의 스캔이 비어 Git Bash에서 다시 읽었다). 끝난 뒤 `ManagedPods.stop`으로 EXITED를 확인했다.
+
+| 사례 | 결과 | train_loss | 최대 GPU 메모리(MiB) |
+|---|---|---|---|
+| Qwen3.5-0.8B SFT LoRA(평가, 1차 `qwen3_5_nothink`) | COMPLETED, 실행 승인 안 환경 준비·이전 환경 1개 정리 | 0.148 | 3,107 |
+| 〃 SFT QLoRA 4비트 | COMPLETED | 0.148 | 2,287 |
+| 〃 DPO / PT | COMPLETED / COMPLETED | 0.192 / 0.449 | 5,271 / 5,683 |
+| 〃 KTO | FAILED(엔진: M-RoPE `mm_token_type_ids` 없음) → 앱에서 거부 | — | — |
+| 〃 SFT full / freeze(mlp) | COMPLETED / COMPLETED(Pod의 `result.json`) | 2.728 / 0.337 | 16,481 / 3,143 |
+| 〃 SFT LoRA(평가, 2차 `qwen3_5`) | COMPLETED(Pod의 `result.json`) | 0.123 | — |
+| gemma-4-E2B-it SFT LoRA(평가) | COMPLETED, 2차 환경 준비·이전 환경 1개 정리, json_validity 0.84 | 1.115 | 12,761 |
+| 〃 DPO / PT | COMPLETED / COMPLETED | 0.221 / 1.169 | 18,711 / 14,823 |
+| 〃 KTO | FAILED(엔진: `pixel_position_ids` bool) → 앱에서 거부 | — | — |
+| Qwen3.5-9B SFT LoRA | COMPLETED | 0.184 | 19,825 |
+| RM(앱 밖, 런타임의 `llamafactory-cli`) Qwen3.5-0.8B / gemma-4-E2B-it | 통과: `value_head.safetensors`, eval_accuracy 1.0, eval_loss 0.0 / 0.0033 | 0.191 / 0.162 | — |
+
+- 대상·확정(`q08-sft-lora` 어댑터, Pod에서): `inspect_linear_modules` 186개 = `resolved_lora_targets("all")` 186개(linear
+  attention 5종 18개씩, MLP 3종 24개씩, full attention 4종 6개씩), 어댑터 `target_modules`는 잎 이름 12개로 줄어 기록됐고 PEFT의
+  접미사 규칙을 전체 534개 모듈(비전 포함)에 적용해도 정확히 186개만 고른다. 텐서 372개 모두 `model.language_model.` 아래.
+  1차 런타임(v1 허용 오차)에서는 확정이 로짓 비교로 거부됐고(아래), `bc020b0` 런타임에서 CUDA 확정이 발행됐다: `model-ops-f32-v2`,
+  델타 2.84e-8, 로짓 최대 절대 오차 1.79e-5(한계 1.91e-3), 상대 L2 9.8e-7(한계 1e-5), 출력 473개 = 기본 488개 − `mtp.*` 15개,
+  `model.visual.*` 153개 그대로, 토크나이저·processor 파일 7개 바이트 동일. 확정 결과를 LLaMA-Factory 예측(`finetuning_type: full`,
+  `qwen3_5`, 생각 끔)으로 불러 4행 생성(생각 블록 없음).
+- 시험에서 찾아 고친 결함(각각 시험을 먼저 작성): Qwen3.5 기본 템플릿 `qwen3_5_nothink` → `qwen3_5`(`2c932b9`; 1차 예측이
+  모두 `<think>\n\n</think>\n\n`으로 시작해 json_validity 0.0, LLaMA-Factory `qwen3_5`는 생각 끔일 때 빈 생각 블록을 프롬프트에 넣는다),
+  확정 로짓 허용 오차 `model-ops-f32-v2`(`382409d`), 단계 정책(`bbc40ca`·`1cd33be`: 두 계열 모두 pt·sft·rm·dpo, KTO 거부),
+  MoE 전문가 가중치의 QLoRA 추정(`bc020b0`), 검증 표시와 로짓 메모리 항(`5bce65c`·`df0011f`), 최종 검토 수정(`63d4f67`:
+  저장된 `qwen3_5_nothink` 설정에 한국어 경고, 템플릿 불일치 오류 한국어화, RM 로짓 계수 2, 허브 프로필 `vocab_size`,
+  v1 영수증 수거 허용, Qwen3.6 이름).
+- 2차 `qwen3_5` 평가: 32개 예측 모두 `<think>` 없이 JSON으로 시작했지만, JSON 뒤에 `\n</think>\n\n`과 같은 JSON을 한 번 더 내
+  원시 JSON 유효성은 1/32였다. 32행·8단계 학습으로 끝맺음(`<|im_end|>`)을 배우지 못한 것과 합성 정답의 끝 줄바꿈 때문으로
+  보지만 확인하지 않았다(같은 조건의 gemma-4-E2B-it는 0.84). 실제 데이터와 더 긴 학습으로 다시 볼 일이다.
+- 운영 기록: (1) `provision.py`를 PowerShell `Start-Process`로 부를 때 인자 "NVIDIA A40"이 갈라져 첫 시도가 실패했다(Pod 없음).
+  (2) 삭제한 1단계 시험 Pod 7개의 소유 기록이 남아 `ManagedPods.create`가 HTTP 404로 멈췄다 — 404를 확인한 기록과 요청만
+  `managed-pods/deleted-20261030/`으로 옮겼다. (3) full 결과(체크포인트 포함 12 GB)를 받는 데 약 2시간 걸렸고, freeze 결과(3.5 GB)는
+  네트워크가 초당 약 37 KB로 떨어져 받지 않고 멈췄다(Pod에서 결과 확인). (4) 묶음 실행 스크립트가 full 사례 뒤 이유를 알 수 없이
+  끝나 freeze·gemma 사례가 2차로 밀렸다. (5) 앱이 올린 `train.yaml`은 CRLF다(LLaMA-Factory는 문제없이 읽음). (6) 시험 엔진
+  저장소 `phase2-a40/engine`에는 중단된 freeze 작업이 RUNNING으로 남아 2차 `qwen3_5` 평가는 같은 Pod에 새 저장소(`phase2-a40b`)로 했다.
+- 남은 일: full·freeze 결과에 옵티마이저 상태가 든 체크포인트까지 내려받는 문제(`save_only_model: false`; 0.8B full이 12 GB),
+  느린 결과 내려받기, 긴 행의 메모리 측정, 복합 구조 KTO(엔진 수정 대기), 2차 평가의 반복 출력 원인, 볼륨 `cys1ne5znp`에 남은
+  시험 작업·HF 캐시(약 30 GB)·`target-check-20261031`·`rm-trial-*` 폴더 정리.
+
+# Qwen3.5·Gemma 4 A40 결과 반영 — 단계 정책, 검증 표시, 로짓 메모리 항, 2026-10-31
+
+- 단계: Gemma 4도 Qwen3.5처럼 pt·sft·rm·dpo(`model_hub.COMPOSITE_STAGES` 하나로 합침). Gemma 4 RM은 엔진 수준 시험
+  (`value_head.safetensors`, eval_accuracy 1.0, eval_loss 0.0033)으로 허용하고 값 헤드 거부를 지웠다. Gemma 4 KTO는 A40에서
+  `AttributeError: 'bool' object has no attribute 'all'`(transformers `modeling_gemma4.py:1999`의
+  `(pixel_position_ids == -1).all(dim=-1)`; LLaMA-Factory KTO의 KL 배치가 텐서가 아닌 멀티모달 입력을 넘김)로 실패해
+  "Gemma 4의 KTO 학습은 현재 학습 엔진(...)에서 KL 배치의 멀티모달 입력 처리 오류로 실패하므로 지원하지 않습니다."로 거부한다.
+- 검증 표시: `capabilities.VERIFIED_COMPOSITE`로 `Qwen/Qwen3.5-0.8B`("0.6.0 SFT LoRA/QLoRA/full/freeze, DPO, PT, RM (engine-level),
+  materialize synthetic A40"), `Qwen/Qwen3.5-9B`("0.6.0 SFT LoRA synthetic A40"), `google/gemma-4-E2B-it`("0.6.0 SFT LoRA, DPO, PT,
+  RM (engine-level) synthetic A40")에 `gpu_verified: true`, `verified_capabilities: ["8.6"]`. Base와 다른 크기는 미검증이고,
+  검증된 세 모델도 8.6이 아닌 세대(예: H100 9.0)에서는 세대 주의가 나온다.
+- 메모리: 복합 기본 목록 항목에 `vocab_size`(Qwen3.5 248320, Gemma 4 262144, `SIZE_FACTS` 포함)를 두고 `estimate_memory`에 LM head
+  로짓 `배치 × cutoff_len × vocab_size × 11바이트 × (dpo·kto 3) × (full 2)`를 더했다. A40 nvidia-smi 최대치(배치 1, cutoff_len 1024,
+  합성 데이터, SFT·DPO 행은 약 60–100토큰, PT만 cutoff_len까지 채움) 대 추정(GiB, 보정 전 → 후): Qwen3.5-0.8B SFT LoRA 3.03 대
+  3.32 → 5.92(1.95배), QLoRA 2.23 대 2.48 → 5.09, DPO 5.15 대 3.32 → 11.13, PT 5.55 대 3.32 → 5.92, full 16.09 대 13.02 → 18.23,
+  freeze 3.07 대 4.02 → 6.63; gemma-4-E2B-it SFT LoRA 12.46 대 11.89 → 14.64(1.17배), DPO 18.27 대 11.89 → 20.14, PT 14.48 대
+  11.89 → 14.64; Qwen3.5-9B SFT LoRA 19.36 대 21.20 → 23.80(1.23배). 모든 실측이 추정 이하, SFT LoRA는 2배 이하. 근거와 규칙은
+  설계 4.5. `vocab_size`가 없는 모델은 기본 목록 모든 모델 × 방법 5 × 단계 6 × 크기 2(1,020개)에서 보정 전과 비트 단위로 같고,
+  가중치 추정은 2,160개 모두 같다.
+- 검증(2026-10-31): 시험을 먼저 고쳐 실패를 확인했다(단계 9개, 검증 표시 3개, 메모리 9개 실패 → 구현 후 통과).
+  `uv run pytest` 2229 passed, 2 skipped, `uv run ruff check src tests scripts` 통과.
+- 남은 일: cutoff_len까지 채운 긴 행의 SFT·DPO와 full, RM의 최대 메모리 측정. full 초과분(짧은 행에서 약 3GiB)은 로짓보다 fp32
+  학습 가중치·옵티마이저 임시 버퍼(학습 매개변수당 약 4바이트)로 보여 `FULL_STATE_BYTES` 재보정이 맞지만, 모든 모델의 추정이
+  바뀌므로 이번에는 로짓 항 2배로 덮었다. 기본 목록 밖의 허브 모델은 `vocab_size`를 기록하지 않아 로짓 항이 없다. 복합 구조 KTO는
+  엔진 수정을 기다린다.
+
+# 모델 작업 로짓 허용 오차 `model-ops-f32-v2`, 2026-10-31
+
+- 결함(A40 GPU 인수에서 발견): 실제 Qwen3.5-0.8B LoRA 어댑터의 올바른 확정을 `materialize_model`이
+  `reloaded logits differ beyond tolerance policy`로 거부했다. Pod에서 잰 값: 확정 모델과 병합 전 PEFT 모델의 FP32 로짓
+  (5토큰 × 어휘 248,320) 최대 절대 오차 CPU 2.24e-5(1,241,600개 중 33개가 v1 경계 atol 1e-5 + rtol 1e-4 × 기대값의 절댓값을
+  넘음, 최대 1.35배), CUDA 1.79e-5(4개, 1.13배), 평균 약 1.9e-6, 로짓 최대 절댓값 19.1. 메모리 안 병합 모델과 저장 후 다시 불러온
+  모델은 비트 단위로 같았고 델타는 2.8e-8로 통과했다. v1의 원소별 allclose는 0 근처 로짓에 rtol 여유가 없어 24층의 FP32 반올림을
+  견디지 못한다(v1의 CPU 시험은 작은 모델만 썼다).
+- 수정: 새 정책 `model-ops-f32-v2`(`model_ops.CURRENT_POLICY`). 저장(F32)과 델타 규칙은 v1과 같고, 로짓은 상대 L2 오차 ≤ 1e-5와
+  최대 절대 오차 ≤ 1e-4 × max(1, 기대 로짓의 최대 절댓값)을 모두 만족해야 한다(모두 유한). v1은 `TOLERANCE_POLICIES`에 뜻 그대로
+  남아 이전 영수증을 읽는다. `merge_adapters`·`materialize_model`의 기본값, `operation_dispatch`(호출과 영수증 검사),
+  `operation_outputs`(접수 검사), `simulated_dispatch`, `scripts/verify_model_ops_cpu.py`가 `CURRENT_POLICY`를 쓴다. 판정은 torch
+  없는 `scale_aware_logits_ok`(통계 4개)로 분리했고, CPU 시험 스크립트는 같은 규칙을 따로 구현해 상대 L2 오차도 기록한다.
+  dtype 거부 문구는 `... under policy model-ops-f32-v2`가 된다.
+- 검증(2026-10-31): 시험을 먼저 고쳐 17개 실패를 확인한 뒤 구현했다. 측정값 모양의 합성 로짓(5 × 4096, 최대 절댓값 19.1, 평균
+  절대 오차 약 1.9e-6, 0 근처 4개에 2.24e-5)은 v1에서 거부되고 v2에서 통과하며, 값 하나가 1e-2 틀린 로짓과 상대 L2 오차 1e-4인
+  로짓은 v2에서 거부된다. 실제 크기(1,241,600개) 통계로는 값 하나의 1e-2 오류가 L2 조건을 통과하고 최대 절대 오차 조건에서
+  거부된다. `uv run pytest` 2204 passed, 2 skipped, `uv run ruff check src tests scripts` 통과.
+- CPU 수치 검증(`.factory/model-ops-cpu-venv`, 영수증은 임시 폴더): 종료 코드 0, **35/35 통과**, `stopped_after` null, 모든 영수증의
+  `policy_id`가 `model-ops-f32-v2`. 로짓 오차(최대 절대 / 상대 L2): 텍스트 병합 3.4e-8 / 1.2e-7, 확정 3.0e-8 / 1.3e-7;
+  `qwen3_5` 병합 2.0e-7 / 5.1e-7, 확정 8.9e-8 / 2.2e-7; `gemma4` 병합 7.1e-7 / 1.0e-6, 확정 6.9e-7 / 8.3e-7.
+- GPU 재시험(2026-10-31, `bc020b0` 런타임): 0.8B 확정이 발행됐다. 로짓 최대 절대 오차 1.79e-5, 상대 L2 9.8e-7(위 결과 절).
+  병합은 Pod에서 다시 재지 않았다.
+
+# 2단계 GPU 인수 시험(A40) — 승인 범위, 2026-10-30
+
+사용자 지시(2026-10-30): "2단계 및 후속 과제도 내 허락 받지 않고 계속 다 테스트해가면서 구현해줘". 이에 따른 유료 시험 범위:
+
+- 공장 소유 Pod만 만든다(`ManagedPods`, 정책: GPU 1개, 실행당 $5, 최대 4시간, 다이제스트 고정 이미지). A40 1대, CA-MTL-1, 시간당 $0.59.
+  볼륨 `cys1ne5znp`(80 GB)를 쓴다. 같은 볼륨의 사용자 Pod `amdva0lurw9rv1`은 EXITED로 두고 건드리지 않는다.
+- 데이터는 결정적으로 만든 합성 데이터(32행)만 쓰고 MLflow는 끈다. 엔진은 `claude/phase2-models`에서 빌드한 `dist/factory-bridge.exe`.
+- 사례: Qwen3.5-0.8B SFT LoRA(평가 포함)·QLoRA·DPO·KTO·PT·full·freeze, gemma-4-E2B-it SFT LoRA, Qwen3.5-9B SFT LoRA, RM 시험(앱 밖),
+  0.8B 어댑터의 대상·확정 확인. 끝나면 Pod를 멈추고 EXITED를 확인한다. 드라이버는 저장소 밖 `%TEMP%\gpu_accept\run_phase2.py`.
+
+# Qwen3.5·Gemma 4 텍스트 학습 (2단계) — Task 13–14 대상 규칙·병합·확정과 CPU 수치 검증, 2026-10-30
+
+[설계](superpowers/specs/2026-10-30-phase2-latest-models-design.md) · [계획](superpowers/plans/2026-10-30-phase2-latest-models.md) ·
+브랜치 `claude/phase2-models`.
+
+- Task 13(torch 없이): 복합 모델(`qwen3_5`·`qwen3_5_moe`·`gemma4`)의 LoRA 대상은 `model.language_model.` 아래 Linear다. 헤더 증거는
+  `qwen3_5`·`gemma4`를 받아 언어 모델 텐서만 본다(비전·오디오·투영·`mtp.*` 무시, `linear_attn.conv1d` 3차원 커널 허용, 전문가 텐서와
+  `qwen3_5_moe`는 계속 거부). 계획의 대상 비교는 잎 이름(`target_leaves`)으로 하고, 모의 실행 어댑터는 `resolved_lora_targets`로
+  전체 이름을 쓴다. `verify_inspected_targets`는 증거가 모두 언어 모델 안에 있을 때만 기대 집합을 줄인다(비전 모듈을 함께 내는
+  gemma3 증거는 전체 규칙 그대로).
+- Task 14: 복합 모델은 meta 대상 검사와 병합·확정의 FP32 로드를 `AutoModelForImageTextToText`로 한다. 확정의 키 집합 검사는
+  불러온 모델이 선언한 "불러오지 않는 키"(`_keys_to_ignore_on_load_unexpected`, transformers처럼 `re.search`로 맞춤)만 기대 집합에서 뺀다.
+  Qwen3.5는 `^mtp.*`, Gemma 4는 KV 공유 층의 `self_attn.k_proj`·`v_proj`·`k_norm`·`v_norm`이고, 텍스트 모델은 선언이 없어 그대로다.
+- 검토에서 찾은 결함과 수정(2026-10-30): Gemma 4 E2B는 35층 중 20층이 앞 층의 key/value를 공유하는데(`num_kv_shared_layers`), 체크포인트
+  헤더에는 그 층들의 `k_proj`·`v_proj`·`k_norm`이 남아 있고 transformers 5.6은 만들지도 불러오지도 않는다. 그래서 헤더 증거에 없는 모듈이
+  생겼고(meta 26개 대 헤더 28개), 그 증거로는 이어 학습 대상 검사가 거부했으며, 확정은 키 집합 검사에서 `DELTA_FAILED`로 실패했다.
+  torch 없는 쪽은 config에서 같은 목록을 만드는 `target_inspection.unloaded_modules`를 더해 헤더 증거(`model_root_targets`가 해시로 묶인
+  루트 config.json을 읽어 넘김)와 `verify_inspected_targets(config=...)`에 쓰고, torch 쪽은 위 선언을 쓴다. CPU 검증은 transformers의 선언과
+  `unloaded_modules`가 같은지도 확인한다.
+- PEFT 0.18.1은 20개 이상의 전체 이름을 가장 짧은 구별 접미사로 기록한다(CPU 검증에서 Qwen3.5 `all` 31개 → 잎 이름 12개,
+  Gemma 4 `all` 26개 → `language_model.layers.0.self_attn.q_proj`, `1.self_attn.q_proj` 등 22개; Gemma 4 비전 타워도 q_proj~down_proj를 쓰기 때문).
+  앱의 비교는 잎 이름과 접미사 일치로 하므로 그대로 동작하고, 접미사로 기록된 두 어댑터의 병합도 통과한다. 실제 0.8B·9B의 `q_proj,v_proj`는
+  20개 미만이라 전체 이름으로 남는다.
+- CPU 수치 검증(2026-10-30, 수정 후, `.factory/model-ops-cpu-venv`: torch 2.7.1+cpu, transformers 5.6.0, peft 0.18.1):
+  `scripts/verify_model_ops_cpu.py --receipt dist/model-ops-cpu-0.6.0.json` 종료 코드 0, **35/35 통과**, `stopped_after` null
+  (검사 수는 그대로이고 복합 병합 검사 안에 `all` 어댑터 병합이 더해져 병합 4건·확정 4건을 확인한다). 기존 29개 검사 기록과 텍스트 모델의
+  병합·확정 영수증은 이전 영수증(`.factory/model-ops-cpu-receipt.json`)과 같다(텍스트 모델 출력 불변). 새 6개:
+
+| 작은 무작위 모델 | 대상 검사 | 병합(r2+r3 → r5) | 확정(q·v 어댑터와 `all` 어댑터) |
+|---|---|---|---|
+| `qwen3_5`(linear_attn 3층 + self_attn 1층, 비전 1블록, 가짜 `mtp.fc.weight`) | 언어 모델 Linear 31개, meta = 헤더 = 동결 산출물, 검증 통과 | q·v 2개(전체 이름)와 `all` 31개(접미사 12개): 델타 ≤ 1.1e-8, 로짓 ≤ 2.0e-7 | 텐서 77개 = 기본 78개 − mtp, 비전 21개 동일, 델타 ≤ 1.5e-8, 로짓 ≤ 8.9e-8 |
+| `gemma4`(3층 중 마지막 층이 KV 공유, 그 층의 원본 k/v/k_norm 텐서 포함, 층별 입력 투영, 비전 1층, 오디오 없음) | 26개, 같은 일치(config 없이 원본 체크포인트 증거는 거부) | q·v 5개와 `all` 26개(접미사 22개): 델타 ≤ 1.6e-8, 로짓 ≤ 7.1e-7 | 69개 = 기본 72개 − KV 공유 텐서 3개, 비전·투영 16개 동일, 델타 ≤ 1.8e-8, 로짓 ≤ 6.9e-7 |
+
+  로짓은 병합·확정 결과를 기본 모델 가중치에 델타를 직접 더한 모델과 비교했다(허용 오차 정책 `model-ops-f32-v1`). 확정 결과의
+  `architectures`는 복합 클래스이고, 토크나이저와 `preprocessor_config.json`이 바이트 그대로 복사되며, 동결 뒤 대상 검사도 통과한다.
+  Task 14 소스 전(Task 13 커밋)에는 대상 검사 둘이 계획대로 실패했고(`'Qwen3_5Config' object has no attribute 'vocab_size'`,
+  `'Gemma4ClippableLinear' object has no attribute 'in_features'`), 텍스트 전용 로더로는 Qwen3.5 병합·확정이 어댑터 대상을 찾지 못했으며,
+  `mtp.*` 제외 없이는 Qwen3.5 확정이 키 집합 검사에서 실패했다. 검토 수정 전 규칙(`mtp.*`만 제외, config 없는 헤더 증거)으로는 KV 공유
+  Gemma 4의 대상 검사와 확정(`DELTA_FAILED`)이 실패했다.
+- 계획과 다른 점: `GEMMA4` 상수에 `vocab_size_per_layer_input=32`, `hidden_size_per_layer_input=8`, `global_head_dim=16`,
+  `num_kv_shared_layers=1`, `layer_types=["full_attention","sliding_attention","full_attention"]`을 더하고 층을 3개로 했다(기본 층별 임베딩은
+  fp32로 약 0.5 GB이고, 3층이면 `all`이 20개를 넘어 PEFT 접미사 기록을 시험한다). 병합 검사는 q·v 어댑터에 더해 `all` 어댑터 둘도 병합하고,
+  확정 검사는 q·v 어댑터에 더해 `all` 어댑터도 확정한다.
+- 남은 일(GPU 인수): 실제 LLaMA-Factory 어댑터의 `target_modules`와 meta 검사 비교, Qwen3.5-0.8B 어댑터 병합, gemma-4-E2B-it의
+  헤더 증거와 실제 모듈 비교(KV 공유 20층).
+
+# Task 16 GPU 인수 시험 — 승인 범위와 결과, 2026-10-30
+
+사용자 승인(2026-10-30): Blackwell Pod `yuft63rjggvh5z`(1 × RTX PRO 4000 Blackwell, 시간당 $0.57, 이미 실행 중)에서 먼저 시험하고,
+이후 사용자가 알려 줄 Ampere 또는 Hopper Pod에서 회귀 시험한다. 데이터는 합성 데이터(32행, 이전 GPU 인수 시험의
+`desktop_gpu_train` 원본)만 쓴다. 이 PC의 앱은 기존 위치에 0.5.0으로 업그레이드한다.
+
+- 범위: Pod의 `/workspace/factory-desktop` 아래 학습 환경 설치, Qwen2.5-0.5B-Instruct SFT LoRA 1회, GPU 메모리 관측.
+- 제외: 실제 MLflow 서버 기록(별도 승인 대상이므로 시험 설정에서 MLflow를 끈다), 실제 연구 데이터 전송.
+- 빌린 Pod는 멈추거나 지우지 않는다. 시험 상태는 `state/gpu-acceptance-20261030/`(git 제외)에 둔다.
+
+**시도 결과(2026-10-30):** 시작하지 못했다. 첫 단계(환경 확인)에서 RunPod API가 Pod `yuft63rjggvh5z`에 HTTP 404를 돌려주었다.
+같은 키로 보이는 Pod 55개(실행·정지 포함) 목록에도 없고, 전날 주소의 SSH도 거부되어 Pod가 삭제된 것으로 본다.
+원격 접속 전에 멈췄으므로 설치·데이터 전송·학습은 없었다. 다른 사람의 실행 중 Pod는 쓰지 않았다.
+엔진은 최종 코드 `0163b8a`로 빌드한 `dist/factory-bridge.exe`(설치 파일에 들어간 것과 바이트 동일)로 실행했고,
+이 PC의 설치된 앱은 실행 중이라 이번에는 업그레이드하지 않았다.
+
+**추가 승인(2026-10-30):** "api key 이용해서 필요한 runpod 진행해". 이 PC의 앱을 닫은 뒤, 저장된 RunPod API 키로 시험용 네트워크 볼륨과
+Pod를 직접 만들어 시험했다. Pod는 모두 `ManagedPods`(정책: GPU 1개, 실행당 $5, 4시간, 다이제스트 고정 이미지, 네트워크 볼륨 필수)로
+만든 공장 소유 Pod이고, SSH 서버 지문은 공인 IP와 RunPod SSH 프록시 두 경로에서 같은지 확인한 뒤 고정했다. 데이터는 같은 합성 32행,
+MLflow는 껐다. Ampere와 Hopper를 모두 시험했다.
+
+**결과(엔진 `9871d8b`로 빌드한 `dist/factory-bridge.exe`, Qwen2.5-0.5B-Instruct SFT LoRA):**
+
+| GPU | compute capability · 드라이버 | Pod · 볼륨 | 환경 | 결과 |
+|---|---|---|---|---|
+| RTX PRO 4000 Blackwell 24 GB | 12.0 · 595.91.07 | `02o4sst2tbacov` · `ls9ua5ymse`(EU-RO-1) | 실행 승인 안에서 준비, 실행 706초 | COMPLETED(시도 1), train_loss 0.148, train_runtime 12.2초 |
+| A40 48 GB | 8.6 · 595.91.07 | `p7qe8lr3a0yzm8` · `cys1ne5znp`(CA-MTL-1) | 실행 승인 안에서 준비, 실행 416초 | COMPLETED(시도 1), train_loss 0.148, train_runtime 9.5초 |
+| H100 80GB HBM3 | 9.0 · 595.91.07 | `zi5ftxz6bj0q22` · `cys1ne5znp`(CA-MTL-1) | A40이 만든 환경을 그대로 사용(`ready`), 실행 238초 | COMPLETED(시도 1), train_loss 0.147, train_runtime 10.4초 |
+
+- 시험 방법: 앱 창(화면)은 조작하지 않았다. 계획 Task 16 Step 1의 화면 조작 대신, 화면이 보내는 요청 순서(환경 확인 → 데이터 등록 → 계획 →
+  제출 → 실행(`prepare_runtime`) → 작업·로그)를 시험 드라이버가 엔진에 한 줄 JSON으로 직접 보냈다. 계획 카드의 거부·주의 표시, 승인 창의 설치 안내,
+  준비 중 안내 같은 화면 동작은 `npm test`로만 확인했다. 0.5.0의 "연결 검사"(MLflow 포함)는 실행하지 않았다. 실제 앱 화면으로 처음부터 하는
+  시험이 남아 있다.
+- 세 GPU 모두 `simulation: false`, `training_success: true`, bf16 지원, 어댑터(`adapter_model.safetensors`) 저장, 런타임 torch `2.7.1+cu128`,
+  transformers 5.6.0, LLaMA-Factory 0.9.5, Python 3.12.3. 한 환경이 sm_86·sm_90·sm_120에서 모두 동작했다.
+- 점검 결과: Blackwell·A40에서는 `MODEL_UNVERIFIED` 경고만(그때 검증 목록이 9.0뿐), H100에서는 항목 없음. 거부 항목 없음.
+  H100은 시간당 $3.99라 시험 설정의 예산을 $4.00/시간·$4.50로 올렸다(기본 $0.60·$2.00이면 요금 초과로 거부되는 것이 맞다).
+- 메모리(학습 중 별도 SSH의 `nvidia-smi` 5초 간격): Blackwell 최대 1,494 MiB, H100 최대 1,977 MiB. 앱 추정치는 합계 2.58 GiB(가중치 0.93 GiB)로
+  관측치보다 크다(보수적). 학습이 10초 남짓이라 5초 간격 표본은 순간 최대를 놓칠 수 있다. A40은 측정하지 못했다(아래). 계수 보정 제안은 없다.
+- 검증 범위 반영(`2815c03`): `model_catalog()`의 Qwen2.5-0.5B-Instruct `verified_capabilities`를 `["8.6", "9.0", "12.0"]`로,
+  `verification_scope`에 0.5.0 SFT LoRA 범위를 적었다. QLoRA와 다른 학습 단계는 이번에 GPU에서 검증하지 않았다.
+
+**시험 중 찾아 고친 결함(각각 테스트를 먼저 작성해 실패를 확인):**
+- `8f08390`: 런타임 확인 probe가 60초 제한에 걸렸다. 네트워크 볼륨에서 처음 torch를 import하는 데 60초를 넘는다. probe만 900초로 늘렸다.
+- `1685eef`: transformers 5.6.0이 `save_safetensors` 인자를 거부해 학습이 시작 직후 실패했다(설치된 0.5.0 `0163b8a` 빌드에도 있는 결함).
+  인자를 넘기지 않는다(5.x는 항상 safetensors, PPO의 4.52.4는 기본값이 참).
+- `9871d8b`: 볼륨 용량 초과로 중단된 설치가 torch를 반쯤 설치된 채 남겼고(`module 'torch' has no attribute '__version__'`),
+  `uv pip sync`는 이를 설치됨으로 보아(`uv pip check`도 통과) 준비 직후 확인이 계속 실패했다. 준비할 때마다 개인 venv를
+  `uv venv --clear`로 다시 만든다(원격 `flock` 안).
+
+**운영 기록:**
+- 처음 Blackwell 시도들에서 RunPod 용량 부족(HTTP 500 "does not have the resources")으로 생성·재시작이 실패해 같은 볼륨에 새 Pod를 만들었다.
+  40 GB 볼륨이 런타임 여러 벌로 가득 차 `ls9ua5ymse`를 80 GB로 늘렸다. 새 볼륨 `cys1ne5znp`는 80 GB로 만들었다.
+- 정책이 실행 중인 Blackwell Pod와 동시에 A40을 만드는 것을 "total owned GPU count exceeds policy"로 거부했다(의도된 동작). 순서대로 실행했다.
+- 마지막 Blackwell 실행은 학습이 끝난 뒤 로그 수집 중 Claude Code가 PC 메모리 부족으로 시험 드라이버를 종료했다. Pod는 `ManagedPods.stop`으로 직접 멈췄고,
+  메모리 기록은 남은 `gpu-memory.csv`에서 계산했다. 같은 이유로 그때의 전체 테스트 실행도 끝나지 않았다(아래에서 다시 실행).
+- SSH 개인 키가 바탕화면에서 사라져, 메신저 임시 폴더(`AppData\Local\AtMessenger\temp`)에 있는 같은 이름의 키를 썼다. Pod에 넣은 공개 키와
+  같은 쌍이고 실제 인증되는 것을 확인했다(공개 키 지문 `SHA256:jTHM4Owf2rDiR9HNR12P2LbxNwk+DudZTgpP3z6HaOU`). 이 파일은 상속 권한으로 다른 계정
+  (`CodexSandboxUsers` 등)도 수정할 수 있어 Windows OpenSSH가 키를 거부한다. 이 때문에 A40 실행의 메모리 감시(Windows OpenSSH로 실행됨)가
+  아무것도 기록하지 못했다. 앱(paramiko)은 영향이 없었다. 앱 설정의 `ssh_key_file`은 여전히 바탕화면 경로를 가리킨다.
+- 정리: 공장 소유 시험 Pod 7개(위 3개와 실패한 Blackwell 시도 `36ncz2rp4rqkcu`·`cpc3fjmd36wf3f`·`2u65h3mq0i3svu`·`9w8n2eu6ur1zd2`)를 멈춘 뒤 삭제했다.
+  볼륨 `ls9ua5ymse`(EU-RO-1, 80 GB)와 `cys1ne5znp`(CA-MTL-1, 80 GB)는 사용자 결정을 기다리며 남겼다(합성 시험 결과와 런타임만 있음,
+  RunPod 네트워크 볼륨 요금으로 둘 합쳐 대략 월 $11). 다른 사람의 Pod는 쓰지 않았다.
+- 비용(추정, 정확한 금액은 RunPod 청구 내역): Blackwell Pod들 $0.57/시간로 합계 약 2–3시간, A40 $0.59/시간 약 15분, H100 $3.99/시간 약 12분.
+
+- 검증(2026-10-30, `953168a`): `uv run pytest` 2031 passed, 1 skipped(494.74초); `uv run ruff check src tests scripts` 통과.
+  그 전 실행(2815c03)에서 `tests/test_model_inputs.py`의 고정 다이제스트 2개가 실패했다. `1685eef`가 학습 설정에서 `save_safetensors`를 뺐기
+  때문이고, 그 키를 다시 넣으면 이전 다이제스트가 그대로 나오는 것을 확인한 뒤 다시 고정했다(`953168a`). 데스크톱(TypeScript·Rust)은 바뀌지 않았다.
+- 설치 프로그램 다시 빌드(`953168a`): `desktop/src-tauri/target/release/bundle/nsis/LLM Tuning Factory_0.5.0_x64-setup.exe`,
+  48,279,277 바이트, SHA-256 `18b27086335e506ea70eed8ba35ae3b2d4866c41d7692fcbdfe4b28076aaf13e`. 영수증 `dist/verify-0.5.0-acceptance.json`:
+  bridge_mode frozen, source_commit `953168a91885cce3cce260868ebbc207a325e066`, 모든 검사 true, gpu_started false.
+  이 빌드의 엔진 소스는 GPU 인수에 쓴 `9871d8b` 빌드와 모델 목록의 검증 범위만 다르다.
+
+- 이 PC 재설치(2026-10-30 16:11): 설치된 0.5.0(`0163b8a`)에는 위 세 결함이 있어 transformers 5 학습이 실패하므로, 앱이 꺼진 상태에서 위 설치
+  프로그램을 `/S /D=%LOCALAPPDATA%\LLM Tuning Factory`로 같은 위치에 설치했다(종료 코드 0). 설치된 `factory-bridge.exe`의 SHA-256
+  `73c3522dbea4fec9472be1d50f8c859e64eea169948ad12764c30b85de400e71`이 영수증의 `bridge_sha256`과 같고, 앱 설정 파일은 바뀌지 않았다.
+
+- 사용자 요청 "ssh 키 옮기고 새 pod도 api key로 해줘"(2026-10-30): 키 쌍을 `%USERPROFILE%\.ssh\id_ed25519_runpod(.pub)`로 옮겼다(내용 해시 동일
+  확인 후 메신저 임시 폴더의 원본 삭제). 상속 권한을 끊고 본인 계정과 SYSTEM만 남겨 Windows OpenSSH도 키를 받아들인다.
+  새 사용자 Pod `amdva0lurw9rv1`(이름 `llm-tuning-factory`, A40 48 GB, CA-MTL-1, 시간당 $0.59, 볼륨 `cys1ne5znp`)를 공장 소유 기록 없이 만들었다.
+  Blackwell은 EU-RO-1 재고가 Low이고 시험 중 생성이 여러 번 실패해 A40을 골랐다. 앱이 빌린 Pod로 다루므로 자동으로 멈추지 않는다.
+  SSH 서버 지문 `SHA256:GVLJvq8jBbwib7RXw4CYjUlm3oO+71UyQ+S3Pwidd+M`은 공인 IP와 RunPod 프록시에서 같았다. 앱이 꺼진 상태에서 앱 설정의
+  `pod_id`·`ssh_fingerprint`·`ssh_key_file`만 바꿨다(다른 항목 동일, 이전 설정은 백업). 설치된 앱의 엔진으로 `runtime_check`(앱 저장소)를 실행해
+  SSH 접속과 GPU 확인(A40, 8.6, 46,068 MiB, 드라이버 595.91.07, 점검 항목 없음)을 확인했다. `runtime_state`는 `missing`이다. 설치된 빌드의 소스 해시가
+  인수 시험 빌드와 달라 첫 학습 실행이 승인 창 안에서 환경을 준비한다.
+
+- 사용자 요청으로 Pod `amdva0lurw9rv1`을 멈췄다(EXITED). 공장 소유가 아니라 `RunPodController.stop`의 안전장치 대신 RunPod REST stop을 직접 불렀다.
+  다시 켜면 공인 IP·포트와 SSH 서버 지문이 바뀔 수 있어 연결 설정의 지문을 다시 확인해야 한다. 볼륨 `ls9ua5ymse` 삭제는 사용자가 승인했지만
+  Claude Code 권한 검사가 되돌릴 수 없는 삭제로 막아 남아 있다.
+
+**남은 일:**
+- 설치된 0.5.0 앱 화면으로 처음부터 하는 시험(연결 검사, 환경 확인, 계획, 학습 시작의 설치 안내 승인, 결과 확인). 배포 안내 전에 한다.
+- 볼륨 `ls9ua5ymse`(EU-RO-1, 80 GB, 사용하는 Pod 없음) 삭제: RunPod 콘솔에서 사용자가 직접 지운다.
+- 앱의 이전 대기 작업 `76986bce`는 삭제된 Pod를 대상으로 한다. 사용자가 앱에서 취소한다.
+- 볼륨의 런타임 정리: 앱 소스가 바뀔 때마다 새 런타임(5–12 GB)이 생기고 지우지 않는다(`ls9ua5ymse`에 4벌). 사용자 볼륨이 차는 원인이다.
+- 긴 probe 동안 SSH keepalive, GPU 서버(SSH) 연결의 요금은 점검이 판단하지 않는 점, 2단계(Qwen3.5·Gemma 4).
+
+# GPU 호환성 점검과 CUDA 12.8 학습 환경 (1단계) — 소프트웨어 완료, GPU 인수 완료(위 Task 16)
+
+[설계](superpowers/specs/2026-10-29-gpu-compat-runtime-design.md) · [계획](superpowers/plans/2026-10-29-gpu-compat-runtime.md) ·
+브랜치 `claude/gpu-compat-runtime` (작업 시작 기준 `96aea2e`). Task 1–13은 구현·검토를 마쳤고 Task 14(문서·전체 검증)를 2026-10-29에 실행했다.
+
+- 고정 파일: 두 GPU 고정 파일이 torch·torchaudio·torchvision `+cu128`, NVIDIA 12.8 계열로 바뀌었다
+  (`uv pip compile ... --torch-backend cu128`을 기존 파일 위에 실행, PPO는 `--override containers/gpu-ppo-overrides.txt`,
+  pydantic==2.10.6). 재생성이 `pyproject.toml`이 요구하지만 옛 고정 파일에 없던 의존성도 추가했다: 두 파일 모두
+  boto3 1.43.114, botocore 1.43.121, jmespath 1.1.0, s3transfer 0.19.3; PPO 파일은 추가로 bcrypt 5.0.0,
+  cryptography 50.0.2, invoke 3.0.3, paramiko 5.0.0, pynacl 1.6.2. 그 밖의 버전은 바뀌지 않았다.
+- `scripts/inspect_gpu_wheels.py`(2026-10-29, 종료 코드 0): 컴파일된 구조 `sm_75 sm_80 sm_86 sm_90 sm_100 sm_120 compute_120`,
+  기타 후보 없음, sass `["7.5","8.0","8.6","9.0","10.0","12.0"]`, ptx `["12.0"]`, bitsandbytes CUDA 12.8 라이브러리 있음,
+  torch·bitsandbytes 해시가 고정 파일과 일치.
+- 런타임 검사 상태: ready / missing / mismatch / incompatible(GPU 세대 미지원) / unavailable(GPU 없음·개수 불일치·사용 중·오류,
+  준비를 제안하지 않음). 준비는 RunPod에서만 실행 시 단일 승인 안에서 하고, GPU 서버는 연결 설정의 검토된 조회 흐름으로만
+  준비한다. `factory server-runtime`은 `ready`가 아니면 JSON을 출력하고 종료 코드 1을 돌려준다.
+- 런타임 검사는 결과를 `TF_PROBE <json>` 한 줄로 출력하고 `devices`를 보고한다. 실행 중에는 Pod를 다른 작업이 쓰는 경우와 준비 직후 확인이 실패한 경우에도 한국어 문구로 거부한다(동시 준비 거부와 별도).
+- 호환성 판정은 계획의 코드에 더해 `POD_FACTS_UNKNOWN`(RunPod API가 GPU 종류·개수를 주지 않음)과 `PRICE_UNKNOWN`
+  (유효한 현재 요금 없음)을 차단한다. 요금 비교에 허용 오차는 없다(`execution.validate_budget`과 같음).
+  결과는 `{level, code, message}`이며 조언은 `message`에 있다.
+- 화면: 계획 카드에 "실행 시 거부될 항목"/"주의 항목"; "학습 시작"/"대기 작업 실행"은 읽기 전용 점검을 먼저 하고, 거부 항목·
+  incompatible·unavailable이면 멈추며, RunPod 환경 설치 안내를 한 번의 승인 창에 합치고, 점검 중 중복 클릭을 무시하며,
+  그 사이 계획·선택 작업이 바뀌면 멈추고, 승인받은 작업만 실행한다. 데스크톱 앱 버전 0.5.0(Python 패키지는 0.1.0).
+- 검증(2026-10-29, 문서 변경 후): `uv run pytest` 2021 passed, 1 skipped(616.82초); `uv run ruff check src tests scripts` 통과;
+  `desktop`의 `npm run build` 통과, `npm test` 280 passed; `cargo test --manifest-path src-tauri/Cargo.toml --locked` 54 passed.
+  실패·재실행 없음.
+- GPU·Pod·데이터 전송·MLflow 쓰기는 사용하지 않았다. GPU 인수 대기.
+- Task 15 결과(다시 빌드): 설치 프로그램 `desktop/src-tauri/target/release/bundle/nsis/LLM Tuning Factory_0.5.0_x64-setup.exe`,
+  48,285,418 바이트, SHA-256 `9007ef4b500e00004df587c3492674b8913bc18da789f29860ca1f6024b899ed`, 커밋 `0163b8a`에서 빌드
+  (`scripts/build_desktop.py` 후 `npm run tauri -- build --ci`; 빌드 뒤 추적 파일 변경 없음).
+  `scripts/verify_desktop_package.py` 영수증 `dist/verify-0.5.0-final.json`: bridge_mode frozen,
+  source_commit `0163b8af01572ad8e1ae6fef5bbae2a7f0b5abdf`, 모든 검사 true, gpu_started false.
+  설치하지 않았다. 설치는 사용자 확인이 필요하며, 설치 프로그램이 이전 설치 폴더를 기억하므로 NSIS `/D=<폴더>`로 실제 설치 폴더를 지정해야 한다.
+- 최종 검토 결과와 수정: 다른 앱 버전(소스 해시가 다름)의 작업은 원격 접속·환경 설치 전에 한국어로 거부한다(`runtime_check`와 실행 모두).
+  준비 직후 확인 실패는 고정 문구로 거부한다. 검증된 모델도 검증되지 않은 GPU 세대에서는 `MODEL_UNVERIFIED`로 경고한다.
+  메모리 문구에 95%·90% 기준을 밝혔다. `inspect_gpu_wheels.py`는 호환표와 어긋나면 종료 코드 1을 돌려준다. 환경 확인은 작업 자체의
+  학습 단계를 쓴다. 화면은 점검·승인 뒤 대기 작업의 연결 대상을 다시 확인하고 환경 준비 중 안내를 보여 준다.
+- 마지막 수정(`0163b8a`): 실행 전 점검 중이나 승인 창 뒤에 저장된 RunPod Pod ID가 바뀌면 "연결된 Pod가 바뀌었습니다. 실행 전 확인을 다시 진행하세요."로 멈추고,
+  `resume`은 작업 매니페스트의 소스 해시를 먼저 확인해 다른 앱 버전의 작업을 QUEUED로 되돌리기 전에 거부한다. 두 수정 모두 테스트를 먼저 작성해 실패를 확인했다.
+- 최종 코드 검증(2026-10-29, `0163b8a`): `uv run pytest` 2030 passed, 1 skipped(497.26초); `uv run ruff check src tests scripts` 통과;
+  `desktop`의 `npm run build` 통과, `npm test` 282 passed. `cargo test` 54 passed는 Task 14에서 마지막으로 실행했고 그 뒤 Rust 변경은 없다.
+- 사용자의 대기 작업 `76986bce…`는 0.4.0으로 제출되어 0.5.0에서 실행할 수 없다. '취소 요청'으로 정리하고 다시 제출한다
+  (GPU 종류·요금은 'GPU 정보 → 학습 설정에 적용'으로 맞춘다).
+- **남은 일(후속):** SSH 서버의 시간당 요금은 호환성 판정이 아직 보지 않는다(기존 서버 예산 검사만 적용). 판정 표에 넣을 것.
+- **남은 일(유료, 별도 승인):** Task 16 GPU 인수 시험. Blackwell Pod와 Ampere 또는 Hopper Pod에서 새 환경 준비,
+  `arch_ok`·`kernel_ok`, Qwen2.5-0.5B SFT LoRA 회귀, 메모리 추정과 실제 최대 사용량 비교.
+- **2단계 남음:** Qwen3.5·Gemma 4 텍스트 학습 GPU 검증과 수정, 허브 모델 메모리 추정.
+
 # General-purpose workflows — Windows 0.4.0 accepted on one PC, 2026-10-22
 
 User approved the [design](superpowers/specs/2026-10-17-general-training-workflows-design.md) and
@@ -6586,6 +6909,69 @@ The NSIS 3.11 toolchain was copied from the existing local Tauri cache after the
 - The running-idle interactive installer path.
 - IME, hidden-window polling and Narrator.
 - A clean second PC, code signing and redirected AppData.
+
+## SSH reachability check on a borrowed RunPod Pod, 2026-10-29
+
+A read-only check the user asked for. There is no `.env` or `RUNPOD_API_KEY` environment variable. The desktop app
+has a RunPod key in Credential Manager, but it was not read. The CLI check below used the 2026-10-14 connection
+profile instead.
+
+- **Key.** The supplied ed25519 key is in OpenSSH format with no passphrase. Its public half matches, and paramiko
+  loads it.
+- **Pod.** `yuft63rjggvh5z` (EU-RO-1, 1 × RTX PRO 4000 Blackwell, 24,467 MiB, idle) accepted the key over both the
+  RunPod SSH proxy and direct TCP. Inside the container, `RUNPOD_POD_ID`, `RUNPOD_PUBLIC_IP` and `RUNPOD_TCP_PORT_22`
+  match the direct-TCP address the user gave.
+- **Host key.** The ED25519 host key offered on direct TCP matches the one read inside the container over the proxy.
+- **App path.** paramiko with `RejectPolicy`, as the CLI's `RemoteExecutor` uses it, connected and ran commands once
+  given that pinned host key. The user's `~/.ssh/known_hosts` has no entry for the Pod, so CLI `work` would refuse the
+  host. The desktop app uses its `ssh_fingerprint` setting (`PinnedHostKey`) instead, and that setting is empty.
+- **Desktop MLflow.** The saved desktop settings still point at `http://127.0.0.1:5999` (operator
+  `acceptance-upgrade`), where nothing listens, and no MLflow secret is saved. Reproduced with `check_connections`:
+  that URI raises `MlflowException` (connection refused). `https://mlflow.kbiofoundry.kr` without credentials returns
+  the SSO login page, which raises `MlflowException` (response not valid JSON). The check stops at MLflow before
+  reading the Pod.
+- **CLI doctor.** `factory --state-dir <temp> --connection-file .factory/connection.json doctor --pod-id
+  yuft63rjggvh5z` passed. That is the gitignored 2026-10-14 profile: OIDC, client ID `mlflow`, the secret from its
+  referenced credential file. MLflow authenticated read and model-registry read passed (`mlflow_auth: oidc`). The
+  RunPod API read the Pod as RUNNING, 1 × RTX PRO 4000 Blackwell, $0.57/h, network volume `m1b4qscsnl`, with the
+  SSH mapping available. No MLflow write test was run.
+- **Desktop check, slow MLflow failure.** The user then saved the desktop settings (13:26:39): OIDC, URI
+  `https://mlflow.kbiofoundry.kr/`, the Pod ID, the key file and the fingerprint. The saved OIDC secret and RunPod key
+  equal the CLI profile's files (compared in-process, never printed). Results, each with a temporary state root:
+  - The installed 0.4.0 `factory-bridge.exe` passed the `connection` action with the saved settings in 7.0 s, and
+    `DesktopService.dispatch` from source passed in 2.8 s.
+  - With the pre-save settings (`http://127.0.0.1:5999`), the installed bridge failed after 269.2 s, returning only
+    `{"ok": false, "error": "MlflowException"}`. MLflow retries a refused connection with backoff, and `desktop.main`
+    shows only the class name of non-`ValueError` exceptions.
+  - The button checks only saved settings, so the slow failure came from a check against the old address.
+  - Product follow-ups, not fixed: give the connection check a short MLflow retry budget, and map refused, timeout
+    and HTML-login responses to fixed Korean messages.
+- **Runtime prerequisites (read-only SSH).**
+  - Present: `cc` (GCC 13.3), `python3 -m pip`, outbound PyPI, HF and GitHub, and driver 595.91 (CUDA 13.2).
+  - No `/workspace/factory*` folder exists (the desktop runtime root is `/workspace/factory-desktop`), so the runtime
+    has never been prepared on this volume. `/workspace` holds the
+    Pod owner's other project folders.
+- **GPU architecture risk (unverified on this GPU).**
+  - The GPU's compute capability is 12.0 (sm_120). `containers/gpu-requirements.lock` pins the PyPI `torch==2.7.1`
+    with CUDA 12.6 libraries. Public reports say cu126 wheels ship no sm_120 kernels and Blackwell needs cu128.
+  - `desktop_runtime.check` only asserts `torch.cuda.is_available()`, so preparation and the runtime check would
+    likely pass while the first CUDA kernel fails.
+  - The image's own torch 2.8.0+cu128 lists sm_120, but the factory runtime does not use it.
+  - Earlier GPU evidence was on H200 (sm_90). Not tested here; needs a non-Blackwell Pod, a cu128 lock with an
+    architecture check, or an approved throwaway probe.
+- **Remote tools.** Python 3.12.3, rsync, tar and sha256sum are present, and `/workspace` is a RunPod network-volume
+  mount.
+- **Not done.** Nothing was installed, transferred or started, and the Pod was not stopped. MLflow was only read, and
+  HF was not contacted.
+
+**Still outstanding.**
+- A desktop "연결 검사" click after the save, and the operator label, which is still `acceptance-upgrade`.
+- The user's queued desktop job `76986bce…` (QUEUED, 0 attempts, `Qwen/Qwen2.5-0.5B-Instruct` SFT) declares 1 ×
+  `NVIDIA RTX A4000` at $0.50/h. Against this Pod, "실행" would first stop at the unprepared runtime, then at the
+  GPU-type and price checks.
+- The known_hosts entry, for CLI use only.
+- Runtime preparation.
+- L1–L3.
 
 ## Windows workbench refinement — 0.2.1
 

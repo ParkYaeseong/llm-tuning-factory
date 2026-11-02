@@ -1,6 +1,9 @@
 import base64
 import hashlib
 import json
+import os
+import sys
+import time
 
 import paramiko
 import pytest
@@ -58,11 +61,8 @@ def test_remote_command_timeout_message_names_no_provider():
 
 def test_runtime_rejects_missing_compiler_even_when_cuda_is_available(monkeypatch):
     from tuning_factory import desktop_runtime as runtime
-    from tuning_factory.desktop import assets_root
-    from tuning_factory.registry import digest
 
-    ready = {"source": runtime.source_hash(), "engine": "0.9.5", "cuda": True,
-             "lock": digest((assets_root() / "containers/gpu-requirements.lock").read_bytes())}
+    ready = ready_reply(runtime)
 
     def run(client, argv, **kwargs):
         if argv[0] == "sh":
@@ -76,11 +76,8 @@ def test_runtime_rejects_missing_compiler_even_when_cuda_is_available(monkeypatc
 
 def test_runtime_accepts_compiler_with_matching_cuda_and_lock(monkeypatch):
     from tuning_factory import desktop_runtime as runtime
-    from tuning_factory.desktop import assets_root
-    from tuning_factory.registry import digest
 
-    ready = {"source": runtime.source_hash(), "engine": "0.9.5", "cuda": True,
-             "lock": digest((assets_root() / "containers/gpu-requirements.lock").read_bytes())}
+    ready = ready_reply(runtime)
     monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: "" if argv[0] == "sh" else json.dumps(ready))
     assert runtime.check(None) == ready
 
@@ -137,12 +134,9 @@ def test_executor_for_v2_selects_runtime_profile_and_cache_root(tmp_path, monkey
 
 def test_check_model_ops_pins_only_when_requested(monkeypatch):
     from tuning_factory import desktop_runtime as runtime
-    from tuning_factory.desktop import assets_root
-    from tuning_factory.registry import digest
     from tuning_factory.runtime_profiles import MODEL_OPS_PINS
 
-    ready = {"source": runtime.source_hash(), "engine": "0.9.5", "cuda": True,
-             "lock": digest((assets_root() / "containers/gpu-requirements.lock").read_bytes())}
+    ready = ready_reply(runtime)
     probes, replies = [], []
 
     def run(client, argv, **kwargs):
@@ -154,17 +148,14 @@ def test_check_model_ops_pins_only_when_requested(monkeypatch):
     monkeypatch.setattr(runtime, "command", run)
     replies.append(ready)
     assert runtime.check(None) == ready
-    root = runtime.runtime_path("sft")
-    legacy = ("import json,torch,importlib.metadata;from pathlib import Path;"
-              "from tuning_factory.manifest import source_hash;from tuning_factory.registry import digest;"
-              "print(json.dumps(dict(source=source_hash(),engine=importlib.metadata.version('llamafactory'),"
-              "cuda=torch.cuda.is_available(),lock=digest(Path(" + repr(root + "/gpu-requirements.lock")
-              + ").read_bytes()))))")
-    assert probes[0] == legacy   # the default probe and result dict are byte-identical to before
+    import ast
+    ast.parse(probes[0])
+    assert "arch_ok=arch_ok,kernel_ok=kernel_ok" in probes[0] and "model_ops" not in probes[0]
+    assert repr(runtime.runtime_path("sft") + "/gpu-requirements.lock") in probes[0]
     pinned = {**ready, "model_ops": dict(MODEL_OPS_PINS)}
     replies.append(pinned)
     assert runtime.check(None, model_ops=True) == pinned
-    assert all(repr(name) in probes[1] for name in MODEL_OPS_PINS) and probes[1] != legacy
+    assert all(repr(name) in probes[1] for name in MODEL_OPS_PINS) and probes[1] != probes[0]
     replies.append({**ready, "model_ops": {**MODEL_OPS_PINS, "peft": "0.18.0"}})
     with pytest.raises(ValueError, match="pinned PEFT 0.18.1"):
         runtime.check(None, model_ops=True)
@@ -270,3 +261,772 @@ def _yield(pod):
         yield dict(pod), SimpleNamespace(close=lambda: None)
 
     return manager()
+
+
+def ready_reply(runtime, lock="containers/gpu-requirements.lock", engine="0.9.5", **extra):
+    from tuning_factory.desktop import assets_root
+    from tuning_factory.registry import digest
+    return {"source": runtime.source_hash(), "engine": engine, "cuda": True,
+            "lock": digest((assets_root() / lock).read_bytes()), "arch_ok": True, "kernel_ok": True,
+            "bf16": True, "capability": "12.0", **extra}
+
+
+def test_check_separates_a_missing_runtime_from_a_broken_one(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+
+    calls = []
+
+    def absent(client, argv, **kwargs):
+        calls.append(argv)
+        if argv[0] == "sh":
+            return ""
+        raise runtime.RemoteCommandFailed("GPU runtime command failed. not found")
+
+    monkeypatch.setattr(runtime, "command", absent)
+    with pytest.raises(runtime.RuntimeMissing, match="GPU runtime command failed"):
+        runtime.check(None)
+    assert calls[-1] == ["test", "-x", runtime.runtime_path("sft") + "/venv/bin/python"]
+
+    def broken(client, argv, **kwargs):
+        if argv[0] in {"sh", "test"}:
+            return ""
+        raise runtime.RemoteCommandFailed("GPU runtime command failed. ImportError")
+
+    monkeypatch.setattr(runtime, "command", broken)
+    with pytest.raises(runtime.RuntimeMismatch, match="preflight mismatch"):
+        runtime.check(None)
+
+
+def probe_command(reply, trailer=""):
+    return lambda client, argv, **kw: "" if argv[0] == "sh" else "noise\nTF_PROBE " + json.dumps(reply) + trailer
+
+
+def test_check_gives_the_probe_a_long_timeout_but_not_the_prerequisites(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+
+    calls = []
+
+    def record(client, argv, **kwargs):
+        calls.append((argv, kwargs.get("timeout")))
+        return "" if argv[0] == "sh" else "TF_PROBE " + json.dumps(ready_reply(runtime))
+
+    monkeypatch.setattr(runtime, "command", record)
+    runtime.check(None)
+    assert runtime.PROBE_TIMEOUT_SECONDS >= 600
+    probe = [timeout for argv, timeout in calls if argv[0] != "sh"]
+    assert probe == [runtime.PROBE_TIMEOUT_SECONDS]
+    assert all(timeout in (None, 60) for argv, timeout in calls if argv[0] == "sh")
+
+
+def test_check_separates_an_incompatible_gpu_from_a_busy_one(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+
+    monkeypatch.setattr(runtime, "command", probe_command(ready_reply(runtime, arch_ok=False)))
+    with pytest.raises(runtime.GPUIncompatible, match="세대"):
+        runtime.check(None)
+    monkeypatch.setattr(runtime, "command", probe_command(ready_reply(runtime, kernel_ok=False)))
+    with pytest.raises(runtime.GPUUnavailable, match="사용 중"):
+        runtime.check(None)
+
+
+def test_check_reports_a_missing_or_miscounted_gpu_as_unavailable(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+
+    monkeypatch.setattr(runtime, "command", probe_command(ready_reply(runtime, cuda=False)))
+    with pytest.raises(runtime.GPUUnavailable, match="GPU를 사용할 수 없습니다"):
+        runtime.check(None)
+    uuids = ("GPU-a", "GPU-b")
+    monkeypatch.setattr(runtime, "command", probe_command(ready_reply(runtime, devices=1)))
+    with pytest.raises(runtime.GPUUnavailable):
+        runtime.check(None, selected_gpu_uuids=uuids)
+    reply = ready_reply(runtime, devices=2)
+    monkeypatch.setattr(runtime, "command", probe_command(reply))
+    assert runtime.check(None, selected_gpu_uuids=uuids) == reply
+
+
+def test_check_parses_the_marked_line_and_rejects_unparseable_output(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+
+    reply = ready_reply(runtime)
+    monkeypatch.setattr(runtime, "command", probe_command(reply, trailer="\nWARNING: garbage"))
+    assert runtime.check(None) == reply
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: "" if argv[0] == "sh" else "no json here")
+    with pytest.raises(runtime.RuntimeMismatch, match="preflight mismatch"):
+        runtime.check(None)
+
+
+@pytest.mark.parametrize("capability,arch,ok", [
+    ((8, 9), ["sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"], True),   # Ada runs sm_86 machine code
+    ((12, 0), ["sm_80", "sm_90", "compute_90"], True),                           # PTX JIT
+    ((12, 0), ["sm_80", "sm_86", "sm_90"], False),                               # the cu126 situation
+    ((7, 0), ["sm_75", "sm_80"], False),
+    ((12, 0), ["sm_80", "sm_86", "sm_90", "sm_100", "sm_120"], True),
+    ((12, 1), ["sm_120"], True),
+    ((10, 0), ["sm_120"], False)])
+def test_arch_probe_applies_the_same_major_rule(capability, arch, ok):
+    import re
+    from types import SimpleNamespace
+
+    from tuning_factory import desktop_runtime as runtime
+
+    class Tensor:
+        def __mul__(self, other):
+            return self
+
+        def sum(self):
+            return SimpleNamespace(item=lambda: 16)
+
+    cuda = SimpleNamespace(is_available=lambda: True, get_device_capability=lambda: capability,
+                           get_arch_list=lambda: arch, is_bf16_supported=lambda: True)
+    namespace = {"torch": SimpleNamespace(cuda=cuda, ones=lambda n, device: Tensor()), "re": re}
+    exec(runtime.ARCH_PROBE, namespace)
+    assert namespace["arch_ok"] is ok and namespace["kernel_ok"] is True
+    assert namespace["capability"] == "%d.%d" % capability
+
+
+def fake_torch(capability=(12, 0), arch=("sm_120",), available=True, devices=1, ones=None):
+    from types import SimpleNamespace
+
+    class Tensor:
+        def __mul__(self, other):
+            return self
+
+        def sum(self):
+            return SimpleNamespace(item=lambda: 16)
+
+    cuda = SimpleNamespace(is_available=lambda: available, get_device_capability=lambda: capability,
+                           get_arch_list=lambda: list(arch), is_bf16_supported=lambda: True,
+                           device_count=lambda: devices)
+    return SimpleNamespace(cuda=cuda, ones=ones or (lambda n, device: Tensor()))
+
+
+def test_arch_probe_reports_a_failing_kernel_and_an_absent_gpu():
+    import re
+
+    from tuning_factory import desktop_runtime as runtime
+
+    def broken(n, device):
+        raise RuntimeError("no kernel image")
+
+    namespace = {"torch": fake_torch(ones=broken), "re": re}
+    exec(runtime.ARCH_PROBE, namespace)
+    assert namespace["arch_ok"] is True and namespace["kernel_ok"] is False and namespace["bf16"] is False
+    namespace = {"torch": fake_torch(available=False), "re": re}
+    exec(runtime.ARCH_PROBE, namespace)
+    assert (namespace["arch_ok"], namespace["kernel_ok"], namespace["capability"]) == (False, False, None)
+
+
+def test_generated_probe_program_runs_with_its_own_imports(monkeypatch, tmp_path, capsys):
+    import importlib.metadata
+    import sys
+
+    from tuning_factory import desktop_runtime as runtime
+
+    captured = []
+
+    def run(client, argv, **kwargs):
+        if argv[0] == "sh":
+            return ""
+        captured.append(argv)
+        return "TF_PROBE " + json.dumps(ready_reply(runtime))
+
+    monkeypatch.setattr(runtime, "command", run)
+    runtime.check(None, "sft", remote_root=str(tmp_path))
+    lock = __import__("pathlib").Path(runtime.runtime_path("sft", str(tmp_path)) + "/gpu-requirements.lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_bytes(b"pins")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch(devices=3))
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "0.9.5")
+    exec(captured[-1][-1], {})
+    last = capsys.readouterr().out.splitlines()[-1]
+    assert last.startswith("TF_PROBE ")
+    result = json.loads(last[len("TF_PROBE "):])
+    assert result["arch_ok"] is True and result["kernel_ok"] is True
+    assert result["devices"] == 3 and result["capability"] == "12.0"
+
+
+SMI = ("GPU-aaaa, NVIDIA RTX PRO 4000 Blackwell, 12.0, 24467, 595.91.07\n"
+       "GPU-bbbb, NVIDIA RTX PRO 4000 Blackwell, 12.0, 24467, 595.91.07\n")
+POD = {"id": "borrowed", "gpu": {"id": "NVIDIA RTX PRO 4000 Blackwell", "displayName": None, "count": 1},
+       "costPerHr": 0.57}
+
+
+def test_observation_keys_and_gpu_selection(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+    from tuning_factory.gpu_compat import GPU_QUERY
+
+    assert runtime.observation_key({"pod_id": "yuft63rjggvh5z"}) == "runpod-yuft63rjggvh5z"
+    with pytest.raises(ValueError, match="Pod ID"):
+        runtime.observation_key({"pod_id": "../x"})
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI if tuple(argv) == GPU_QUERY else "")
+    assert [gpu["uuid"] for gpu in runtime.read_gpu_facts(None, ("GPU-bbbb",))] == ["GPU-bbbb"]
+    with pytest.raises(ValueError, match="selected GPU"):
+        runtime.read_gpu_facts(None, ("GPU-cccc",))
+
+
+def test_observe_saves_facts_and_tolerates_an_unreadable_query(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+    from tuning_factory.gpu_compat import load_observation
+
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    observation = runtime.observe(None, {"pod_id": "borrowed"}, tmp_path, POD)
+    assert observation["pod"]["hourly_cost_usd"] == 0.57 and len(observation["gpus"]) == 2
+    assert load_observation(tmp_path, "runpod-borrowed") == observation
+
+    def refused(client, argv, **kwargs):
+        raise runtime.RemoteCommandFailed("GPU runtime command failed. Field compute_cap is not valid")
+
+    monkeypatch.setattr(runtime, "command", refused)
+    assert runtime.observe(None, {"pod_id": "borrowed"}, tmp_path, POD)["gpus"] == []
+
+
+def test_runtime_check_reports_a_missing_runtime_with_gpu_facts(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from tuning_factory import desktop_runtime as runtime
+
+    @contextmanager
+    def connect(settings, **kwargs):
+        yield POD, object()
+
+    def missing(*args, **kwargs):
+        raise runtime.RuntimeMissing(runtime.RUNTIME_MISSING)
+
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    monkeypatch.setattr(runtime, "check", missing)
+    report = runtime.runtime({"pod_id": "borrowed"}, tmp_path)
+    assert report["ready"] is False and report["runtime_state"] == "missing" and report["pod_id"] == "borrowed"
+    assert report["observation"]["gpus"][0]["capability"] == "12.0"
+    monkeypatch.setattr(runtime, "check", lambda *a, **kw: {"source": "fixture"})
+    ready = runtime.runtime({"pod_id": "borrowed"}, tmp_path)
+    assert ready["ready"] is True and ready["runtime_state"] == "ready" and ready["source"] == "fixture"
+
+
+def install_fixture(tmp_path, monkeypatch):
+    """Packaged assets and a fake GPU host for install_runtime."""
+    from test_remote_worker import FakeSSH
+
+    from tuning_factory import desktop
+    from tuning_factory import desktop_runtime as runtime
+
+    assets = tmp_path / "assets"
+    (assets / "dist").mkdir(parents=True)
+    (assets / "containers").mkdir()
+    (assets / "dist/llm_tuning_factory-fixture.whl").write_text("fixture")
+    (assets / "containers/gpu-requirements.lock").write_text("fixture")
+    monkeypatch.setattr(desktop, "assets_root", lambda: assets)
+    client = FakeSSH(tmp_path / "remote")
+    client.sftp.root.mkdir()
+    return runtime, client
+
+
+def test_install_runtime_uses_the_cu128_backend(tmp_path, monkeypatch):
+    runtime, client = install_fixture(tmp_path, monkeypatch)
+    scripts = []
+    monkeypatch.setattr(runtime, "command", lambda _, argv, **kw: scripts.append(argv[2]) or "")
+    preparation = {"started": False, "stopped": False}
+    runtime.install_runtime(client, "sft", runtime.REMOTE, POD, preparation)
+    assert preparation == {"started": True, "stopped": True, "cleanup": {
+        "removed": [], "kept_in_use": [], "cleanup_error": "cleanup report missing"}}
+    assert "--require-hashes --torch-backend cu128 " in scripts[0]
+    assert " venv --python 3.12 --clear " in scripts[0] and "--allow-existing" not in scripts[0]
+
+
+
+def test_observe_survives_an_unwritable_state_file(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+    from tuning_factory import gpu_compat
+
+    def locked(root, observation):
+        raise PermissionError("state file is locked")
+
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    monkeypatch.setattr(gpu_compat, "save_observation", locked)
+    observation = runtime.observe(None, {"pod_id": "borrowed"}, tmp_path, POD)
+    assert observation["pod"]["hourly_cost_usd"] == 0.57 and len(observation["gpus"]) == 2
+
+
+def test_check_rejects_a_probe_line_that_is_not_an_object(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: "" if argv[0] == "sh" else "16")
+    with pytest.raises(runtime.RuntimeMismatch, match="preflight mismatch"):
+        runtime.check(None)
+
+
+def runpod_executor_fixture(monkeypatch, states, events):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tuning_factory import desktop_runtime as runtime
+
+    @contextmanager
+    def connect(settings, **kwargs):
+        yield POD, SimpleNamespace(close=lambda: None)
+
+    def check(client, stage, *args, **kwargs):
+        events.append("check")
+        if states.pop(0) == "missing":
+            raise runtime.RuntimeMissing(runtime.RUNTIME_MISSING)
+        return {}
+
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    monkeypatch.setattr(runtime, "check", check)
+    monkeypatch.setattr(runtime, "prerequisites", lambda client: events.append("prerequisites"))
+    monkeypatch.setattr(runtime, "bootstrap_prerequisites", lambda client: events.append("bootstrap"))
+    monkeypatch.setattr(runtime, "install_runtime", lambda *args: events.append("install"))
+    return runtime
+
+
+def test_executor_for_gates_first_and_prepares_only_when_approved(tmp_path, monkeypatch):
+    events = []
+    runtime = runpod_executor_fixture(monkeypatch, ["missing"], events)
+
+    def gate(observation):
+        events.append(("gate", observation["gpus"][0]["capability"]))
+
+    with pytest.raises(ValueError, match="학습 환경이 없습니다"):
+        with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=gate):
+            pytest.fail("ran without a runtime")
+    assert events == [("gate", "12.0"), "check"]
+    events.clear()
+    runtime = runpod_executor_fixture(monkeypatch, ["missing", "ready"], events)
+    with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=gate, prepare_runtime=True) as executor:
+        assert executor.pod == POD and executor.runtime_lock_file == runtime.runtime_path("sft") + "/in-use.lock"
+    assert events == [("gate", "12.0"), "check", "prerequisites", "bootstrap", "install", "check"]
+
+
+def test_a_gate_refusal_stops_before_any_runtime_work(tmp_path, monkeypatch):
+    events = []
+    runtime = runpod_executor_fixture(monkeypatch, ["ready"], events)
+
+    def gate(observation):
+        raise ValueError("실행할 수 없습니다. fixture")
+
+    with pytest.raises(ValueError, match="fixture"):
+        with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=gate, prepare_runtime=True):
+            pytest.fail("refused destination used")
+    assert events == []
+
+
+def test_without_a_gate_the_missing_runtime_error_is_unchanged(tmp_path, monkeypatch):
+    events = []
+    runtime = runpod_executor_fixture(monkeypatch, ["missing"], events)
+    with pytest.raises(runtime.RuntimeMissing):
+        with runtime.executor_for({"pod_id": "borrowed"}, tmp_path):
+            pytest.fail("ran without a runtime")
+
+
+def test_execution_preparation_is_runpod_preflight_only(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+
+    monkeypatch.setattr(runtime, "connection", lambda *a, **kw: pytest.fail("GPU host contacted"))
+    for settings, kwargs in (({"provider": "ssh_server"}, {}), ({"pod_id": "borrowed"}, {"preflight": False})):
+        with pytest.raises(ValueError, match="RunPod preflight only"):
+            with runtime.executor_for(settings, tmp_path, prepare_runtime=True, **kwargs):
+                pytest.fail("prepared outside a RunPod preflight")
+
+
+@pytest.mark.parametrize("error, state", [("RuntimeMissing", "missing"), ("RuntimeMismatch", "mismatch"),
+                                          ("GPUIncompatible", "incompatible"), ("GPUUnavailable", "unavailable")])
+def test_runtime_reports_each_check_failure_as_a_state(tmp_path, monkeypatch, error, state):
+    from contextlib import contextmanager
+
+    from tuning_factory import desktop_runtime as runtime
+
+    @contextmanager
+    def connect(settings, **kwargs):
+        yield POD, object()
+
+    def failing(*args, **kwargs):
+        raise getattr(runtime, error)("fixture")
+
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    monkeypatch.setattr(runtime, "check", failing)
+    report = runtime.runtime({"pod_id": "borrowed"}, tmp_path)
+    assert report["ready"] is False and report["runtime_state"] == state
+    assert report["observation"]["gpus"][0]["capability"] == "12.0"
+
+
+def test_observe_an_ssh_server_keeps_only_the_selected_gpus(tmp_path, monkeypatch):
+    from test_gpu_servers import UUID1, UUID2, observation, settings
+
+    from tuning_factory import desktop_runtime as runtime
+
+    config = settings()
+    facts = observation(config)
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    output = (f"{UUID1}, NVIDIA A100, 8.0, 81920, 550.00\n{UUID2}, NVIDIA A100, 8.0, 81920, 550.00\n")
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: output)
+    result = runtime.observe(None, native, tmp_path, facts)
+    assert result["key"].startswith("server-") and result["key"] == runtime.observation_key(native)
+    assert result["pod"] is None
+    assert [gpu["uuid"] for gpu in result["gpus"]] == [UUID2]
+
+
+@pytest.mark.parametrize("error", ["GPUIncompatible", "GPUUnavailable"])
+def test_a_bad_gpu_never_triggers_preparation(tmp_path, monkeypatch, error):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tuning_factory import desktop_runtime as runtime
+
+    events = []
+
+    @contextmanager
+    def connect(settings, **kwargs):
+        yield POD, SimpleNamespace(close=lambda: None)
+
+    def check(client, stage, *args, **kwargs):
+        events.append("check")
+        raise getattr(runtime, error)("fixture")
+
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    monkeypatch.setattr(runtime, "check", check)
+    for name in ("prerequisites", "bootstrap_prerequisites"):
+        monkeypatch.setattr(runtime, name, lambda client, name=name: events.append(name))
+    monkeypatch.setattr(runtime, "install_runtime", lambda *args: events.append("install"))
+    with pytest.raises(getattr(runtime, error)):
+        with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=lambda o: events.append("gate"),
+                                  prepare_runtime=True):
+            pytest.fail("ran with a bad GPU")
+    assert events == ["gate", "check"]
+
+
+@pytest.mark.parametrize("gated", [True, False])
+def test_ssh_server_missing_runtime_is_explained_only_when_gated(tmp_path, monkeypatch, gated):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from test_gpu_servers import UUID1, UUID2, observation, settings
+
+    from tuning_factory import desktop_runtime as runtime
+
+    config = settings()
+    facts = observation(config)
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    events = []
+
+    @contextmanager
+    def connect(_settings, **kwargs):
+        yield facts, SimpleNamespace(close=lambda: None)
+
+    def check(client, stage, *args, **kwargs):
+        events.append("check")
+        raise runtime.RuntimeMissing(runtime.RUNTIME_MISSING)
+
+    output = f"{UUID1}, NVIDIA A100, 8.0, 81920, 550.00\n{UUID2}, NVIDIA A100, 8.0, 81920, 550.00\n"
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: output)
+    monkeypatch.setattr(runtime, "check", check)
+    kwargs = {"gate": lambda o: events.append("gate")} if gated else {}
+    expected, match = (ValueError, "GPU 서버에 이 앱 버전의 학습 환경이 없습니다") if gated else (
+        runtime.RuntimeMissing, None)
+    with pytest.raises(expected, match=match):
+        with runtime.executor_for(native, tmp_path, **kwargs):
+            pytest.fail("ran without a runtime")
+    assert events == (["gate", "check"] if gated else ["check"])
+
+
+def test_without_a_gate_no_gpu_query_runs_and_no_observation_is_stored(tmp_path, monkeypatch):
+    events = []
+    commands = []
+    runtime = runpod_executor_fixture(monkeypatch, ["missing"], events)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: commands.append(argv) or SMI)
+    with pytest.raises(runtime.RuntimeMissing):
+        with runtime.executor_for({"pod_id": "borrowed"}, tmp_path):
+            pytest.fail("ran without a runtime")
+    assert commands == [] and not (tmp_path / "gpu-observations").exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_failed_post_preparation_check_is_explained(tmp_path, monkeypatch):
+    events = []
+    runtime = runpod_executor_fixture(monkeypatch, ["missing"], events)
+    calls = []
+
+    def check(client, stage, *args, **kwargs):
+        events.append("check")
+        calls.append(1)
+        raise (runtime.RuntimeMissing if len(calls) == 1 else runtime.RuntimeMismatch)("fixture")
+
+    monkeypatch.setattr(runtime, "check", check)
+    with pytest.raises(ValueError, match="학습 환경을 준비했지만 확인을 통과하지 못했습니다"):
+        with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=lambda o: None, prepare_runtime=True):
+            pytest.fail("ran an unverified runtime")
+    assert events.count("install") == 1
+
+
+def test_a_concurrent_preparation_is_reported_as_busy(tmp_path, monkeypatch):
+    from test_remote_worker import FakeSSH
+
+    from tuning_factory import desktop
+    from tuning_factory import desktop_runtime as runtime
+
+    assets = tmp_path / "assets"
+    (assets / "dist").mkdir(parents=True)
+    (assets / "containers").mkdir()
+    (assets / "dist/llm_tuning_factory-fixture.whl").write_text("fixture")
+    (assets / "containers/gpu-requirements.lock").write_text("fixture")
+    monkeypatch.setattr(desktop, "assets_root", lambda: assets)
+    client = FakeSSH(tmp_path / "remote")
+    client.sftp.root.mkdir()
+    scripts = []
+
+    def busy(_, argv, **kw):
+        scripts.append(argv[2])
+        raise runtime.RemoteCommandFailed("GPU runtime command failed. TF_PREPARE_BUSY")
+
+    monkeypatch.setattr(runtime, "command", busy)
+    preparation = {"started": False, "stopped": False}
+    with pytest.raises(ValueError, match="다른 학습 환경 준비가 이 GPU에서 진행 중입니다"):
+        runtime.install_runtime(client, "sft", runtime.REMOTE, POD, preparation)
+    assert preparation == {"started": True, "stopped": True}
+    assert "flock -n 9 || { echo TF_PREPARE_BUSY; exit 75; }" in scripts[0]
+
+
+def test_ssh_destination_receipt_is_validated_before_the_gate(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from test_gpu_servers import observation, settings
+
+    from tuning_factory import desktop_runtime as runtime
+
+    config = settings()
+    facts = observation(config)
+    native = {"provider": "ssh_server", **config.model_dump(mode="json")}
+    events = []
+
+    @contextmanager
+    def connect(_settings, **kwargs):
+        yield facts, SimpleNamespace(close=lambda: None)
+
+    class Receipt:
+        manifest_sha256 = "x"
+
+        def validate_destination(self, *args):
+            events.append("receipt")
+
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "validate_server_receipt", lambda settings, receipt: receipt)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: "")
+    with pytest.raises(ValueError, match="stop here"):
+        with runtime.executor_for(native, tmp_path, server_receipt=Receipt(), preflight=False,
+                                  gate=lambda o: (events.append("gate"), (_ for _ in ()).throw(
+                                      ValueError("stop here")))):
+            pytest.fail("refused")
+    assert events == ["receipt", "gate"]
+
+
+@pytest.mark.parametrize("error", ["RuntimeMissing", "RuntimeMismatch"])
+def test_runtime_preparation_that_fails_its_check_gets_the_fixed_message(tmp_path, monkeypatch, error):
+    from contextlib import contextmanager
+
+    from tuning_factory import desktop_runtime as runtime
+
+    @contextmanager
+    def connect(settings, **kwargs):
+        yield POD, object()
+
+    def failing(*args, **kwargs):
+        raise getattr(runtime, error)("fixture detail")
+
+    monkeypatch.setattr(runtime, "connection", connect)
+    monkeypatch.setattr(runtime, "command", lambda client, argv, **kw: SMI)
+    monkeypatch.setattr(runtime, "prerequisites", lambda *a: None)
+    monkeypatch.setattr(runtime, "bootstrap_prerequisites", lambda *a: None)
+    monkeypatch.setattr(runtime, "install_runtime", lambda *a: None)
+    monkeypatch.setattr(runtime, "check", failing)
+    with pytest.raises(ValueError) as caught:
+        runtime.runtime({"pod_id": "borrowed"}, tmp_path, prepare=True)
+    assert str(caught.value) == runtime.POST_PREPARATION_FAILED
+
+
+def test_prerequisites_require_flock_and_a_c_compiler(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+    scripts = []
+    monkeypatch.setattr(runtime, "command", lambda _, argv, **kw: scripts.append(argv) or "")
+    runtime.prerequisites(None)
+    assert len(scripts) == 1 and scripts[0][:2] == ["sh", "-c"]
+    assert "command -v flock" in scripts[0][2] and "flock (util-linux) required" in scripts[0][2]
+
+
+CURRENT, OLD, OLDER = "a" * 16, "b" * 16, "c" * 16
+
+
+def prune_tree(root):
+    """A remote root: current runtimes, two old ones, a non-runtime folder, a leftover trash folder and the caches."""
+    for name in (CURRENT, CURRENT + "-ppo", OLD, OLDER + "-ppo", "notahash", ".trash-dead-1"):
+        (root / "runtime" / name / "venv").mkdir(parents=True)
+    (root / "runtime" / OLD / "venv" / "lib").write_bytes(b"x" * 10)
+    for name in ("uv-cache", "python", "hf-cache", "model-cache", "jobs"):
+        (root / name).mkdir()
+    return root
+
+
+def attempt(root, source, *, manifest=None, finished=False, age=0):
+    directory = root / "jobs" / "j" / source[:4]
+    directory.mkdir(parents=True)
+    (directory / "worker.log").write_text("started")
+    if finished:
+        (directory / "result.json").write_text("{}")
+    (directory / "manifest.json").write_text(manifest if manifest is not None else json.dumps(
+        {"source_sha256": source * 4, "config": {"resource_profile": {"timeout_seconds": 60}}}))
+    os.utime(directory, (time.time() - age, time.time() - age))
+
+
+def prune(root, source=None):
+    import subprocess
+
+    from tuning_factory import desktop_runtime as runtime
+    done = subprocess.run([sys.executable, "-I", "-c", source or runtime.PRUNE_SOURCE, str(root), CURRENT],
+                          capture_output=True, text=True, timeout=120, check=True)
+    return runtime.prune_report(done.stdout)
+
+
+def test_prune_removes_only_old_idle_runtimes(tmp_path):
+    root = prune_tree(tmp_path)
+    attempt(root, OLD, finished=True)
+    report = prune(root)
+    assert sorted(report["removed"]) == [OLD, OLDER + "-ppo"] and report["errors"] == []
+    assert sorted(path.name for path in (root / "runtime").iterdir()) == sorted([CURRENT, CURRENT + "-ppo", "notahash"])
+    assert all((root / name).is_dir() for name in ("uv-cache", "python", "hf-cache", "model-cache", "jobs"))
+    # Freed space is the free-space delta (venvs share hard-linked files with uv-cache), never a sum of file sizes.
+    assert "cleanup_error" not in report and "incomplete" not in report
+    assert report["free_before"] > 0 and report["free_after"] > 0
+
+
+def test_prune_keeps_the_runtime_of_a_live_attempt_and_forgets_expired_ones(tmp_path):
+    root = prune_tree(tmp_path)
+    attempt(root, OLD)                                    # unfinished, within its deadline
+    attempt(root, OLDER, age=60 + 3600 + 5, manifest=json.dumps(
+        {"source_sha256": OLDER * 4, "operation": {"resources": {"timeout_seconds": 60}}}))   # v2, expired
+    report = prune(root)
+    assert report["kept_in_use"] == [OLD] and report["removed"] == [OLDER + "-ppo"]
+
+
+def test_prune_deletes_nothing_when_an_unfinished_manifest_is_unreadable(tmp_path):
+    root = prune_tree(tmp_path)
+    attempt(root, OLD, manifest="{")
+    report = prune(root)
+    assert report["removed"] == [] and "unreadable" in report["cleanup_error"]
+    assert (root / "runtime" / OLD).is_dir() and (root / "runtime" / (OLDER + "-ppo")).is_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fcntl locks and symlinks are exercised on Linux only")
+def test_prune_keeps_locked_runtimes_and_never_follows_symlinks(tmp_path):
+    import fcntl
+    root = prune_tree(tmp_path)
+    (root / "runtime" / ("d" * 16)).symlink_to(root / "hf-cache", target_is_directory=True)
+    with open(root / "runtime" / OLD / "in-use.lock", "a") as held:
+        fcntl.flock(held, fcntl.LOCK_SH)                  # a running worker's `flock -s`
+        report = prune(root)
+    assert report["kept_in_use"] == [OLD] and report["removed"] == [OLDER + "-ppo"]
+    assert (root / "runtime" / ("d" * 16)).is_symlink() and (root / "hf-cache").is_dir()
+
+
+def test_prune_takes_its_locks_writable_and_never_through_a_link():
+    from tuning_factory import desktop_runtime as runtime
+    # An exclusive flock on NFS needs a descriptor open for writing; O_NOFOLLOW refuses a planted link.
+    assert "os.open(path/name,os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW|os.O_CLOEXEC,0o666)" in runtime.PRUNE_SOURCE
+    assert "O_RDONLY" not in runtime.PRUNE_SOURCE and "open(path/name,'a')" not in runtime.PRUNE_SOURCE
+
+
+def test_prune_rechecks_liveness_under_the_candidate_locks_just_before_the_rename():
+    from tuning_factory import desktop_runtime as runtime
+    loop = runtime.PRUNE_SOURCE[runtime.PRUNE_SOURCE.index("for path in sorted("):]
+    assert loop.index("hold(path)") < loop.index("in live()") < loop.index("path.rename(trash)")
+
+
+def test_prune_stops_starting_candidates_after_its_budget(tmp_path):
+    from tuning_factory import desktop_runtime as runtime
+    assert runtime.PRUNE_SOURCE.count("BUDGET=300\n") == 1 and "time.monotonic()" in runtime.PRUNE_SOURCE
+    root = prune_tree(tmp_path)
+    report = prune(root, runtime.PRUNE_SOURCE.replace("BUDGET=300\n", "BUDGET=-1\n"))
+    assert report["incomplete"] is True and report["removed"] == [] and "cleanup_error" not in report
+    for name in (OLD, OLDER + "-ppo", ".trash-dead-1"):   # left for the next preparation
+        assert (root / "runtime" / name).is_dir()
+
+
+def test_prune_records_a_runtime_it_cannot_remove_and_goes_on(tmp_path):
+    root = prune_tree(tmp_path)
+    blocked = root / "runtime" / OLD / "venv"
+    if sys.platform == "win32":
+        context = open(blocked / "lib", "rb")             # Windows refuses to rename a folder with an open file
+    else:
+        if os.geteuid() == 0:
+            pytest.skip("root removes read-only folders")
+        blocked.chmod(0o500)                              # rename succeeds, removing its files does not
+        context = open(os.devnull)
+    try:
+        with context:
+            report = prune(root)
+    finally:
+        for path in (root / "runtime").glob("*/venv"):
+            path.chmod(0o700)
+    assert report["errors"] == [OLD] and report["removed"] == [OLDER + "-ppo"] and "cleanup_error" not in report
+
+
+def test_preparation_prunes_under_its_prepare_lock_and_keeps_the_report(tmp_path, monkeypatch):
+    import shlex
+    runtime, client = install_fixture(tmp_path, monkeypatch)
+    cleanup = {"removed": [OLD], "kept_in_use": [], "errors": [], "free_before": 1, "free_after": 11}
+    scripts = []
+    monkeypatch.setattr(runtime, "command",
+                        lambda _, argv, **kw: scripts.append(argv[2]) or "pip ok\nTF_PRUNE " + json.dumps(cleanup))
+    preparation = {"started": False, "stopped": False}
+    runtime.install_runtime(client, "sft", runtime.REMOTE, POD, preparation)
+    script = scripts[0]
+    prune_line = f"prune=$(python3 -I -c {shlex.quote(runtime.PRUNE_SOURCE)} {shlex.quote(runtime.REMOTE)} "
+    assert script.index("TF_PREPARE_BUSY") < script.index(prune_line) < script.index(" venv ")
+    assert f"{shlex.quote(runtime.REMOTE)} {runtime.source_hash()[:16]} 2>&1 || true)\n" in script
+    # Printed last, after the uv output, so the 128 KB output tail always keeps it.
+    assert script.rindex('"$prune"') > script.index("--no-deps") and script.rstrip("\n").endswith('"$prune"')
+    assert preparation == {"started": True, "stopped": True, "cleanup": cleanup}
+
+
+def test_preparation_never_rebuilds_a_venv_that_a_running_worker_holds(tmp_path, monkeypatch):
+    runtime, client = install_fixture(tmp_path, monkeypatch)
+    scripts = []
+
+    def in_use(_, argv, **kw):
+        scripts.append(argv[2])
+        raise runtime.RemoteCommandFailed("GPU runtime command failed. TF_RUNTIME_IN_USE")
+
+    monkeypatch.setattr(runtime, "command", in_use)
+    preparation = {"started": False, "stopped": False}
+    with pytest.raises(ValueError) as caught:
+        runtime.install_runtime(client, "sft", runtime.REMOTE, POD, preparation)
+    assert str(caught.value) == runtime.RUNTIME_IN_USE and preparation == {"started": True, "stopped": True}
+    script, lock = scripts[0], runtime.runtime_path("sft") + "/in-use.lock"
+    guard = f"exec 8>{lock}\nflock -x -n 8 || {{ echo TF_RUNTIME_IN_USE; exit 75; }}\n"
+    assert script.index("flock -n 9 ||") < script.index(guard) < script.index("prune=$(")
+    assert script.index(guard) < script.index(" venv --python 3.12 --clear ")
+
+
+def test_a_prepared_runtime_reports_its_cleanup(tmp_path, monkeypatch):
+    events = []
+    runtime = runpod_executor_fixture(monkeypatch, ["ready", "ready"], events)
+    cleanup = {"removed": [], "kept_in_use": [OLD], "free_before": 1, "free_after": 1}
+    monkeypatch.setattr(runtime, "install_runtime",
+                        lambda client, stage, root, pod, preparation: preparation.update(cleanup=cleanup))
+    assert runtime.runtime({"pod_id": "borrowed"}, tmp_path, prepare=True)["cleanup"] == cleanup
+    assert "cleanup" not in runtime.runtime({"pod_id": "borrowed"}, tmp_path)   # a check never prunes
+
+
+def test_a_preparation_in_the_run_approval_carries_its_cleanup_on_the_executor(tmp_path, monkeypatch):
+    events = []
+    runtime = runpod_executor_fixture(monkeypatch, ["missing", "ready"], events)
+    cleanup = {"removed": [OLD], "kept_in_use": [], "free_before": 1, "free_after": 3}
+    monkeypatch.setattr(runtime, "install_runtime",
+                        lambda client, stage, root, pod, preparation: preparation.update(cleanup=cleanup))
+    with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=lambda o: None, prepare_runtime=True) as executor:
+        assert executor.runtime_cleanup == cleanup
+    runtime = runpod_executor_fixture(monkeypatch, ["ready"], events)
+    with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=lambda o: None, prepare_runtime=True) as executor:
+        assert executor.runtime_cleanup is None             # nothing prepared, nothing pruned

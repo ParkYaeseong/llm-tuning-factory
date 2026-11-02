@@ -805,3 +805,107 @@ def test_snapshot_then_targets_lift_d15_and_run_a_simulated_lora_all_train(tmp_p
     for module, (out, inp) in EXPECTED.items():
         assert shapes[f"base_model.model.{module}.lora_A.weight"][1] == inp
         assert shapes[f"base_model.model.{module}.lora_B.weight"][0] == out
+
+
+# -- composite (vision/audio + text) models: only the language model -----------------------------------
+
+def composite_tensors(extra=()):
+    from tuning_factory.model_artifacts import TensorMetadata
+    shapes = {"model.language_model.embed_tokens.weight": (64, 32),
+              "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": (96, 32),
+              "model.language_model.layers.0.linear_attn.conv1d.weight": (96, 1, 4),
+              "model.language_model.layers.0.linear_attn.out_proj.weight": (32, 32),
+              "model.language_model.layers.0.input_layernorm.weight": (32,),
+              "model.language_model.layers.3.self_attn.q_proj.weight": (64, 32),
+              "model.language_model.norm.weight": (32,),
+              "model.visual.blocks.0.attn.qkv.weight": (48, 16),
+              "model.visual.patch_embed.proj.weight": (16, 3, 2, 16, 16),
+              "model.visual.merger.linear_fc1.weight": (64, 64), "mtp.fc.weight": (32, 64), **dict(extra)}
+    return tuple(TensorMetadata(file="model.safetensors", name=name, shape=shape, dtype="BF16")
+                 for name, shape in shapes.items())
+
+
+def test_composite_header_evidence_keeps_only_language_model_linears():
+    ht = targets()
+    from tuning_factory.graph_planner import ModelTargetEvidence
+    from tuning_factory.model_artifacts import HFRootRef, ModelArtifactRef, ModelDescriptor
+    from tuning_factory.target_inspection import verify_inspected_targets
+    root = HFRootRef(repo_id="test/tiny-qwen3_5", revision="a" * 40, config_sha256="c" * 64,
+                     tokenizer_fingerprint="d" * 64)
+    evidence = ht.target_evidence(root, composite_tensors())
+    assert [module.name for module in evidence.modules] == [
+        "model.language_model.layers.0.linear_attn.in_proj_qkv", "model.language_model.layers.0.linear_attn.out_proj",
+        "model.language_model.layers.3.self_attn.q_proj"]
+    descriptor = ModelDescriptor(producer_job_id="i", producer_attempt_id="i", producer_manifest_sha256="b" * 64,
+                                 storage_kind="full_model", semantic_kind="causal_lm", has_value_head=False,
+                                 root=root, effective_base=root, config_sha256=root.config_sha256,
+                                 tokenizer_fingerprint=root.tokenizer_fingerprint, tensors=composite_tensors())
+    ref = ModelArtifactRef(artifact_id=digest(canonical(descriptor.model_dump(mode="json"))), inventory_sha256="0" * 64)
+    moved = ModelTargetEvidence(base=ref, modules=evidence.modules)
+    assert verify_inspected_targets(moved, descriptor, ref).modules == evidence.modules
+    for extra in ({"model.language_model.layers.1.mlp.experts.gate_up_proj": (4, 64, 32)},
+                  {"model.language_model.layers.1.self_attn.k_proj.weight": (4, 32, 2)}):
+        with pytest.raises(ht._Refused):
+            ht.target_evidence(root, composite_tensors(extra))
+
+
+# Gemma 4 E2B/E4B: KV-shared layers keep raw k/v projections and norms in the checkpoint, never loaded by transformers.
+GEMMA4_CONFIG = {"model_type": "gemma4", "torch_dtype": "bfloat16",
+                 "text_config": {"model_type": "gemma4_text", "num_hidden_layers": 2, "num_kv_shared_layers": 1,
+                                 "hidden_size": HIDDEN, "max_position_embeddings": 32768},
+                 "vision_config": {"model_type": "gemma4_vision", "hidden_size": HIDDEN}}
+
+
+def gemma4_layer(index):
+    prefix = f"model.language_model.layers.{index}."
+    return {**{f"{prefix}{name}.weight": shape for name, shape in LINEAR.items()},
+            f"{prefix}self_attn.k_norm.weight": (4,), f"{prefix}input_layernorm.weight": (HIDDEN,)}
+
+
+GEMMA4_FIRST = {"model.language_model.embed_tokens.weight": (VOCAB, HIDDEN), **gemma4_layer(0),
+                "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight": (HIDDEN, HIDDEN),
+                "model.vision_tower.patch_embedder.position_embedding_table": (2, 16, HIDDEN),
+                "model.embed_vision.embedding_projection.weight": (HIDDEN, HIDDEN)}
+GEMMA4_SECOND = {**gemma4_layer(1), "model.language_model.norm.weight": (HIDDEN,)}
+SHARED = ("model.language_model.layers.1.self_attn.k_proj", "model.language_model.layers.1.self_attn.v_proj")
+
+
+def test_gemma4_header_evidence_skips_the_kv_shared_tensors_transformers_never_loads(tmp_path, monkeypatch):
+    ht = targets()
+    from tuning_factory import model_ops
+    from tuning_factory.model_artifacts import HFRootRef, TensorMetadata
+    state = tmp_path / "state"
+    root = wpt.snapshot_root(state, monkeypatch, files={"config.json": canonical(GEMMA4_CONFIG), **wpt.TOKENIZER})
+    FakeShards(checkpoint(GEMMA4_FIRST, GEMMA4_SECOND)).install(monkeypatch)
+    result = inspect(state)
+    assert result["status"] == "ok", result
+    evidence = evidence_of(state, root)
+    expected = {f"model.language_model.layers.{index}.{name}" for index in (0, 1) for name in LINEAR} - set(SHARED)
+    assert {module.name for module in evidence.modules} == expected and len(expected) == 12
+    # An adapter LLaMA-Factory trains with q_proj,v_proj adapts layer 1's q_proj only: continuation accepts it.
+    model_ops.check_continuation_targets("q_proj,v_proj", sorted(
+        name for name in expected if name.endswith(("q_proj", "v_proj"))), evidence)
+    # The rule needs the root config: without it the raw checkpoint names phantom modules.
+    tensors = tuple(TensorMetadata(file="model.safetensors", name=name, shape=shape, dtype="BF16")
+                    for name, shape in {**GEMMA4_FIRST, **GEMMA4_SECOND}.items())
+    plain = ht.target_evidence(HFRootRef.model_validate(root), tensors)
+    assert {module.name for module in plain.modules} == expected | set(SHARED)
+    assert ht.target_evidence(HFRootRef.model_validate(root), tensors, GEMMA4_CONFIG) == evidence
+
+
+@pytest.mark.parametrize("case", ["tampered_snapshot", "invalid_sharing"])
+def test_gemma4_roots_without_a_usable_snapshot_config_are_refused_before_any_request(tmp_path, monkeypatch, case):
+    ht = targets()
+    state = tmp_path / "state"
+    config = {**GEMMA4_CONFIG, "text_config": {**GEMMA4_CONFIG["text_config"], "num_kv_shared_layers": "1"}} if (
+        case == "invalid_sharing") else GEMMA4_CONFIG
+    root = wpt.snapshot_root(state, monkeypatch, files={"config.json": canonical(config), **wpt.TOKENIZER})
+    if case == "tampered_snapshot":
+        owner, name = root["repo_id"].split("/")
+        snapshot = wpt.planning().root_snapshots_dir(state) / owner / name / root["revision"] / "config.json"
+        snapshot.write_bytes(canonical({**GEMMA4_CONFIG, "text_config": {**GEMMA4_CONFIG["text_config"],
+                                                                         "num_kv_shared_layers": 0}}))
+    server = FakeShards(checkpoint(GEMMA4_FIRST, GEMMA4_SECOND)).install(monkeypatch)
+    issue = desk.only_issue(inspect(state), "invalid", "model_root_invalid", "/repo_id")
+    assert issue["message"] == ht.MODEL_ROOT_INVALID
+    assert server.requests == [] and stored(state) == []

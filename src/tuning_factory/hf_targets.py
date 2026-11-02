@@ -17,7 +17,10 @@ The evidence follows exactly the full-model artifact rule of ``target_inspection
 are not plain 2D weights are refused, never guessed: only reviewed dense text architectures are inspected, every
 tensor must sit under the causal LM's own names (``model.`` or ``lm_head.``, the ``base_model_prefix`` of all of
 them), and any tensor of three or more dimensions, any expert tensor, any quantized storage, a zero dimension or no
-target weight at all refuses the root. The evidence is
+target weight at all refuses the root. Composite models (``qwen3_5``, ``gemma4``) contribute only their language
+model (``model.language_model.``, ``lm_head.``): vision and audio towers, projectors and ``mtp.*`` are ignored, and
+the hybrid linear attention's 3D ``conv1d`` kernel (never a target) is allowed; the tensors of Gemma 4's KV-shared
+layers, which transformers never loads, are skipped by the root's hash-bound config.json. The evidence is
 stored immutably beside the root index (``workflow_planning.save_root_targets``); ``graph_plan`` passes it as
 ``ExecutionChoices.base_targets``, which lifts D15 for that root.
 
@@ -43,9 +46,15 @@ from .desktop_workflows import (
     workflow_action,
 )
 from .graph_planner import ModelTargetEvidence, TargetModuleEvidence
-from .model_artifacts import HFRootRef, TensorMetadata, _json, _relative, header_tensors
+from .model_artifacts import HFRootRef, TensorMetadata, _json, _open_regular, _relative, header_tensors
 from .registry import canonical, digest
-from .target_inspection import _not_a_target
+from .target_inspection import (
+    COMPOSITE_MODEL_TYPES,
+    LANGUAGE_MODEL_PREFIX,
+    _not_a_target,
+    is_composite_inventory,
+    unloaded_modules,
+)
 from .workflow_planning import (
     HF_CONNECTION,
     HF_ORIGIN,
@@ -58,6 +67,7 @@ from .workflow_planning import (
     https_only,
     load_root_targets,
     model_roots,
+    root_snapshots_dir,
     save_root_targets,
 )
 
@@ -65,6 +75,7 @@ INDEX_FILE = "model.safetensors.index.json"
 SINGLE_FILE = "model.safetensors"
 MAX_HEADER_BYTES = 16 * 1024 * 1024
 MAX_INDEX_BYTES = 16 * 1024 * 1024
+MAX_CONFIG_BYTES = 1024 * 1024
 MAX_TARGET_TOTAL_BYTES = 64 * 1024 * 1024      # every body byte read; redirect bodies are never read
 MAX_SHARDS = 256
 MAX_REDIRECTS = 5
@@ -72,7 +83,11 @@ MAX_REDIRECTS = 5
 # own module name (phi3's fused qkv_proj and gate_up_proj are such layers). Mixture-of-experts, hybrid
 # linear-attention, multimodal and MLA architectures are refused: the pinned runtime fuses or renames their
 # checkpoint tensors at load, so their headers do not give the module inventory.
-HEADER_TARGET_ARCHITECTURES = frozenset({"qwen2", "qwen3", "llama", "mistral", "gemma2", "gemma3_text", "phi3"})
+# Composite models: only their language model (vision, audio, projectors and mtp.* are frozen or unloaded); hybrid
+# linear attention keeps its 3-D conv1d kernel, which is never a target. Their MoE variants stay refused (fused 3-D
+# experts).
+HEADER_TARGET_ARCHITECTURES = frozenset({"qwen2", "qwen3", "llama", "mistral", "gemma2", "gemma3_text", "phi3",
+                                         "qwen3_5", "gemma4"})
 FLOAT_DTYPES = frozenset({"F16", "BF16", "F32", "F64"})
 QUANTIZED_SUFFIXES = (".qweight", ".weight_packed")       # packed storage beside or instead of ``.weight``
 # The names a causal LM's checkpoint uses at runtime: transformers 5.6 adds ``model.`` to a bare ``XModel`` save
@@ -260,13 +275,21 @@ def _headers(client: httpx.Client, request: RootTargets) -> tuple[tuple[str, ...
 
 # -- evidence ------------------------------------------------------------------------------------
 
-def target_evidence(root: HFRootRef, tensors) -> ModelTargetEvidence:
+def target_evidence(root: HFRootRef, tensors, config=None) -> ModelTargetEvidence:
     """The rule ``verify_inspected_targets`` applies to full-model inventories, or a fixed refusal when the linear
-    modules are not plain 2D floating-point weights."""
+    modules are not plain 2D floating-point weights. ``config`` (the root's config.json) names the checkpoint
+    tensors transformers never builds and loads (``unloaded_modules``: Gemma 4's KV-shared layers)."""
     unsupported = _Refused("architecture_unsupported", ARCHITECTURE_UNSUPPORTED)
     modules = []
+    composite = is_composite_inventory(tensor.name for tensor in tensors)
+    unloaded = unloaded_modules(config) if config is not None else frozenset()
     for tensor in tensors:
-        if (not tensor.name.startswith(CAUSAL_LM_PREFIXES) or len(tensor.shape) >= 3
+        if composite and not tensor.name.startswith((LANGUAGE_MODEL_PREFIX, "lm_head.")):
+            continue
+        if tensor.name.rsplit(".", 1)[0] in unloaded:
+            continue
+        kernel = composite and len(tensor.shape) == 3 and tensor.name.endswith(".linear_attn.conv1d.weight")
+        if (not tensor.name.startswith(CAUSAL_LM_PREFIXES) or (len(tensor.shape) >= 3 and not kernel)
                 or "experts" in tensor.name.split(".") or tensor.name.endswith(QUANTIZED_SUFFIXES)):
             raise unsupported
         if tensor.name.endswith(".weight") and len(tensor.shape) == 2 and not _not_a_target(tensor.name):
@@ -299,6 +322,25 @@ def _indexed_root(context: WorkflowContext, request: RootTargets):
     return found[0]
 
 
+def _root_config(context: WorkflowContext, root: HFRootRef) -> dict:
+    """The snapshotted config.json of an indexed root, bound by its hash and checked for ``unloaded_modules``."""
+    refused = _Refused("model_root_invalid", MODEL_ROOT_INVALID)
+    owner, name = root.repo_id.split("/")
+    path = root_snapshots_dir(context.state_dir) / owner / name / root.revision / "config.json"
+    try:
+        with _open_regular(path) as stream:
+            raw = stream.read(MAX_CONFIG_BYTES + 1)
+        if len(raw) > MAX_CONFIG_BYTES or digest(raw) != root.config_sha256:
+            raise refused
+        config = _json(raw)
+        unloaded_modules(config)
+    except (OSError, ValueError):
+        raise refused from None
+    if not isinstance(config, dict):
+        raise refused
+    return config
+
+
 def _stored(context: WorkflowContext, root: HFRootRef) -> ModelTargetEvidence | None:
     try:
         return load_root_targets(context.state_dir, root)
@@ -317,13 +359,14 @@ def model_root_targets(context: WorkflowContext, request: RootTargets) -> Workfl
         entry = _indexed_root(context, request)
         if entry.profile.architecture not in HEADER_TARGET_ARCHITECTURES:
             raise _Refused("architecture_unsupported", ARCHITECTURE_UNSUPPORTED)
+        config = _root_config(context, entry.root) if entry.profile.architecture in COMPOSITE_MODEL_TYPES else None
         existing = _stored(context, entry.root)
     except _Refused as exc:
         return invalid(issue(exc.code, str(exc), "/repo_id"))
     client = _client(context.secrets.get("HF_TOKEN") or None)
     try:
         shards, tensors = _headers(client, request)
-        evidence = target_evidence(entry.root, tensors)
+        evidence = target_evidence(entry.root, tensors, config)
     except _Refused as exc:
         return invalid(issue(exc.code, str(exc), "/repo_id"))
     except httpx.HTTPError:

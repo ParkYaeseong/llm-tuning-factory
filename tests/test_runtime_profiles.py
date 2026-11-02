@@ -16,7 +16,8 @@ def test_ppo_preflight_uses_exact_legacy_lock(monkeypatch):
     from tuning_factory.registry import digest
 
     expected = {'source': source_hash(), 'engine': '0.9.3', 'cuda': True,
-                'lock': digest((assets_root() / 'containers/gpu-ppo-requirements.lock').read_bytes())}
+                'lock': digest((assets_root() / 'containers/gpu-ppo-requirements.lock').read_bytes()),
+                'arch_ok': True, 'kernel_ok': True, 'bf16': True, 'capability': '9.0'}
     calls = []
     def run(client, argv, **kw):
         calls.append(argv)
@@ -92,3 +93,40 @@ def test_model_ops_pin_drift_is_reported_without_importing_the_runtime(monkeypat
     installed['peft'] = '0.18.0'
     del installed['safetensors']
     assert model_ops_pin_drift() == ('peft', 'safetensors')
+
+
+def test_gpu_locks_pin_the_cu128_pytorch_family():
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for name in ("gpu-requirements.lock", "gpu-ppo-requirements.lock"):
+        text = (root / "containers" / name).read_text(encoding="utf-8")
+        for package, version in (("torch", "2.7.1+cu128"), ("torchaudio", "2.7.1+cu128"),
+                                 ("torchvision", "0.22.1+cu128")):
+            assert re.search(rf"^{package}=={re.escape(version)} \\$", text, re.M), (name, package)
+        assert "\nnvidia-cuda-runtime-cu12==12.8." in text, name
+
+
+def test_runtime_capabilities_match_the_cu128_locks_and_leave_engine_profiles_unchanged():
+    import re
+    from pathlib import Path
+
+    import pytest
+
+    from tuning_factory.runtime_profiles import engine_profile, runtime_capabilities
+
+    root = Path(__file__).resolve().parents[1]
+    for stage, profile in (("sft", "primary"), ("ppo", "ppo")):
+        caps = runtime_capabilities(profile)
+        lock = (root / engine_profile(stage)["lock_file"]).read_text(encoding="utf-8")
+        assert re.search(r"^torch==2\.7\.1\+" + caps["torch_backend"] + r" \\$", lock, re.M)
+        assert caps["torch_cuda"] == "12.8" and caps["bf16_min_capability"] == "8.0"
+        assert caps["min_driver"] == "525.60.13" and caps["recommended_driver"] == "570.26"
+        assert set(engine_profile(stage)) == {"profile", "engine_version", "lock_file"}
+    caps = runtime_capabilities("primary")
+    assert caps["sass"] == ["7.5", "8.0", "8.6", "9.0", "10.0", "12.0"] and caps["ptx"] == ["12.0"]
+    caps["sass"].append("1.0")
+    assert "1.0" not in runtime_capabilities("primary")["sass"]   # callers receive copies
+    with pytest.raises(ValueError, match="unsupported runtime profile"):
+        runtime_capabilities("cuda")

@@ -51,7 +51,7 @@ test('HF model search imports an immutable modern profile and disables unsupport
     const original = native.invoke;
     let registered: any = null;
     const profile = { repo_id: 'Qwen/Qwen3.5-0.8B', revision: 'c'.repeat(40), config_sha256: 'd'.repeat(64),
-      architecture: 'qwen3_5', template: 'qwen3_5_nothink', max_length: 32768, context_length: 262144,
+      architecture: 'qwen3_5', template: 'qwen3_5', max_length: 32768, context_length: 262144,
       hidden_layers: 24, recommended_precision: 'bfloat16', gated: false };
     native.invoke = async (command: string, args: any) => {
       if (command === 'factory_action') {
@@ -315,6 +315,60 @@ test("PPO runtime preparation explicitly confirms and carries selected stage", a
   expect(request).toEqual({ approved: true, training_stage: "ppo" });
 });
 
+test("RunPod runtime preparation names the cleanup and reports what it freed or skipped", async ({ page }) => {
+  // Freed space is the free-space delta of the volume: removed venvs share hard-linked files with uv-cache.
+  const report = { ready: true, runtime_state: "ready", pod_id: "borrowed",
+    cleanup: { removed: ["b".repeat(16), "c".repeat(16) + "-ppo"], kept_in_use: ["d".repeat(16)], errors: [],
+      free_before: 20 * 1024 ** 3, free_after: 23.5 * 1024 ** 3 } };
+  await overrideActions(page, { runtime_prepare: report });
+  await page.locator('nav [data-action="nav:connections"]').click();
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await expect(page.getByRole("dialog")).toContainText("이전 앱 버전의 학습 환경 중 쓰지 않는 것을 지웁니다");
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 2개를 지워 3.5GB를 확보했습니다.");
+  await expect(page.locator(".notice")).not.toContainText("지우지 못했습니다");
+  // Some removed, one failed and the time budget ran out: what was removed still shows, with short notes.
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: ["b".repeat(16)], kept_in_use: [],
+    errors: ["c".repeat(16)], incomplete: true, free_before: 20 * 1024 ** 3, free_after: 21 * 1024 ** 3 } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 1개를 지워 1.0GB를 확보했습니다.");
+  await expect(page.locator(".notice")).toContainText("일부 이전 학습 환경은 지우지 못했습니다(학습 환경 준비에는 영향이 없습니다).");
+  await expect(page.locator(".notice")).toContainText("남은 이전 학습 환경은 다음 학습 환경 준비 때 정리합니다.");
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: ["b".repeat(16)], kept_in_use: [],
+    cleanup_error: "ValueError: unreadable manifest", free_before: 20 * 1024 ** 3, free_after: 19 * 1024 ** 3 } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  // Less than 0.1 GB freed (here the volume even lost space): the count alone, without a GB figure.
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 1개를 지웠습니다.");
+  await expect(page.locator(".notice")).not.toContainText("GB를 확보");
+  await expect(page.locator(".notice")).toContainText("일부 이전 학습 환경은 지우지 못했습니다");
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: ["b".repeat(16)], kept_in_use: [],
+    errors: [], free_before: 20 * 1024 ** 3, free_after: 20.05 * 1024 ** 3 } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).not.toContainText("지우지 못했습니다");   // this preparation's notice
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 1개를 지웠습니다.");
+  await expect(page.locator(".notice")).not.toContainText("GB를 확보");
+  // Nothing removed because every removal failed: not a skipped cleanup.
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: [], kept_in_use: [],
+    errors: ["b".repeat(16)], free_before: 20 * 1024 ** 3, free_after: 20 * 1024 ** 3 } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("이전 학습 환경을 지우지 못했습니다(학습 환경 준비에는 영향이 없습니다).");
+  await expect(page.locator(".notice")).not.toContainText("건너뛰었습니다");
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: [], kept_in_use: [], cleanup_error: "cleanup report missing" } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("이전 학습 환경 정리는 건너뛰었습니다(학습 환경 준비에는 영향이 없습니다).");
+  await expect(page.locator(".notice")).not.toContainText("지우지 못했습니다");
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: [], kept_in_use: [] } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("학습 환경과 CUDA를 확인했습니다.");
+  await expect(page.locator(".notice")).not.toContainText("이전");
+});
+
 test("changed S3 object clears its inspected version and access errors prevent import", async ({ page }) => {
   await page.evaluate(() => {
     const original = (window as any).__TAURI_INTERNALS__.invoke;
@@ -383,4 +437,205 @@ test("model revision metadata stays outside strict training config and clears on
   await expect(page.getByLabel("최대 토큰 길이", { exact: true })).toHaveValue("1024");
   await page.getByLabel("기반 모델", { exact: true }).selectOption("example/ServerCatalogModel");
   await expect(page.getByText("고정 버전 메타데이터 · 확인됨", { exact: true })).toHaveCount(0);
+});
+
+async function overrideActions(page: import("@playwright/test").Page, answers: Record<string, unknown>) {
+  await page.evaluate(answers => {
+    const bridge = (window as any).__TAURI_INTERNALS__;
+    const original = bridge.invoke;
+    (window as any).__overridden = [];
+    bridge.invoke = async (command: string, args: any) => {
+      if (command === "factory_action" && args.action in answers) {
+        (window as any).__overridden.push(args);
+        const answer = answers[args.action];
+        if (answer && (answer as any).__reject) throw new Error((answer as any).__reject);
+        if (answer && (answer as any).__hold) await new Promise<void>(resolve => { ((window as any).__releases ||= []).push(resolve); });
+        return args.action === "plan" ? { ...(await original(command, args)), ...(answer as object) } : answer;
+      }
+      return original(command, args);
+    };
+  }, answers);
+}
+
+test("plan lists escaped GPU compatibility findings from the stored observation", async ({ page }) => {
+  await overrideActions(page, { plan: { compatibility: { observed_at: 1793249000, findings: [
+    { level: "block", code: "GPU_TYPE_MISMATCH", message: "학습 설정의 GPU 종류(<b>A4000</b>)가 다릅니다." },
+    { level: "warn", code: "MODEL_UNVERIFIED", message: "이 모델은 아직 GPU에서 검증되지 않았습니다." }] } } });
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  const section = page.getByTestId("plan-compatibility");
+  await expect(section).toContainText("실행 시 거부될 항목");
+  await expect(section).toContainText("학습 설정의 GPU 종류(<b>A4000</b>)가 다릅니다.");
+  await expect(section).toContainText("주의 항목");
+  await expect(section.locator("b")).toHaveCount(0);
+});
+
+test("blocking preflight findings stop the run before approval or submit", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { ready: true, runtime_state: "ready", findings: [
+    { level: "block", code: "GPU_ARCH_UNSUPPORTED", message: "이 GPU는 지원하지 않는 세대입니다." }] } });
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).click();
+  await expect(page.getByRole("alert")).toContainText("이 GPU는 지원하지 않는 세대입니다.");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__testCalls.some((c: any) => c.args?.action === "submit"))).toBe(false);
+});
+
+test("a missing RunPod runtime is folded into the single run approval", async ({ page }) => {
+  await overrideActions(page, {
+    runtime_check: { ready: false, runtime_state: "missing", findings: [
+      { level: "warn", code: "MEMORY_TIGHT", message: "예상 메모리가 GPU 메모리에 빠듯합니다." }] },
+    execute: { __hold: true } });
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog).toContainText("학습 환경이 없어 학습 전에 먼저 설치합니다");
+  await expect(dialog).toContainText("이전 앱 버전의 학습 환경 중 쓰지 않는 것을 지웁니다");
+  await expect(dialog).toContainText("예상 메모리가 GPU 메모리에 빠듯합니다.");
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.getByText("Pod에 학습 환경을 준비한 뒤 학습을 시작합니다. 최대 30분 걸릴 수 있으며, 쓰지 않는 이전 앱 버전 학습 환경을 정리합니다.", { exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (window as any).__overridden
+    .find((args: any) => args.action === "execute")?.data?.prepare_runtime)).toBe(true);
+  const check = await page.evaluate(() => (window as any).__overridden.find((args: any) => args.action === "runtime_check"));
+  expect(check.data.config.base_model).toBeTruthy();
+});
+
+const startRun = async (page: import("@playwright/test").Page) => {
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).click();
+};
+const calledActions = (page: import("@playwright/test").Page) => page.evaluate(() => [
+  ...(window as any).__testCalls.map((c: any) => c.args?.action), ...(window as any).__overridden.map((a: any) => a.action)]);
+
+test("a preparation in the run approval reports what it pruned with the result", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { ready: false, runtime_state: "missing", findings: [] },
+    execute: { id: "c".repeat(32), status: "COMPLETED", runtime_cleanup: { removed: ["b".repeat(16)], kept_in_use: [],
+      errors: [], free_before: 10 * 1024 ** 3, free_after: 12 * 1024 ** 3 } } });
+  await startRun(page);
+  await expect(page.getByRole("dialog")).toContainText("이전 앱 버전의 학습 환경 중 쓰지 않는 것을 지웁니다");
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("학습 처리가 끝났습니다.");
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 1개를 지워 2.0GB를 확보했습니다.");
+});
+
+test("a ready environment is approved without preparing the runtime", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { ready: true, runtime_state: "ready", findings: [] }, execute: null });
+  await startRun(page);
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__overridden
+    .find((args: any) => args.action === "execute")?.data?.prepare_runtime)).toBe(false);
+});
+
+test("an unavailable GPU stops the run before approval or submit", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { ready: false, runtime_state: "unavailable", findings: [] } });
+  await startRun(page);
+  await expect(page.getByRole("alert")).toContainText("GPU를 사용할 수 없거나 사용 중입니다");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("submit");
+});
+
+test("an unknown runtime state stops the run before approval or submit", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { ready: false, runtime_state: "strange", findings: [] } });
+  await startRun(page);
+  await expect(page.getByRole("alert")).toContainText("학습 환경 상태를 확인하지 못했습니다");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("submit");
+});
+
+test("a failing runtime check stops the run before approval or submit", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { __reject: "연결 실패 테스트" } });
+  await startRun(page);
+  await expect(page.getByRole("alert")).toContainText("연결 실패 테스트");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("submit");
+});
+
+test("a GPU server with a missing runtime is told to prepare it from the connection settings", async ({ page }) => {
+  await page.addInitScript(() => {
+    const bridge = (window as any).__TAURI_INTERNALS__, original = bridge.invoke;
+    bridge.invoke = async (command: string, args: any) => command === "settings_get" ? {
+      provider: "ssh_server", server_ssh_host: "gpu.example.org", server_ssh_port: "2222", server_ssh_username: "researcher",
+      server_ssh_fingerprint: "SHA256:" + "A".repeat(43), server_remote_root: "/home/researcher/factory",
+      server_selected_gpu_uuids: JSON.stringify(["GPU-11111111-2222-3333-4444-555555555555"]) } : original(command, args);
+  });
+  await page.goto("/");
+  await overrideActions(page, { plan: { destination_sha256: "a".repeat(64) },
+    runtime_check: { ready: false, runtime_state: "missing", findings: [] }, execute: null });
+  await startRun(page);
+  await expect(page.getByRole("alert")).toContainText("연결 설정에서 GPU 목록을 조회한 뒤");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("execute");
+  expect(await calledActions(page)).not.toContain("submit");
+});
+
+test("a double click on start runs one preflight and opens one approval", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { __hold: true, ready: true, runtime_state: "ready", findings: [] }, execute: null });
+  await page.locator('nav [data-action="nav:training"]').click();
+  await page.getByRole("button", { name: "실행 계획 확인", exact: true }).click();
+  await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).evaluate(button => { (button as HTMLButtonElement).click(); (button as HTMLButtonElement).click(); });
+  await expect.poll(() => page.evaluate(() => (window as any).__releases?.length ?? 0)).toBeGreaterThan(0);
+  await page.evaluate(() => (window as any).__releases.forEach((release: () => void) => release()));
+  await expect(page.getByRole("dialog")).toHaveCount(1);
+  expect((await calledActions(page)).filter(action => action === "runtime_check")).toHaveLength(1);
+});
+
+test("a plan changed during the preflight is not submitted", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { __hold: true, ready: true, runtime_state: "ready", findings: [] } });
+  await startRun(page);
+  await expect.poll(() => page.evaluate(() => (window as any).__releases?.length ?? 0)).toBe(1);
+  await page.getByLabel("학습 횟수 (epoch)", { exact: true }).fill("3");
+  await page.getByLabel("학습 횟수 (epoch)", { exact: true }).blur();
+  await page.evaluate(() => (window as any).__releases.forEach((release: () => void) => release()));
+  await expect(page.getByRole("alert")).toContainText("변경된 설정으로 실행 계획을 다시 확인하세요.");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("submit");
+});
+
+test("a Pod changed during the preflight is not submitted", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { __hold: true, ready: true, runtime_state: "ready", findings: [] } });
+  await startRun(page);
+  await expect.poll(() => page.evaluate(() => (window as any).__releases?.length ?? 0)).toBe(1);
+  await page.locator('nav [data-action="nav:connections"]').click();
+  await page.getByLabel("Pod ID", { exact: true }).fill("another-pod");
+  await page.getByRole("button", { name: "연결 정보 저장", exact: true }).click();
+  await page.evaluate(() => (window as any).__releases.forEach((release: () => void) => release()));
+  await expect(page.getByRole("alert")).toContainText("연결된 Pod가 바뀌었습니다. 실행 전 확인을 다시 진행하세요.");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("submit");
+});
+
+test("a queued job runs only if it is still the selected job after the preflight", async ({ page }) => {
+  const queued = (id: string) => ({ id: id.repeat(32), status: "QUEUED", attempts: 0, manifest: { config, simulation: false } });
+  await overrideActions(page, { jobs: [queued("a"), queued("b")], execute: null,
+    runtime_check: { __hold: true, ready: true, runtime_state: "ready", findings: [] } });
+  await page.locator('nav [data-action="nav:jobs"]').click();
+  await page.getByRole("button", { name: "새로고침", exact: true }).click();
+  await page.getByRole("button", { name: "선택", exact: true }).first().click();
+  await page.getByRole("button", { name: "대기 작업 실행", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__releases?.length ?? 0)).toBe(1);
+  await page.getByRole("button", { name: "선택", exact: true }).nth(1).click();
+  await page.evaluate(() => (window as any).__releases.forEach((release: () => void) => release()));
+  await expect(page.getByRole("alert")).toContainText("선택한 작업이 바뀌었습니다");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("execute");
+});
+
+test("a queued job whose destination stops matching during the preflight is not executed", async ({ page }) => {
+  const queued = (route: unknown) => ({ id: "a".repeat(32), status: "QUEUED", attempts: 0, manifest: { config, simulation: false }, server_destination: route });
+  await overrideActions(page, { jobs: [queued(null)], execute: null,
+    runtime_check: { __hold: true, ready: true, runtime_state: "ready", findings: [] } });
+  await page.locator('nav [data-action="nav:jobs"]').click();
+  await page.getByRole("button", { name: "새로고침", exact: true }).click();
+  await page.getByRole("button", { name: "선택", exact: true }).first().click();
+  await page.getByRole("button", { name: "대기 작업 실행", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).__releases?.length ?? 0)).toBe(1);
+  // The job now carries a GPU server route that the saved RunPod connection does not match.
+  await overrideActions(page, { jobs: [queued({ ssh_host: "gpu.example.org", ssh_port: 22, ssh_username: "researcher", remote_root: "/srv/factory", selected_gpu_uuids: ["GPU-1"] })] });
+  await page.getByRole("button", { name: "새로고침", exact: true }).click();
+  await page.evaluate(() => (window as any).__releases.forEach((release: () => void) => release()));
+  await expect(page.getByRole("alert")).toContainText("GPU 서버용으로 승인되었습니다");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  expect(await calledActions(page)).not.toContain("execute");
 });

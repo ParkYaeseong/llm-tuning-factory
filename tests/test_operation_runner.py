@@ -320,7 +320,8 @@ def gpu_host(tmp_path, monkeypatch, calls, *, server=None, **engine):
     destination = dict(server_profile=server[0], server_facts=server[1]) if server else dict(pod=dict(POD))
     executor = SSHExecutor("test-host", 22, "root", "unused", client=host, remote_root=base + "/jobs",
                            remote_python=base + "/runtime/venv/bin/python", worker_lock_file=lock,
-                           hf_home=base + "/hf-cache", model_cache_root=base + "/model-cache", **destination)
+                           hf_home=base + "/hf-cache", model_cache_root=base + "/model-cache",
+                           runtime_lock_file=base + "/runtime/in-use.lock", **destination)
     pinned_runtime(monkeypatch)
     monkeypatch.setattr(worker, "LlamaFactoryBackend", engine_fixture(calls, **engine))
     monkeypatch.setattr(worker, "runtime_preflight_bound",
@@ -764,6 +765,45 @@ def test_engine_tokenizer_check_compares_real_vocabulary_facts(tmp_path):
     assert original["tokenizer_config.json"] == [("0", "<unk>", True)]
 
 
+def test_vocabulary_size_is_read_from_text_config_for_composite_configs():
+    from tuning_factory.operation_outputs import _vocab_size
+    assert _vocab_size({"text_config": {"vocab_size": 248320}}) == 248320
+    assert _vocab_size({"vocab_size": 151936}) == 151936
+    assert _vocab_size({"text_config": {"vocab_size": 1}, "vocab_size": 2}) == 1
+    assert _vocab_size({"text_config": {}}) is None
+
+
+COMPOSITE_CONFIG = {"model_type": "qwen3_5", "text_config": {"model_type": "qwen3_5_text", "hidden_size": 2,
+                                                             "vocab_size": 248320}}
+
+
+@pytest.mark.parametrize("vocabulary,status", [(248320, "COMPLETED"), (248321, "FAILED")])
+def test_full_training_of_a_composite_compares_its_text_config_vocabulary(tmp_path, monkeypatch, vocabulary, status):
+    """Composite configs keep vocab_size only in text_config: a changed text vocabulary is refused, an equal one
+    (beside a top level without vocab_size) is accepted."""
+    full_model, peft_adapter, engine_output = inputs.full_model, inputs.peft_adapter, write_engine_output
+
+    def composite_output(output, tokenizer, method="lora"):
+        engine_output(output, tokenizer, method)
+        text = {**COMPOSITE_CONFIG["text_config"], "vocab_size": vocabulary}
+        (output / "config.json").write_bytes(canonical({**COMPOSITE_CONFIG, "text_config": text,
+                                                        "torch_dtype": "bfloat16"}))
+
+    # The plan's base artifact (and the adapters frozen on it) carries the composite config.
+    monkeypatch.setattr(inputs, "full_model", lambda *a, **kw: full_model(*a, config=canonical(COMPOSITE_CONFIG), **kw))
+    monkeypatch.setattr(inputs, "peft_adapter",
+                        lambda *a, **kw: peft_adapter(*a, config=canonical(COMPOSITE_CONFIG), **kw))
+    monkeypatch.setitem(globals(), "write_engine_output", composite_output)
+    w = world(tmp_path, monkeypatch, ("full_train",), method="full")
+    outcome = run(w)
+    assert outcome.status == status, outcome.error
+    if status == "FAILED":
+        assert outcome.error.endswith(outputs_api().VOCABULARY_CHANGED) and outcome.outputs is None
+    else:
+        files = w.store.artifacts.path(outcome.outputs.model.model)
+        assert json.loads((files / "config.json").read_bytes())["text_config"]["vocab_size"] == 248320
+
+
 def test_remote_failure_is_final_and_releases_the_lock(tmp_path, monkeypatch):
     w = world(tmp_path, monkeypatch, fail="engine exited with status 1")
     before = artifact_entries(w.store)
@@ -813,6 +853,7 @@ def test_merge_output_descriptor_rank_and_parents(tmp_path, monkeypatch):
     assert (descriptor.adapter.rank, descriptor.adapter.alpha, descriptor.adapter.method) == (5, 5, "lora")
     receipt = json.loads((launch_dir(w) / "operation-receipt.json").read_bytes())
     assert ref.inventory_sha256 == receipt["output_inventory_sha256"]   # frozen bytes are the receipted output
+    assert receipt["receipt"]["policy_id"] == "model-ops-f32-v2"
     assert w.calls == ["merge"] and outcome.inspected_targets == ()
     w.store.record_outputs(w.lease, outcome.outputs)
 
@@ -1127,6 +1168,38 @@ def test_model_op_output_differing_from_its_receipt_leaves_no_artifact(tmp_path,
     assert (outcome.status, outcome.uncertain, outcome.outputs) == ("FAILED", False, None)
     assert "output inventory differs from operation-receipt.json" in outcome.error
     assert artifact_entries(w.store) == before and not held_locks(w)
+
+
+@pytest.mark.parametrize("kinds", [("merge",), ("full",)])
+def test_model_op_receipt_under_an_undefined_policy_leaves_no_artifact(tmp_path, monkeypatch, kinds):
+    """Collection accepts the two defined policies (v1 receipts of an operation launched by an older build)."""
+    w = world(tmp_path, monkeypatch, kinds)
+    before = artifact_entries(w.store)
+
+    def forge_policy(directory):
+        receipt = json.loads((directory / "operation-receipt.json").read_bytes())
+        assert receipt["receipt"]["policy_id"] == "model-ops-f32-v2"
+        receipt["receipt"]["policy_id"] = "model-ops-f32-v0"
+        forge_evidence(directory, "operation-receipt.json", canonical(receipt))
+
+    w.host.after_worker = forge_policy
+    outcome = run(w)
+    assert (outcome.status, outcome.uncertain, outcome.outputs) == ("FAILED", False, None)
+    assert artifact_entries(w.store) == before and not held_locks(w)
+
+
+@pytest.mark.parametrize("kinds", [("merge",), ("full",)])
+def test_model_op_receipt_under_the_v1_policy_is_collected(tmp_path, monkeypatch, kinds):
+    w = world(tmp_path, monkeypatch, kinds)
+
+    def older_build(directory):
+        receipt = json.loads((directory / "operation-receipt.json").read_bytes())
+        receipt["receipt"]["policy_id"] = "model-ops-f32-v1"
+        forge_evidence(directory, "operation-receipt.json", canonical(receipt))
+
+    w.host.after_worker = older_build
+    outcome = run(w)
+    assert (outcome.status, outcome.uncertain) == ("COMPLETED", False) and outcome.outputs
 
 
 @pytest.mark.parametrize("kinds,engine", [(("full_train",), {"method": "full"}), (("full",), {})])
@@ -1559,3 +1632,16 @@ def test_a_long_or_odd_path_that_open_could_reach_stays_content(monkeypatch, err
     monkeypatch.setattr(execution, "_stat", stat or (lambda path: None))
     assert api().local_transient(error) is False
     assert execution.transient_error(error) is False
+
+
+def test_base_snapshot_carries_processor_files_beside_config_and_tokenizer(tmp_path):
+    from tuning_factory.operation_dispatch import BASE_SNAPSHOT
+    base, directory = tmp_path / "base", tmp_path / "launch"
+    base.mkdir()
+    directory.mkdir()
+    for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "preprocessor_config.json",
+                 "model.safetensors"):
+        (base / name).write_text("{}")
+    names = operation_dispatch._write_base_snapshot(directory, base)
+    assert sorted(names) == [f"{BASE_SNAPSHOT}/{name}" for name in (
+        "config.json", "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json")]

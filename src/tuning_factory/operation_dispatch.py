@@ -23,9 +23,9 @@ import yaml
 
 from . import model_ops as default_model_ops
 from .capabilities import STAGES
-from .model_artifacts import check_link_free, directory_inventory_sha256, is_tokenizer_file
+from .model_artifacts import check_link_free, directory_inventory_sha256, is_processor_file, is_tokenizer_file
 from .model_ops import (
-    POLICY_F32_V1,
+    CURRENT_POLICY,
     LocalModel,
     MaterializeReceipt,
     MergeReceipt,
@@ -175,11 +175,12 @@ def _write_target_inventory(directory: Path, output: Path, ops) -> None:
 
 
 def _write_base_snapshot(directory: Path, base: Path) -> list[str]:
-    """Copy the bound policy base's config.json and tokenizer files (never weights) to ``base-snapshot/``."""
+    """Copy the bound policy base's config.json, tokenizer and processor files (never weights) to ``base-snapshot/``."""
     names = []
     for path in sorted(base.rglob("*")):
         relative = path.relative_to(base).as_posix()
-        if path.is_file() and (relative == "config.json" or is_tokenizer_file(relative)):
+        if path.is_file() and (relative == "config.json" or is_tokenizer_file(relative)
+                               or is_processor_file(relative)):
             check_link_free(path)   # verified link-free already; tokenizer.json may exceed the small-file limit
             target = directory / BASE_SNAPSHOT / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -288,17 +289,17 @@ def _execute_model_operation(operation, directory: Path, budget: _Budget, resolv
     if isinstance(operation, MergeOperation):
         inputs = tuple(_local_model(verified, "operation_adapter", index) for index in range(len(operation.models)))
         receipt = MergeReceipt.model_validate(_dump(ops.merge_adapters(
-            inputs, operation.weights, output, base=base, policy=POLICY_F32_V1, device=device,
+            inputs, operation.weights, output, base=base, policy=CURRENT_POLICY, device=device,
             require_real=not operation.lineage.simulation)))
         matches = receipt.inputs == operation.models
     else:
         adapter = _local_model(verified, "operation_adapter")
         receipt = MaterializeReceipt.model_validate(_dump(ops.materialize_model(
-            StagedLoad(base=base, adapter=adapter), output, policy=POLICY_F32_V1, device=device)))
+            StagedLoad(base=base, adapter=adapter), output, policy=CURRENT_POLICY, device=device)))
         matches = (receipt.base, receipt.adapter) == (base.identity, operation.model)
     check_link_free(output)
     files = sorted(path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file())
-    if not matches or receipt.policy_id != POLICY_F32_V1 or sorted(receipt.output_files) != files:
+    if not matches or receipt.policy_id != CURRENT_POLICY or sorted(receipt.output_files) != files:
         raise ValueError("model-operation receipt differs from the operation or its output")
     names = [MODEL_BINDING]
     if isinstance(operation, MaterializeOperation):

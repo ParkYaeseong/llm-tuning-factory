@@ -1,5 +1,5 @@
 # Separate CPU-only acceptance runtime for model operations (merge/materialize numerics).
-# Shared library pins equal containers/gpu-requirements.lock. torch is the official CPU build selected by
+# Shared library base versions (without the +cu128 local label) equal containers/gpu-requirements.lock. torch is the official CPU build selected by
 # --torch-backend cpu (https://download.pytorch.org/whl/cpu). No LLaMA-Factory, bitsandbytes or CUDA.
 torch==2.7.1+cpu
 peft==0.18.1

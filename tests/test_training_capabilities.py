@@ -26,7 +26,7 @@ def test_stage_method_translation(stage, method):
     assert plan["finetuning_type"] == ("lora" if method == "qlora" else method)
     assert ("quantization_bit" in plan) == (method == "qlora")
     assert ("lora_rank" in plan) == (method in {"lora", "qlora"})
-    assert plan["save_safetensors"] is True
+    assert "save_safetensors" not in plan
 
 
 def test_capabilities_explain_model_rules_and_engine_runtime_limits():
@@ -265,3 +265,308 @@ def test_reward_preflight_rejects_incompatible_pinned_reward_inventory(tmp_path,
     monkeypatch.setattr(training, "Path", lambda value: reward if value == "/workspace/reward" else Path(value))
     with pytest.raises(ValueError, match=reason):
         training.LlamaFactoryBackend.verify_reward_model(config)
+
+
+def test_catalog_records_sizes_for_memory_estimates_and_adds_llama_70b():
+    from tuning_factory.capabilities import model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    assert all(model["hidden_size"] > 0 and model["num_layers"] > 0 for model in models.values())
+    qwen = models["Qwen/Qwen2.5-0.5B-Instruct"]
+    assert (qwen["hidden_size"], qwen["num_layers"], qwen["gpu_verified"]) == (896, 24, True)
+    for name in ("meta-llama/Llama-3.1-70B-Instruct", "meta-llama/Llama-3.1-70B"):
+        model = models[name]
+        assert (model["template"], model["architecture"], model["gated"]) == ("llama3", "llama", True)
+        assert (model["parameters_b"], model["hidden_size"], model["num_layers"]) == (70, 8192, 80)
+        assert model["gpu_verified"] is False
+
+
+def test_catalog_lists_the_verified_gpu_generations():
+    from tuning_factory.capabilities import model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    assert all("verified_capabilities" in model for model in models.values())
+    qwen = models["Qwen/Qwen2.5-0.5B-Instruct"]
+    # 0.5.0 GPU acceptance (2026-10-30): SFT LoRA on A40, H100 and RTX PRO 4000 Blackwell.
+    assert qwen["verified_capabilities"] == ["8.6", "9.0", "12.0"]
+    assert "0.5.0" in qwen["verification_scope"] and "A40" in qwen["verification_scope"]
+    assert all(model["verified_capabilities"] == [] and model["gpu_verified"] is False for name, model in models.items()
+               if name != "Qwen/Qwen2.5-0.5B-Instruct" and name not in VERIFIED_ON_A40)
+
+
+# 0.6.0 GPU acceptance (A40, compute capability 8.6, synthetic data): the composite models and what ran on each.
+VERIFIED_ON_A40 = {
+    "Qwen/Qwen3.5-0.8B": "0.6.0 SFT LoRA/QLoRA/full/freeze, DPO, PT, RM (engine-level), materialize synthetic A40",
+    "Qwen/Qwen3.5-9B": "0.6.0 SFT LoRA synthetic A40",
+    "google/gemma-4-E2B-it": "0.6.0 SFT LoRA, DPO, PT, RM (engine-level) synthetic A40"}
+
+
+def test_a40_verified_composite_models_are_marked():
+    from tuning_factory.capabilities import VERIFIED_COMPOSITE, model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    assert VERIFIED_COMPOSITE == VERIFIED_ON_A40
+    for name, scope in VERIFIED_ON_A40.items():
+        assert (models[name]["gpu_verified"], models[name]["verified_capabilities"],
+                models[name]["verification_scope"]) == (True, ["8.6"], scope)
+    # Base variants and the other sizes ran nowhere: still unverified.
+    for name in ("Qwen/Qwen3.5-0.8B-Base", "Qwen/Qwen3.5-9B-Base", "google/gemma-4-E2B", "Qwen/Qwen3.5-2B",
+                 "google/gemma-4-E4B-it"):
+        assert (models[name]["gpu_verified"], models[name]["verified_capabilities"]) == (False, [])
+        assert "GPU verification pending" in models[name]["verification_scope"]
+
+
+def test_catalog_lists_qwen35_and_gemma4_with_sizes_and_text_scope():
+    from tuning_factory.capabilities import model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    composite = [m for m in models.values() if m["architecture"] in {"qwen3_5", "qwen3_5_moe", "gemma4"}]
+    assert len(composite) == 19 and "Qwen/Qwen3.5-27B-Base" not in models
+    assert all(not m["gated"] and m["gpu_verified"] is (m["id"] in VERIFIED_ON_A40)
+               and 0 < m["text_parameters"] < m["parameters_total"] and m["max_length"] == 32768
+               and m["supported_stages"] == ["pt", "sft", "rm", "dpo"] and "oft" not in m["methods"]
+               for m in composite)
+    small = models["Qwen/Qwen3.5-0.8B"]
+    assert (small["template"], small["parameters_total"], small["text_parameters"], small["hidden_size"],
+            small["num_layers"], small["tie_word_embeddings"], small["moe"]) == (
+        "qwen3_5", 873_438_784, 752_393_024, 1024, 24, True, False)
+    assert models["Qwen/Qwen3.5-35B-A3B-Base"]["architecture"] == "qwen3_5_moe" and models["Qwen/Qwen3.5-35B-A3B"]["moe"]
+    assert not models["Qwen/Qwen3.5-9B"]["tie_word_embeddings"]
+    assert {models["google/gemma-4-" + n]["template"] for n in ("E2B", "E2B-it", "E4B", "E4B-it")} == {"gemma4n"}
+    assert {models["google/gemma-4-" + n]["template"] for n in ("26B-A4B", "26B-A4B-it", "31B", "31B-it")} == {"gemma4"}
+    assert models["google/gemma-4-26B-A4B-it"]["moe"] and models["google/gemma-4-31B"]["parameters_b"] == 31.27
+
+
+def test_composite_catalog_entries_count_the_embedding_tables_bitsandbytes_leaves_unquantized():
+    from tuning_factory.capabilities import model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    # vocab x hidden for the input embedding, again for an untied lm_head, and vocab x layers x 256 for the per-layer
+    # embedding table of Gemma 4 E2B/E4B (Qwen3.5 vocab 248320, Gemma 4 vocab 262144).
+    assert {name: models[name]["embedding_parameters"] for name in (
+        "Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B-Base", "Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B", "Qwen/Qwen3.5-27B",
+        "Qwen/Qwen3.5-35B-A3B", "google/gemma-4-E2B-it", "google/gemma-4-E4B", "google/gemma-4-26B-A4B-it",
+        "google/gemma-4-31B")} == {
+        "Qwen/Qwen3.5-0.8B": 254_279_680, "Qwen/Qwen3.5-2B-Base": 508_559_360, "Qwen/Qwen3.5-4B": 635_699_200,
+        "Qwen/Qwen3.5-9B": 2_034_237_440, "Qwen/Qwen3.5-27B": 2_542_796_800, "Qwen/Qwen3.5-35B-A3B": 1_017_118_720,
+        "google/gemma-4-E2B-it": 2_751_463_424, "google/gemma-4-E4B": 3_489_660_928,
+        "google/gemma-4-26B-A4B-it": 738_197_504, "google/gemma-4-31B": 1_409_286_144}
+    composite = [m for m in models.values() if m["architecture"] in {"qwen3_5", "qwen3_5_moe", "gemma4"}]
+    assert all(0 < m["embedding_parameters"] < m["text_parameters"] for m in composite)
+    assert all("embedding_parameters" not in m for m in models.values() if m not in composite)
+
+
+def test_composite_catalog_entries_carry_the_vocabulary_size_of_their_logits():
+    from tuning_factory.capabilities import SIZE_FACTS, model_catalog, with_catalog_sizes
+    from tuning_factory.model_hub import ModelProfile, imported_model
+    models = {model["id"]: model for model in model_catalog()}
+    composite = [m for m in models.values() if m["architecture"] in {"qwen3_5", "qwen3_5_moe", "gemma4"}]
+    assert {m["id"]: m["vocab_size"] for m in composite} == {
+        m["id"]: 262_144 if m["architecture"] == "gemma4" else 248_320 for m in composite}
+    assert all("vocab_size" not in m for m in models.values() if m not in composite)   # estimates unchanged
+    assert "vocab_size" in SIZE_FACTS
+    # A hub registration of a catalog repository takes the size; any other repository has none.
+    reviewed = ModelProfile(repo_id="google/gemma-4-E2B-it", revision="a" * 40, config_sha256="c" * 64,
+                            architecture="gemma4", template="gemma4n", hidden_layers=35)
+    assert with_catalog_sizes(imported_model(reviewed))["vocab_size"] == 262_144
+    other = ModelProfile(repo_id="someone/gemma-4-E2B-sft", revision="a" * 40, config_sha256="c" * 64,
+                         architecture="gemma4", template="gemma4n", hidden_layers=35)
+    assert "vocab_size" not in with_catalog_sizes(imported_model(other))
+
+
+def test_moe_catalog_entries_count_the_three_dimensional_expert_weights_bitsandbytes_leaves_at_bf16():
+    from tuning_factory.capabilities import model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    # experts x 3 x hidden x moe_intermediate x layers (HF config.json)
+    qwen, gemma = 256 * 3 * 2048 * 512 * 40, 128 * 3 * 2816 * 704 * 30
+    assert (qwen, gemma) == (32_212_254_720, 22_837_985_280)
+    assert {models[name]["expert_parameters"] for name in ("Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.5-35B-A3B-Base")} == {qwen}
+    assert {models[name]["expert_parameters"] for name in (
+        "google/gemma-4-26B-A4B", "google/gemma-4-26B-A4B-it")} == {gemma}
+    assert all("expert_parameters" not in m for m in models.values() if not m.get("moe"))
+
+
+QWEN35 = {"base_model": "Qwen/Qwen3.5-0.8B", "template": "qwen3_5"}
+
+
+@pytest.mark.parametrize("change,message", [
+    ({"training_stage": "kto"}, "Qwen3.5·Qwen3.6의 KTO 학습은 현재 학습 엔진(LLaMA-Factory 0.9.5·transformers 5.6.0)에서 "
+                                "멀티모달 위치 계산 오류로 실패하므로 지원하지 않습니다. SFT·DPO·RM·PT를 쓰세요."),
+    ({"training_stage": "ppo"}, "PPO 전용 학습 환경"),
+    ({"training_method": "freeze", "finetuning_options": {"freeze_trainable_modules": "self_attn"}},
+     "'학습할 모듈'로 'Attention'·'Attention + MLP'를 고를 수 없습니다. '전체' 또는 'MLP'를 고르세요."),
+    ({"training_method": "freeze", "finetuning_options": {"freeze_trainable_modules": "self_attn,mlp"}},
+     "층에 따라 linear_attn 또는 self_attn을 써서"),
+    ({"training_method": "freeze", "finetuning_options": {"freeze_extra_modules": "embed_tokens,lm_head"}},
+     "'추가 학습 모듈'로 'LM head'·'Embedding + LM head' 대신 'Embedding' 또는 '추가 없음'을 고르세요"),
+    ({"training_method": "oft"}, "oft is unavailable")])
+def test_composite_models_refuse_unverified_stages_and_missing_modules(change, message):
+    from tuning_factory.capabilities import compatibility
+    result = compatibility({**QWEN35, **change})
+    assert not result["valid"] and any(message in error for error in result["errors"])
+
+
+@pytest.mark.parametrize("stage", ["pt", "sft", "rm", "dpo"])
+def test_composite_models_allow_text_stages(stage):
+    from tuning_factory.capabilities import compatibility
+    assert compatibility({**QWEN35, "training_stage": stage})["valid"]
+
+
+@pytest.mark.parametrize("model,template,stage,allowed", [
+    ("Qwen/Qwen3.5-35B-A3B", "qwen3_5", "rm", True), ("Qwen/Qwen3.5-35B-A3B", "qwen3_5", "kto", False),
+    ("google/gemma-4-E2B-it", "gemma4n", "rm", True), ("google/gemma-4-31B", "gemma4", "rm", True),
+    ("google/gemma-4-E2B-it", "gemma4n", "kto", False), ("google/gemma-4-26B-A4B-it", "gemma4", "kto", False),
+    ("google/gemma-4-E2B-it", "gemma4n", "ppo", False)])
+def test_composite_stage_policy_is_shared_by_the_families(model, template, stage, allowed):
+    from tuning_factory.capabilities import compatibility
+    result = compatibility({"base_model": model, "template": template, "training_stage": stage})
+    assert result["valid"] is allowed
+    assert not any("값 헤드" in error for error in result["errors"])   # Gemma 4 RM passed its A40 trial
+
+
+def test_gemma4_refuses_kto_naming_the_engine_failure():
+    from tuning_factory.capabilities import compatibility
+    # A40 (LLaMA-Factory 0.9.5, transformers 5.6.0): the KTO KL batch hands Gemma 4 non-tensor multimodal inputs,
+    # AttributeError: 'bool' object has no attribute 'all' at (pixel_position_ids == -1).all(dim=-1).
+    result = compatibility({"base_model": "google/gemma-4-E2B-it", "template": "gemma4n", "training_stage": "kto"})
+    assert result["errors"] == [
+        "Gemma 4의 KTO 학습은 현재 학습 엔진(LLaMA-Factory 0.9.5·transformers 5.6.0)에서 KL 배치의 멀티모달 입력 처리 "
+        "오류로 실패하므로 지원하지 않습니다. SFT·DPO·RM·PT를 쓰세요."]
+    assert result["supported_stages"] == ["pt", "sft", "rm", "dpo"]
+
+
+def test_composite_models_allow_existing_freeze_modules():
+    from tuning_factory.capabilities import compatibility
+    assert compatibility({**QWEN35, "training_method": "freeze", "finetuning_options": {
+        "freeze_trainable_modules": "mlp", "freeze_extra_modules": "embed_tokens"}})["valid"]
+    assert compatibility({"base_model": "Qwen/Qwen3.5-9B", "template": "qwen3_5", "training_method": "freeze",
+                          "finetuning_options": {"freeze_extra_modules": "lm_head"}})["valid"]   # untied
+    assert compatibility({"base_model": "google/gemma-4-E2B-it", "template": "gemma4n", "training_method": "freeze",
+                          "finetuning_options": {"freeze_trainable_modules": "self_attn"}})["valid"]
+
+
+def test_freeze_refusals_name_the_screen_labels_rather_than_raw_module_ids():
+    from tuning_factory.capabilities import FREEZE_SELF_ATTN, FREEZE_TIED_LM_HEAD
+    for raw in ("'self_attn'", "'all'", "'mlp'", "'lm_head'", "'embed_tokens'", "lm_head", "embed_tokens"):
+        assert raw not in FREEZE_TIED_LM_HEAD and (raw == "'self_attn'" or raw not in FREEZE_SELF_ATTN), raw
+    assert FREEZE_SELF_ATTN.endswith("고르세요.") and FREEZE_TIED_LM_HEAD.endswith("함께 학습됩니다).")
+
+
+def test_a_hub_registration_without_size_facts_still_refuses_a_tied_lm_head():
+    from tuning_factory.capabilities import compatibility
+    from tuning_factory.model_hub import ModelProfile
+    # Registered from the hub before profiles carried tie_word_embeddings: the reviewed catalog knows it is tied.
+    profile = ModelProfile(repo_id="Qwen/Qwen3.5-0.8B", revision="a" * 40, config_sha256="c" * 64,
+                           architecture="qwen3_5", template="qwen3_5", hidden_layers=24).model_dump()
+    config = {**QWEN35, "model_revision": "a" * 40, "model_profile": profile, "training_method": "freeze",
+              "finetuning_options": {"freeze_extra_modules": "lm_head"}}
+    result = compatibility(config)
+    assert not result["valid"] and any("LM head" in error for error in result["errors"])
+
+
+FROZEN = ("freeze_vision_tower", "freeze_multi_modal_projector", "freeze_language_model")
+
+
+def test_composite_training_freezes_vision_and_reasoning_templates_turn_thinking_off():
+    qwen = LlamaFactoryBackend.translate(configuration(base_model="Qwen/Qwen3.5-0.8B", template="qwen3_5"))
+    assert tuple(qwen[key] for key in FROZEN) == (True, True, False)
+    assert qwen["template"] == "qwen3_5" and qwen["enable_thinking"] is False and qwen["stage"] == "sft"
+    gemma = LlamaFactoryBackend.translate(configuration(base_model="google/gemma-4-E2B-it", template="gemma4n"))
+    assert gemma["enable_thinking"] is False and gemma["freeze_vision_tower"] is True
+    legacy = LlamaFactoryBackend.translate(load_config("configs/ai/paper_extraction.yaml"))
+    assert not {*FROZEN, "enable_thinking"} & set(legacy)
+
+
+def test_prediction_plans_turn_thinking_off_only_for_reasoning_templates():
+    def plan(template):
+        benchmark = SimpleNamespace(semantic_model_kind="causal_lm", generation_mode="greedy", precision="bf16",
+                                    template=template, max_new_tokens=8, cutoff_len=64, seed=1, quantization_bit=None)
+        return LlamaFactoryBackend.prediction_plan(benchmark, model_path="/m", adapter_path=None, max_samples=1)
+    assert all(plan(name)["enable_thinking"] is False for name in ("qwen3_5", "qwen3_6", "gemma4", "gemma4n"))
+    assert "enable_thinking" not in plan("qwen")
+
+
+def test_qwen35_catalog_defaults_to_the_reasoning_template_and_keeps_the_legacy_name_valid():
+    from tuning_factory.capabilities import COMPOSITE_MODELS
+    from tuning_factory.model_hub import ARCHITECTURES, ModelProfile
+    assert {row[2] for row in COMPOSITE_MODELS if row[1] in {"qwen3_5", "qwen3_5_moe"}} == {"qwen3_5"}
+    assert ARCHITECTURES["qwen3_5"][0] == ARCHITECTURES["qwen3_5_moe"][0] == "qwen3_5"
+    ModelProfile(repo_id="Qwen/Qwen3.5-0.8B", revision="a" * 40, config_sha256="c" * 64, architecture="qwen3_5",
+                 template="qwen3_5_nothink", hidden_layers=24)
+
+
+def test_native_prediction_of_a_reasoning_template_turns_thinking_off(tmp_path):
+    config = configuration(base_model="google/gemma-4-E2B-it", template="gemma4n")
+    plans = []
+
+    class Backend(LlamaFactoryBackend):
+        def run_config(self, directory, timeout, canceled, filename, log_name):
+            plans.append(yaml.safe_load((directory / filename).read_text()))
+            (directory / "prediction").mkdir()
+            (directory / "prediction/generated_predictions.jsonl").write_text('{"predict":"a","label":"a"}\n')
+    backend = Backend()
+    backend.prepare(config, tmp_path, b'[{"instruction":"a","output":"b"}]')
+    backend.predict(config, tmp_path, "abc", 1)
+    assert plans[-1]["enable_thinking"] is False and "freeze_vision_tower" not in plans[-1]
+
+
+def hub_registered(architecture, template, repo_id):
+    """Config fields of a model registered from the hub (no catalog entry: the profile path of model_entry)."""
+    from tuning_factory.model_hub import ModelProfile
+    profile = ModelProfile(repo_id=repo_id, revision="a" * 40, config_sha256="c" * 64, architecture=architecture,
+                           template=template, hidden_layers=24)
+    return {"base_model": repo_id, "model_profile": profile, "model_revision": "a" * 40,
+            "tokenizer_revision": "a" * 40, "template": template}
+
+
+def graph_plan(**changes):
+    """The v2 logical template (translate(config, model_input)) of a new adapter on the config's HF root."""
+    from tuning_factory.config import GraphTrainingConfig
+    from tuning_factory.model_artifacts import HFRootRef, ModelInput, ModelLoadRef
+    config = GraphTrainingConfig.model_validate(configuration(**changes).model_dump() | {"evaluation_profile": {}})
+    root = HFRootRef(repo_id=config.base_model, revision=config.model_revision, config_sha256="c" * 64,
+                     tokenizer_fingerprint="d" * 64)
+    return LlamaFactoryBackend.translate(config, ModelInput(policy=ModelLoadRef(base=root),
+                                                            initialization="new_adapter"))
+
+
+def test_hub_registered_composites_freeze_vision_on_the_legacy_and_graph_paths():
+    hub = hub_registered("qwen3_5", "qwen3_5", "someone/Qwen3.5-0.8B-sft")
+    for plan in (LlamaFactoryBackend.translate(configuration(**hub)), graph_plan(**hub)):
+        assert tuple(plan[key] for key in FROZEN) == (True, True, False) and plan["enable_thinking"] is False
+    graph = graph_plan(base_model="google/gemma-4-E2B-it", template="gemma4n")   # the catalog path
+    assert tuple(graph[key] for key in FROZEN) == (True, True, False) and graph["enable_thinking"] is False
+    assert graph["model_name_or_path"].endswith("policy_base")
+    legacy = graph_plan()
+    assert not {*FROZEN, "enable_thinking"} & set(legacy)
+
+
+def test_gemma4_text_turns_thinking_off_without_freezing_a_vision_tower():
+    plan = LlamaFactoryBackend.translate(configuration(**hub_registered("gemma4_text", "gemma4",
+                                                                        "someone/gemma-4-text-only")))
+    assert plan["enable_thinking"] is False and not set(FROZEN) & set(plan)
+
+
+def test_a_catalog_model_with_another_template_is_refused_in_korean_with_the_fix():
+    from tuning_factory.capabilities import compatibility
+    result = compatibility({**QWEN35, "template": "qwen3_5_nothink"})
+    assert not result["valid"] and result["errors"] == [
+        "이 모델의 템플릿은 qwen3_5입니다. 학습 설정에서 모델의 '버전 확인'을 다시 눌러 템플릿을 적용하세요."]
+
+
+NOTHINK_WARNING = ("qwen3_5_nothink 템플릿으로 학습하면 모델이 답마다 빈 <think> 블록을 생성합니다. "
+                   "모델의 '버전 확인'을 다시 눌러 qwen3_5 템플릿을 적용하세요.")
+
+
+def test_a_registered_qwen35_profile_with_the_nothink_template_still_validates_but_warns():
+    from tuning_factory.capabilities import compatibility
+    old = compatibility(hub_registered("qwen3_5", "qwen3_5_nothink", "Qwen/Qwen3.5-0.8B"))
+    assert old["valid"] and NOTHINK_WARNING in old["warnings"]
+    moe = compatibility(hub_registered("qwen3_5_moe", "qwen3_5_nothink", "someone/Qwen3.6-A3B"))
+    assert moe["valid"] and NOTHINK_WARNING in moe["warnings"]
+    for template in ("qwen3_5", "qwen3_6"):
+        current = compatibility(hub_registered("qwen3_5", template, "Qwen/Qwen3.5-0.8B"))
+        assert current["valid"] and NOTHINK_WARNING not in current["warnings"]
+    assert NOTHINK_WARNING not in compatibility(QWEN35)["warnings"]
+
+
+def test_kto_refusal_of_a_hub_qwen36_model_names_both_families():
+    from tuning_factory.capabilities import compatibility
+    result = compatibility({**hub_registered("qwen3_5_moe", "qwen3_6", "someone/Qwen3.6-A3B"),
+                            "training_stage": "kto"})
+    assert any("Qwen3.5·Qwen3.6의 KTO" in error for error in result["errors"])

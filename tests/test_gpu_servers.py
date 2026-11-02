@@ -110,13 +110,19 @@ def test_gpu_config_mismatch_and_zero_cost_policy_need_verified_server_context()
 
 
 def test_ssh_connection_uses_nonroot_and_never_runpod(monkeypatch):
+    from types import SimpleNamespace
+
     from tuning_factory import desktop_runtime
 
     policies = []
+    keepalives = []
 
     class Client:
         def set_missing_host_key_policy(self, policy):
             policies.append(policy)
+
+        def get_transport(self):
+            return SimpleNamespace(set_keepalive=keepalives.append)
 
         def connect(self, host, **kwargs):
             assert policies, "host key policy must be pinned before connecting"
@@ -135,6 +141,7 @@ def test_ssh_connection_uses_nonroot_and_never_runpod(monkeypatch):
         assert facts.provider == "ssh_server"
     assert len(policies) == 1 and isinstance(policies[0], desktop_runtime.PinnedHostKey)
     assert policies[0].fingerprint == PIN
+    assert keepalives == [30]
 
 
 def test_pinned_host_key_accepts_only_the_configured_sha256_fingerprint():
@@ -224,6 +231,8 @@ def test_native_strings_keep_provider_keys_independent_and_key_changes_invalidat
 
 
 def test_readonly_inspection_can_list_inventory_before_selection(monkeypatch):
+    from types import SimpleNamespace
+
     from tuning_factory import desktop_runtime
 
     monkeypatch.setattr(desktop_runtime, "command", lambda _, argv, **kw:
@@ -233,6 +242,9 @@ def test_readonly_inspection_can_list_inventory_before_selection(monkeypatch):
     class Client:
         def set_missing_host_key_policy(self, policy):
             pass
+
+        def get_transport(self):
+            return SimpleNamespace(set_keepalive=lambda seconds: None)
 
         def connect(self, *a, **kw):
             pass
@@ -442,6 +454,7 @@ def test_server_runtime_preparation_requires_same_inspection_and_unlocked_server
         yield facts, object()
 
     monkeypatch.setattr(desktop_runtime, "connection", connect)
+    monkeypatch.setattr(desktop_runtime, "command", lambda client, argv, **kw: "")   # observe() queries nvidia-smi
     native = {"provider": "ssh_server", **config.model_dump(mode="json")}
     with pytest.raises(ValueError, match="inspection"):
         desktop_runtime.runtime(native, tmp_path, prepare=True)
@@ -947,6 +960,8 @@ class FakeServer:
         self.policies, self.connects, self.commands = [], [], []
 
     def install(self, monkeypatch):
+        from types import SimpleNamespace
+
         from tuning_factory import desktop_runtime
 
         server = self
@@ -954,6 +969,9 @@ class FakeServer:
         class Client:
             def set_missing_host_key_policy(self, policy):
                 server.policies.append(policy)
+
+            def get_transport(self):
+                return SimpleNamespace(set_keepalive=lambda seconds: None)
 
             def connect(self, host, **kwargs):
                 server.connects.append((host, kwargs))
@@ -1533,3 +1551,30 @@ def test_raw_server_receipts_chunks_large_id_lists(tmp_path):
     result = store.raw_server_receipts(ids)
     assert result == {job: "receipt-" + job for job in ids[::2]}
     assert max(seen) <= 500 and len(seen) == 3
+
+
+@pytest.mark.parametrize("ready,code", [(False, 1), (True, 0)])
+def test_cli_server_runtime_exit_code_follows_readiness(tmp_path, monkeypatch, ready, code):
+    from typer.testing import CliRunner
+
+    from tuning_factory import cli, desktop_runtime
+
+    path = tmp_path / "server.json"
+    path.write_text(settings().model_dump_json())
+    monkeypatch.setattr(cli, "server_connection", lambda ctx, profile=None: {"provider": "ssh_server"})
+    monkeypatch.setattr(desktop_runtime, "runtime", lambda *a, **kw: {"ready": ready, "runtime_state": "x"})
+    result = CliRunner().invoke(cli.app, ["--state-dir", str(tmp_path / "state"), "server-runtime", str(path)])
+    assert result.exit_code == code, result.output
+    assert json.loads(result.stdout)["ready"] is ready
+
+
+@pytest.mark.parametrize("saved,price", [
+    ({"server_total_hourly_cost_usd": "1.5"}, 1.5), ({"server_total_hourly_cost_usd": " 0 "}, 0.0),
+    ({"server_total_hourly_cost_usd": ""}, None), ({"server_total_hourly_cost_usd": "abc"}, None),
+    ({"server_total_hourly_cost_usd": "-1"}, None), ({"server_total_hourly_cost_usd": "nan"}, None),
+    ({"server_total_hourly_cost_usd": "inf"}, None),
+    ({"server_ssh_host": "gpu.example"}, None), ({"total_hourly_cost_usd": 2}, 2.0),
+    ({"total_hourly_cost_usd": True}, None)])
+def test_server_hourly_cost_reads_only_the_saved_price_offline(saved, price):
+    from tuning_factory.gpu_servers import server_hourly_cost
+    assert server_hourly_cost({"provider": "ssh_server", **saved}) == {"hourly_cost_usd": price}

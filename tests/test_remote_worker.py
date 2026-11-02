@@ -92,7 +92,7 @@ class FakeSSH:
     def exec_command(self, command, timeout):
         self.commands.append(command)
         args = shlex.split(command)
-        directory = self.sftp.path(args[4])
+        directory = self.sftp.path(args[args.index("tuning_factory.worker") + 1])
         (directory / "output").mkdir(exist_ok=True)
         (directory / "output" / "evidence.txt").write_text("mock transport fixture")
         hashes = LlamaFactoryBackend().collect_artifacts(directory)
@@ -885,8 +885,9 @@ class GPUHost:
     def launch(self, args):
         from tuning_factory.worker_protocol import StartMarker, create_start_marker
         index = args.index("tuning_factory.worker")
-        assert args[:2] == ["nohup", "env"] and args[-6] == ">>" and args[-4:] == ["2>&1", "<", "/dev/null", "&"]
-        for item in args[2:index - 2]:
+        assert args[:3] == ["nohup", "flock", "-s"] and args[3].endswith("/runtime/in-use.lock") and args[4] == "env"
+        assert args[-6] == ">>" and args[-4:] == ["2>&1", "<", "/dev/null", "&"]
+        for item in args[5:index - 2]:
             name, value = item.split("=", 1)
             if name in {"FACTORY_MODEL_CACHE", "HF_HOME", "FACTORY_GPU_LOCK_FILE"}:
                 self.monkeypatch.setenv(name, str(self.sftp.path(value)))
@@ -931,7 +932,8 @@ def v2_transport(tmp_path, monkeypatch, provider="runpod"):
     host.sftp.path(lock).write_bytes(launch.lock.read_bytes())
     executor = SSHExecutor("test-host", 22, "root", "unused", client=host, remote_root=base + "/jobs",
                            remote_python=base + "/runtime/venv/bin/python", worker_lock_file=lock,
-                           hf_home=base + "/hf-cache", model_cache_root=base + "/model-cache", **options)
+                           hf_home=base + "/hf-cache", model_cache_root=base + "/model-cache",
+                           runtime_lock_file=base + "/runtime/in-use.lock", **options)
     ref = launch.sft_ref
     transfer = CachedTransfer(ref=ref, local_location=launch.store.root / ref.artifact_id / ref.inventory_sha256)
     return SimpleNamespace(launch=launch, host=host, executor=executor, transfers=(transfer,), base=base,
@@ -1160,7 +1162,8 @@ def test_v2_launch_command_is_fixed_argv_with_append_redirect(tmp_path, monkeypa
     (launch,) = t.host.launches
     args = shlex.split(launch)
     index = args.index("tuning_factory.worker")
-    assert args[:2] == ["nohup", "env"] and dict(item.split("=", 1) for item in args[2:index - 2]) == {
+    assert args[:5] == ["nohup", "flock", "-s", t.base + "/runtime/in-use.lock", "env"] and dict(
+        item.split("=", 1) for item in args[5:index - 2]) == {
         "CUDA_VISIBLE_DEVICES": UUID2, "FACTORY_GPU_LOCK_FILE": t.base + "/runtime/gpu-requirements.lock",
         "HF_HOME": t.base + "/hf-cache", "FACTORY_MODEL_CACHE": t.cache}
     assert args[index - 2:] == [t.executor.remote_python, "-m", "tuning_factory.worker", t.remote, "--request",
@@ -1589,12 +1592,17 @@ def test_v2_methods_require_a_validated_injected_connection(tmp_path, monkeypatc
         unconfigured.publish_cached_artifact(t.transfers[0], launch_id=LAUNCH_ID)
     assert opened == []   # validated before any SFTP session is opened
 
+    keepalives = []
+
     class OwnClient:
         def load_system_host_keys(self):
             pass
 
         def set_missing_host_key_policy(self, policy):
             pass
+
+        def get_transport(self):
+            return SimpleNamespace(set_keepalive=keepalives.append)
 
         def connect(self, *args, **kwargs):
             pass
@@ -1605,6 +1613,7 @@ def test_v2_methods_require_a_validated_injected_connection(tmp_path, monkeypatc
     monkeypatch.setattr(execution.paramiko, "SSHClient", OwnClient)
     owned = SSHExecutor("test-host", 22, "root", "unused", remote_root=RUNPOD_ROOT + "/jobs",
                         model_cache_root=RUNPOD_ROOT + "/model-cache")
+    assert keepalives == [30]
     for call in (lambda: owned.run_operation(t.job, t.launch.directory, t.launch.request, t.transfers, lambda: False),
                  lambda: owned.collect_operation_result(t.job, t.launch.directory, t.launch.request),
                  lambda: owned.publish_cached_artifact(t.transfers[0], launch_id=LAUNCH_ID)):
@@ -1648,3 +1657,15 @@ def test_v2_directory_detection_is_one_shared_helper(tmp_path):
         for file, data in files.items():
             (directory / file).write_bytes(data)
         assert worker_protocol.is_v2_directory(directory) is expected, name
+
+
+def test_launch_lines_hold_the_runtime_in_use_lock_shared():
+    plain = SSHExecutor("", 22, "root", "", client=SimpleNamespace())
+    held = SSHExecutor("", 22, "root", "", client=SimpleNamespace(), runtime_lock_file="/w/runtime/abc/in-use.lock")
+    command = ["env", "A=1", "/w/venv/bin/python", "-m", "tuning_factory.worker", "/w/jobs/j/a"]
+    assert plain._launch_line(command, ">", "/w/jobs/j/a/worker.log") == (
+        "nohup env A=1 /w/venv/bin/python -m tuning_factory.worker /w/jobs/j/a"
+        " > /w/jobs/j/a/worker.log 2>&1 < /dev/null &")
+    assert held._launch_line(command, ">>", "/w/jobs/j/a/worker.log") == (
+        "nohup flock -s /w/runtime/abc/in-use.lock env A=1 /w/venv/bin/python -m tuning_factory.worker /w/jobs/j/a"
+        " >> /w/jobs/j/a/worker.log 2>&1 < /dev/null &")

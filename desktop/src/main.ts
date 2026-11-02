@@ -9,6 +9,7 @@ import { viewById, views as workflowViews } from "./view-registry";
 import type { Catalog, View, ViewContext } from "./view-types";
 import { createTutorial, rememberTutorial, tutorialSeen } from "./tutorial";
 import { TUTORIAL_DATASET } from "./tutorial-steps";
+import { cleanupSummary, gpuCompatibilityView, preflightOutcome, RUNTIME_CLEANUP_NOTICE, runtimeNotice } from "./gpu-preflight";
 import { connectionResult, destinationChange, GPU_POLICY_MESSAGE, inventoryTable, isServer, jobDestination, jobDestinationIssue,
   MAX_GPUS_PER_JOB, prepareApproval, prepareIssue, puttyKeyPath, releaseApproval, reservationMatches, reservationTable, resourcesFromFacts,
   sameSelection, selectedGpus, selectionPolicyIssue, serverAddress, serverBridge, serverConfigured, settingsRoute, shortIdentifier,
@@ -445,7 +446,7 @@ function training() {
   </div><p class="muted">현재 앱 정책은 동시 GPU 1개, 최대 4시간·예상 비용 $5입니다. 기존 Pod의 실제 청구를 차단하는 한도는 아닙니다.</p>
   ${compatibilityView()}<div class="actions"><button class="primary" type="submit" data-tour="training-plan" ${!state.capabilities?.valid || state.capabilityPending ? "disabled" : ""}>실행 계획 확인</button>${button("설정 저장", "save-profile")}</div></section></form>
   ${state.plan ? `<section class="card plan" data-tour="plan-summary"><h3>실행 전 확인</h3><div class="stats"><article><small>업무 AI</small><b>${esc(state.plan.manifest.config.ai_id)}</b></article><article><small>학습 데이터</small><b>${esc(state.plan.manifest.dataset.dataset_id)} · ${num(state.plan.manifest.dataset.rows)}건</b></article><article><small>최대 시간 기준 예상 GPU 비용</small><b>$${num(state.plan.estimated_cost_usd)}</b></article></div>
-  <p>${esc(state.plan.note)}</p><p class="muted">${isServer(state.settings) ? `GPU 서버: ${esc(serverAddress(state.settings))} · 선택 GPU ${selectedGpus(state.settings).length}개` : `Pod: ${esc(state.settings.pod_id || "미설정")}`} · GPU: ${esc(state.plan.manifest.config.resource_profile.gpu_type)}</p>
+  <p>${esc(state.plan.note)}</p><p class="muted">${isServer(state.settings) ? `GPU 서버: ${esc(serverAddress(state.settings))} · 선택 GPU ${selectedGpus(state.settings).length}개` : `Pod: ${esc(state.settings.pod_id || "미설정")}`} · GPU: ${esc(state.plan.manifest.config.resource_profile.gpu_type)}</p>${gpuCompatibilityView(state.plan.compatibility)}
   ${planIssues().map(issue => `<p class="warning-text">${esc(issue)}</p>`).join("")}
   ${button("데이터 전송에 동의하고 학습 시작", "start", "primary", planIssues().length > 0)}
   <details><summary>확정된 설정 보기</summary><pre>${esc(JSON.stringify(state.plan.manifest.config, null, 2))}</pre></details></section>` : ""}`;
@@ -692,19 +693,39 @@ function settingsFromForm(form: HTMLFormElement) {
   form.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-key]").forEach(el => values[el.dataset.key!] = el.value.trim());
   return values;
 }
-async function execute(job: Obj) {
+/** runtime_check before a run (read-only SSH): blocking findings stop here; a missing RunPod runtime joins the approval. */
+async function executionPreflight(job: Obj | null): Promise<{ prepare: boolean; extra: string } | null> {
+  const config = job ? job.manifest?.config : state.plan?.manifest?.config;
+  const server = job ? !!job.server_destination : isServer(state.settings);
+  captureDrafts();
+  state.error = ""; state.notice = "실행 전 GPU와 학습 환경을 확인하는 중입니다."; render();
+  try {
+    const report = await api("runtime_check", { training_stage: config?.training_stage || "sft", ...(job ? { job_id: job.id } : { config }) });
+    const outcome = preflightOutcome(report, server);
+    state.notice = "";
+    if ("error" in outcome) { state.error = outcome.error; render(); return null; }
+    render();
+    return outcome;
+  } catch (error) {
+    state.notice = ""; state.error = errorText(error); render(); return null;
+  }
+}
+let preflightRunning = false;
+async function execute(job: Obj, prepareRuntime = false) {
   // The job's task may have run while the user typed on another page, which this switch to 실행 관리 replaces.
   captureDrafts();
   state.active = job.id; state.jobCapabilities = null; state.page = "jobs"; await refresh(); render();
+  if (prepareRuntime) { state.notice = "Pod에 학습 환경을 준비한 뒤 학습을 시작합니다. 최대 30분 걸릴 수 있으며, 쓰지 않는 이전 앱 버전 학습 환경을 정리합니다."; render(); }
   // Deliberately do not block navigation: a separate bridge process owns this attempt.
-  api("execute", { job_id: job.id, approved: true }).then(async result => {
+  api("execute", { job_id: job.id, approved: true, prepare_runtime: prepareRuntime }).then(async result => {
     await refresh();
     const current = state.jobs.find((j: Obj) => j.id === job.id);
     const waiting = "GPU를 사용할 수 없어 작업은 대기 중입니다. 다른 작업이 끝나면 ‘대기 작업 실행’을 눌러 주세요."
       // A GPU server job can also wait on a lock another job or an unfinished job of another destination left behind.
       + ((current ?? job).server_destination ? " 다른 작업이나 다른 연결 대상(RunPod 등)의 끝나지 않은 작업 잠금이 남아 있을 수 있습니다. 실행 관리에서 확인하세요." : "");
-    state.notice = result ? "학습 처리가 끝났습니다. 상태와 평가 결과를 확인하세요." :
-      ["PENDING", "QUEUED", "RETRYING"].includes(current?.status) ? waiting : "새로 실행된 작업이 없습니다. 현재 작업 상태를 확인하세요.";
+    state.notice = (result ? "학습 처리가 끝났습니다. 상태와 평가 결과를 확인하세요." :
+      ["PENDING", "QUEUED", "RETRYING"].includes(current?.status) ? waiting : "새로 실행된 작업이 없습니다. 현재 작업 상태를 확인하세요.")
+      + cleanupSummary({ cleanup: result?.runtime_cleanup });   // what a preparation in this approval pruned
     renderLate();
   }).catch(async error => { state.error = errorText(error); await refresh(); renderLate(); });
 }
@@ -830,7 +851,7 @@ async function prepareServer() {
       state.reservations = await gpuServer.runtimeReservations().catch(() => state.reservations);
       throw error;
     }
-    state.notice = "GPU 서버 작업 폴더에 학습 환경을 준비하고 CUDA를 확인했습니다.";
+    state.notice = "GPU 서버 작업 폴더에 학습 환경을 준비하고 CUDA를 확인했습니다." + cleanupSummary(state.runtimeReport);
   });
 }
 async function releaseReservation(reservation: Obj | undefined) {
@@ -938,8 +959,9 @@ async function action(name: string) {
   const policy = isServer(state.settings) && ["runtime_check", "runtime_prepare", "apply-pod"].includes(name) && selectionPolicyIssue(state.settings);
   if (policy) { state.error = policy; render(); return; }
   if (name === "runtime_prepare" && isServer(state.settings)) { await prepareServer(); return; }
-  if (name === "runtime_prepare" && !await approve("GPU 학습 환경 준비", "저장된 연결의 현재 실행 중인 Pod에 앱 전용 학습 환경을 설치합니다. 의존성과 모델 실행 도구를 다운로드하며 GPU 요금은 계속 발생합니다. 사용자 데이터는 전송하지 않습니다.")) return;
+  if (name === "runtime_prepare" && !await approve("GPU 학습 환경 준비", "저장된 연결의 현재 실행 중인 Pod에 앱 전용 학습 환경을 설치합니다. 의존성과 모델 실행 도구를 다운로드하며 GPU 요금은 계속 발생합니다. 사용자 데이터는 전송하지 않습니다. " + RUNTIME_CLEANUP_NOTICE)) return;
   if (name === "resume" && state.jobCapabilities?.resume_supported === false) { state.error = "이 학습 단계·방식은 체크포인트 재개를 지원하지 않습니다."; render(); return; }
+  let prepareRuntime = false, approvedJob: Obj | null = null;
   if (["start", "execute", "resume"].includes(name)) {
     captureConfig();
     if (name === "start" && !state.plan) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
@@ -948,7 +970,37 @@ async function action(name: string) {
     const job = name === "start" ? null : state.jobs.find((j: Obj) => j.id === state.active);
     const issue = job ? jobDestinationIssue(job, state.settings) : null;
     if (issue) { state.error = issue; render(); return; }
-    if (!await approve("실제 GPU 학습 실행", transferApproval(job ? job.server_destination ?? null : settingsRoute(state.settings)))) return;
+    if (preflightRunning) return;
+    preflightRunning = true;
+    try {
+      const planAtCheck = state.plan, podAtCheck = state.settings.pod_id;
+      let extra = "";
+      if (name !== "resume") {
+        const preflight = await executionPreflight(job);
+        if (!preflight) return;
+        ({ prepare: prepareRuntime, extra } = preflight);
+      }
+      // A saved Pod change during the check or the dialog moves a RunPod run to a Pod that was never checked.
+      const podChanged = () => !isServer(state.settings) && !(name === "execute" && job?.server_destination) && state.settings.pod_id !== podAtCheck;
+      const podMessage = "연결된 Pod가 바뀌었습니다. 실행 전 확인을 다시 진행하세요.";
+      const planChanged = () => name === "start" && (!state.plan || state.plan !== planAtCheck);
+      const jobChanged = () => name === "execute" && state.active !== job?.id;
+      // Settings or the job list may have changed during the check or the dialog: judge the current route again.
+      const destinationIssue = () => {
+        const current = job && name === "execute" ? state.jobs.find((j: Obj) => j.id === job.id) ?? job : null;
+        return current ? jobDestinationIssue(current, state.settings) : null;
+      };
+      if (podChanged()) { state.error = podMessage; render(); return; }
+      if (planChanged()) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
+      if (jobChanged()) { state.error = "선택한 작업이 바뀌었습니다. 작업을 다시 선택한 뒤 실행하세요."; render(); return; }
+      { const moved = destinationIssue(); if (moved) { state.error = moved; render(); return; } }
+      if (!await approve("실제 GPU 학습 실행", transferApproval(job ? job.server_destination ?? null : settingsRoute(state.settings)) + extra)) return;
+      if (podChanged()) { state.error = podMessage; render(); return; }
+      if (planChanged()) { state.error = "변경된 설정으로 실행 계획을 다시 확인하세요."; render(); return; }
+      if (jobChanged()) { state.error = "선택한 작업이 바뀌었습니다. 작업을 다시 선택한 뒤 실행하세요."; render(); return; }
+      { const moved = destinationIssue(); if (moved) { state.error = moved; render(); return; } }
+      approvedJob = job;
+    } finally { preflightRunning = false; }
   }
   const checkpoint = document.querySelector<HTMLInputElement>("#checkpoint")?.value;
   captureConfig();
@@ -980,7 +1032,9 @@ async function action(name: string) {
         else state.notice = "저장된 인증값을 삭제했습니다.";
       }
     }
-    else if (name === "runtime_check" || name === "runtime_prepare") { state.runtimeReport = await api(name, { approved: name === "runtime_prepare", training_stage: state.config?.training_stage || "sft" }); state.notice = `선택한 ${isServer(state.settings) ? "GPU 서버" : "Pod"}에서 앱과 일치하는 학습 환경과 CUDA를 확인했습니다.`; }
+    else if (name === "runtime_check" || name === "runtime_prepare") { state.runtimeReport = await api(name, { approved: name === "runtime_prepare", training_stage: state.config?.training_stage || "sft" }); const message = runtimeNotice(state.runtimeReport, isServer(state.settings))
+        + cleanupSummary(state.runtimeReport);   // a check never prunes, so it has no cleanup
+      if (state.runtimeReport?.ready === false && ["incompatible", "unavailable"].includes(state.runtimeReport.runtime_state)) state.error = message; else state.notice = message; }
     else if (name === "server-inspect") { state.serverInspection = null; state.gpuDraft = null; state.serverInspection = await gpuServer.serverInspect(); }
     else if (name === "server-select") {
       const selected: string[] = state.gpuDraft ?? selectedGpus(state.settings);
@@ -1037,9 +1091,9 @@ async function action(name: string) {
     else if (name === "start") {
       // The server destination approved in the dialog is the one the offline plan hashed; submit refuses any other.
       const destination = isServer(state.settings) ? { destination_sha256: state.plan.destination_sha256 } : {};
-      const job = await api("submit", { config: state.plan.manifest.config, approved: true, request_key: crypto.randomUUID(), ...destination }); await execute(job); state.plan = null;
+      const job = await api("submit", { config: state.plan.manifest.config, approved: true, request_key: crypto.randomUUID(), ...destination }); await execute(job, prepareRuntime); state.plan = null;
     }
-    else if (name === "execute") { await execute(state.jobs.find((j: Obj) => j.id === state.active)); }
+    else if (name === "execute") { if (approvedJob) await execute(approvedJob, prepareRuntime); }
     else if (name === "refresh") { await refresh(); }
     else if (name === "recover") { await api("recover"); await refresh(); state.notice = "오래된 작업 상태를 확인했습니다. 실패한 원격 작업은 결과 회수를 시도하세요."; }
     else if (["logs", "live_logs", "evaluation"].includes(name)) { const result = await api(name === "live_logs" ? name : "logs", { job_id: state.active, name: name === "evaluation" ? "evaluation.json" : "train.log" }); state.logs = result.text || result.note || "아직 로그가 없습니다."; }

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import paramiko
 
-from .execution import ExecutionUncertain, RunPodController, SSHExecutor
+from .execution import ExecutionUncertain, RunPodController, SSHExecutor, keep_alive
 from .gpu_servers import (
     ServerApprovalReceipt,
     SSHServerFacts,
@@ -39,6 +39,64 @@ def local_key_file(path):
 
 class RemoteCommandFailed(ValueError):
     """The remote command returned an observed nonzero exit status."""
+
+
+RUNTIME_MISSING = ("GPU runtime command failed. The private runtime is not prepared on this host; "
+                   "prepare runtime first")
+RUNTIME_MISMATCH = "GPU runtime source, lock, engine or CUDA preflight mismatch; prepare runtime first"
+GPU_INCOMPATIBLE = "이 GPU에서 앱 학습 환경의 CUDA 연산이 실행되지 않습니다. 지원하는 GPU 세대인지 확인하세요."
+RUNTIME_PREPARATION_REQUIRED = ("Pod에 이 앱 버전의 학습 환경이 없습니다. 실행 승인에서 학습 환경 준비를 함께 "
+                                "승인하거나 연결 설정의 '학습 환경 준비'를 먼저 누르세요.")
+SERVER_RUNTIME_REQUIRED = ("GPU 서버에 이 앱 버전의 학습 환경이 없습니다. 연결 설정에서 GPU 목록을 조회한 뒤 "
+                           "'학습 환경 준비'를 먼저 누르세요.")
+POST_PREPARATION_FAILED = ("학습 환경을 준비했지만 확인을 통과하지 못했습니다. 연결 설정에서 '환경 확인'으로 "
+                           "상태를 확인하거나 '학습 환경 준비'를 다시 실행하세요.")
+PREPARATION_BUSY = "다른 학습 환경 준비가 이 GPU에서 진행 중입니다. 끝난 뒤 다시 시도하세요."
+RUNTIME_IN_USE = ("이 앱 버전의 학습 환경을 쓰는 작업이 실행 중이라 학습 환경을 다시 준비할 수 없습니다. "
+                  "작업이 끝난 뒤 다시 시도하세요.")
+PREPARE_IN_EXECUTION_RUNPOD_ONLY = "runtime preparation during execution applies to a RunPod preflight only"
+# The first import of the pinned torch/LLaMA-Factory and CUDA initialisation from a fresh venv on a network volume can take minutes.
+PROBE_TIMEOUT_SECONDS = 900
+
+
+class RuntimeMissing(RemoteCommandFailed):
+    """The private runtime's interpreter is absent on the GPU host."""
+
+
+class RuntimeMismatch(ValueError):
+    """The private runtime exists but its source, lock, engine or CUDA availability differs, or its probe failed."""
+
+
+class GPUIncompatible(ValueError):
+    """The installed runtime cannot run CUDA kernels on this GPU."""
+
+
+GPU_UNAVAILABLE = "GPU를 사용할 수 없습니다. 인식된 GPU가 없거나 선택한 GPU 수와 다릅니다. Pod·서버의 GPU 상태를 확인하세요."
+GPU_BUSY = "GPU가 사용 중이거나 오류 상태라 CUDA 연산을 실행하지 못했습니다. 다른 작업이 GPU를 쓰고 있는지 확인하세요."
+
+
+class GPUUnavailable(ValueError):
+    """The runtime is installed, but the GPU is absent, a different count, busy or in an error state."""
+
+
+# gpu_compat.capability_supported's rule, run inside the private runtime: same-major machine code with a lower or
+# equal minor, or PTX at or below the device. A failing kernel is reported, never raised.
+ARCH_PROBE = (
+    "arch_ok=kernel_ok=bf16=False\n"
+    "capability=None\n"
+    "if torch.cuda.is_available():\n"
+    " cap=tuple(torch.cuda.get_device_capability())\n"
+    " capability='%d.%d'%cap\n"
+    " codes=[re.fullmatch(r'(sm|compute)_(\\d+)(\\d)[a-z]?',a) for a in torch.cuda.get_arch_list()]\n"
+    " codes=[(m[1],int(m[2]),int(m[3])) for m in codes if m]\n"
+    " arch_ok=any(k=='sm' and j==cap[0] and n<=cap[1] for k,j,n in codes)"
+    " or any(k=='compute' and (j,n)<=cap for k,j,n in codes)\n"
+    " try:\n"
+    "  kernel_ok=(torch.ones(8,device='cuda')*2).sum().item()==16\n"
+    "  bf16=bool(torch.cuda.is_bf16_supported())\n"
+    " except Exception:\n"
+    "  kernel_ok=False\n"
+)
 
 
 class PinnedHostKey(paramiko.MissingHostKeyPolicy):
@@ -72,6 +130,7 @@ def connection(settings, *, inspection_only=False, recovery=False):
             client.connect(config.ssh_host, port=config.ssh_port, username=config.ssh_username,
                            key_filename=key_file, allow_agent=False, look_for_keys=False,
                            timeout=20, banner_timeout=20, auth_timeout=20)
+            keep_alive(client)
             if recovery:
                 facts = probe_server_identity(client, config, command)
             elif inspection_only:
@@ -95,6 +154,7 @@ def connection(settings, *, inspection_only=False, recovery=False):
         client.connect(pod["publicIp"], port=int(pod["portMappings"]["22"]), username="root",
                        key_filename=settings["ssh_key_file"], allow_agent=False, look_for_keys=False,
                        timeout=20, banner_timeout=20, auth_timeout=20)
+        keep_alive(client)
         yield pod, client
     finally:
         client.close()
@@ -129,7 +189,10 @@ def runtime_path(training_stage="sft", remote_root=REMOTE):
 
 def prerequisites(client):
     # Triton's CUDA driver helper compiles C even when torch reports CUDA available.
-    command(client, ["sh", "-c", 'compiler="${CC:-cc}"; '
+    # flock marks a runtime in use (`flock -s in-use.lock`) for the old-runtime cleanup of PRUNE_SOURCE.
+    command(client, ["sh", "-c", 'command -v flock >/dev/null || { printf "%s\\n" "flock (util-linux) required to mark '
+                    'runtimes in use; ask its administrator to install util-linux." >&2; exit 1; }; '
+                    'compiler="${CC:-cc}"; '
                     'command -v "$compiler" >/dev/null && "$compiler" --version >/dev/null || '
                     '{ printf "%s\\n" "C compiler required for Triton; use a CUDA devel Pod image "'
                     '"or ask its administrator to install a C toolchain before preparing training." >&2; exit 1; }'])
@@ -146,7 +209,9 @@ def bootstrap_prerequisites(client):
 
 def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=(), *, model_ops=False):
     """Probe the private runtime. ``model_ops=True`` (merge/materialize) also requires the installed
-    MODEL_OPS_PINS versions; the default probe and result are unchanged."""
+    MODEL_OPS_PINS versions. Raises RuntimeMissing (no interpreter), RuntimeMismatch (stale or unparseable
+    runtime), GPUUnavailable (runtime fine, GPU absent, miscounted or busy) or GPUIncompatible (no kernel for
+    this GPU generation)."""
     profile = engine_profile(training_stage)
     if model_ops and profile["profile"] != "primary":
         raise ValueError(MODEL_OPS_RUNTIME)
@@ -156,31 +221,259 @@ def check(client, training_stage="sft", remote_root=REMOTE, selected_gpu_uuids=(
     pins = (",model_ops=dict((n,importlib.metadata.version(n).split('+')[0]) for n in "
             + repr(tuple(MODEL_OPS_PINS)) + ")") if model_ops else ""
     probe = (
-        "import json,torch,importlib.metadata;"
-        + ("from llamafactory.train.ppo.trainer import CustomPPOTrainer;" if training_stage == "ppo" else "") +
-        "from pathlib import Path;"
-        "from tuning_factory.manifest import source_hash;"
-        "from tuning_factory.registry import digest;"
-        + ("assert torch.cuda.device_count()==" + str(len(selected_gpu_uuids)) + ";" if selected_gpu_uuids else "") +
-        "print(json.dumps(dict(source=source_hash(),engine=importlib.metadata.version('llamafactory'),"
-        "cuda=torch.cuda.is_available(),lock=digest(Path(" + repr(root + "/" + lock_name) +
-        ").read_bytes())" + pins + ")))"
+        "import json,re,torch,importlib.metadata\n"
+        + ("from llamafactory.train.ppo.trainer import CustomPPOTrainer\n" if training_stage == "ppo" else "")
+        + "from pathlib import Path\n"
+        "from tuning_factory.manifest import source_hash\n"
+        "from tuning_factory.registry import digest\n"
+        + ARCH_PROBE
+        + "print('TF_PROBE '+json.dumps(dict(source=source_hash(),engine=importlib.metadata.version('llamafactory'),"
+        "cuda=torch.cuda.is_available(),lock=digest(Path(" + repr(root + "/" + lock_name) + ").read_bytes()),"
+        "devices=torch.cuda.device_count(),arch_ok=arch_ok,kernel_ok=kernel_ok,bf16=bf16,capability=capability" + pins + ")))"
     )
-    argv = [root + "/venv/bin/python", "-c", probe]
+    python = root + "/venv/bin/python"
+    argv = [python, "-c", probe]
     if selected_gpu_uuids:
         argv = ["env", "CUDA_VISIBLE_DEVICES=" + ",".join(selected_gpu_uuids), *argv]
-    result = json.loads(command(client, argv).splitlines()[-1])
+    try:
+        output = command(client, argv, timeout=PROBE_TIMEOUT_SECONDS)
+    except RemoteCommandFailed:
+        try:
+            command(client, ["test", "-x", python])
+        except RemoteCommandFailed:
+            raise RuntimeMissing(RUNTIME_MISSING) from None
+        raise RuntimeMismatch(RUNTIME_MISMATCH) from None
+    lines = output.splitlines()
+    marked = [line for line in lines if line.startswith("TF_PROBE ")]
+    try:
+        result = json.loads(marked[-1][len("TF_PROBE "):] if marked else lines[-1])
+    except (json.JSONDecodeError, IndexError):
+        raise RuntimeMismatch(RUNTIME_MISMATCH) from None
+    if not isinstance(result, dict):
+        raise RuntimeMismatch(RUNTIME_MISMATCH)
     from .desktop import assets_root
     expected = hashlib.sha256((assets_root() / profile["lock_file"]).read_bytes()).hexdigest()
-    base = {key: value for key, value in result.items() if key != "model_ops"} if model_ops else result
-    if base != {"source": source_hash(), "engine": profile["engine_version"], "cuda": True, "lock": expected}:
-        raise ValueError("GPU runtime source, lock, engine or CUDA preflight mismatch; prepare runtime first")
+    base = {key: result.get(key) for key in ("source", "engine", "lock")}
+    if (base != {"source": source_hash(), "engine": profile["engine_version"], "lock": expected}
+            or ("model_ops" in result and not model_ops)):
+        raise RuntimeMismatch(RUNTIME_MISMATCH)
+    if result.get("cuda") is not True or (selected_gpu_uuids and result.get("devices") != len(selected_gpu_uuids)):
+        raise GPUUnavailable(GPU_UNAVAILABLE)
     if model_ops and result.get("model_ops") != dict(MODEL_OPS_PINS):
         raise ValueError(MODEL_OPS_RUNTIME)
+    if result.get("arch_ok") is not True:
+        raise GPUIncompatible(GPU_INCOMPATIBLE)
+    if result.get("kernel_ok") is not True:
+        raise GPUUnavailable(GPU_BUSY)
     return result
 
 
+def observation_key(settings):
+    """The local GPU observation key of the saved destination; never contacts it."""
+    if settings.get("provider", "existing_runpod") == "ssh_server":
+        return "server-" + server_settings(settings).destination_sha256[:16]
+    pod_id = str(settings.get("pod_id", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", pod_id):
+        raise ValueError("invalid Pod ID")
+    return "runpod-" + pod_id
+
+
+def read_gpu_facts(client, gpu_uuids=()):
+    from .gpu_compat import GPU_QUERY, parse_gpu_facts
+    gpus = parse_gpu_facts(command(client, list(GPU_QUERY)))
+    if not gpu_uuids:
+        return gpus
+    selected = [gpu for gpu in gpus if gpu["uuid"] in set(gpu_uuids)]
+    if len(selected) != len(set(gpu_uuids)):
+        raise ValueError("selected GPU missing from nvidia-smi output")
+    return selected
+
+
+def observe(client, settings, state_root, pod):
+    """Read (read-only nvidia-smi) and store this destination's GPU facts. An unreadable query is recorded as no
+    facts, so the compatibility judge warns and the runtime check still decides."""
+    from .gpu_compat import make_observation, save_observation
+    server = isinstance(pod, SSHServerFacts)
+    try:
+        gpus = read_gpu_facts(client, server_settings(settings).selected_gpu_uuids if server else ())
+    except ValueError:   # RemoteCommandFailed included
+        gpus = []
+    observation = make_observation(observation_key(settings), gpus, None if server else pod)
+    try:
+        save_observation(state_root, observation)
+    except OSError:
+        pass   # the live observation is still returned; a locked or unwritable state file must not abort a run
+    return observation
+
+
+# Fixed source run by the preparation script under this runtime's prepare.lock and exclusive in-use.lock. The only
+# arguments are the validated remote root and the current 16-hex source hash, each separately quoted. It removes old
+# app-version runtimes that no worker holds (`flock -s in-use.lock`), that no preparation holds and that no live
+# attempt references, checked again under the candidate's locks just before the rename. It never follows a link,
+# never touches uv-cache/, python/, hf-cache/, model-cache/ or jobs/, and with any doubt it removes nothing. A runtime
+# it cannot remove is listed in `errors` and the others go on; after BUDGET seconds it starts no new removal
+# (`incomplete`; the rest waits for the next preparation). Venvs share hard-linked files with uv-cache, so the space a
+# removal frees is the free-space delta (free_after - free_before), never a sum of file sizes.
+PRUNE_SOURCE = r'''import json,os,re,shutil,sys,time
+from pathlib import Path
+try:
+    import fcntl
+except ImportError:
+    fcntl=None
+BUDGET=300
+deadline=time.monotonic()+BUDGET
+root,current=Path(sys.argv[1]),sys.argv[2]
+runtime,jobs=root/'runtime',root/'jobs'
+report=dict(removed=[],kept_in_use=[],errors=[],free_before=None,free_after=None)
+def live():
+    found=set()
+    for attempt in jobs.glob('*/*'):
+        if attempt.is_symlink() or not attempt.is_dir() or not (attempt/'worker.log').exists() or (attempt/'result.json').exists():
+            continue
+        try:
+            manifest=json.loads((attempt/'manifest.json').read_text())
+            timeout=(manifest.get('config') or {}).get('resource_profile',{}).get('timeout_seconds') or (manifest.get('operation') or {}).get('resources',{}).get('timeout_seconds')
+            if time.time()<attempt.stat().st_mtime+int(timeout)+3600:
+                found.add(str(manifest['source_sha256'])[:16])
+        except Exception:
+            raise ValueError('unreadable manifest of an unfinished attempt; nothing removed') from None
+    return found
+def hold(path):
+    if fcntl is None:
+        return []
+    handles=[]
+    try:
+        for name in ('in-use.lock','prepare.lock'):
+            handles.append(os.open(path/name,os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW|os.O_CLOEXEC,0o666))
+            fcntl.flock(handles[-1],fcntl.LOCK_EX|fcntl.LOCK_NB)
+        return handles
+    except OSError:
+        for handle in handles:
+            os.close(handle)
+        return None
+try:
+    if not re.fullmatch('[0-9a-f]{16}',current):
+        raise ValueError('invalid current runtime')
+    report['free_before']=shutil.disk_usage(root).free
+    referenced=live()
+    for path in sorted(runtime.iterdir()) if runtime.is_dir() and not runtime.is_symlink() else ():
+        name=path.name
+        if path.is_symlink() or not path.is_dir():
+            continue
+        leftover=name.startswith('.trash-')
+        if not leftover and (not re.fullmatch('[0-9a-f]{16}(-ppo)?',name) or name[:16]==current):
+            continue
+        if time.monotonic()>deadline:
+            report['incomplete']=True
+            break
+        if leftover:
+            shutil.rmtree(path,ignore_errors=True)
+            continue
+        handles=None if name[:16] in referenced else hold(path)
+        if handles is None:
+            report['kept_in_use'].append(name)
+            continue
+        try:
+            try:
+                if name[:16] in live():
+                    report['kept_in_use'].append(name)
+                    continue
+                trash=runtime/('.trash-%s-%d'%(name,os.getpid()))
+                path.rename(trash)
+            finally:
+                for handle in handles:
+                    os.close(handle)
+            shutil.rmtree(trash)
+            report['removed'].append(name)
+        except OSError:
+            report['errors'].append(name)
+except Exception as error:
+    report['cleanup_error']=(type(error).__name__+': '+str(error))[:300]
+try:
+    report['free_after']=shutil.disk_usage(root).free
+except OSError:
+    pass
+print('TF_PRUNE '+json.dumps(report,sort_keys=True))
+'''
+
+
+def prune_report(output):
+    """The TF_PRUNE report of a preparation; a missing or unreadable report is a cleanup error, never fatal."""
+    for line in reversed(output.splitlines()):
+        if line.startswith("TF_PRUNE "):
+            try:
+                report = json.loads(line[len("TF_PRUNE "):])
+            except ValueError:
+                break
+            if isinstance(report, dict):
+                return report
+            break
+    return {"removed": [], "kept_in_use": [], "cleanup_error": "cleanup report missing"}
+
+
+def install_runtime(client, training_stage, remote_root, pod, preparation):
+    """Upload the pinned lock and worker wheel, then install the private runtime below ``remote_root``.
+
+    The caller holds ``preparation_guard`` and has run prerequisites() and bootstrap_prerequisites()."""
+    from .desktop import assets_root
+    from .runtime_profiles import runtime_capabilities
+    profile = engine_profile(training_stage)
+    lock_name = Path(profile["lock_file"]).name
+    backend = runtime_capabilities(profile["profile"])["torch_backend"]
+    assets = assets_root()
+    wheels = list((assets / "dist").glob("llm_tuning_factory-*.whl"))
+    if len(wheels) != 1:
+        raise ValueError("matching worker wheel missing; rebuild desktop package")
+    root = runtime_path(training_stage, remote_root)
+    helper = SSHExecutor("", 22, "root", "", client=client, pod=None if isinstance(pod, SSHServerFacts) else pod)
+    with client.open_sftp() as sftp:
+        helper.mkdir(sftp, root)
+        for path in [assets / profile["lock_file"], wheels[0]]:
+            sftp.put(str(path), root + "/" + path.name)
+    # All installs, Python downloads and caches stay below the private root.
+    # A preparation always rebuilds the private venv (--clear, under the flock): an interrupted
+    # install can leave packages that uv still reports as installed. A worker of this version holds
+    # in-use.lock shared for its whole life, so the rebuild first takes it exclusively (fd 8, held to the end)
+    # and never clears a venv under a running worker. The prune report is printed last, after the uv output,
+    # so the 128 KB output tail that command() keeps always contains it.
+    script = (
+        "set -eu\n"
+        "command -v flock >/dev/null\n"
+        f"exec 9>{shlex.quote(root + '/prepare.lock')}\nflock -n 9 || {{ echo TF_PREPARE_BUSY; exit 75; }}\n"
+        f"exec 8>{shlex.quote(root + '/in-use.lock')}\nflock -x -n 8 || {{ echo TF_RUNTIME_IN_USE; exit 75; }}\n"
+        f"prune=$(python3 -I -c {shlex.quote(PRUNE_SOURCE)} {shlex.quote(remote_root)} {source_hash()[:16]} "
+        "2>&1 || true)\n"
+        f"export UV_PYTHON_INSTALL_DIR={shlex.quote(remote_root + '/python')}\n"
+        f"export UV_CACHE_DIR={shlex.quote(remote_root + '/uv-cache')}\n"
+        f"python3 -m pip install --disable-pip-version-check --no-cache-dir "
+        f"--target {shlex.quote(root + '/bootstrap')} uv==0.11.23\n"
+        f"export PYTHONPATH={shlex.quote(root + '/bootstrap')}\n"
+        f"python3 -m uv venv --python 3.12 --clear {shlex.quote(root + '/venv')}\n"
+        f"python3 -m uv pip sync --python {shlex.quote(root + '/venv/bin/python')} --require-hashes "
+        f"--torch-backend {backend} {shlex.quote(root + '/' + lock_name)}\n"
+        f"python3 -m uv pip install --python {shlex.quote(root + '/venv/bin/python')} --no-deps "
+        f"{shlex.quote(root + '/' + wheels[0].name)}\n"
+        'printf "%s\\n" "$prune"\n'
+    )
+    preparation["started"] = True
+    try:
+        output = command(client, ["sh", "-c", script], timeout=1800)
+    except RemoteCommandFailed as error:
+        preparation["stopped"] = True
+        if "TF_PREPARE_BUSY" in str(error):
+            raise ValueError(PREPARATION_BUSY) from None
+        if "TF_RUNTIME_IN_USE" in str(error):
+            raise ValueError(RUNTIME_IN_USE) from None
+        raise
+    preparation["stopped"] = True
+    preparation["cleanup"] = prune_report(output)
+
+
 def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspection=None):
+    """Check (or, approved, prepare) the private runtime and record this destination's GPU facts.
+
+    A check reports ``runtime_state`` ("ready", "missing", "mismatch", "incompatible" or "unavailable") instead of
+    raising."""
     if settings.get("provider") == "ssh_server" and prepare:
         if inspection is None:
             raise ValueError("approved destination inspection required for server preparation")
@@ -188,7 +481,6 @@ def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspec
             if hasattr(inspection, "model_dump") else inspection)
         inspection.validate_settings(server_settings(settings))
     profile = engine_profile(training_stage)
-    lock_name = Path(profile["lock_file"]).name
     with connection(settings) as (pod, client):
         generic = isinstance(pod, SSHServerFacts)
         config = server_settings(settings) if generic else None
@@ -197,52 +489,37 @@ def runtime(settings, state_root, prepare=False, training_stage="sft", *, inspec
         if generic and inspection is not None and (inspection.server_id != pod.server_id
                                                    or inspection.inventory != pod.inventory):
             raise ValueError("server hardware differs from approved preparation inspection")
+        observation = observe(client, settings, state_root, pod)
+        state = "ready"
         if prepare:
             with preparation_guard(state_root, config.profile(pod) if generic else None, pod) as preparation:
                 prerequisites(client)
                 bootstrap_prerequisites(client)
-                from .desktop import assets_root
-                assets = assets_root()
-                wheels = list((assets / "dist").glob("llm_tuning_factory-*.whl"))
-                if len(wheels) != 1:
-                    raise ValueError("matching worker wheel missing; rebuild desktop package")
-                root = runtime_path(training_stage, remote_root)
-                helper = SSHExecutor("", 22, "root", "", client=client, pod=None if generic else pod)
-                with client.open_sftp() as sftp:
-                    helper.mkdir(sftp, root)
-                    for path in [assets / profile["lock_file"], wheels[0]]:
-                        sftp.put(str(path), root + "/" + path.name)
-                # All installs, Python downloads and caches stay below the private root.
-                script = (
-                    "set -eu\n"
-                    "command -v flock >/dev/null\n"
-                    f"exec 9>{shlex.quote(root + '/prepare.lock')}\nflock -n 9\n"
-                    f"export UV_PYTHON_INSTALL_DIR={shlex.quote(remote_root + '/python')}\n"
-                    f"export UV_CACHE_DIR={shlex.quote(remote_root + '/uv-cache')}\n"
-                    f"python3 -m pip install --disable-pip-version-check --no-cache-dir "
-                    f"--target {shlex.quote(root + '/bootstrap')} uv==0.11.23\n"
-                    f"export PYTHONPATH={shlex.quote(root + '/bootstrap')}\n"
-                    f"python3 -m uv venv --python 3.12 --allow-existing {shlex.quote(root + '/venv')}\n"
-                    f"python3 -m uv pip sync --python {shlex.quote(root + '/venv/bin/python')} --require-hashes "
-                    f"{shlex.quote(root + '/' + lock_name)}\n"
-                    f"python3 -m uv pip install --python {shlex.quote(root + '/venv/bin/python')} --no-deps "
-                    f"{shlex.quote(root + '/' + wheels[0].name)}\n"
-                )
-                preparation["started"] = True
+                install_runtime(client, training_stage, remote_root, pod, preparation)
+                cleanup = preparation.get("cleanup")
                 try:
-                    command(client, ["sh", "-c", script], timeout=1800)
-                except RemoteCommandFailed:
-                    preparation["stopped"] = True
-                    raise
-                preparation["stopped"] = True
-                result = check(client, training_stage, remote_root, selected) if generic else check(client, training_stage)
+                    result = check(client, training_stage, remote_root, selected)
+                except (RuntimeMissing, RuntimeMismatch):
+                    raise ValueError(POST_PREPARATION_FAILED) from None
         else:
-            result = check(client, training_stage, remote_root, selected) if generic else check(client, training_stage)
+            try:
+                result = check(client, training_stage, remote_root, selected)
+            except RuntimeMissing:
+                result, state = {}, "missing"
+            except RuntimeMismatch:
+                result, state = {}, "mismatch"
+            except GPUIncompatible:
+                result, state = {}, "incompatible"
+            except GPUUnavailable:
+                result, state = {}, "unavailable"
+        report = {"ready": state == "ready", "runtime_state": state, "observation": observation,
+                  "profile": profile["profile"], **result}
+        if prepare:
+            report["cleanup"] = cleanup   # what the preparation pruned; a check never prunes
         if generic:
-            return {"ready": True, "provider": "ssh_server", "facts": pod.model_dump(mode="json"),
-                    "runtime": runtime_path(training_stage, remote_root), "profile": profile["profile"], **result}
-        return {"ready": True, "pod_id": pod["id"], "runtime": runtime_path(training_stage),
-                "profile": profile["profile"], **result}
+            return {**report, "provider": "ssh_server", "facts": pod.model_dump(mode="json"),
+                    "runtime": runtime_path(training_stage, remote_root)}
+        return {**report, "pod_id": pod["id"], "runtime": runtime_path(training_stage)}
 
 
 @contextmanager
@@ -326,17 +603,24 @@ def _profile_identity(settings, profile_identity, server_receipt):
 
 @contextmanager
 def executor_for(settings, state_root, preflight=True, training_stage="sft", *, server_receipt=None,
-                 recovery=False, runtime_profile=None, model_ops=False, profile_identity=None):
+                 recovery=False, runtime_profile=None, model_ops=False, profile_identity=None,
+                 gate=None, prepare_runtime=False):
     """Executor for one destination. ``runtime_profile`` (a v2 operation's runtime) selects the private runtime;
     ``model_ops`` adds the MODEL_OPS_PINS probe for merge/materialize. Launch executors carry the remote model
     cache root (``<remote_root>/model-cache``) for v2 operations; v1 runs ignore it. ``profile_identity`` (Task 8.4)
     gives an SSH launch executor's profile the pinned profile ID, revision, name and credential scope; without it
-    the default identity is unchanged."""
+    the default identity is unchanged.
+    ``gate`` (the desktop's compatibility judge) receives this destination's GPU observation before any runtime
+    work and raises to refuse it. ``prepare_runtime`` (RunPod preflight only) installs a missing or mismatched
+    private runtime instead of refusing."""
     # recovery=True always means the SSH recovery-only executor; RunPod reconciles with preflight=False.
     identity = _profile_identity(settings, profile_identity, server_receipt)   # before any contact
     training_stage = operation_stage(training_stage, runtime_profile)
     if model_ops and engine_profile(training_stage)["profile"] != "primary":
         raise ValueError(MODEL_OPS_RUNTIME)
+    if prepare_runtime and (recovery or not preflight
+                            or settings.get("provider", "existing_runpod") == "ssh_server"):
+        raise ValueError(PREPARE_IN_EXECUTION_RUNPOD_ONLY)
     pins = {"model_ops": True} if model_ops else {}
     if recovery:
         if settings.get("provider", "existing_runpod") != "ssh_server":
@@ -349,10 +633,18 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
     with connection(settings) as (pod, client):
         if isinstance(pod, SSHServerFacts):
             config = server_settings(settings)
-            if server_receipt is not None:
+            if server_receipt is not None:   # before the gate: destination drift is then the reported cause
                 server_receipt.validate_destination(server_receipt.manifest_sha256, config.transport, pod)
+        if gate is not None:
+            gate(observe(client, settings, state_root, pod))
+        if isinstance(pod, SSHServerFacts):
             if preflight:
-                check(client, training_stage, config.remote_root, config.selected_gpu_uuids, **pins)
+                try:
+                    check(client, training_stage, config.remote_root, config.selected_gpu_uuids, **pins)
+                except (RuntimeMissing, RuntimeMismatch):
+                    if gate is None:
+                        raise
+                    raise ValueError(SERVER_RUNTIME_REQUIRED) from None
             root = runtime_path(training_stage, config.remote_root)
             lock_name = Path(engine_profile(training_stage)["lock_file"]).name
             executor = SSHExecutor("", 22, config.ssh_username, "", client=client,
@@ -361,17 +653,35 @@ def executor_for(settings, state_root, preflight=True, training_stage="sft", *, 
                                    server_facts=pod,
                                    remote_root=config.remote_root + "/jobs", remote_python=root + "/venv/bin/python",
                                    worker_lock_file=root + "/" + lock_name, hf_home=config.remote_root + "/hf-cache",
-                                   model_cache_root=config.remote_root + "/model-cache")
+                                   model_cache_root=config.remote_root + "/model-cache",
+                                   runtime_lock_file=root + "/in-use.lock")
             yield executor
             return
+        cleanup = None
         if preflight:
-            check(client, training_stage, **pins)
+            try:
+                check(client, training_stage, **pins)
+            except (RuntimeMissing, RuntimeMismatch):
+                if not prepare_runtime:
+                    if gate is None:
+                        raise
+                    raise ValueError(RUNTIME_PREPARATION_REQUIRED) from None
+                with preparation_guard(state_root, None, pod) as preparation:
+                    prerequisites(client)
+                    bootstrap_prerequisites(client)
+                    install_runtime(client, training_stage, REMOTE, pod, preparation)
+                cleanup = preparation.get("cleanup")
+                try:
+                    check(client, training_stage, **pins)
+                except (RuntimeMissing, RuntimeMismatch):
+                    raise ValueError(POST_PREPARATION_FAILED) from None
         root = runtime_path(training_stage)
         lock_name = Path(engine_profile(training_stage)["lock_file"]).name
         executor = SSHExecutor("", 22, "root", "", client=client, pod=pod,
                                remote_root=REMOTE + "/jobs", remote_python=root + "/venv/bin/python",
                                worker_lock_file=root + "/" + lock_name, hf_home=REMOTE + "/hf-cache",
-                               model_cache_root=REMOTE + "/model-cache")
+                               model_cache_root=REMOTE + "/model-cache", runtime_lock_file=root + "/in-use.lock")
+        executor.runtime_cleanup = cleanup   # what a preparation in this run approval pruned; None without one
         yield executor
 
 

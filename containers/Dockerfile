@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssh-server 
 
 WORKDIR /opt/factory
 COPY containers/gpu-requirements.lock /opt/factory/containers/gpu-requirements.lock
-RUN pip install --no-cache-dir --require-hashes -r containers/gpu-requirements.lock
+RUN pip install --no-cache-dir --require-hashes --extra-index-url https://download.pytorch.org/whl/cu128 -r containers/gpu-requirements.lock
 COPY pyproject.toml README.md uv.lock ./
 COPY src ./src
 RUN pip install --no-cache-dir --no-deps .

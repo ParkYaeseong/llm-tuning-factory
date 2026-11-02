@@ -90,7 +90,10 @@ def server_runtime(ctx: typer.Context, profile: Path, prepare: bool = False,
         raise typer.BadParameter("--approve-preparation required for private runtime installation")
     settings = server_connection(ctx, profile)
     inspection = inspect_server(settings) if prepare else None
-    output(runtime(settings, ctx.obj.root, prepare=prepare, training_stage=training_stage, inspection=inspection))
+    result = runtime(settings, ctx.obj.root, prepare=prepare, training_stage=training_stage, inspection=inspection)
+    output(result)
+    if not result.get("ready"):
+        raise typer.Exit(1)
 
 
 @app.command("server-runtime-status")

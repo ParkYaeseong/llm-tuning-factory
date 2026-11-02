@@ -30,7 +30,7 @@ script = '''#!/bin/bash
 set -eu
 export UV_CACHE_DIR=/workspace/factory-acceptance/uv-cache
 uv venv --python python3 /workspace/factory-acceptance/runtime/venv
-uv pip sync --python /workspace/factory-acceptance/runtime/venv/bin/python --require-hashes /workspace/factory-acceptance/runtime/containers/gpu-requirements.lock
+uv pip sync --python /workspace/factory-acceptance/runtime/venv/bin/python --require-hashes --torch-backend cu128 /workspace/factory-acceptance/runtime/containers/gpu-requirements.lock
 cp /workspace/factory-acceptance/runtime/factory.whl /workspace/factory-acceptance/runtime/llm_tuning_factory-0.1.0-py3-none-any.whl
 uv pip install --python /workspace/factory-acceptance/runtime/venv/bin/python --no-deps /workspace/factory-acceptance/runtime/llm_tuning_factory-0.1.0-py3-none-any.whl
 touch /workspace/factory-acceptance/runtime/READY

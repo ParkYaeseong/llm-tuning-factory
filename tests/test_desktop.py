@@ -100,7 +100,7 @@ def test_unauthenticated_tracking_allows_local_http_and_drops_stale_credentials(
 def test_runtime_preparation_refuses_a_reserved_pod(tmp_path, monkeypatch):
     app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
     monkeypatch.setattr(app.factory.store, "gpu_locked", lambda pod: True)
-    with pytest.raises(ValueError, match="reserved"):
+    with pytest.raises(ValueError, match="다른 작업이 이 Pod를 사용 중"):
         app.dispatch("runtime_prepare", {"approved": True})
 
 
@@ -153,7 +153,7 @@ def test_desktop_runtime_prepare_observes_canonical_and_unknown_locks(tmp_path, 
     claimed = store.claim(lock_key)
     store.transition(claimed['lease'], 'FAILED')
     monkeypatch.setattr(desktop_runtime, 'runtime', lambda *args, **kwargs: pytest.fail('reserved Pod runtime was prepared'))
-    with pytest.raises(ValueError, match='reserved'):
+    with pytest.raises(ValueError, match="다른 작업이 이 Pod를 사용 중"):
         app.dispatch('runtime_prepare', {'approved': True})
     assert store.gpu_locked(lock_key)
 
@@ -185,3 +185,289 @@ def test_desktop_claim_is_visible_to_canonical_workers(tmp_path, monkeypatch):
     # Ambiguous old strings remain unmapped; their uncertainty quarantines real claims.
     with store.connection() as db:
         assert db.execute('SELECT gpu FROM gpu_locks').fetchone()[0] == 'existing_runpod:borrowed'
+
+
+def test_plan_ignores_a_stored_observation_with_wrong_value_types(tmp_path):
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    catalog = app.dispatch("catalog", {})
+    config = next(x["config"] for x in catalog["templates"] if x["name"] == "paper_extraction")
+    source = tmp_path / "input.json"
+    source.write_text(json.dumps([{"instruction": "question", "output": "answer"}]))
+    app.dispatch("dataset", {"dataset_id": "dummy", "version": "1", "path": str(source)})
+    folder = tmp_path / "gpu-observations"
+    folder.mkdir()
+    broken = {"key": "runpod-borrowed", "observed_at": 1.0, "gpus": [{**BLACKWELL, "memory_mib": "24467"}],
+              "pod": POD_API}
+    (folder / "runpod-borrowed.json").write_text(json.dumps(broken))
+    compat = app.dispatch("plan", {"config": config})["compatibility"]
+    assert compat["observed_at"] is None and ("warn", "OBSERVATION_MISSING") in finding_codes(compat["findings"])
+
+
+BLACKWELL = {"uuid": "GPU-1", "name": "NVIDIA RTX PRO 4000 Blackwell", "capability": "12.0", "memory_mib": 24467,
+             "driver": "595.91.07"}
+POD_API = {"gpu": {"id": "NVIDIA RTX PRO 4000 Blackwell", "displayName": None, "count": 1}, "costPerHr": 0.57}
+A4000_JOB = {"training_stage": "sft", "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+             "resource_profile": {"gpu_type": "NVIDIA RTX A4000", "gpu_count": 1, "hourly_cost_usd": 0.5}}
+
+
+def finding_codes(findings):
+    return {(item["level"], item["code"]) for item in findings}
+
+
+def hub_job(**profile):
+    from tuning_factory.model_hub import ModelProfile
+    profile = ModelProfile(revision="a" * 40, config_sha256="c" * 64, **profile).model_dump()
+    return {**A4000_JOB, "base_model": profile["repo_id"], "model_profile": profile,
+            "resource_profile": {**A4000_JOB["resource_profile"], "gpu_type": BLACKWELL["name"]}}
+
+
+def test_compatibility_estimates_memory_for_a_registered_hub_model(tmp_path):
+    from tuning_factory.gpu_compat import make_observation
+    config = hub_job(repo_id="someone/gemma-4-31B-text-sft", architecture="gemma4", template="gemma4",
+                     hidden_layers=60, hidden_size=5376, parameters_total=31_273_088_876)
+    findings = desktop.DesktopService(tmp_path).compatibility(config, make_observation("runpod-x", [BLACKWELL]),
+                                                              "execute")
+    found = finding_codes(findings)
+    assert ("block", "MEMORY_WEIGHTS_EXCEED") in found and ("warn", "MEMORY_UNKNOWN") not in found
+
+
+def test_a_hub_registration_without_size_facts_uses_the_catalog_sizes_of_the_same_model(tmp_path):
+    from tuning_factory.gpu_compat import make_observation
+    # Registered from the hub before profiles carried sizes: only the layer count was stored.
+    config = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3_5", template="qwen3_5", hidden_layers=64)
+    app = desktop.DesktopService(tmp_path)
+    found = finding_codes(app.compatibility(config, make_observation("runpod-x", [BLACKWELL]), "execute"))
+    assert ("block", "MEMORY_WEIGHTS_EXCEED") in found and ("warn", "MEMORY_UNKNOWN") not in found
+    unknown = hub_job(repo_id="someone/Qwen3.5-27B-sft", architecture="qwen3_5", template="qwen3_5",
+                      hidden_layers=64)
+    found = finding_codes(app.compatibility(unknown, make_observation("runpod-x", [BLACKWELL]), "execute"))
+    assert ("warn", "MEMORY_UNKNOWN") in found and ("block", "MEMORY_WEIGHTS_EXCEED") not in found
+
+
+def test_plan_warns_that_memory_is_unknown_for_a_hub_model_without_sizes_before_any_observation(tmp_path):
+    config = hub_job(repo_id="someone/Qwen3.5-27B-sft", architecture="qwen3_5", template="qwen3_5",
+                     hidden_layers=64)
+    found = finding_codes(desktop.DesktopService(tmp_path).plan_compatibility(config)["findings"])
+    assert {("warn", "MEMORY_UNKNOWN"), ("warn", "OBSERVATION_MISSING")} <= found
+    sized = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3_5", template="qwen3_5", hidden_layers=64)
+    assert ("warn", "MEMORY_UNKNOWN") not in finding_codes(
+        desktop.DesktopService(tmp_path).plan_compatibility(sized)["findings"])   # the catalog knows its sizes
+
+
+def judged_model(tmp_path, monkeypatch, config):
+    """The model entry DesktopService.compatibility hands gpu_compat.evaluate for ``config``."""
+    from tuning_factory import gpu_compat
+    seen = []
+    monkeypatch.setattr(gpu_compat, "evaluate", lambda config, observation, capabilities, model, **kw: seen.append(
+        model) or [])
+    desktop.DesktopService(tmp_path).compatibility(config, None, "plan")
+    return seen[0]
+
+
+def test_a_hub_registration_of_the_verified_catalog_model_keeps_its_gpu_verification(tmp_path):
+    from tuning_factory.gpu_compat import make_observation
+    config = hub_job(repo_id="Qwen/Qwen2.5-0.5B-Instruct", architecture="qwen2", template="qwen", hidden_layers=24)
+    app = desktop.DesktopService(tmp_path)
+    found = finding_codes(app.compatibility(config, make_observation("runpod-x", [BLACKWELL]), "execute"))
+    assert ("warn", "MODEL_UNVERIFIED") not in found   # 12.0 is a verified generation of the catalog entry
+    a100 = {**BLACKWELL, "name": "NVIDIA A100", "capability": "8.0", "memory_mib": 81920}
+    config["resource_profile"]["gpu_type"] = "NVIDIA A100"
+    findings = app.compatibility(config, make_observation("runpod-x", [a100]), "execute")
+    assert [item["message"] for item in findings if item["code"] == "MODEL_UNVERIFIED"] == [
+        "이 모델은 이 GPU 세대(compute capability 8.0)에서 아직 검증되지 않았습니다."]
+
+
+def test_a_sized_hub_registration_of_a_catalog_composite_is_judged_with_the_catalog_entry(tmp_path, monkeypatch):
+    from tuning_factory.capabilities import model_catalog
+    reviewed = next(m for m in model_catalog() if m["id"] == "Qwen/Qwen3.5-27B")
+    config = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3_5", template="qwen3_5", hidden_layers=64,
+                     hidden_size=5120, parameters_total=27_781_427_952, moe=False, tie_word_embeddings=False)
+    assert judged_model(tmp_path, monkeypatch, config) == reviewed
+    other = hub_job(repo_id="someone/Qwen3.5-27B-sft", architecture="qwen3_5", template="qwen3_5",
+                    hidden_layers=64, hidden_size=5120, parameters_total=27_781_427_952)
+    model = judged_model(tmp_path, monkeypatch, other)
+    assert model["source"] == "huggingface" and "text_parameters" not in model
+    # Another architecture under a catalog name is not the reviewed model: its own profile is judged.
+    renamed = hub_job(repo_id="Qwen/Qwen3.5-27B", architecture="qwen3", template="qwen3_nothink", hidden_layers=64)
+    assert judged_model(tmp_path, monkeypatch, renamed)["source"] == "huggingface"
+
+
+def test_catalog_sizes_fill_every_size_fact_a_hub_entry_lacks_and_the_entry_values_win():
+    from tuning_factory.capabilities import with_catalog_sizes
+    from tuning_factory.model_hub import ModelProfile, imported_model
+    profile = ModelProfile(repo_id="Qwen/Qwen3.5-27B", revision="a" * 40, config_sha256="c" * 64,
+                           architecture="qwen3_5", template="qwen3_5", hidden_layers=64, hidden_size=5120,
+                           parameters_total=27_000_000_000, tie_word_embeddings=False)
+    entry = with_catalog_sizes(imported_model(profile))
+    assert entry["text_parameters"] == 26_895_998_464 and entry["moe"] is False   # filled from the catalog
+    assert (entry["parameters_total"], entry["parameters_b"]) == (27_000_000_000, 27.0)   # the hub's own values
+    assert entry["source"] == "huggingface" and not entry["gpu_verified"]
+
+
+def test_plan_reports_gpu_compatibility_from_the_stored_observation(tmp_path):
+    from tuning_factory.gpu_compat import make_observation, save_observation
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    catalog = app.dispatch("catalog", {})
+    config = next(x["config"] for x in catalog["templates"] if x["name"] == "paper_extraction")
+    source = tmp_path / "input.json"
+    source.write_text(json.dumps([{"instruction": "question", "output": "answer"}]))
+    app.dispatch("dataset", {"dataset_id": "dummy", "version": "1", "path": str(source)})
+    first = app.dispatch("plan", {"config": config})["compatibility"]
+    assert first["observed_at"] is None and ("warn", "OBSERVATION_MISSING") in finding_codes(first["findings"])
+    save_observation(tmp_path, make_observation("runpod-borrowed", [BLACKWELL], POD_API))
+    second = app.dispatch("plan", {"config": config})["compatibility"]
+    assert second["observed_at"] > 0
+    assert ("block", "GPU_TYPE_MISMATCH") in finding_codes(second["findings"])   # the template asks for an A4000
+    assert app.dispatch("jobs", {}) == []
+
+
+def test_runtime_check_judges_a_queued_job_or_a_plan_config(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    from tuning_factory.gpu_compat import make_observation
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    job = app.factory.store.submit({"sha256": "a4000", "simulation": False, "config": A4000_JOB}, "a4000")
+    observation = make_observation("runpod-borrowed", [BLACKWELL], POD_API)
+    monkeypatch.setattr(desktop_runtime, "runtime", lambda *a, **kw: {"ready": False, "runtime_state": "missing",
+                                                                     "observation": observation})
+    report = app.dispatch("runtime_check", {"training_stage": "sft", "job_id": job["id"]})
+    assert {("block", "GPU_TYPE_MISMATCH"), ("block", "PRICE_OVER_BUDGET")} <= finding_codes(report["findings"])
+    assert "findings" not in app.dispatch("runtime_check", {"training_stage": "sft"})
+
+
+def test_execute_gates_the_job_and_forwards_runtime_preparation(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tuning_factory import desktop_runtime
+    from tuning_factory.gpu_compat import make_observation
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    store = app.factory.store
+    job = store.submit({"sha256": "a4000", "simulation": False, "config": A4000_JOB}, "a4000")
+    store.transition(job["id"], "QUEUED")
+    seen = {}
+
+    @contextmanager
+    def fake_executor(settings, root, **kwargs):
+        seen.update(kwargs)
+        kwargs["gate"](make_observation("runpod-borrowed", [BLACKWELL], POD_API))
+        yield SimpleNamespace(remote=True)
+
+    monkeypatch.setattr(desktop_runtime, "executor_for", fake_executor)
+    monkeypatch.setattr(app.factory, "run_claimed", lambda *args: pytest.fail("refused job launched"))
+    with pytest.raises(ValueError, match="실행할 수 없습니다"):
+        app.dispatch("execute", {"approved": True, "job_id": job["id"], "prepare_runtime": True})
+    assert seen["prepare_runtime"] is True and store.get(job["id"])["attempts"] == 0
+    server = desktop.DesktopService(tmp_path / "server", {"provider": "ssh_server"})
+    with pytest.raises(ValueError, match="GPU 서버는 실행 승인에서"):
+        server.dispatch("execute", {"approved": True, "job_id": "0" * 32, "prepare_runtime": True})
+
+
+def test_execute_returns_what_its_runtime_preparation_pruned(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    store = app.factory.store
+    job = store.submit({"sha256": "a4000", "simulation": False, "config": A4000_JOB}, "a4000")
+    store.transition(job["id"], "QUEUED")
+    cleanup = {"removed": ["b" * 16], "kept_in_use": [], "free_before": 1, "free_after": 3}
+    prepared = {"value": cleanup}
+
+    @contextmanager
+    def fake_executor(settings, root, **kwargs):
+        yield SimpleNamespace(remote=True, runtime_cleanup=prepared["value"])
+
+    monkeypatch.setattr(desktop_runtime, "executor_for", fake_executor)
+    finished = {"id": job["id"], "status": "COMPLETED"}
+    monkeypatch.setattr(app.factory, "work", lambda **kwargs: dict(finished))
+    request = {"approved": True, "job_id": job["id"], "prepare_runtime": True}
+    assert app.dispatch("execute", request) == {**finished, "runtime_cleanup": cleanup}
+    prepared["value"] = None                              # no preparation: the job record is unchanged
+    assert app.dispatch("execute", request) == finished
+    monkeypatch.setattr(app.factory, "work", lambda **kwargs: None)
+    assert app.dispatch("execute", request) is None       # nothing claimed: still the waiting answer
+
+
+def test_execute_with_preparation_refuses_a_pod_held_by_another_job(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    store = app.factory.store
+    old = store.submit({"sha256": "old", "simulation": False}, "old")
+    store.transition(old["id"], "QUEUED")
+    claimed = store.claim("existing_runpod:borrowed")
+    store.transition(claimed["lease"], "FAILED")
+    second = store.submit({"sha256": "a4000", "simulation": False, "config": A4000_JOB}, "a4000")
+    store.transition(second["id"], "QUEUED")
+    monkeypatch.setattr(desktop_runtime, "executor_for", lambda *a, **kw: pytest.fail("held Pod was prepared"))
+    with pytest.raises(ValueError, match="다른 작업이 이 Pod를 사용 중"):
+        app.dispatch("execute", {"approved": True, "job_id": second["id"], "prepare_runtime": True})
+
+
+def test_plan_survives_an_observation_key_that_cannot_be_derived(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    catalog = app.dispatch("catalog", {})
+    config = next(x["config"] for x in catalog["templates"] if x["name"] == "paper_extraction")
+    source = tmp_path / "input.json"
+    source.write_text(json.dumps([{"instruction": "question", "output": "answer"}]))
+    app.dispatch("dataset", {"dataset_id": "dummy", "version": "1", "path": str(source)})
+
+    def broken(settings):
+        raise RuntimeError("no home directory")
+
+    monkeypatch.setattr(desktop_runtime, "observation_key", broken)
+    compat = app.dispatch("plan", {"config": config})["compatibility"]
+    assert ("warn", "OBSERVATION_MISSING") in finding_codes(compat["findings"])
+
+
+def test_runtime_check_validates_the_job_before_any_remote_contact(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    monkeypatch.setattr(desktop_runtime, "runtime", lambda *a, **kw: pytest.fail("runtime contacted"))
+    with pytest.raises(ValueError):
+        app.dispatch("runtime_check", {"training_stage": "sft", "job_id": "not-a-job"})
+
+
+def test_a_job_from_another_app_version_is_refused_before_any_contact(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    store = app.factory.store
+    job = store.submit({"sha256": "old", "simulation": False, "config": A4000_JOB, "source_sha256": "0" * 64}, "old")
+    store.transition(job["id"], "QUEUED")
+    monkeypatch.setattr(desktop_runtime, "runtime", lambda *a, **kw: pytest.fail("runtime contacted"))
+    monkeypatch.setattr(desktop_runtime, "executor_for", lambda *a, **kw: pytest.fail("Pod was prepared"))
+    with pytest.raises(ValueError) as caught:
+        app.dispatch("runtime_check", {"training_stage": "sft", "job_id": job["id"]})
+    assert str(caught.value) == desktop.STALE_JOB
+    with pytest.raises(ValueError) as caught:
+        app.dispatch("execute", {"approved": True, "job_id": job["id"], "prepare_runtime": True})
+    assert str(caught.value) == desktop.STALE_JOB
+
+
+def test_a_stale_job_is_refused_before_resume_resets_it(tmp_path):
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    store = app.factory.store
+    job = store.submit({"sha256": "old", "simulation": False, "config": A4000_JOB, "source_sha256": "0" * 64}, "old")
+    store.transition(job["id"], "QUEUED")
+    store.transition(job["id"], "CANCELED")
+    with pytest.raises(ValueError) as caught:
+        app.dispatch("resume", {"approved": True, "job_id": job["id"], "checkpoint": "checkpoint-1"})
+    assert str(caught.value) == desktop.STALE_JOB
+    assert store.get(job["id"])["status"] == "CANCELED"
+
+
+def test_runtime_check_judges_a_job_with_its_own_training_stage(tmp_path, monkeypatch):
+    from tuning_factory import desktop_runtime
+    app = desktop.DesktopService(tmp_path, {"pod_id": "borrowed"})
+    job = app.factory.store.submit({"sha256": "p", "simulation": False,
+                                    "config": {**A4000_JOB, "training_stage": "ppo"}}, "p")
+    seen = {}
+
+    def fake(settings, root, **kwargs):
+        seen.update(kwargs)
+        return {"ready": False, "runtime_state": "missing", "observation": None}
+
+    monkeypatch.setattr(desktop_runtime, "runtime", fake)
+    app.dispatch("runtime_check", {"training_stage": "sft", "job_id": job["id"]})
+    assert seen["training_stage"] == "ppo"
