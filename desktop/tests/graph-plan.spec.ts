@@ -17,7 +17,7 @@ const CATALOG_DATASETS = DATASETS.map(binding => ({ ...binding.dataset, rows: 20
 const PROFILES = [{ profile_id: "pod-a", RUNPOD_API_KEY_saved: true, fields: { provider: "existing_runpod", name: "A100 Pod" } },
   { profile_id: "pod-b", RUNPOD_API_KEY_saved: true, fields: { provider: "existing_runpod", name: `${HOSTILE} Pod` } }];
 const ESTIMATE = { profile_id: "estimate-a100", gpu_type: "NVIDIA A100", gpu_count: 1, total_hourly_cost_usd: 1.5 };
-const MLFLOW = "https://mlflow.kbiofoundry.kr";
+const MLFLOW = "https://mlflow.example.org";
 const VALID = ok({ project_id: "validated", project_revision: H("1"), node_count: 1 });
 const RUN = "a".repeat(32);
 

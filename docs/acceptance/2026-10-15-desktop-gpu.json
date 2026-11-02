@@ -46,7 +46,7 @@
       "quality_status": "synthetic_only",
       "simulation": false,
       "synthetic_data": true,
-      "url": "https://mlflow.kbiofoundry.kr/#/experiments/16/runs/6a12982b12344b1a8aabd4e8aaeb3957"
+      "url": "https://mlflow.example.org/#/experiments/16/runs/6a12982b12344b1a8aabd4e8aaeb3957"
     },
     {
       "job_id": "069ba78280a84b07a17741aaebff6cfd",
@@ -76,7 +76,7 @@
       "quality_status": "synthetic_only",
       "simulation": false,
       "synthetic_data": true,
-      "url": "https://mlflow.kbiofoundry.kr/#/experiments/16/runs/a43fd2727a5441b58fb5d920f746ab59"
+      "url": "https://mlflow.example.org/#/experiments/16/runs/a43fd2727a5441b58fb5d920f746ab59"
     },
     {
       "job_id": "7f4d3983916b4e8cbe9c7e64802e5dac",
@@ -107,7 +107,7 @@
       "simulation": false,
       "synthetic_data": true,
       "quantization": null,
-      "url": "https://mlflow.kbiofoundry.kr/#/experiments/16/runs/df6c2cc533204533aa1b7fd76c3dcb0d"
+      "url": "https://mlflow.example.org/#/experiments/16/runs/df6c2cc533204533aa1b7fd76c3dcb0d"
     },
     {
       "job_id": "b03bddf3286d4c6fa12174a846eee3be",
@@ -147,7 +147,7 @@
           "[INFO|2026-10-15 01:37:49] llamafactory.model.model_utils.quantization:144 >> Quantizing model to 4 bit with bitsandbytes."
         ]
       },
-      "url": "https://mlflow.kbiofoundry.kr/#/experiments/16/runs/ddc1585a277e4e5091c13f52a6a5873d"
+      "url": "https://mlflow.example.org/#/experiments/16/runs/ddc1585a277e4e5091c13f52a6a5873d"
     }
   ],
   "checkpoint_resume": {

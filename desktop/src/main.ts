@@ -57,9 +57,9 @@ const ctx: ViewContext = {
   reloadCatalog: () => catalog(),
 };
 const defaults: Obj = {
-  MLFLOW_TRACKING_URI: "https://mlflow.kbiofoundry.kr",
+  MLFLOW_TRACKING_URI: "",
   FACTORY_MLFLOW_ARTIFACT_LOCATION: "mlflow-artifacts:/llm-tuning-factory",
-  MLFLOW_OIDC_TOKEN_URL: "https://sso.k-biofoundrycopilot.duckdns.org/realms/kbf/protocol/openid-connect/token",
+  MLFLOW_OIDC_TOKEN_URL: "",
   MLFLOW_OIDC_CLIENT_ID: "mlflow", auth_mode: "oidc", provider: "existing_runpod", server_ssh_port: "22",
 };
 const esc = (v: unknown) => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
@@ -359,10 +359,10 @@ function connections() {
   </div></section>
   ${server ? sshServer : runpod}
   <section class="card"><h3>공용 MLflow 연결</h3><div class="grid">
-  ${field("MLflow 서버 주소", "MLFLOW_TRACKING_URI", s.MLFLOW_TRACKING_URI)}
+  ${field("MLflow 서버 주소", "MLFLOW_TRACKING_URI", s.MLFLOW_TRACKING_URI, "text", "예: https://mlflow.example.org")}
   ${field("산출물 저장 위치", "FACTORY_MLFLOW_ARTIFACT_LOCATION", s.FACTORY_MLFLOW_ARTIFACT_LOCATION)}
   ${select("인증 방식", "auth_mode", auth, [["oidc", "기관 인증 (OIDC)"], ["token", "발급받은 토큰"], ["none", "인증 없음 · 로컬·내부 서버"]])}
-  ${auth === "oidc" ? `${field("인증 서버 주소", "MLFLOW_OIDC_TOKEN_URL", s.MLFLOW_OIDC_TOKEN_URL)}
+  ${auth === "oidc" ? `${field("인증 서버 주소", "MLFLOW_OIDC_TOKEN_URL", s.MLFLOW_OIDC_TOKEN_URL, "text", "예: https://sso.example.org/realms/&lt;realm&gt;/protocol/openid-connect/token")}
   ${field("클라이언트 ID", "MLFLOW_OIDC_CLIENT_ID", s.MLFLOW_OIDC_CLIENT_ID)}
   ${field("클라이언트 인증값", "MLFLOW_OIDC_CLIENT_SECRET", s.MLFLOW_OIDC_CLIENT_SECRET || "", "password", s.MLFLOW_OIDC_CLIENT_SECRET_saved ? "보안 저장됨" : "관리자에게 별도로 전달받으세요.")}` : ""}
   ${auth === "token" ? field("별도 발급 토큰", "MLFLOW_TRACKING_TOKEN", s.MLFLOW_TRACKING_TOKEN || "", "password", s.MLFLOW_TRACKING_TOKEN_saved ? "보안 저장됨" : "관리자에게 발급받은 토큰을 입력하세요.") : ""}

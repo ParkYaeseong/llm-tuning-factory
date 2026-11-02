@@ -1,16 +1,16 @@
 # Live connection configuration
 
-The legacy https://mlflow.k-biofoundrycopilot.duckdns.org address redirects to the canonical
-https://mlflow.kbiofoundry.kr. Use the canonical host for API calls so bearer authentication is not lost on a cross-host redirect.
+The legacy https://mlflow-legacy.example.org address redirects to the canonical
+https://mlflow.example.org. Use the canonical host for API calls so bearer authentication is not lost on a cross-host redirect.
 Keycloak's existing realm/token endpoint remains valid.
 
 The local ignored `.factory/connection.json` refers to the existing credential files without copying values:
 
 ```json
 {
-  "tracking_uri": "https://mlflow.kbiofoundry.kr",
+  "tracking_uri": "https://mlflow.example.org",
   "artifact_location": "mlflow-artifacts:/llm-tuning-factory",
-  "oidc_token_url": "https://sso.k-biofoundrycopilot.duckdns.org/realms/kbf/protocol/openid-connect/token",
+  "oidc_token_url": "https://sso.example.org/realms/kbf/protocol/openid-connect/token",
   "oidc_client_id": "mlflow",
   "oidc_secret_file": "D:/workflow/.env",
   "runpod_env_file": "D:/workflow/rp.env",

@@ -6927,7 +6927,7 @@ profile instead.
   host. The desktop app uses its `ssh_fingerprint` setting (`PinnedHostKey`) instead, and that setting is empty.
 - **Desktop MLflow.** The saved desktop settings still point at `http://127.0.0.1:5999` (operator
   `acceptance-upgrade`), where nothing listens, and no MLflow secret is saved. Reproduced with `check_connections`:
-  that URI raises `MlflowException` (connection refused). `https://mlflow.kbiofoundry.kr` without credentials returns
+  that URI raises `MlflowException` (connection refused). `https://mlflow.example.org` without credentials returns
   the SSO login page, which raises `MlflowException` (response not valid JSON). The check stops at MLflow before
   reading the Pod.
 - **CLI doctor.** `factory --state-dir <temp> --connection-file .factory/connection.json doctor --pod-id
@@ -6936,7 +6936,7 @@ profile instead.
   RunPod API read the Pod as RUNNING, 1 × RTX PRO 4000 Blackwell, $0.57/h, network volume `m1b4qscsnl`, with the
   SSH mapping available. No MLflow write test was run.
 - **Desktop check, slow MLflow failure.** The user then saved the desktop settings (13:26:39): OIDC, URI
-  `https://mlflow.kbiofoundry.kr/`, the Pod ID, the key file and the fingerprint. The saved OIDC secret and RunPod key
+  `https://mlflow.example.org/`, the Pod ID, the key file and the fingerprint. The saved OIDC secret and RunPod key
   equal the CLI profile's files (compared in-process, never printed). Results, each with a temporary state root:
   - The installed 0.4.0 `factory-bridge.exe` passed the `connection` action with the saved settings in 7.0 s, and
     `DesktopService.dispatch` from source passed in 2.8 s.
@@ -7049,7 +7049,7 @@ locked installation, lint, history secret scan and CPU tests. A separate clean l
 successfully and completed the synthetic CLI example without accessing paid infrastructure.
 
 Production MLflow authentication, registry reads, successful/failed diagnostic runs and artifact upload/download
-checksums pass at https://mlflow.kbiofoundry.kr. The legacy URL redirects here. Receipts are
+checksums pass at https://mlflow.example.org. The legacy URL redirects here. Receipts are
 state/live-integration/connection-check.json and state/production-acceptance/acceptance.json.
 Three synthetic CPU AI workflows completed with distinct production runs. These are infrastructure checks.
 
