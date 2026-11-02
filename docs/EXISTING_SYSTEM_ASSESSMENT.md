@@ -38,8 +38,8 @@ dataset-generation scripts, server credentials, historical model weights/data, o
 Existing Llama-3.1/3.2 bases are supported by the conservative template catalog; newer/custom models need a tested profile.
 The initial upstream-pinned image has no local production patches and cannot replace the current Pod blindly.
 
-The known existing MLflow URL is https://mlflow.k-biofoundrycopilot.duckdns.org and its documented realm is
-https://sso.k-biofoundrycopilot.duckdns.org/realms/kbf. Unauthenticated read-only /health and /version probes both
+The known existing MLflow URL is https://mlflow-legacy.example.org and its documented realm is
+https://sso.example.org/realms/kbf. Unauthenticated read-only /health and /version probes both
 returned HTTP 308. This establishes an HTTP response, not authenticated tracking or writable artifact-store readiness.
 No production MLflow runs or remote changes were made. See OPERATIONS.md for explicit configuration to reuse this server.
 

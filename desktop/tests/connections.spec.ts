@@ -91,6 +91,8 @@ test("a fresh install has an empty MLflow address and the overview says it is no
   await connectionsPage(page);
   await expect(page.getByLabel("MLflow 서버 주소", { exact: true })).toHaveValue("");
   await expect(page.getByText("예: https://mlflow.example.org", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("인증 서버 주소", { exact: true })).toHaveValue("");
+  await expect(page.getByText("예: https://sso.example.org/realms/<realm>/protocol/openid-connect/token", { exact: true })).toBeVisible();
 });
 
 test("a saved MLflow address wins over the empty default", async ({ page }) => {
