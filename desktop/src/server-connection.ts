@@ -1,6 +1,7 @@
 // SSH GPU server ("ssh_server") connection contract for the Windows workbench: native settings helpers,
 // typed sidecar calls, approval texts and escaped renderers. Screen state stays with the caller, so later
 // profile and graph screens can reuse this module without importing main.ts.
+import { RUNTIME_CLEANUP_NOTICE } from "./gpu-preflight";
 import { button, escapeHtml as esc, formatDate } from "./workbench";
 
 type Obj = Record<string, any>;
@@ -140,7 +141,8 @@ export function prepareApproval(inspection: Obj, stage: string) {
   const t = inspection.transport, names = new Map(inspection.inventory.map((gpu: Obj) => [gpu.uuid, gpu.name]));
   const gpus = t.selected_gpu_uuids.map((uuid: string) => `${names.get(uuid) || "조회되지 않은 GPU"} (${uuid})`).join(", ");
   return `${sshAddress(t.ssh_username, t.ssh_host, t.ssh_port)}의 작업 폴더 ${t.remote_root} 아래에 ${stage} 학습용 앱 전용 환경을 설치합니다. `
-    + "의존성·Python·학습 도구는 이 폴더로 다운로드하며 서버의 기본 Python과 시스템 패키지는 변경하지 않습니다.\n"
+    + "의존성·Python·학습 도구는 이 폴더로 다운로드하며 서버의 기본 Python과 시스템 패키지는 변경하지 않습니다. "
+    + RUNTIME_CLEANUP_NOTICE + "\n"
     + `선택 GPU: ${gpus}\n사용자 데이터는 전송하지 않습니다. 앱은 서버를 켜거나 끄지 않습니다.`;
 }
 export function releaseApproval(reservation: Obj) {

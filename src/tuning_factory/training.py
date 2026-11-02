@@ -12,9 +12,10 @@ from types import MappingProxyType
 
 import yaml
 
-from .capabilities import STAGES, compatibility
+from .capabilities import STAGES, compatibility, model_entry
 from .config import AIConfig, GraphTrainingConfig
 from .model_artifacts import ModelInput
+from .model_hub import COMPOSITE_ARCHITECTURES
 from .registry import canonical, dataset_descriptor, digest, file_digest, parse_dataset
 
 # A v2 logical training template holds no model location. Each model slot holds the sentinel
@@ -28,6 +29,9 @@ PPO_CONTINUATION = ("PPO adapter continuation is unsupported: its KL reference w
                     "materialize the parent first")
 # Every graph training output is frozen as a typed artifact, and OFT exports have no typed adapter contract.
 OFT_UNFREEZABLE = "OFT training is unsupported in graphs: its output cannot be frozen as a typed model artifact"
+# LLaMA-Factory 0.9.5 reasoning templates default to enable_thinking=True, which trains an empty thought block on
+# answers that have none; the app trains and evaluates plain text answers.
+REASONING_TEMPLATES = frozenset({"qwen3_5", "qwen3_6", "gemma4", "gemma4n"})
 
 
 def requires_frozen_reference(config) -> bool:
@@ -65,6 +69,12 @@ def check_generation_benchmark(benchmark) -> None:
         raise ValueError("v2 evaluation supports greedy causal-LM generation benchmarks only")
     if benchmark.precision == "fp32":
         raise ValueError("fp32 benchmark precision cannot be enforced by the pinned engine")
+
+
+def _plain_answers(plan, template):
+    if template in REASONING_TEMPLATES:
+        plan["enable_thinking"] = False
+    return plan
 
 
 class CanceledError(RuntimeError):
@@ -184,7 +194,11 @@ class LlamaFactoryBackend(TrainingBackend):
                     "reward_model", "reward_model_type"},
         }.get(config.training_stage, set())
         plan.update(config.stage_options.model_dump(include=fields, exclude_none=True))
-        return plan
+        model = model_entry(config)
+        if model is not None and model["architecture"] in COMPOSITE_ARCHITECTURES:
+            # Text data only: LLaMA-Factory's composite defaults, written out so every plan states them.
+            plan.update(freeze_vision_tower=True, freeze_multi_modal_projector=True, freeze_language_model=False)
+        return _plain_answers(plan, config.template)
 
     def train(self, directory, timeout, canceled=lambda: False):
         self.run_config(directory, timeout, canceled, "train.yaml", "train.log")
@@ -248,6 +262,7 @@ class LlamaFactoryBackend(TrainingBackend):
         elif config.training_method in {"full", "freeze"}:
             plan.update(model_name_or_path="./output", finetuning_type="full")
             plan.pop("adapter_name_or_path")
+        _plain_answers(plan, config.template)
         (directory / "predict.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
         self.run_config(directory, timeout, canceled, "predict.yaml", "predict.log")
         if config.training_method == "qlora":
@@ -277,7 +292,7 @@ class LlamaFactoryBackend(TrainingBackend):
             plan["adapter_name_or_path"] = adapter_path
         if benchmark.quantization_bit is not None:
             plan.update(quantization_bit=benchmark.quantization_bit, quantization_method="bnb")
-        return plan
+        return _plain_answers(plan, benchmark.template)
 
     def predict_bound(self, directory, plan, sample_ids, timeout, canceled=lambda: False) -> dict:
         """Run a bound prediction plan; write ``output/predictions.json`` with predictions only, in sample order.
@@ -319,6 +334,7 @@ class LlamaFactoryBackend(TrainingBackend):
         elif config.training_method in {"full", "freeze"}:
             plan.update(model_name_or_path="./output", finetuning_type="full")
             plan.pop("adapter_name_or_path")
+        _plain_answers(plan, config.template)
         (directory / "reward-evaluate.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
         self.run_config(directory, timeout, canceled, "reward-evaluate.yaml", "reward-evaluate.log")
         if config.training_method == "qlora":

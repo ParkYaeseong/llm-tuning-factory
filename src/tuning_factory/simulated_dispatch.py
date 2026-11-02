@@ -63,11 +63,12 @@ from .model_artifacts import (
     ModelArtifactStore,
     check_link_free,
     directory_inventory_sha256,
+    is_processor_file,
     is_tokenizer_file,
     list_files,
 )
 from .model_ops import (
-    POLICY_F32_V1,
+    CURRENT_POLICY,
     MaterializeReceipt,
     MergeReceipt,
     local_config_sha256,
@@ -94,6 +95,7 @@ from .operation_runner import (
 from .operations import EvaluateOperation, MaterializeOperation, MergeOperation, TrainOperation
 from .registry import canonical, digest, file_digest
 from .runtime_profiles import operation_profile
+from .target_inspection import resolved_lora_targets
 from .training import OFT_UNFREEZABLE, CanceledError, LlamaFactoryBackend
 from .worker_protocol import COMMAND, OperationResult, WorkerRequest
 
@@ -279,7 +281,7 @@ def _base_directory(base, verifier, roots) -> Path:
 
 def _snapshot_files(directory: Path, prefix: str) -> list:
     return [(f"{prefix}/{relative}", file.read_bytes()) for relative, file in list_files(directory)
-            if relative == "config.json" or is_tokenizer_file(relative)]
+            if relative == "config.json" or is_tokenizer_file(relative) or is_processor_file(relative)]
 
 
 def _evidence_for(base, target_evidence, verifier) -> ModelTargetEvidence | None:
@@ -422,10 +424,11 @@ class SimulatedWorker:
             if evidence is None:
                 raise ValueError(TARGETS_REQUIRED.format(kind=operation.kind))
             targets = tuple(sorted(verifier.verify(model_input.policy.adapter).adapter.target_modules))
-        elif config.hyperparameters.lora_target == "all":   # LLaMA-Factory expands to every inspected Linear module
-            if evidence is None:
-                raise ValueError(TARGETS_REQUIRED.format(kind=operation.kind))
-            targets = tuple(sorted({item.name.rsplit(".", 1)[-1] for item in evidence.modules}))
+        elif evidence is not None:   # LLaMA-Factory: leaf names, or full language-model names for composite models
+            targets = resolved_lora_targets(config.hyperparameters.lora_target,
+                                            [item.name for item in evidence.modules])
+        elif config.hyperparameters.lora_target == "all":
+            raise ValueError(TARGETS_REQUIRED.format(kind=operation.kind))
         else:
             targets = tuple(sorted(config.hyperparameters.lora_target.split(",")))
         if evidence is None:
@@ -436,7 +439,8 @@ class SimulatedWorker:
 
         modules = tuple((item.name, item.input_dimension, item.output_dimension)
                         for item in sorted(evidence.modules, key=lambda item: item.name) if targeted(item.name))
-        if any(not any(name == target or name.endswith("." + target) for name, _, _ in modules) for target in targets):
+        if not modules or any(not any(name == target or name.endswith("." + target) for name, _, _ in modules)
+                              for target in targets):
             raise ValueError("simulated adapter target is absent from the inspected base modules")
         return targets, modules
 
@@ -457,7 +461,7 @@ class SimulatedWorker:
             "target_modules": list(plan.target_modules), "bias": "none", "fan_in_fan_out": False,
             "task_type": "CAUSAL_LM", "inference_mode": True, "base_model_name_or_path": first.root.repo_id})),
                  (f"{prefix}/adapter_model.safetensors", _Tensors(shapes)), *_snapshot_files(directory, prefix)]
-        receipt = MergeReceipt(policy_id=POLICY_F32_V1, inputs=plan.inputs, normalized_weights=plan.normalized_weights,
+        receipt = MergeReceipt(policy_id=CURRENT_POLICY, inputs=plan.inputs, normalized_weights=plan.normalized_weights,
                                output_rank=rank, max_abs_delta_error=0.0, max_abs_logits_error=0.0,
                                finite_tensors_checked=len(shapes), output_files=_output_files(files, prefix))
         return _Layout(files=tuple(files), receipt=receipt)
@@ -472,7 +476,7 @@ class SimulatedWorker:
             raise ValueError(TARGETS_REQUIRED.format(kind=operation.kind))
         prefix = f"{MODEL_OP_PARENT}/output"
         files = [(f"{prefix}/model.safetensors", _full_weights(evidence)), *_snapshot_files(directory, prefix)]
-        receipt = MaterializeReceipt(policy_id=POLICY_F32_V1, base=base, adapter=operation.model,
+        receipt = MaterializeReceipt(policy_id=CURRENT_POLICY, base=base, adapter=operation.model,
                                      max_abs_delta_error=0.0, max_abs_logits_error=0.0,
                                      non_target_tensors_identical=True,
                                      tokenizer_fingerprint=adapter.tokenizer_fingerprint,

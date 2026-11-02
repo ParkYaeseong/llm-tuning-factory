@@ -60,40 +60,64 @@ OVERHEAD_GIB = 1.5                  # CUDA context and framework buffers
 BYTES_PER_PARAMETER = {"bf16": 2.0, "fp16": 2.0, 8: 1.0, 4: 0.55}   # 4-bit includes quantization constants
 FULL_STATE_BYTES = 14.0             # bf16 gradient 2 + Adam fp32 moments 8 + fp32 master 4, beside the weight
 ADAPTER_FRACTION, ADAPTER_STATE_BYTES = 0.01, 16.0   # adapter weight, gradient and Adam states (generous)
+# LM-head logits of a model with a known ``vocab_size`` (the Qwen3.5/Gemma 4 catalog entries; 248k/262k vocabularies):
+# batch x cutoff_len x vocab_size x LOGITS_BYTES, which the activation term ignores. Per element: the bf16 logits, their
+# fp32 copy for the loss and its fp32/bf16 gradients (10-12 bytes). Calibrated on the 0.6.0 A40 peaks (spec 4.5): 11
+# lies between the 10.4 Gemma 4 E2B PT (packed to cutoff_len) needs and the 11.6 that keeps Qwen3.5-0.8B SFT LoRA
+# within twice its peak. dpo/kto x3: chosen + rejected, and the measured peaks hold about one more set (likely the
+# reference pass, adapters disabled); x2 would still miss Gemma 4 E2B DPO. rm x2: the pairwise collator concatenates chosen
+# and rejected and trl's value head still computes full fp32 lm_logits; unmeasured, so conservative until RM peaks are measured. full x2: covers the measured full peak, whose surplus
+# is mostly fp32 weights and optimizer temporaries rather than logits (FULL_STATE_BYTES is shared with every model).
+LOGITS_BYTES = 11.0
+LOGITS_STAGE_FACTOR = {"dpo": 3, "kto": 3, "rm": 2}
+LOGITS_FULL_FACTOR = 2
 
 
 def estimate_memory(model, config):
-    """Rough single-GPU training memory in GiB with gradient checkpointing; None without catalog sizes.
+    """Rough single-GPU training memory in GiB with gradient checkpointing; None without model sizes.
 
-    {"weights_gib": weights alone, "total_gib": weights + training state + activations + overhead}."""
-    if not model or not all(model.get(key) for key in ("parameters_b", "hidden_size", "num_layers")):
+    {"weights_gib": weights alone, "total_gib": weights + training state + activations + logits + overhead}.
+    weights: every tensor (vision/audio and Gemma per-layer embeddings included); training state: the text model.
+    QLoRA quantizes linear layers only: a model's ``embedding_parameters`` (embedding tables and an untied lm_head,
+    which bitsandbytes keeps in bf16) and ``expert_parameters`` (MoE experts, 3-D nn.Parameters it cannot quantize) count at
+    the bf16 rate; without the facts every weight counts at the 4/8-bit rate. logits: only with a ``vocab_size``
+    (LOGITS_BYTES), so a model without one keeps its stage-independent estimate."""
+    if not model or not (model.get("parameters_total") or model.get("parameters_b")) or not all(
+            model.get(key) for key in ("hidden_size", "num_layers")):
         return None
-    parameters = float(model["parameters_b"]) * 1e9
+    parameters = float(model.get("parameters_total") or float(model["parameters_b"]) * 1e9)   # every tensor on the GPU
+    trainable = float(model.get("text_parameters") or parameters)   # vision/audio stay frozen; unknown: all of them
     layers = int(model["num_layers"])
     method = config.get("training_method", "lora")
     hyper = config.get("hyperparameters") or {}
+    unquantized = BYTES_PER_PARAMETER[hyper.get("precision", "bf16")]
     if method == "qlora":
-        per_parameter = BYTES_PER_PARAMETER[int(config.get("quantization_bit", 4))]
+        embedding = min(float(model.get("embedding_parameters") or 0) + float(model.get("expert_parameters") or 0),
+                        parameters)
+        weights = (embedding * unquantized
+                   + (parameters - embedding) * BYTES_PER_PARAMETER[int(config.get("quantization_bit", 4))])
     else:
-        per_parameter = BYTES_PER_PARAMETER[hyper.get("precision", "bf16")]
-    weights = parameters * per_parameter
+        weights = parameters * unquantized
     if method == "full":
-        state = parameters * FULL_STATE_BYTES
+        state = trainable * FULL_STATE_BYTES
     elif method == "freeze":
-        trainable = min(abs(int((config.get("finetuning_options") or {}).get("freeze_trainable_layers", 2))), layers)
-        state = parameters * trainable / layers * FULL_STATE_BYTES
+        selected = min(abs(int((config.get("finetuning_options") or {}).get("freeze_trainable_layers", 2))), layers)
+        state = trainable * selected / layers * FULL_STATE_BYTES
     else:   # lora, qlora, oft
-        state = parameters * ADAPTER_FRACTION * ADAPTER_STATE_BYTES
-    activations = (int(hyper.get("per_device_train_batch_size", 1)) * int(hyper.get("cutoff_len", 1024))
-                   * int(model["hidden_size"]) * (2 * layers + 34))
-    return {"weights_gib": weights / GIB, "total_gib": (weights + state + activations) / GIB + OVERHEAD_GIB}
+        state = trainable * ADAPTER_FRACTION * ADAPTER_STATE_BYTES
+    tokens = int(hyper.get("per_device_train_batch_size", 1)) * int(hyper.get("cutoff_len", 1024))
+    activations = tokens * int(model["hidden_size"]) * (2 * layers + 34)
+    logits = (tokens * int(model.get("vocab_size") or 0) * LOGITS_BYTES
+              * LOGITS_STAGE_FACTOR.get(config.get("training_stage", "sft"), 1)
+              * (LOGITS_FULL_FACTOR if method == "full" else 1))
+    return {"weights_gib": weights / GIB, "total_gib": (weights + state + activations + logits) / GIB + OVERHEAD_GIB}
 
 
 STALE_SECONDS = 24 * 3600
 WEIGHTS_BLOCK_RATIO, TOTAL_WARN_RATIO = 0.95, 0.90
 OBSERVATION_KEY = re.compile(r"(runpod|server)-[A-Za-z0-9_-]{1,64}")
 
-MEMORY_UNKNOWN = "앱 기본 목록에 없는 모델이라 메모리 요구량을 추정하지 못했습니다."
+MEMORY_UNKNOWN = "모델 크기 정보가 없어 메모리 요구량을 추정하지 못했습니다."
 MODEL_UNVERIFIED = "이 모델은 아직 GPU에서 검증되지 않았습니다."
 OBSERVATION_MISSING = ("저장된 GPU 정보가 없습니다. 연결 설정의 '환경 확인'을 누르면 실행 전에 GPU를 미리 "
                        "점검할 수 있습니다.")
@@ -102,23 +126,44 @@ GPU_FACTS_UNKNOWN = ("GPU 정보를 읽지 못해 세대·드라이버·메모�
                      "학습 직전 환경 검사가 대신 확인합니다.")
 POD_FACTS_UNKNOWN = "RunPod에서 Pod의 GPU 종류·개수를 확인하지 못했습니다. 잠시 후 '환경 확인'을 다시 누르세요."
 PRICE_UNKNOWN = "RunPod에서 Pod의 현재 시간당 요금을 확인하지 못했습니다. 잠시 후 다시 시도하세요."
+SERVER_PRICE_UNKNOWN = ("GPU 서버의 시간당 비용이 비어 있거나 올바르지 않습니다. 연결 설정에서 0 이상의 숫자를 입력하세요"
+                        "(내부 서버는 0).")
 
 
 def _finding(level, code, message):
     return {"level": level, "code": code, "message": message}
 
 
-def evaluate(config, observation, capabilities, model, *, stage, now=None):
+def _price_findings(price, resource, *, allow_zero, unknown):
+    """PRICE_UNKNOWN or PRICE_OVER_BUDGET for one destination's hourly price against the job's per-GPU budget x GPUs.
+    A server may cost 0 (internal hardware); a RunPod price of 0 means the API gave no price."""
+    if (isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price) or price < 0
+            or (price == 0 and not allow_zero)):
+        return [_finding("block", "PRICE_UNKNOWN", unknown)]
+    limit = float(resource.get("hourly_cost_usd", 0)) * int(resource.get("gpu_count", 1))
+    if price > limit:
+        return [_finding("block", "PRICE_OVER_BUDGET",
+                         f"현재 시간당 요금 ${price:.3f}가 학습 설정의 한도 ${limit:.3f}를 넘습니다.")]
+    return []
+
+
+def evaluate(config, observation, capabilities, model, *, stage, now=None, server=None):
     """Block/warn findings for one job config against one observed destination.
 
-    ``stage`` is "plan" (a stored observation; missing or stale facts are reported) or "execute" (live facts)."""
+    ``stage`` is "plan" (a stored observation; missing or stale facts are reported) or "execute" (live facts).
+    ``server`` is ``{"hourly_cost_usd": float | None}`` for an SSH server destination (judged even without an
+    observation)."""
     if stage not in {"plan", "execute"}:
         raise ValueError("unsupported compatibility stage")
     findings = []
-    if model is None:
+    estimate = estimate_memory(model, config)   # None for an unknown model or one without size facts
+    if estimate is None:   # judged without an observation too: the plan can say so before any GPU was observed
         findings.append(_finding("warn", "MEMORY_UNKNOWN", MEMORY_UNKNOWN))
     if model is None or not model.get("gpu_verified"):
         findings.append(_finding("warn", "MODEL_UNVERIFIED", MODEL_UNVERIFIED))
+    if server is not None:
+        findings += _price_findings(server.get("hourly_cost_usd"), config.get("resource_profile") or {},
+                                    allow_zero=True, unknown=SERVER_PRICE_UNKNOWN)
     if observation is None:
         if stage == "plan":
             findings.append(_finding("warn", "OBSERVATION_MISSING", OBSERVATION_MISSING))
@@ -177,21 +222,10 @@ def evaluate(config, observation, capabilities, model, *, stage, now=None):
             findings.append(_finding("block", "GPU_COUNT_MISMATCH",
                                      f"학습 설정의 GPU 수({count})가 연결된 GPU 수({observed_count})와 다릅니다."))
     if pod is not None:
-        price = pod.get("hourly_cost_usd")
-        if (isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price)
-                or price <= 0):
-            findings.append(_finding("block", "PRICE_UNKNOWN", PRICE_UNKNOWN))
-        else:
-            limit = float(resource.get("hourly_cost_usd", 0)) * int(resource.get("gpu_count", 1))
-            if price > limit:
-                findings.append(_finding("block", "PRICE_OVER_BUDGET",
-                                         f"현재 시간당 요금 ${price:.3f}가 학습 설정의 한도 ${limit:.3f}를 넘습니다."))
-    if gpu is not None and model is not None:
-        estimate = estimate_memory(model, config)
+        findings += _price_findings(pod.get("hourly_cost_usd"), resource, allow_zero=False, unknown=PRICE_UNKNOWN)
+    if gpu is not None and estimate is not None:
         vram = gpu["memory_mib"] / 1024
-        if estimate is None:
-            findings.append(_finding("warn", "MEMORY_UNKNOWN", MEMORY_UNKNOWN))
-        elif estimate["weights_gib"] > vram * WEIGHTS_BLOCK_RATIO:
+        if estimate["weights_gib"] > vram * WEIGHTS_BLOCK_RATIO:
             findings.append(_finding("block", "MEMORY_WEIGHTS_EXCEED",
                                      f"모델 가중치만 약 {estimate['weights_gib']:.0f}GiB로 GPU 메모리 {vram:.0f}GiB의 "
                                      "95%를 넘습니다. 4비트 QLoRA, 더 작은 모델 또는 더 큰 GPU를 선택하세요."))

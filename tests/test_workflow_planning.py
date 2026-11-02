@@ -468,6 +468,16 @@ def test_model_root_snapshot_downloads_only_config_and_tokenizer_files(tmp_path,
     assert again.requests and not any("authorization" in request.headers for request in again.requests)
 
 
+def test_root_snapshot_selects_processor_files_beside_the_tokenizer():
+    from tuning_factory.workflow_planning import _selected_files
+    names = ["config.json", "tokenizer.json", "tokenizer_config.json", "preprocessor_config.json",
+             "video_preprocessor_config.json", "processor_config.json", "chat_template.jinja", "README.md",
+             "model.safetensors-00001-of-00001.safetensors", "model.safetensors.index.json"]
+    assert _selected_files({"siblings": [{"rfilename": name} for name in names]}) == (
+        "chat_template.jinja", "config.json", "preprocessor_config.json", "processor_config.json",
+        "tokenizer.json", "tokenizer_config.json", "video_preprocessor_config.json")
+
+
 @pytest.mark.parametrize("case", ["config_changed", "oversized", "oversized_streamed", "over_total",
                                   "weights_named_like_a_template", "unsafe_name", "incomplete_tokenizer",
                                   "unsupported"])
@@ -1299,7 +1309,9 @@ class KeyErrorHub(FakeHub):
 
 
 @pytest.mark.parametrize("config, error", [
-    (canonical({"model_type": "qwen2", "max_position_embeddings": "big"}), "TypeError"),
+    # A malformed optional fact (max_position_embeddings "big") is now dropped by the inspection; an unhashable
+    # model_type still raises inside it.
+    (canonical({"model_type": ["qwen2"]}), "TypeError"),
     (canonical([{"model_type": "qwen2"}]), "AttributeError"),
     (None, "KeyError")])
 def test_snapshot_errors_stay_in_the_issue_envelope(tmp_path, monkeypatch, config, error):

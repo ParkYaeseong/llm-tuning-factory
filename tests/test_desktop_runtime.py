@@ -1,6 +1,9 @@
 import base64
 import hashlib
 import json
+import os
+import sys
+import time
 
 import paramiko
 import pytest
@@ -500,7 +503,8 @@ def test_runtime_check_reports_a_missing_runtime_with_gpu_facts(tmp_path, monkey
     assert ready["ready"] is True and ready["runtime_state"] == "ready" and ready["source"] == "fixture"
 
 
-def test_install_runtime_uses_the_cu128_backend(tmp_path, monkeypatch):
+def install_fixture(tmp_path, monkeypatch):
+    """Packaged assets and a fake GPU host for install_runtime."""
     from test_remote_worker import FakeSSH
 
     from tuning_factory import desktop
@@ -514,11 +518,17 @@ def test_install_runtime_uses_the_cu128_backend(tmp_path, monkeypatch):
     monkeypatch.setattr(desktop, "assets_root", lambda: assets)
     client = FakeSSH(tmp_path / "remote")
     client.sftp.root.mkdir()
+    return runtime, client
+
+
+def test_install_runtime_uses_the_cu128_backend(tmp_path, monkeypatch):
+    runtime, client = install_fixture(tmp_path, monkeypatch)
     scripts = []
     monkeypatch.setattr(runtime, "command", lambda _, argv, **kw: scripts.append(argv[2]) or "")
     preparation = {"started": False, "stopped": False}
     runtime.install_runtime(client, "sft", runtime.REMOTE, POD, preparation)
-    assert preparation == {"started": True, "stopped": True}
+    assert preparation == {"started": True, "stopped": True, "cleanup": {
+        "removed": [], "kept_in_use": [], "cleanup_error": "cleanup report missing"}}
     assert "--require-hashes --torch-backend cu128 " in scripts[0]
     assert " venv --python 3.12 --clear " in scripts[0] and "--allow-existing" not in scripts[0]
 
@@ -584,7 +594,7 @@ def test_executor_for_gates_first_and_prepares_only_when_approved(tmp_path, monk
     events.clear()
     runtime = runpod_executor_fixture(monkeypatch, ["missing", "ready"], events)
     with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=gate, prepare_runtime=True) as executor:
-        assert executor.pod == POD
+        assert executor.pod == POD and executor.runtime_lock_file == runtime.runtime_path("sft") + "/in-use.lock"
     assert events == [("gate", "12.0"), "check", "prerequisites", "bootstrap", "install", "check"]
 
 
@@ -835,3 +845,188 @@ def test_runtime_preparation_that_fails_its_check_gets_the_fixed_message(tmp_pat
     with pytest.raises(ValueError) as caught:
         runtime.runtime({"pod_id": "borrowed"}, tmp_path, prepare=True)
     assert str(caught.value) == runtime.POST_PREPARATION_FAILED
+
+
+def test_prerequisites_require_flock_and_a_c_compiler(monkeypatch):
+    from tuning_factory import desktop_runtime as runtime
+    scripts = []
+    monkeypatch.setattr(runtime, "command", lambda _, argv, **kw: scripts.append(argv) or "")
+    runtime.prerequisites(None)
+    assert len(scripts) == 1 and scripts[0][:2] == ["sh", "-c"]
+    assert "command -v flock" in scripts[0][2] and "flock (util-linux) required" in scripts[0][2]
+
+
+CURRENT, OLD, OLDER = "a" * 16, "b" * 16, "c" * 16
+
+
+def prune_tree(root):
+    """A remote root: current runtimes, two old ones, a non-runtime folder, a leftover trash folder and the caches."""
+    for name in (CURRENT, CURRENT + "-ppo", OLD, OLDER + "-ppo", "notahash", ".trash-dead-1"):
+        (root / "runtime" / name / "venv").mkdir(parents=True)
+    (root / "runtime" / OLD / "venv" / "lib").write_bytes(b"x" * 10)
+    for name in ("uv-cache", "python", "hf-cache", "model-cache", "jobs"):
+        (root / name).mkdir()
+    return root
+
+
+def attempt(root, source, *, manifest=None, finished=False, age=0):
+    directory = root / "jobs" / "j" / source[:4]
+    directory.mkdir(parents=True)
+    (directory / "worker.log").write_text("started")
+    if finished:
+        (directory / "result.json").write_text("{}")
+    (directory / "manifest.json").write_text(manifest if manifest is not None else json.dumps(
+        {"source_sha256": source * 4, "config": {"resource_profile": {"timeout_seconds": 60}}}))
+    os.utime(directory, (time.time() - age, time.time() - age))
+
+
+def prune(root, source=None):
+    import subprocess
+
+    from tuning_factory import desktop_runtime as runtime
+    done = subprocess.run([sys.executable, "-I", "-c", source or runtime.PRUNE_SOURCE, str(root), CURRENT],
+                          capture_output=True, text=True, timeout=120, check=True)
+    return runtime.prune_report(done.stdout)
+
+
+def test_prune_removes_only_old_idle_runtimes(tmp_path):
+    root = prune_tree(tmp_path)
+    attempt(root, OLD, finished=True)
+    report = prune(root)
+    assert sorted(report["removed"]) == [OLD, OLDER + "-ppo"] and report["errors"] == []
+    assert sorted(path.name for path in (root / "runtime").iterdir()) == sorted([CURRENT, CURRENT + "-ppo", "notahash"])
+    assert all((root / name).is_dir() for name in ("uv-cache", "python", "hf-cache", "model-cache", "jobs"))
+    # Freed space is the free-space delta (venvs share hard-linked files with uv-cache), never a sum of file sizes.
+    assert "cleanup_error" not in report and "incomplete" not in report
+    assert report["free_before"] > 0 and report["free_after"] > 0
+
+
+def test_prune_keeps_the_runtime_of_a_live_attempt_and_forgets_expired_ones(tmp_path):
+    root = prune_tree(tmp_path)
+    attempt(root, OLD)                                    # unfinished, within its deadline
+    attempt(root, OLDER, age=60 + 3600 + 5, manifest=json.dumps(
+        {"source_sha256": OLDER * 4, "operation": {"resources": {"timeout_seconds": 60}}}))   # v2, expired
+    report = prune(root)
+    assert report["kept_in_use"] == [OLD] and report["removed"] == [OLDER + "-ppo"]
+
+
+def test_prune_deletes_nothing_when_an_unfinished_manifest_is_unreadable(tmp_path):
+    root = prune_tree(tmp_path)
+    attempt(root, OLD, manifest="{")
+    report = prune(root)
+    assert report["removed"] == [] and "unreadable" in report["cleanup_error"]
+    assert (root / "runtime" / OLD).is_dir() and (root / "runtime" / (OLDER + "-ppo")).is_dir()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fcntl locks and symlinks are exercised on Linux only")
+def test_prune_keeps_locked_runtimes_and_never_follows_symlinks(tmp_path):
+    import fcntl
+    root = prune_tree(tmp_path)
+    (root / "runtime" / ("d" * 16)).symlink_to(root / "hf-cache", target_is_directory=True)
+    with open(root / "runtime" / OLD / "in-use.lock", "a") as held:
+        fcntl.flock(held, fcntl.LOCK_SH)                  # a running worker's `flock -s`
+        report = prune(root)
+    assert report["kept_in_use"] == [OLD] and report["removed"] == [OLDER + "-ppo"]
+    assert (root / "runtime" / ("d" * 16)).is_symlink() and (root / "hf-cache").is_dir()
+
+
+def test_prune_takes_its_locks_writable_and_never_through_a_link():
+    from tuning_factory import desktop_runtime as runtime
+    # An exclusive flock on NFS needs a descriptor open for writing; O_NOFOLLOW refuses a planted link.
+    assert "os.open(path/name,os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW|os.O_CLOEXEC,0o666)" in runtime.PRUNE_SOURCE
+    assert "O_RDONLY" not in runtime.PRUNE_SOURCE and "open(path/name,'a')" not in runtime.PRUNE_SOURCE
+
+
+def test_prune_rechecks_liveness_under_the_candidate_locks_just_before_the_rename():
+    from tuning_factory import desktop_runtime as runtime
+    loop = runtime.PRUNE_SOURCE[runtime.PRUNE_SOURCE.index("for path in sorted("):]
+    assert loop.index("hold(path)") < loop.index("in live()") < loop.index("path.rename(trash)")
+
+
+def test_prune_stops_starting_candidates_after_its_budget(tmp_path):
+    from tuning_factory import desktop_runtime as runtime
+    assert runtime.PRUNE_SOURCE.count("BUDGET=300\n") == 1 and "time.monotonic()" in runtime.PRUNE_SOURCE
+    root = prune_tree(tmp_path)
+    report = prune(root, runtime.PRUNE_SOURCE.replace("BUDGET=300\n", "BUDGET=-1\n"))
+    assert report["incomplete"] is True and report["removed"] == [] and "cleanup_error" not in report
+    for name in (OLD, OLDER + "-ppo", ".trash-dead-1"):   # left for the next preparation
+        assert (root / "runtime" / name).is_dir()
+
+
+def test_prune_records_a_runtime_it_cannot_remove_and_goes_on(tmp_path):
+    root = prune_tree(tmp_path)
+    blocked = root / "runtime" / OLD / "venv"
+    if sys.platform == "win32":
+        context = open(blocked / "lib", "rb")             # Windows refuses to rename a folder with an open file
+    else:
+        if os.geteuid() == 0:
+            pytest.skip("root removes read-only folders")
+        blocked.chmod(0o500)                              # rename succeeds, removing its files does not
+        context = open(os.devnull)
+    try:
+        with context:
+            report = prune(root)
+    finally:
+        for path in (root / "runtime").glob("*/venv"):
+            path.chmod(0o700)
+    assert report["errors"] == [OLD] and report["removed"] == [OLDER + "-ppo"] and "cleanup_error" not in report
+
+
+def test_preparation_prunes_under_its_prepare_lock_and_keeps_the_report(tmp_path, monkeypatch):
+    import shlex
+    runtime, client = install_fixture(tmp_path, monkeypatch)
+    cleanup = {"removed": [OLD], "kept_in_use": [], "errors": [], "free_before": 1, "free_after": 11}
+    scripts = []
+    monkeypatch.setattr(runtime, "command",
+                        lambda _, argv, **kw: scripts.append(argv[2]) or "pip ok\nTF_PRUNE " + json.dumps(cleanup))
+    preparation = {"started": False, "stopped": False}
+    runtime.install_runtime(client, "sft", runtime.REMOTE, POD, preparation)
+    script = scripts[0]
+    prune_line = f"prune=$(python3 -I -c {shlex.quote(runtime.PRUNE_SOURCE)} {shlex.quote(runtime.REMOTE)} "
+    assert script.index("TF_PREPARE_BUSY") < script.index(prune_line) < script.index(" venv ")
+    assert f"{shlex.quote(runtime.REMOTE)} {runtime.source_hash()[:16]} 2>&1 || true)\n" in script
+    # Printed last, after the uv output, so the 128 KB output tail always keeps it.
+    assert script.rindex('"$prune"') > script.index("--no-deps") and script.rstrip("\n").endswith('"$prune"')
+    assert preparation == {"started": True, "stopped": True, "cleanup": cleanup}
+
+
+def test_preparation_never_rebuilds_a_venv_that_a_running_worker_holds(tmp_path, monkeypatch):
+    runtime, client = install_fixture(tmp_path, monkeypatch)
+    scripts = []
+
+    def in_use(_, argv, **kw):
+        scripts.append(argv[2])
+        raise runtime.RemoteCommandFailed("GPU runtime command failed. TF_RUNTIME_IN_USE")
+
+    monkeypatch.setattr(runtime, "command", in_use)
+    preparation = {"started": False, "stopped": False}
+    with pytest.raises(ValueError) as caught:
+        runtime.install_runtime(client, "sft", runtime.REMOTE, POD, preparation)
+    assert str(caught.value) == runtime.RUNTIME_IN_USE and preparation == {"started": True, "stopped": True}
+    script, lock = scripts[0], runtime.runtime_path("sft") + "/in-use.lock"
+    guard = f"exec 8>{lock}\nflock -x -n 8 || {{ echo TF_RUNTIME_IN_USE; exit 75; }}\n"
+    assert script.index("flock -n 9 ||") < script.index(guard) < script.index("prune=$(")
+    assert script.index(guard) < script.index(" venv --python 3.12 --clear ")
+
+
+def test_a_prepared_runtime_reports_its_cleanup(tmp_path, monkeypatch):
+    events = []
+    runtime = runpod_executor_fixture(monkeypatch, ["ready", "ready"], events)
+    cleanup = {"removed": [], "kept_in_use": [OLD], "free_before": 1, "free_after": 1}
+    monkeypatch.setattr(runtime, "install_runtime",
+                        lambda client, stage, root, pod, preparation: preparation.update(cleanup=cleanup))
+    assert runtime.runtime({"pod_id": "borrowed"}, tmp_path, prepare=True)["cleanup"] == cleanup
+    assert "cleanup" not in runtime.runtime({"pod_id": "borrowed"}, tmp_path)   # a check never prunes
+
+
+def test_a_preparation_in_the_run_approval_carries_its_cleanup_on_the_executor(tmp_path, monkeypatch):
+    events = []
+    runtime = runpod_executor_fixture(monkeypatch, ["missing", "ready"], events)
+    cleanup = {"removed": [OLD], "kept_in_use": [], "free_before": 1, "free_after": 3}
+    monkeypatch.setattr(runtime, "install_runtime",
+                        lambda client, stage, root, pod, preparation: preparation.update(cleanup=cleanup))
+    with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=lambda o: None, prepare_runtime=True) as executor:
+        assert executor.runtime_cleanup == cleanup
+    runtime = runpod_executor_fixture(monkeypatch, ["ready"], events)
+    with runtime.executor_for({"pod_id": "borrowed"}, tmp_path, gate=lambda o: None, prepare_runtime=True) as executor:
+        assert executor.runtime_cleanup is None             # nothing prepared, nothing pruned

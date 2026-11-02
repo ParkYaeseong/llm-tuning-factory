@@ -1,3 +1,181 @@
+# 0.6.0 최종 빌드·설치와 실제 앱 화면 끝까지 시험, 2026-10-31
+
+- 최종 검증(`63d4f67`, 2026-10-31 06:03–06:25): `uv run pytest` 2245 passed, 2 skipped(492초); `uv run ruff check src tests scripts` 통과;
+  `desktop`의 `npm run build` 통과, `npm test` 284 passed; `cargo test --manifest-path src-tauri/Cargo.toml --locked` 54 passed;
+  `.factory/model-ops-cpu-venv`의 `scripts/verify_model_ops_cpu.py --receipt dist/model-ops-cpu-0.6.0.json` 통과(`stopped_after` null,
+  모든 영수증 `model-ops-f32-v2`).
+- 설치 프로그램(`63d4f67`): `desktop/src-tauri/target/release/bundle/nsis/LLM Tuning Factory_0.6.0_x64-setup.exe`, 48,355,092 바이트,
+  SHA-256 `9be9862efbf9dfbe63deeabdf140d66e71287e79b082511556a99049966d5005`. 영수증 `dist/verify-0.6.0.json`: bridge_mode frozen,
+  source_commit `63d4f67526916e506e7187dacb2ca22555da0786`, 모든 검사 true, gpu_started false, bridge_sha256 `9c0f6741…d865a`.
+  앱이 꺼진 상태에서 `/S /D=%LOCALAPPDATA%\LLM Tuning Factory`로 같은 위치에 설치했다(0.6.0, 설치된 엔진 해시가 영수증과 같음).
+- 사용자 Pod: `amdva0lurw9rv1`은 다시 켜기가 HTTP 500(용량 부족)으로 6번 모두 실패해 EXITED로 남겼다. 같은 볼륨 `cys1ne5znp`에 새
+  사용자 Pod `mqpnial878ja1o`(이름 `llm-tuning-factory`, A40, CA-MTL-1, 시간당 $0.59, 공장 소유 기록 없음)를 만들고 SSH 지문
+  `SHA256:HQVYDR33XaVZ5SJLF+YyLDmb47QO7q91RzcQE9wZNbI`을 공인 IP와 프록시에서 확인한 뒤, 앱 설정의 `pod_id`·`ssh_fingerprint`만 바꿨다.
+- 실제 앱 화면 시험(`scripts/desktop_gui_acceptance.py`, Playwright 1.64.0, WebView2 원격 디버깅 포트 9223): 읽기 전용 예행 통과 후
+  `--confirm-paid-run --max-cost 2`로 실행했다. 연결 검사(MLflow 기관 인증 확인, Pod RUNNING) → 환경 확인(A40 8.6, 45.0 GiB,
+  드라이버 595.91.07, 환경 없음) → 합성 데이터 32건 등록(합성·전송 허용) → GPU 정보 적용 → Qwen3.5-0.8B SFT LoRA, 버전 고정 →
+  실행 계획(예상 $0.59, 점검 항목 없음) → 승인 창(학습 환경 설치 안내와 이전 환경 정리 문구 포함) → 제출 → 대기 → 학습 중.
+  학습은 Pod에서 COMPLETED(학습 환경 `0a8f737acf2ab5fd` 새로 준비, 이전 환경 정리), train_loss 1.3593, 학습 103초. 이 PC와
+  CA-MTL-1 사이 네트워크가 초당 15–40 KB로 느려(같은 파일의 `scp`도 초당 약 31 KB) 결과 122 MB를 받는 데 08:22까지 걸렸고,
+  스크립트는 45분 제한에 걸려 실패로 끝났다(작업 진행 중이라 앱은 열어 둠). 작업이 완료된 뒤 같은 포트로 다시 붙어 실행 관리에서
+  "완료"와 학습 로그(train_loss 1.3593)를 확인했다. 이 실행의 기록은 승인 창 문구대로 공용 MLflow에 저장된다. 예전 작업
+  `76986bce`는 "취소" 상태다. 끝난 뒤 Pod `mqpnial878ja1o`를 멈췄다(EXITED). 시험이 띄운 앱 창은 Claude Code 권한 검사가 종료를
+  막아 열려 있으며 사용자가 닫는다.
+- 남은 일: 화면 시험 스크립트의 작업 대기 제한(45분)이 느린 결과 내려받기보다 짧다. 위 GPU 시험의 남은 일과 함께 처리한다.
+
+# 2단계 GPU 인수 시험(A40) — 결과, 2026-10-31
+
+공장 소유 Pod `r0d9wiystzwx0m`(A40 48 GB, compute capability 8.6, 드라이버 595.91.07, CA-MTL-1, 볼륨 `cys1ne5znp`)에서
+2026-10-30 23:05–10-31 06:03(약 6.95시간, 약 $4.10) 시험했다. 합성 데이터 32행, MLflow 끔. 앱 엔진은 `dist/factory-bridge.exe`로,
+1차는 `560a2b4` 빌드, 2차는 `bc020b0` 빌드(아래 템플릿·허용 오차·단계 수정 포함). SSH 지문은 공인 IP와 RunPod 프록시에서 같았다
+(공인 IP 쪽은 `provision.py`의 스캔이 비어 Git Bash에서 다시 읽었다). 끝난 뒤 `ManagedPods.stop`으로 EXITED를 확인했다.
+
+| 사례 | 결과 | train_loss | 최대 GPU 메모리(MiB) |
+|---|---|---|---|
+| Qwen3.5-0.8B SFT LoRA(평가, 1차 `qwen3_5_nothink`) | COMPLETED, 실행 승인 안 환경 준비·이전 환경 1개 정리 | 0.148 | 3,107 |
+| 〃 SFT QLoRA 4비트 | COMPLETED | 0.148 | 2,287 |
+| 〃 DPO / PT | COMPLETED / COMPLETED | 0.192 / 0.449 | 5,271 / 5,683 |
+| 〃 KTO | FAILED(엔진: M-RoPE `mm_token_type_ids` 없음) → 앱에서 거부 | — | — |
+| 〃 SFT full / freeze(mlp) | COMPLETED / COMPLETED(Pod의 `result.json`) | 2.728 / 0.337 | 16,481 / 3,143 |
+| 〃 SFT LoRA(평가, 2차 `qwen3_5`) | COMPLETED(Pod의 `result.json`) | 0.123 | — |
+| gemma-4-E2B-it SFT LoRA(평가) | COMPLETED, 2차 환경 준비·이전 환경 1개 정리, json_validity 0.84 | 1.115 | 12,761 |
+| 〃 DPO / PT | COMPLETED / COMPLETED | 0.221 / 1.169 | 18,711 / 14,823 |
+| 〃 KTO | FAILED(엔진: `pixel_position_ids` bool) → 앱에서 거부 | — | — |
+| Qwen3.5-9B SFT LoRA | COMPLETED | 0.184 | 19,825 |
+| RM(앱 밖, 런타임의 `llamafactory-cli`) Qwen3.5-0.8B / gemma-4-E2B-it | 통과: `value_head.safetensors`, eval_accuracy 1.0, eval_loss 0.0 / 0.0033 | 0.191 / 0.162 | — |
+
+- 대상·확정(`q08-sft-lora` 어댑터, Pod에서): `inspect_linear_modules` 186개 = `resolved_lora_targets("all")` 186개(linear
+  attention 5종 18개씩, MLP 3종 24개씩, full attention 4종 6개씩), 어댑터 `target_modules`는 잎 이름 12개로 줄어 기록됐고 PEFT의
+  접미사 규칙을 전체 534개 모듈(비전 포함)에 적용해도 정확히 186개만 고른다. 텐서 372개 모두 `model.language_model.` 아래.
+  1차 런타임(v1 허용 오차)에서는 확정이 로짓 비교로 거부됐고(아래), `bc020b0` 런타임에서 CUDA 확정이 발행됐다: `model-ops-f32-v2`,
+  델타 2.84e-8, 로짓 최대 절대 오차 1.79e-5(한계 1.91e-3), 상대 L2 9.8e-7(한계 1e-5), 출력 473개 = 기본 488개 − `mtp.*` 15개,
+  `model.visual.*` 153개 그대로, 토크나이저·processor 파일 7개 바이트 동일. 확정 결과를 LLaMA-Factory 예측(`finetuning_type: full`,
+  `qwen3_5`, 생각 끔)으로 불러 4행 생성(생각 블록 없음).
+- 시험에서 찾아 고친 결함(각각 시험을 먼저 작성): Qwen3.5 기본 템플릿 `qwen3_5_nothink` → `qwen3_5`(`2c932b9`; 1차 예측이
+  모두 `<think>\n\n</think>\n\n`으로 시작해 json_validity 0.0, LLaMA-Factory `qwen3_5`는 생각 끔일 때 빈 생각 블록을 프롬프트에 넣는다),
+  확정 로짓 허용 오차 `model-ops-f32-v2`(`382409d`), 단계 정책(`bbc40ca`·`1cd33be`: 두 계열 모두 pt·sft·rm·dpo, KTO 거부),
+  MoE 전문가 가중치의 QLoRA 추정(`bc020b0`), 검증 표시와 로짓 메모리 항(`5bce65c`·`df0011f`), 최종 검토 수정(`63d4f67`:
+  저장된 `qwen3_5_nothink` 설정에 한국어 경고, 템플릿 불일치 오류 한국어화, RM 로짓 계수 2, 허브 프로필 `vocab_size`,
+  v1 영수증 수거 허용, Qwen3.6 이름).
+- 2차 `qwen3_5` 평가: 32개 예측 모두 `<think>` 없이 JSON으로 시작했지만, JSON 뒤에 `\n</think>\n\n`과 같은 JSON을 한 번 더 내
+  원시 JSON 유효성은 1/32였다. 32행·8단계 학습으로 끝맺음(`<|im_end|>`)을 배우지 못한 것과 합성 정답의 끝 줄바꿈 때문으로
+  보지만 확인하지 않았다(같은 조건의 gemma-4-E2B-it는 0.84). 실제 데이터와 더 긴 학습으로 다시 볼 일이다.
+- 운영 기록: (1) `provision.py`를 PowerShell `Start-Process`로 부를 때 인자 "NVIDIA A40"이 갈라져 첫 시도가 실패했다(Pod 없음).
+  (2) 삭제한 1단계 시험 Pod 7개의 소유 기록이 남아 `ManagedPods.create`가 HTTP 404로 멈췄다 — 404를 확인한 기록과 요청만
+  `managed-pods/deleted-20261030/`으로 옮겼다. (3) full 결과(체크포인트 포함 12 GB)를 받는 데 약 2시간 걸렸고, freeze 결과(3.5 GB)는
+  네트워크가 초당 약 37 KB로 떨어져 받지 않고 멈췄다(Pod에서 결과 확인). (4) 묶음 실행 스크립트가 full 사례 뒤 이유를 알 수 없이
+  끝나 freeze·gemma 사례가 2차로 밀렸다. (5) 앱이 올린 `train.yaml`은 CRLF다(LLaMA-Factory는 문제없이 읽음). (6) 시험 엔진
+  저장소 `phase2-a40/engine`에는 중단된 freeze 작업이 RUNNING으로 남아 2차 `qwen3_5` 평가는 같은 Pod에 새 저장소(`phase2-a40b`)로 했다.
+- 남은 일: full·freeze 결과에 옵티마이저 상태가 든 체크포인트까지 내려받는 문제(`save_only_model: false`; 0.8B full이 12 GB),
+  느린 결과 내려받기, 긴 행의 메모리 측정, 복합 구조 KTO(엔진 수정 대기), 2차 평가의 반복 출력 원인, 볼륨 `cys1ne5znp`에 남은
+  시험 작업·HF 캐시(약 30 GB)·`target-check-20261031`·`rm-trial-*` 폴더 정리.
+
+# Qwen3.5·Gemma 4 A40 결과 반영 — 단계 정책, 검증 표시, 로짓 메모리 항, 2026-10-31
+
+- 단계: Gemma 4도 Qwen3.5처럼 pt·sft·rm·dpo(`model_hub.COMPOSITE_STAGES` 하나로 합침). Gemma 4 RM은 엔진 수준 시험
+  (`value_head.safetensors`, eval_accuracy 1.0, eval_loss 0.0033)으로 허용하고 값 헤드 거부를 지웠다. Gemma 4 KTO는 A40에서
+  `AttributeError: 'bool' object has no attribute 'all'`(transformers `modeling_gemma4.py:1999`의
+  `(pixel_position_ids == -1).all(dim=-1)`; LLaMA-Factory KTO의 KL 배치가 텐서가 아닌 멀티모달 입력을 넘김)로 실패해
+  "Gemma 4의 KTO 학습은 현재 학습 엔진(...)에서 KL 배치의 멀티모달 입력 처리 오류로 실패하므로 지원하지 않습니다."로 거부한다.
+- 검증 표시: `capabilities.VERIFIED_COMPOSITE`로 `Qwen/Qwen3.5-0.8B`("0.6.0 SFT LoRA/QLoRA/full/freeze, DPO, PT, RM (engine-level),
+  materialize synthetic A40"), `Qwen/Qwen3.5-9B`("0.6.0 SFT LoRA synthetic A40"), `google/gemma-4-E2B-it`("0.6.0 SFT LoRA, DPO, PT,
+  RM (engine-level) synthetic A40")에 `gpu_verified: true`, `verified_capabilities: ["8.6"]`. Base와 다른 크기는 미검증이고,
+  검증된 세 모델도 8.6이 아닌 세대(예: H100 9.0)에서는 세대 주의가 나온다.
+- 메모리: 복합 기본 목록 항목에 `vocab_size`(Qwen3.5 248320, Gemma 4 262144, `SIZE_FACTS` 포함)를 두고 `estimate_memory`에 LM head
+  로짓 `배치 × cutoff_len × vocab_size × 11바이트 × (dpo·kto 3) × (full 2)`를 더했다. A40 nvidia-smi 최대치(배치 1, cutoff_len 1024,
+  합성 데이터, SFT·DPO 행은 약 60–100토큰, PT만 cutoff_len까지 채움) 대 추정(GiB, 보정 전 → 후): Qwen3.5-0.8B SFT LoRA 3.03 대
+  3.32 → 5.92(1.95배), QLoRA 2.23 대 2.48 → 5.09, DPO 5.15 대 3.32 → 11.13, PT 5.55 대 3.32 → 5.92, full 16.09 대 13.02 → 18.23,
+  freeze 3.07 대 4.02 → 6.63; gemma-4-E2B-it SFT LoRA 12.46 대 11.89 → 14.64(1.17배), DPO 18.27 대 11.89 → 20.14, PT 14.48 대
+  11.89 → 14.64; Qwen3.5-9B SFT LoRA 19.36 대 21.20 → 23.80(1.23배). 모든 실측이 추정 이하, SFT LoRA는 2배 이하. 근거와 규칙은
+  설계 4.5. `vocab_size`가 없는 모델은 기본 목록 모든 모델 × 방법 5 × 단계 6 × 크기 2(1,020개)에서 보정 전과 비트 단위로 같고,
+  가중치 추정은 2,160개 모두 같다.
+- 검증(2026-10-31): 시험을 먼저 고쳐 실패를 확인했다(단계 9개, 검증 표시 3개, 메모리 9개 실패 → 구현 후 통과).
+  `uv run pytest` 2229 passed, 2 skipped, `uv run ruff check src tests scripts` 통과.
+- 남은 일: cutoff_len까지 채운 긴 행의 SFT·DPO와 full, RM의 최대 메모리 측정. full 초과분(짧은 행에서 약 3GiB)은 로짓보다 fp32
+  학습 가중치·옵티마이저 임시 버퍼(학습 매개변수당 약 4바이트)로 보여 `FULL_STATE_BYTES` 재보정이 맞지만, 모든 모델의 추정이
+  바뀌므로 이번에는 로짓 항 2배로 덮었다. 기본 목록 밖의 허브 모델은 `vocab_size`를 기록하지 않아 로짓 항이 없다. 복합 구조 KTO는
+  엔진 수정을 기다린다.
+
+# 모델 작업 로짓 허용 오차 `model-ops-f32-v2`, 2026-10-31
+
+- 결함(A40 GPU 인수에서 발견): 실제 Qwen3.5-0.8B LoRA 어댑터의 올바른 확정을 `materialize_model`이
+  `reloaded logits differ beyond tolerance policy`로 거부했다. Pod에서 잰 값: 확정 모델과 병합 전 PEFT 모델의 FP32 로짓
+  (5토큰 × 어휘 248,320) 최대 절대 오차 CPU 2.24e-5(1,241,600개 중 33개가 v1 경계 atol 1e-5 + rtol 1e-4 × 기대값의 절댓값을
+  넘음, 최대 1.35배), CUDA 1.79e-5(4개, 1.13배), 평균 약 1.9e-6, 로짓 최대 절댓값 19.1. 메모리 안 병합 모델과 저장 후 다시 불러온
+  모델은 비트 단위로 같았고 델타는 2.8e-8로 통과했다. v1의 원소별 allclose는 0 근처 로짓에 rtol 여유가 없어 24층의 FP32 반올림을
+  견디지 못한다(v1의 CPU 시험은 작은 모델만 썼다).
+- 수정: 새 정책 `model-ops-f32-v2`(`model_ops.CURRENT_POLICY`). 저장(F32)과 델타 규칙은 v1과 같고, 로짓은 상대 L2 오차 ≤ 1e-5와
+  최대 절대 오차 ≤ 1e-4 × max(1, 기대 로짓의 최대 절댓값)을 모두 만족해야 한다(모두 유한). v1은 `TOLERANCE_POLICIES`에 뜻 그대로
+  남아 이전 영수증을 읽는다. `merge_adapters`·`materialize_model`의 기본값, `operation_dispatch`(호출과 영수증 검사),
+  `operation_outputs`(접수 검사), `simulated_dispatch`, `scripts/verify_model_ops_cpu.py`가 `CURRENT_POLICY`를 쓴다. 판정은 torch
+  없는 `scale_aware_logits_ok`(통계 4개)로 분리했고, CPU 시험 스크립트는 같은 규칙을 따로 구현해 상대 L2 오차도 기록한다.
+  dtype 거부 문구는 `... under policy model-ops-f32-v2`가 된다.
+- 검증(2026-10-31): 시험을 먼저 고쳐 17개 실패를 확인한 뒤 구현했다. 측정값 모양의 합성 로짓(5 × 4096, 최대 절댓값 19.1, 평균
+  절대 오차 약 1.9e-6, 0 근처 4개에 2.24e-5)은 v1에서 거부되고 v2에서 통과하며, 값 하나가 1e-2 틀린 로짓과 상대 L2 오차 1e-4인
+  로짓은 v2에서 거부된다. 실제 크기(1,241,600개) 통계로는 값 하나의 1e-2 오류가 L2 조건을 통과하고 최대 절대 오차 조건에서
+  거부된다. `uv run pytest` 2204 passed, 2 skipped, `uv run ruff check src tests scripts` 통과.
+- CPU 수치 검증(`.factory/model-ops-cpu-venv`, 영수증은 임시 폴더): 종료 코드 0, **35/35 통과**, `stopped_after` null, 모든 영수증의
+  `policy_id`가 `model-ops-f32-v2`. 로짓 오차(최대 절대 / 상대 L2): 텍스트 병합 3.4e-8 / 1.2e-7, 확정 3.0e-8 / 1.3e-7;
+  `qwen3_5` 병합 2.0e-7 / 5.1e-7, 확정 8.9e-8 / 2.2e-7; `gemma4` 병합 7.1e-7 / 1.0e-6, 확정 6.9e-7 / 8.3e-7.
+- GPU 재시험(2026-10-31, `bc020b0` 런타임): 0.8B 확정이 발행됐다. 로짓 최대 절대 오차 1.79e-5, 상대 L2 9.8e-7(위 결과 절).
+  병합은 Pod에서 다시 재지 않았다.
+
+# 2단계 GPU 인수 시험(A40) — 승인 범위, 2026-10-30
+
+사용자 지시(2026-10-30): "2단계 및 후속 과제도 내 허락 받지 않고 계속 다 테스트해가면서 구현해줘". 이에 따른 유료 시험 범위:
+
+- 공장 소유 Pod만 만든다(`ManagedPods`, 정책: GPU 1개, 실행당 $5, 최대 4시간, 다이제스트 고정 이미지). A40 1대, CA-MTL-1, 시간당 $0.59.
+  볼륨 `cys1ne5znp`(80 GB)를 쓴다. 같은 볼륨의 사용자 Pod `amdva0lurw9rv1`은 EXITED로 두고 건드리지 않는다.
+- 데이터는 결정적으로 만든 합성 데이터(32행)만 쓰고 MLflow는 끈다. 엔진은 `claude/phase2-models`에서 빌드한 `dist/factory-bridge.exe`.
+- 사례: Qwen3.5-0.8B SFT LoRA(평가 포함)·QLoRA·DPO·KTO·PT·full·freeze, gemma-4-E2B-it SFT LoRA, Qwen3.5-9B SFT LoRA, RM 시험(앱 밖),
+  0.8B 어댑터의 대상·확정 확인. 끝나면 Pod를 멈추고 EXITED를 확인한다. 드라이버는 저장소 밖 `%TEMP%\gpu_accept\run_phase2.py`.
+
+# Qwen3.5·Gemma 4 텍스트 학습 (2단계) — Task 13–14 대상 규칙·병합·확정과 CPU 수치 검증, 2026-10-30
+
+[설계](superpowers/specs/2026-10-30-phase2-latest-models-design.md) · [계획](superpowers/plans/2026-10-30-phase2-latest-models.md) ·
+브랜치 `claude/phase2-models`.
+
+- Task 13(torch 없이): 복합 모델(`qwen3_5`·`qwen3_5_moe`·`gemma4`)의 LoRA 대상은 `model.language_model.` 아래 Linear다. 헤더 증거는
+  `qwen3_5`·`gemma4`를 받아 언어 모델 텐서만 본다(비전·오디오·투영·`mtp.*` 무시, `linear_attn.conv1d` 3차원 커널 허용, 전문가 텐서와
+  `qwen3_5_moe`는 계속 거부). 계획의 대상 비교는 잎 이름(`target_leaves`)으로 하고, 모의 실행 어댑터는 `resolved_lora_targets`로
+  전체 이름을 쓴다. `verify_inspected_targets`는 증거가 모두 언어 모델 안에 있을 때만 기대 집합을 줄인다(비전 모듈을 함께 내는
+  gemma3 증거는 전체 규칙 그대로).
+- Task 14: 복합 모델은 meta 대상 검사와 병합·확정의 FP32 로드를 `AutoModelForImageTextToText`로 한다. 확정의 키 집합 검사는
+  불러온 모델이 선언한 "불러오지 않는 키"(`_keys_to_ignore_on_load_unexpected`, transformers처럼 `re.search`로 맞춤)만 기대 집합에서 뺀다.
+  Qwen3.5는 `^mtp.*`, Gemma 4는 KV 공유 층의 `self_attn.k_proj`·`v_proj`·`k_norm`·`v_norm`이고, 텍스트 모델은 선언이 없어 그대로다.
+- 검토에서 찾은 결함과 수정(2026-10-30): Gemma 4 E2B는 35층 중 20층이 앞 층의 key/value를 공유하는데(`num_kv_shared_layers`), 체크포인트
+  헤더에는 그 층들의 `k_proj`·`v_proj`·`k_norm`이 남아 있고 transformers 5.6은 만들지도 불러오지도 않는다. 그래서 헤더 증거에 없는 모듈이
+  생겼고(meta 26개 대 헤더 28개), 그 증거로는 이어 학습 대상 검사가 거부했으며, 확정은 키 집합 검사에서 `DELTA_FAILED`로 실패했다.
+  torch 없는 쪽은 config에서 같은 목록을 만드는 `target_inspection.unloaded_modules`를 더해 헤더 증거(`model_root_targets`가 해시로 묶인
+  루트 config.json을 읽어 넘김)와 `verify_inspected_targets(config=...)`에 쓰고, torch 쪽은 위 선언을 쓴다. CPU 검증은 transformers의 선언과
+  `unloaded_modules`가 같은지도 확인한다.
+- PEFT 0.18.1은 20개 이상의 전체 이름을 가장 짧은 구별 접미사로 기록한다(CPU 검증에서 Qwen3.5 `all` 31개 → 잎 이름 12개,
+  Gemma 4 `all` 26개 → `language_model.layers.0.self_attn.q_proj`, `1.self_attn.q_proj` 등 22개; Gemma 4 비전 타워도 q_proj~down_proj를 쓰기 때문).
+  앱의 비교는 잎 이름과 접미사 일치로 하므로 그대로 동작하고, 접미사로 기록된 두 어댑터의 병합도 통과한다. 실제 0.8B·9B의 `q_proj,v_proj`는
+  20개 미만이라 전체 이름으로 남는다.
+- CPU 수치 검증(2026-10-30, 수정 후, `.factory/model-ops-cpu-venv`: torch 2.7.1+cpu, transformers 5.6.0, peft 0.18.1):
+  `scripts/verify_model_ops_cpu.py --receipt dist/model-ops-cpu-0.6.0.json` 종료 코드 0, **35/35 통과**, `stopped_after` null
+  (검사 수는 그대로이고 복합 병합 검사 안에 `all` 어댑터 병합이 더해져 병합 4건·확정 4건을 확인한다). 기존 29개 검사 기록과 텍스트 모델의
+  병합·확정 영수증은 이전 영수증(`.factory/model-ops-cpu-receipt.json`)과 같다(텍스트 모델 출력 불변). 새 6개:
+
+| 작은 무작위 모델 | 대상 검사 | 병합(r2+r3 → r5) | 확정(q·v 어댑터와 `all` 어댑터) |
+|---|---|---|---|
+| `qwen3_5`(linear_attn 3층 + self_attn 1층, 비전 1블록, 가짜 `mtp.fc.weight`) | 언어 모델 Linear 31개, meta = 헤더 = 동결 산출물, 검증 통과 | q·v 2개(전체 이름)와 `all` 31개(접미사 12개): 델타 ≤ 1.1e-8, 로짓 ≤ 2.0e-7 | 텐서 77개 = 기본 78개 − mtp, 비전 21개 동일, 델타 ≤ 1.5e-8, 로짓 ≤ 8.9e-8 |
+| `gemma4`(3층 중 마지막 층이 KV 공유, 그 층의 원본 k/v/k_norm 텐서 포함, 층별 입력 투영, 비전 1층, 오디오 없음) | 26개, 같은 일치(config 없이 원본 체크포인트 증거는 거부) | q·v 5개와 `all` 26개(접미사 22개): 델타 ≤ 1.6e-8, 로짓 ≤ 7.1e-7 | 69개 = 기본 72개 − KV 공유 텐서 3개, 비전·투영 16개 동일, 델타 ≤ 1.8e-8, 로짓 ≤ 6.9e-7 |
+
+  로짓은 병합·확정 결과를 기본 모델 가중치에 델타를 직접 더한 모델과 비교했다(허용 오차 정책 `model-ops-f32-v1`). 확정 결과의
+  `architectures`는 복합 클래스이고, 토크나이저와 `preprocessor_config.json`이 바이트 그대로 복사되며, 동결 뒤 대상 검사도 통과한다.
+  Task 14 소스 전(Task 13 커밋)에는 대상 검사 둘이 계획대로 실패했고(`'Qwen3_5Config' object has no attribute 'vocab_size'`,
+  `'Gemma4ClippableLinear' object has no attribute 'in_features'`), 텍스트 전용 로더로는 Qwen3.5 병합·확정이 어댑터 대상을 찾지 못했으며,
+  `mtp.*` 제외 없이는 Qwen3.5 확정이 키 집합 검사에서 실패했다. 검토 수정 전 규칙(`mtp.*`만 제외, config 없는 헤더 증거)으로는 KV 공유
+  Gemma 4의 대상 검사와 확정(`DELTA_FAILED`)이 실패했다.
+- 계획과 다른 점: `GEMMA4` 상수에 `vocab_size_per_layer_input=32`, `hidden_size_per_layer_input=8`, `global_head_dim=16`,
+  `num_kv_shared_layers=1`, `layer_types=["full_attention","sliding_attention","full_attention"]`을 더하고 층을 3개로 했다(기본 층별 임베딩은
+  fp32로 약 0.5 GB이고, 3층이면 `all`이 20개를 넘어 PEFT 접미사 기록을 시험한다). 병합 검사는 q·v 어댑터에 더해 `all` 어댑터 둘도 병합하고,
+  확정 검사는 q·v 어댑터에 더해 `all` 어댑터도 확정한다.
+- 남은 일(GPU 인수): 실제 LLaMA-Factory 어댑터의 `target_modules`와 meta 검사 비교, Qwen3.5-0.8B 어댑터 병합, gemma-4-E2B-it의
+  헤더 증거와 실제 모듈 비교(KV 공유 20층).
+
 # Task 16 GPU 인수 시험 — 승인 범위와 결과, 2026-10-30
 
 사용자 승인(2026-10-30): Blackwell Pod `yuft63rjggvh5z`(1 × RTX PRO 4000 Blackwell, 시간당 $0.57, 이미 실행 중)에서 먼저 시험하고,

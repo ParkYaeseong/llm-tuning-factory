@@ -11,14 +11,14 @@ from pathlib import Path
 
 import yaml
 
-from .capabilities import compatibility, model_catalog, training_stages
+from .capabilities import compatibility, model_catalog, reviewed_model_entry, training_stages
 from .config import AIConfig
 from .connections import ENV_SETTINGS
 from .desktop_inspection import inspect_dataset, parameter_changes, parse_progress
 from .execution import ExecutionUncertain, Policy, RunPodController
 from .gpu_servers import ServerApprovalReceipt, SSHServerInspection, server_settings
 from .manifest import resolve, source_hash
-from .model_hub import ModelHub, register_model, registered_models
+from .model_hub import ModelHub, positive_count, recommended_precision, register_model, registered_models
 from .registry import canonical, digest, parse_dataset, safe_name
 from .runner import Factory
 from .runtime_profiles import engine_profile
@@ -159,12 +159,18 @@ class DesktopService:
             raise ValueError("GPU 서버 연결을 선택한 경우에만 사용할 수 있습니다.")
 
     def compatibility(self, config, observation, stage):
-        """gpu_compat findings for one job config; catalog sizes feed the memory estimate."""
+        """gpu_compat findings for one job config; the model entry's sizes feed the memory estimate. A reviewed catalog
+        entry wins over a hub registration of the same repository and architecture (spec 4.5)."""
         from .gpu_compat import evaluate
+        from .gpu_servers import server_hourly_cost
         from .runtime_profiles import runtime_capabilities
         profile = engine_profile(config.get("training_stage", "sft"))["profile"]
-        model = next((item for item in model_catalog() if item["id"] == config.get("base_model")), None)
-        return evaluate(config, observation, runtime_capabilities(profile), model, stage=stage)
+        model = reviewed_model_entry(config)
+        try:
+            server = server_hourly_cost(self.settings) if self.is_server() else None
+        except ValueError:   # an unsupported provider is reported by the connection screen, not by this judgement
+            server = None
+        return evaluate(config, observation, runtime_capabilities(profile), model, stage=stage, server=server)
 
     def plan_compatibility(self, config):
         """Offline: the plan judges the last stored GPU observation of the saved destination."""
@@ -260,8 +266,9 @@ class DesktopService:
             profiles = [json.loads(p.read_bytes()) for p in sorted((self.root / "profiles").glob("*.json"))]
             datasets = [json.loads(p.read_bytes()) for p in sorted(
                 (self.factory.registry.root / "datasets").glob("*/*.json"))]
+            # A reviewed catalog entry wins over a hub registration of the same repository.
             models = {model["id"]: model for model in model_catalog()}
-            models.update({model["id"]: model for model in registered_models(self.root)})
+            models.update({model["id"]: model for model in registered_models(self.root) if model["id"] not in models})
             return {"templates": templates, "profiles": profiles, "datasets": datasets,
                     "models": list(models.values()), "training_stages": training_stages()}
         if action == "model_search":
@@ -298,7 +305,10 @@ class DesktopService:
         if action == "model_revision":
             import httpx
             model = data["model"]
-            custom = next((m for m in registered_models(self.root) if m["id"] == model), None)
+            # A reviewed catalog entry wins over a hub registration of the same repository (as in "catalog"): the
+            # screen stores a returned model_profile in the config, which would replace the reviewed facts.
+            profile = next((m for m in model_catalog() if m["id"] == model), None)
+            custom = None if profile else next((m for m in registered_models(self.root) if m["id"] == model), None)
             if custom:
                 with self.hub() as hub:
                     result = hub.inspect(model)
@@ -306,7 +316,6 @@ class DesktopService:
                     raise ValueError("; ".join(result["reasons"]))
                 register_model(self.root, result["profile"])
                 return {**result, "model_profile": result["profile"]}
-            profile = next((m for m in model_catalog() if m["id"] == model), None)
             if not profile:
                 raise ValueError("supported model required")
             response = httpx.get("https://huggingface.co/api/models/" + model + "/revision/main", timeout=20)
@@ -320,11 +329,13 @@ class DesktopService:
             metadata = response.json()
             if metadata.get("model_type") != profile["architecture"]:
                 raise ValueError("model architecture differs from the reviewed compatibility profile")
+            text = metadata.get("text_config") or metadata   # composite configs nest the text model
+            positions = positive_count(text.get("max_position_embeddings"), 10_000_000, low=64)
             return {"model_revision": revision, "tokenizer_revision": revision,
                     "template": profile["template"], "architecture": profile["architecture"],
-                    "max_length": min(profile["max_length"], metadata.get("max_position_embeddings") or profile["max_length"]),
-                    "recommended_precision": metadata.get("torch_dtype", metadata.get("dtype")),
-                    "hidden_layers": metadata.get("num_hidden_layers"), "metadata_verified": True}
+                    "max_length": min(profile["max_length"], positions or profile["max_length"]),
+                    "recommended_precision": recommended_precision(metadata),
+                    "hidden_layers": positive_count(text.get("num_hidden_layers"), 10000), "metadata_verified": True}
         if action == "save_profile":
             config = AIConfig.model_validate(data["config"])
             directory = self.root / "profiles"
@@ -421,11 +432,16 @@ class DesktopService:
             receipt = None
             if server:
                 from .desktop_runtime import plan_server_destination
-                # Offline refusals first; the price check needs the observed server facts below.
+                from .gpu_compat import refusal
+                # Offline refusals first; the observed server facts are checked again below.
                 for dataset in filter(None, (manifest["dataset"], manifest.get("validation_dataset"))):
                     self.factory.policy.check(config, dataset)
                     if not dataset.get("export_allowed"):
                         raise ValueError("dataset export has not been authorized in registry")
+                # Price and other offline blocks in Korean before the read-only server observation opens SSH.
+                message = refusal(self.compatibility(manifest["config"], None, "execute"))
+                if message:
+                    raise ValueError(message)
                 # Read-only observation; the receipt freezes the approved destination for this job.
                 receipt = plan_server_destination(self.settings, manifest)
             facts = receipt.facts if receipt else None
@@ -463,8 +479,11 @@ class DesktopService:
                     return result
             with executor_for(self.settings, self.root, training_stage=stage, gate=gate,
                               prepare_runtime=prepare) as executor:
-                return self.factory.work(executor=executor, gpu="existing_runpod:" + self.settings["pod_id"],
-                                         approved_transfer=True, select_mode=True, target_job_id=job_id)
+                result = self.factory.work(executor=executor, gpu="existing_runpod:" + self.settings["pod_id"],
+                                           approved_transfer=True, select_mode=True, target_job_id=job_id)
+            # What a preparation in this run approval pruned (shown with the result); a waiting job stays None.
+            cleanup = getattr(executor, "runtime_cleanup", None)
+            return {**result, "runtime_cleanup": cleanup} if result is not None and cleanup is not None else result
         if action == "jobs":
             jobs = self.factory.store.list()[-200:][::-1]
             destinations = self.server_destinations(jobs)

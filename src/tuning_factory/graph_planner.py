@@ -66,6 +66,7 @@ from .projects import DatasetRef, LocalId, ProjectSpec, Revision, Sha256
 from .recipes import RecipeSpec, recipe_training_options
 from .registry import Registry, canonical, digest
 from .runtime_profiles import engine_profile
+from .target_inspection import target_leaves
 from .training import OFT_UNFREEZABLE, PPO_CONTINUATION, check_generation_benchmark, requires_frozen_reference
 
 RUNPOD_PRICE_REQUIRED = "RunPod resource facts require a positive live hourly price"
@@ -407,7 +408,9 @@ class _MergeLineage:
       base; so do a missing artifact snapshot, an unresolvable recipe and a cycle (reported elsewhere). There the
       check stays silent and compilation (``check_merge_descriptors``) stays authoritative.
 
-    A candidate is ``(base key, sorted targets or None)``; ``None`` instead of a set of candidates means unknown."""
+    A candidate is ``(base key, sorted target leaf names or None)``: composite models' adapters record full
+    language-model names, so every target set is compared by its leaves (``target_leaves``). ``None`` instead of
+    a set of candidates means unknown."""
 
     def __init__(self, nodes, recipes, artifacts=None, evidence=()):
         self.nodes, self.recipes, self.artifacts = nodes, recipes, artifacts
@@ -419,7 +422,7 @@ class _MergeLineage:
         if lora_target != "all":
             return tuple(sorted(lora_target.split(",")))
         evidence = self.evidence.get(base.model_dump_json())
-        return None if evidence is None else tuple(sorted({item.name.rsplit(".", 1)[-1] for item in evidence.modules}))
+        return None if evidence is None else target_leaves(item.name for item in evidence.modules)
 
     def _artifact(self, ref):
         snapshot = self.artifacts.get(_artifact_key(ref)) if self.artifacts is not None else None
@@ -431,7 +434,7 @@ class _MergeLineage:
             if descriptor is None or descriptor.adapter is None:
                 return None
             return frozenset({(descriptor.effective_base.model_dump_json(),
-                               tuple(sorted(descriptor.adapter.target_modules)))})
+                               target_leaves(descriptor.adapter.target_modules))})
         if not isinstance(value, NodeOutputRef):
             return None
         node_id = value.node_id
@@ -458,7 +461,7 @@ class _MergeLineage:
             policy = source.policy
             if policy.adapter is not None and source.initialization == "continue_adapter":
                 descriptor = self._artifact(policy.adapter)
-                targets = (tuple(sorted(descriptor.adapter.target_modules)) if descriptor and descriptor.adapter
+                targets = (target_leaves(descriptor.adapter.target_modules) if descriptor and descriptor.adapter
                            else None)
             else:
                 targets = self._targets(recipe, policy.base)

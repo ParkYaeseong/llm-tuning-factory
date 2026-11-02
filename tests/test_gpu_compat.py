@@ -82,6 +82,111 @@ def test_memory_estimate_needs_catalog_sizes():
     assert gpu_compat.estimate_memory({"parameters_b": 7}, training()) is None
 
 
+QWEN35_08 = {"id": "Qwen/Qwen3.5-0.8B", "parameters_b": 0.87, "parameters_total": 873_438_784,
+             "text_parameters": 752_393_024, "hidden_size": 1024, "num_layers": 24, "gpu_verified": False}
+QWEN35_27 = {"id": "Qwen/Qwen3.5-27B", "parameters_total": 27_781_427_952, "text_parameters": 26_895_998_464,
+             "hidden_size": 5120, "num_layers": 64}
+GEMMA4_31 = {"id": "google/gemma-4-31B-it", "parameters_total": 31_273_088_876, "text_parameters": 30_697_345_340,
+             "hidden_size": 5376, "num_layers": 60}
+
+
+def test_composite_weights_count_every_tensor_and_training_state_only_the_text_model():
+    small = gpu_compat.estimate_memory(QWEN35_08, training())
+    assert 1.62 < small["weights_gib"] < 1.63 and 3.2 < small["total_gib"] < 3.4
+    assert gpu_compat.estimate_memory({**QWEN35_08, "text_parameters": None}, training())["total_gib"] > small["total_gib"]
+    assert 12.9 < gpu_compat.estimate_memory(QWEN35_08, training("full"))["total_gib"] < 13.2
+    assert gpu_compat.estimate_memory(QWEN35_27, training())["weights_gib"] > 51.5
+    qlora = gpu_compat.estimate_memory(GEMMA4_31, training("qlora"))
+    assert 15.9 < qlora["weights_gib"] < 16.1 and 22.5 < qlora["total_gib"] < 23.5
+
+
+def test_qlora_keeps_embedding_tables_at_bf16_and_quantizes_the_rest():
+    gib = 1024 ** 3
+    e2b = {"id": "google/gemma-4-E2B-it", "parameters_total": 5_123_178_051, "text_parameters": 4_647_449_891,
+           "embedding_parameters": 2_751_463_424, "hidden_size": 1536, "num_layers": 35}
+    rest = 5_123_178_051 - 2_751_463_424
+    four = gpu_compat.estimate_memory(e2b, training("qlora"))["weights_gib"]
+    assert four == pytest.approx((2_751_463_424 * 2.0 + rest * 0.55) / gib) and 6.33 < four < 6.35
+    eight = gpu_compat.estimate_memory(e2b, {**training("qlora"), "quantization_bit": 8})["weights_gib"]
+    assert eight == pytest.approx((2_751_463_424 * 2.0 + rest * 1.0) / gib)
+    gemma31 = gpu_compat.estimate_memory({**GEMMA4_31, "embedding_parameters": 1_409_286_144}, training("qlora"))
+    assert 17.9 < gemma31["weights_gib"] < 17.95   # 16.02 GiB if the embedding were 4-bit too
+    for method in ("lora", "full", "freeze"):   # every weight is bf16 already: the fact changes nothing
+        assert gpu_compat.estimate_memory(e2b, training(method)) == gpu_compat.estimate_memory(
+            {key: value for key, value in e2b.items() if key != "embedding_parameters"}, training(method))
+
+
+def test_qlora_keeps_moe_expert_weights_at_bf16_so_a_35b_moe_no_longer_fits_an_a40():
+    from tuning_factory.capabilities import model_catalog
+    gib = 1024 ** 3
+    moe = next(m for m in model_catalog() if m["id"] == "Qwen/Qwen3.5-35B-A3B")
+    assert moe["expert_parameters"] == 32_212_254_720
+    weights = gpu_compat.estimate_memory(moe, training("qlora"))["weights_gib"]
+    rest = moe["parameters_total"] - moe["embedding_parameters"] - moe["expert_parameters"]
+    assert weights == pytest.approx(((moe["embedding_parameters"] + moe["expert_parameters"]) * 2.0 + rest * 0.55) / gib)
+    assert weights > 0.95 * 46068 / 1024   # an A40: refused at the weights block ratio
+    without = {key: value for key, value in moe.items() if key != "expert_parameters"}
+    assert gpu_compat.estimate_memory(without, training("qlora"))["weights_gib"] < 0.95 * 46068 / 1024
+    for method in ("lora", "full", "freeze"):
+        assert gpu_compat.estimate_memory(moe, training(method)) == gpu_compat.estimate_memory(without, training(method))
+
+
+# nvidia-smi peaks of the 0.6.0 GPU acceptance on an A40 (synthetic data; batch 1, cutoff_len 1024, gradient
+# accumulation 4, gradient checkpointing). Rows are short (~60-100 tokens) except PT, which packs text to cutoff_len.
+A40_PEAKS_MIB = [
+    ("Qwen/Qwen3.5-0.8B", "sft", "lora", 3107), ("Qwen/Qwen3.5-0.8B", "sft", "qlora", 2287),
+    ("Qwen/Qwen3.5-0.8B", "dpo", "lora", 5271), ("Qwen/Qwen3.5-0.8B", "pt", "lora", 5683),
+    ("Qwen/Qwen3.5-0.8B", "sft", "full", 16481), ("Qwen/Qwen3.5-0.8B", "sft", "freeze", 3143),
+    ("google/gemma-4-E2B-it", "sft", "lora", 12761), ("google/gemma-4-E2B-it", "dpo", "lora", 18711),
+    ("google/gemma-4-E2B-it", "pt", "lora", 14823), ("Qwen/Qwen3.5-9B", "sft", "lora", 19825)]
+
+
+@pytest.mark.parametrize("name,stage,method,peak_mib", A40_PEAKS_MIB)
+def test_estimates_cover_the_measured_a40_peaks_of_large_vocabulary_models(name, stage, method, peak_mib):
+    from tuning_factory.capabilities import model_catalog
+    model = next(m for m in model_catalog() if m["id"] == name)
+    total = gpu_compat.estimate_memory(model, {**training(method), "training_stage": stage})["total_gib"]
+    assert total >= peak_mib / 1024
+    if (stage, method) == ("sft", "lora"):   # still useful: at most twice the measured peak
+        assert total <= 2 * peak_mib / 1024
+
+
+def test_the_logits_term_scales_with_tokens_and_vocabulary_by_stage_and_method():
+    from tuning_factory.capabilities import model_catalog
+    gib = 1024 ** 3
+    assert gpu_compat.LOGITS_BYTES == 11
+    for name, vocabulary in (("google/gemma-4-E2B-it", 262_144), ("Qwen/Qwen3.5-0.8B", 248_320)):
+        model = next(m for m in model_catalog() if m["id"] == name)
+        without = {key: value for key, value in model.items() if key != "vocab_size"}
+        # chosen + rejected (+ the reference pass) for dpo/kto, chosen + rejected for rm (the pairwise collator
+        # concatenates them; unmeasured); full training doubles the term (spec 4.5)
+        for stage, method, factor in (("sft", "lora", 1), ("pt", "lora", 1), ("rm", "lora", 2), ("dpo", "lora", 3),
+                                      ("kto", "lora", 3), ("sft", "qlora", 1), ("sft", "freeze", 1),
+                                      ("sft", "full", 2), ("dpo", "full", 6)):
+            for batch, cutoff in ((1, 1024), (2, 4096)):
+                config = {**training(method, per_device_train_batch_size=batch, cutoff_len=cutoff),
+                          "training_stage": stage}
+                logits, plain = gpu_compat.estimate_memory(model, config), gpu_compat.estimate_memory(without, config)
+                assert logits["weights_gib"] == plain["weights_gib"]
+                assert logits["total_gib"] - plain["total_gib"] == pytest.approx(
+                    batch * cutoff * vocabulary * 11 * factor / gib), (name, stage, method, batch)
+
+
+def test_models_without_a_vocabulary_size_keep_their_stage_independent_estimates():
+    from tuning_factory.capabilities import model_catalog
+    gib = 1024 ** 3
+    text = [m for m in model_catalog() if "vocab_size" not in m]
+    assert {m["architecture"] for m in text} == {"qwen2", "llama", "mistral", "gemma2"}
+    for model in [*text, QWEN05, LLAMA70, QWEN35_08, GEMMA4_31]:
+        for method in ("lora", "qlora", "full", "freeze", "oft"):
+            sft = gpu_compat.estimate_memory(model, training(method))
+            for stage in ("pt", "rm", "ppo", "dpo", "kto"):
+                assert gpu_compat.estimate_memory(model, {**training(method), "training_stage": stage}) == sft
+    # The previous formula: bf16 weights + adapter state + activations + overhead.
+    assert gpu_compat.estimate_memory(QWEN05, training())["total_gib"] == pytest.approx(
+        (0.5e9 * 2 + 0.5e9 * 0.01 * 16 + 1024 * 896 * (2 * 24 + 34)) / gib + 1.5, rel=1e-12)
+
+
 CAPS = {"torch_cuda": "12.8", "sass": SASS, "ptx": [], "bf16_min_capability": "8.0",
         "min_driver": "525.60.13", "recommended_driver": "570.26"}
 BLACKWELL = gpu_compat.parse_gpu_facts(SMI)[0]
@@ -148,10 +253,28 @@ def test_memory_blocks_on_weights_and_warns_when_tight():
         ("warn", "MEMORY_TIGHT"), ("warn", "MODEL_UNVERIFIED")}
 
 
+def test_a_27b_bf16_lora_is_refused_on_a_48gb_gpu():
+    a40 = {**BLACKWELL, "name": "NVIDIA A40", "capability": "8.6", "memory_mib": 46068}
+    config = job(gpu_type="NVIDIA A40")
+    findings = gpu_compat.evaluate(config, observed(gpus=(a40,), pod=None), CAPS, QWEN35_27, stage="execute")
+    assert ("block", "MEMORY_WEIGHTS_EXCEED") in codes(findings)
+
+
 def test_unknown_models_and_unreadable_gpu_facts_warn():
     findings = gpu_compat.evaluate(job(), observed(gpus=[]), CAPS, None, stage="execute")
     assert codes(findings) == {("warn", "MEMORY_UNKNOWN"), ("warn", "MODEL_UNVERIFIED"),
                                ("warn", "GPU_FACTS_UNKNOWN")}
+
+
+def test_a_model_without_sizes_warns_memory_unknown_once_without_an_observation_too():
+    unsized = {"id": "someone/model", "hidden_size": 2048, "gpu_verified": False}   # no parameter count
+    assert codes(gpu_compat.evaluate(job(), None, CAPS, unsized, stage="plan")) == {
+        ("warn", "MEMORY_UNKNOWN"), ("warn", "MODEL_UNVERIFIED"), ("warn", "OBSERVATION_MISSING")}
+    for observation, stage in ((None, "plan"), (observed(), "plan"), (observed(), "execute"),
+                               (observed(gpus=[]), "execute")):
+        for model in (unsized, None):
+            found = [item["code"] for item in gpu_compat.evaluate(job(), observation, CAPS, model, stage=stage)]
+            assert found.count("MEMORY_UNKNOWN") == 1, (observation, stage, model)
 
 
 def test_plan_reports_missing_and_stale_observations_only():
@@ -232,6 +355,24 @@ def test_a_verified_model_warns_on_a_generation_it_was_not_verified_on():
     assert gpu_compat.evaluate(job(), observed(), CAPS, QWEN05, stage="execute") == []
 
 
+def test_the_a40_verified_composite_models_warn_only_on_other_generations():
+    from tuning_factory.capabilities import model_catalog
+    models = {model["id"]: model for model in model_catalog()}
+    a40 = {**BLACKWELL, "name": "NVIDIA A40", "capability": "8.6", "memory_mib": 46068}
+    h100 = {**BLACKWELL, "name": "NVIDIA H100 80GB HBM3", "capability": "9.0", "memory_mib": 81559}
+    for name in ("Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-9B", "google/gemma-4-E2B-it"):
+        on_a40 = gpu_compat.evaluate(job(gpu_type="NVIDIA A40"), observed([a40], pod=None), CAPS, models[name],
+                                     stage="execute")
+        assert "MODEL_UNVERIFIED" not in {item["code"] for item in on_a40}, name
+        on_h100 = gpu_compat.evaluate(job(gpu_type="NVIDIA H100 80GB HBM3"), observed([h100], pod=None), CAPS,
+                                      models[name], stage="execute")
+        assert [item["message"] for item in on_h100 if item["code"] == "MODEL_UNVERIFIED"] == [
+            "이 모델은 이 GPU 세대(compute capability 9.0)에서 아직 검증되지 않았습니다."], name
+    base = gpu_compat.evaluate(job(gpu_type="NVIDIA A40"), observed([a40], pod=None), CAPS,
+                               models["Qwen/Qwen3.5-0.8B-Base"], stage="execute")
+    assert [item["message"] for item in base if item["code"] == "MODEL_UNVERIFIED"] == [gpu_compat.MODEL_UNVERIFIED]
+
+
 def test_memory_messages_name_their_thresholds():
     h100 = {**BLACKWELL, "name": "NVIDIA H100 80GB HBM3", "capability": "9.0", "memory_mib": 81559}
     pod = {**POD, "gpu_id": "NVIDIA H100 80GB HBM3", "hourly_cost_usd": 2.0}
@@ -244,3 +385,24 @@ def test_memory_messages_name_their_thresholds():
     tight["hyperparameters"].update(cutoff_len=8192, per_device_train_batch_size=4)
     findings = gpu_compat.evaluate(tight, observed(), CAPS, qwen7, stage="execute")
     assert "의 90%를 넘어 부족할 수 있습니다" in next(i for i in findings if i["code"] == "MEMORY_TIGHT")["message"]
+
+
+@pytest.mark.parametrize("price,code", [(0.6, None), (0, None), (0.61, "PRICE_OVER_BUDGET"), (None, "PRICE_UNKNOWN"),
+                                        (float("nan"), "PRICE_UNKNOWN"), (float("inf"), "PRICE_UNKNOWN"), (-1, "PRICE_UNKNOWN"), (True, "PRICE_UNKNOWN")])
+def test_a_server_price_is_judged_like_a_pod_price_but_zero_is_allowed(price, code):
+    for observation in (observed(pod=None), None):   # judged before the missing-observation return
+        findings = gpu_compat.evaluate(job(), observation, CAPS, QWEN05, stage="execute",
+                                       server={"hourly_cost_usd": price})
+        assert {item["code"] for item in findings if item["level"] == "block"} == ({code} if code else set())
+
+
+@pytest.mark.parametrize("price,code", [(1.2, None), (1.21, "PRICE_OVER_BUDGET")])
+def test_a_server_price_is_judged_against_the_budget_for_all_gpus(price, code):
+    findings = gpu_compat.evaluate(job(gpu_count=2), None, CAPS, QWEN05, stage="execute",
+                                   server={"hourly_cost_usd": price})
+    assert {item["code"] for item in findings if item["level"] == "block"} == ({code} if code else set())
+
+
+def test_an_unknown_server_price_points_to_the_connection_settings():
+    findings = gpu_compat.evaluate(job(), None, CAPS, QWEN05, stage="plan", server={"hourly_cost_usd": None})
+    assert gpu_compat.SERVER_PRICE_UNKNOWN in gpu_compat.refusal(findings)

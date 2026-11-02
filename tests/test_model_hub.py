@@ -8,7 +8,7 @@ from tuning_factory.model_hub import ModelHub, ModelProfile, imported_model
 REVISION = 'a' * 40
 
 
-def hub(model_type='qwen3_5', extra=None):
+def hub(model_type='qwen3_5', extra=None, info=None):
     requests = []
     def respond(request):
         requests.append(request)
@@ -16,7 +16,7 @@ def hub(model_type='qwen3_5', extra=None):
             return httpx.Response(200, json=[{'id': 'Qwen/Qwen3.5-0.8B', 'downloads': 10,
                                              'pipeline_tag': 'image-text-to-text', 'lastModified': '2026-03-02'}])
         if '/api/models/' in request.url.path:
-            return httpx.Response(200, json={'sha': REVISION, 'gated': False})
+            return httpx.Response(200, json={'sha': REVISION, 'gated': False, **(info or {})})
         if request.url.path.endswith('tokenizer_config.json'):
             return httpx.Response(200, json={'chat_template': '<|im_start|>{{messages}}'})
         return httpx.Response(200, json={'model_type': model_type, 'text_config': {
@@ -31,7 +31,7 @@ def test_search_and_inspect_modern_model_without_weight_download():
     result = service.inspect('Qwen/Qwen3.5-0.8B')
     assert result['supported'] and result['architecture'] == 'qwen3_5'
     profile = ModelProfile.model_validate(result['profile'])
-    assert profile.template == 'qwen3_5_nothink' and profile.revision == REVISION
+    assert profile.template == 'qwen3_5' and profile.revision == REVISION
     assert len(profile.config_sha256) == 64
     model = imported_model(profile)
     assert model['id'] == 'Qwen/Qwen3.5-0.8B' and not model['gpu_verified']
@@ -76,12 +76,108 @@ def test_current_qwen36_uses_its_upstream_template():
     service, _ = hub('qwen3_5_moe')
     result = service.inspect('Qwen/Qwen3.6-35B-A3B')
     assert result['supported'] and result['profile']['template'] == 'qwen3_6'
+    assert result['supported_stages'] == ['pt', 'sft', 'rm', 'dpo']
 
 
 def test_gemma4_is_discoverable_with_text_training_scope():
     service, _ = hub('gemma4')
     result = service.inspect('google/gemma-4-E2B-it')
-    assert result['supported'] and result['supported_stages'] == ['sft']
+    assert result['supported'] and result['supported_stages'] == ['pt', 'sft', 'rm', 'dpo']
+
+
+@pytest.mark.parametrize('per_layer,experts,template,moe', [(256, None, 'gemma4n', False), (0, 128, 'gemma4', True)])
+def test_hub_profile_records_sizes_and_the_gemma4_template(per_layer, experts, template, moe):
+    service, _ = hub('gemma4', {'tie_word_embeddings': True, 'text_config': {
+        'max_position_embeddings': 131072, 'num_hidden_layers': 35, 'hidden_size': 1536,
+        'hidden_size_per_layer_input': per_layer, 'num_experts': experts, 'dtype': 'bfloat16'}},
+        info={'safetensors': {'total': 5123178051}})
+    profile = service.inspect('google/gemma-4-E2B-it')['profile']
+    assert profile['template'] == template
+    assert (profile['parameters_total'], profile['hidden_size'], profile['hidden_layers'], profile['moe'],
+            profile['tie_word_embeddings']) == (5123178051, 1536, 35, moe, True)
+    model = imported_model(profile)
+    assert (model['parameters_total'], model['hidden_size'], model['num_layers'], model['parameters_b']) == (
+        5123178051, 1536, 35, 5.12)
+    assert model['supported_stages'] == ['pt', 'sft', 'rm', 'dpo'] and 'oft' not in model['methods']
+
+
+@pytest.mark.parametrize('bad', [True, '1536', 0, -1, 10 ** 12, 1.5, [1], {'n': 1}])
+def test_one_malformed_hub_fact_never_blocks_the_import(bad):
+    service, _ = hub('gemma4', {'tie_word_embeddings': 'yes', 'text_config': {
+        'max_position_embeddings': bad, 'num_hidden_layers': bad, 'hidden_size': bad,
+        'hidden_size_per_layer_input': bad, 'num_experts': bad, 'tie_word_embeddings': False, 'dtype': 'bfloat16'}},
+        info={'safetensors': {'total': 'many'}})
+    result = service.inspect('google/gemma-4-E2B-it')
+    assert result['supported'] and result['profile'] is not None
+    profile = result['profile']
+    assert (profile['template'], profile['max_length'], profile['context_length'], profile['hidden_layers'],
+            profile['moe'], profile['tie_word_embeddings']) == ('gemma4', 32768, 32768, None, False, False)
+    assert 'parameters_total' not in profile and 'hidden_size' not in profile
+    assert result['max_length'] == 32768 and result['hidden_layers'] is None and result['hidden_size'] is None
+
+
+@pytest.mark.parametrize('model_type,top,text,tied', [
+    ('qwen3_5', True, False, True), ('qwen3_5', None, False, False), ('qwen3_5', None, True, True),
+    ('qwen3_5', 'yes', None, None), ('qwen3_5', None, None, None), ('qwen3', None, None, None),
+    ('gemma4', None, None, True), ('gemma4_text', None, None, True), ('gemma4', None, False, False)])
+def test_tied_embeddings_fall_back_from_the_top_level_to_text_config_to_the_architecture(model_type, top, text, tied):
+    config = {'max_position_embeddings': 32768, 'num_hidden_layers': 24}
+    extra = {'text_config': {**config, **({} if text is None else {'tie_word_embeddings': text})},
+             **({} if top is None else {'tie_word_embeddings': top})}
+    service, _ = hub(model_type, extra)
+    profile = service.inspect('someone/model')['profile']
+    assert profile.get('tie_word_embeddings') == tied and ('tie_word_embeddings' in profile) == (tied is not None)
+
+
+def test_an_untied_hub_model_without_a_tie_fact_may_train_its_lm_head():
+    from tuning_factory.capabilities import compatibility
+    service, _ = hub('qwen3', {'text_config': {'max_position_embeddings': 32768, 'num_hidden_layers': 28}})
+    profile = service.inspect('someone/qwen3-untied')['profile']
+    result = compatibility({'base_model': profile['repo_id'], 'model_revision': REVISION, 'model_profile': profile,
+                            'template': profile['template'], 'training_method': 'freeze',
+                            'finetuning_options': {'freeze_extra_modules': 'lm_head'}})
+    assert result['valid'], result['errors']
+
+
+@pytest.mark.parametrize('top,text,precision', [
+    ({'torch_dtype': 'bfloat16'}, {}, 'bfloat16'), ({'torch_dtype': 'bfloat16'}, {'dtype': 'float16'}, 'float16'),
+    ({}, {'torch_dtype': 'float32', 'dtype': 'float16'}, 'float32'), ({'dtype': 'bfloat16'}, {'dtype': 5}, 'bfloat16'),
+    ({'dtype': ['bf16']}, {}, None)])
+def test_recommended_precision_reads_text_config_then_the_top_level(top, text, precision):
+    service, _ = hub(extra={**top, 'text_config': {'max_position_embeddings': 32768, 'num_hidden_layers': 24, **text}})
+    result = service.inspect('Qwen/Qwen3.5-0.8B')
+    assert result['recommended_precision'] == precision and result['profile']['recommended_precision'] == precision
+
+
+@pytest.mark.parametrize('safetensors', ['5123178051', [5123178051], 5123178051, None])
+def test_a_safetensors_summary_that_is_not_an_object_is_ignored(safetensors):
+    service, _ = hub(info={'safetensors': safetensors})
+    profile = service.inspect('Qwen/Qwen3.5-0.8B')['profile']
+    assert 'parameters_total' not in profile and profile['hidden_layers'] == 24
+
+
+@pytest.mark.parametrize('total', [True, '873438784', 0, -5, 1.5, 10 ** 16])
+def test_hub_parameter_totals_must_be_positive_integers(total):
+    service, _ = hub(info={'safetensors': {'total': total}})
+    assert 'parameters_total' not in service.inspect('Qwen/Qwen3.5-0.8B')['profile']
+
+
+def test_imported_model_lists_sizes_only_with_a_parameter_total():
+    profile = ModelProfile(repo_id='someone/model', revision=REVISION, config_sha256='c' * 64, architecture='qwen3_5',
+                           template='qwen3_5', hidden_layers=24, hidden_size=1024, moe=True,
+                           tie_word_embeddings=True)
+    model = imported_model(profile)
+    assert not {'parameters_total', 'parameters_b', 'hidden_size', 'num_layers', 'text_parameters'} & set(model)
+    assert (model['moe'], model['tie_word_embeddings']) == (True, True)
+
+
+def test_profiles_without_size_facts_keep_their_exact_bytes():
+    old = {'repo_id': 'Qwen/Qwen3.5-0.8B', 'revision': REVISION, 'config_sha256': 'c' * 64,
+           'architecture': 'qwen3_5', 'template': 'qwen3_5', 'max_length': 32768,
+           'context_length': 262144, 'hidden_layers': 24, 'recommended_precision': 'bfloat16', 'gated': False}
+    profile = ModelProfile.model_validate(old)
+    assert profile.model_dump() == old and profile.model_dump_json() == json.dumps(old, separators=(',', ':'))
+    assert 'parameters_total' not in imported_model(profile)
 
 
 def test_legacy_ppo_runtime_does_not_offer_a_missing_qwen3_template():
@@ -104,7 +200,8 @@ def test_import_registration_persists_only_checked_metadata(tmp_path, monkeypatc
                                               'config_sha256': inspected['profile']['config_sha256']})
     assert registered['model']['id'] == 'Qwen/Qwen3.5-0.8B'
     loaded = DesktopService(tmp_path).dispatch('catalog', {})['models']
-    assert any(item['id'] == 'Qwen/Qwen3.5-0.8B' for item in loaded)
+    entry = next(item for item in loaded if item['id'] == 'Qwen/Qwen3.5-0.8B')
+    assert entry.get('source') != 'huggingface' and entry['template'] == 'qwen3_5'
     assert 'secret' not in json.dumps(list((tmp_path / 'model-profiles').glob('*.json')), default=str)
 
 
@@ -129,3 +226,40 @@ def test_gpu_preflight_checks_actual_pinned_config_bytes(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, 'huggingface_hub', SimpleNamespace(hf_hub_download=lambda **kwargs: str(source)))
     with pytest.raises(ValueError, match='metadata hash'):
         runtime_preflight(AIConfig.model_validate(value))
+
+
+def test_hub_profile_records_the_vocabulary_from_text_config_then_the_top_level():
+    for extra, expected in (({'text_config': {'num_hidden_layers': 24, 'vocab_size': 248320}}, 248320),
+                            ({'vocab_size': 262144, 'text_config': {'num_hidden_layers': 24}}, 262144),
+                            ({'vocab_size': 1, 'text_config': {'num_hidden_layers': 24, 'vocab_size': 248320}}, 248320)):
+        service, _ = hub('qwen3_5', extra)
+        profile = service.inspect('someone/model')['profile']
+        assert profile['vocab_size'] == expected
+        assert imported_model(profile)['vocab_size'] == expected
+
+
+@pytest.mark.parametrize('bad', [True, '248320', 0, -1, 10 ** 9, 1.5, [1], None])
+def test_a_malformed_vocabulary_is_unknown_and_omitted(bad):
+    service, _ = hub('qwen3_5', {'text_config': {'num_hidden_layers': 24, 'vocab_size': bad}})
+    profile = service.inspect('someone/model')['profile']
+    assert 'vocab_size' not in profile and 'vocab_size' not in imported_model(profile)
+
+
+def test_a_hub_registered_large_vocabulary_model_gets_the_logits_term():
+    from tuning_factory import gpu_compat
+    profile = ModelProfile(repo_id='someone/model', revision=REVISION, config_sha256='c' * 64, architecture='qwen3_5',
+                           template='qwen3_5', hidden_layers=24, hidden_size=1024, parameters_total=10 ** 9,
+                           vocab_size=248320)
+    model = imported_model(profile)
+    without = {key: value for key, value in model.items() if key != 'vocab_size'}
+    config = {'training_method': 'lora', 'hyperparameters': {'cutoff_len': 1024, 'per_device_train_batch_size': 1}}
+    extra = gpu_compat.estimate_memory(model, config)['total_gib'] - gpu_compat.estimate_memory(without, config)['total_gib']
+    assert extra == pytest.approx(1024 * 248320 * gpu_compat.LOGITS_BYTES / 1024 ** 3)
+
+
+def test_profiles_without_a_vocabulary_keep_their_exact_bytes_and_a_vocabulary_is_dumped():
+    old = {'repo_id': 'Qwen/Qwen3.5-0.8B', 'revision': REVISION, 'config_sha256': 'c' * 64,
+           'architecture': 'qwen3_5', 'template': 'qwen3_5', 'max_length': 32768,
+           'context_length': 262144, 'hidden_layers': 24, 'recommended_precision': 'bfloat16', 'gated': False}
+    assert ModelProfile.model_validate(old).model_dump_json() == json.dumps(old, separators=(',', ':'))
+    assert ModelProfile.model_validate({**old, 'vocab_size': 248320}).model_dump()['vocab_size'] == 248320

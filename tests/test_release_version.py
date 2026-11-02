@@ -7,7 +7,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-RELEASE = "0.5.0"
+RELEASE = "0.6.0"
 
 
 def read(path: str) -> str:

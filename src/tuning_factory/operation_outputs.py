@@ -37,6 +37,7 @@ from .model_artifacts import (
     ModelDescriptor,
     check_link_free,
     directory_inventory_sha256,
+    is_processor_file,
     is_tokenizer_file,
     list_files,
     read_json,
@@ -44,6 +45,7 @@ from .model_artifacts import (
 )
 from .model_ops import (
     POLICY_F32_V1,
+    POLICY_F32_V2,
     MaterializeReceipt,
     MergeReceipt,
     adapter_metadata_from_config,
@@ -158,6 +160,14 @@ def check_engine_tokenizer(output: Path, base: Path) -> None:
         raise ValueError(VOCABULARY_CHANGED)
 
 
+def _vocab_size(config):
+    """A model config's vocabulary size; composite (vision/audio + text) configs keep it only in text_config."""
+    text = config.get("text_config")
+    if isinstance(text, Mapping) and "vocab_size" in text:
+        return text["vocab_size"]
+    return config.get("vocab_size")
+
+
 def _base_identity(base, verifier) -> tuple[str, str]:
     if isinstance(base, HFRootRef):
         return base.config_sha256, base.tokenizer_fingerprint
@@ -166,11 +176,11 @@ def _base_identity(base, verifier) -> tuple[str, str]:
 
 
 def _base_snapshot(launch_dir: Path, result: OperationResult, identity: tuple[str, str]) -> Path:
-    """``base-snapshot/``: exactly config.json and tokenizer files, each in the evidence, with the base's
-    config hash and tokenizer fingerprint."""
+    """``base-snapshot/``: exactly config.json, tokenizer and processor files, each in the evidence, with the
+    base's config hash and tokenizer fingerprint."""
     snapshot = Path(launch_dir) / BASE_SNAPSHOT
     names = {relative for relative, _ in list_files(snapshot)}
-    if any(not (name == "config.json" or is_tokenizer_file(name)) for name in names) or any(
+    if any(not (name == "config.json" or is_tokenizer_file(name) or is_processor_file(name)) for name in names) or any(
             f"{BASE_SNAPSHOT}/{name}" not in result.evidence for name in names):
         raise ValueError("base snapshot holds files outside the accepted config/tokenizer evidence")
     if (local_config_sha256(snapshot), local_tokenizer_fingerprint(snapshot)) != identity:
@@ -214,7 +224,7 @@ def _train_output(operation: TrainOperation, result, launch_dir: Path, verifier,
     for name in payload:
         _place(output / name, workspace / name)
     for relative, file in list_files(snapshot):
-        if is_tokenizer_file(relative) or adapter and relative == "config.json":
+        if is_tokenizer_file(relative) or is_processor_file(relative) or adapter and relative == "config.json":
             _place(file, workspace / relative)
     metadata = None
     if adapter:
@@ -225,7 +235,7 @@ def _train_output(operation: TrainOperation, result, launch_dir: Path, verifier,
             loraplus_lr_ratio=options.loraplus_lr_ratio, loraplus_lr_embedding=options.loraplus_lr_embedding)
     else:
         trained, original = read_json(workspace / "config.json"), read_json(snapshot / "config.json")
-        if not isinstance(trained, Mapping) or trained.get("vocab_size") != original.get("vocab_size"):
+        if not isinstance(trained, Mapping) or _vocab_size(trained) != _vocab_size(original):
             raise ValueError(VOCABULARY_CHANGED)
     root = policy.base if isinstance(policy.base, HFRootRef) else verifier.verify(policy.base).root
     loads = [load for load in (policy, model_input.frozen_reference, model_input.reward_model) if load]
@@ -246,8 +256,10 @@ def operation_receipt(result: OperationResult, launch_dir: Path, operation) -> d
     receipt = read_json(_evidence_file(result, launch_dir, OPERATION_RECEIPT))
     model = MergeReceipt if isinstance(operation, MergeOperation) else MaterializeReceipt
     inner = model.model_validate(receipt.get("receipt") if isinstance(receipt, Mapping) else None)
-    if (receipt.get("schema_version"), receipt.get("kind"), receipt.get("output"), inner.policy_id) != (
-            1, operation.kind, f"{MODEL_OP_PARENT}/output", POLICY_F32_V1):
+    # An operation launched by a pre-v2 build is collected after the update: both defined policies are accepted
+    # (new operations still run under CURRENT_POLICY at dispatch).
+    if (receipt.get("schema_version"), receipt.get("kind"), receipt.get("output")) != (
+            1, operation.kind, f"{MODEL_OP_PARENT}/output") or inner.policy_id not in {POLICY_F32_V1, POLICY_F32_V2}:
         raise ValueError("operation receipt differs from this operation")
     return {**receipt, "receipt": inner}
 
@@ -258,7 +270,8 @@ def _model_op_output(operation, result, launch_dir: Path, verifier, ids: dict) -
     merge = isinstance(operation, MergeOperation)
     names = [relative for relative, _ in list_files(output)]
     if sorted(inner.output_files) != names or any(
-            not (_payload_name(name, adapter=merge) or is_tokenizer_file(name) or name == "config.json")
+            not (_payload_name(name, adapter=merge) or is_tokenizer_file(name) or is_processor_file(name)
+                 or name == "config.json")
             for name in names):
         raise ValueError("model-operation output differs from its receipt or the artifact file allowlist")
     if merge:

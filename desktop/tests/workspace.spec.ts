@@ -51,7 +51,7 @@ test('HF model search imports an immutable modern profile and disables unsupport
     const original = native.invoke;
     let registered: any = null;
     const profile = { repo_id: 'Qwen/Qwen3.5-0.8B', revision: 'c'.repeat(40), config_sha256: 'd'.repeat(64),
-      architecture: 'qwen3_5', template: 'qwen3_5_nothink', max_length: 32768, context_length: 262144,
+      architecture: 'qwen3_5', template: 'qwen3_5', max_length: 32768, context_length: 262144,
       hidden_layers: 24, recommended_precision: 'bfloat16', gated: false };
     native.invoke = async (command: string, args: any) => {
       if (command === 'factory_action') {
@@ -315,6 +315,60 @@ test("PPO runtime preparation explicitly confirms and carries selected stage", a
   expect(request).toEqual({ approved: true, training_stage: "ppo" });
 });
 
+test("RunPod runtime preparation names the cleanup and reports what it freed or skipped", async ({ page }) => {
+  // Freed space is the free-space delta of the volume: removed venvs share hard-linked files with uv-cache.
+  const report = { ready: true, runtime_state: "ready", pod_id: "borrowed",
+    cleanup: { removed: ["b".repeat(16), "c".repeat(16) + "-ppo"], kept_in_use: ["d".repeat(16)], errors: [],
+      free_before: 20 * 1024 ** 3, free_after: 23.5 * 1024 ** 3 } };
+  await overrideActions(page, { runtime_prepare: report });
+  await page.locator('nav [data-action="nav:connections"]').click();
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await expect(page.getByRole("dialog")).toContainText("이전 앱 버전의 학습 환경 중 쓰지 않는 것을 지웁니다");
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 2개를 지워 3.5GB를 확보했습니다.");
+  await expect(page.locator(".notice")).not.toContainText("지우지 못했습니다");
+  // Some removed, one failed and the time budget ran out: what was removed still shows, with short notes.
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: ["b".repeat(16)], kept_in_use: [],
+    errors: ["c".repeat(16)], incomplete: true, free_before: 20 * 1024 ** 3, free_after: 21 * 1024 ** 3 } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 1개를 지워 1.0GB를 확보했습니다.");
+  await expect(page.locator(".notice")).toContainText("일부 이전 학습 환경은 지우지 못했습니다(학습 환경 준비에는 영향이 없습니다).");
+  await expect(page.locator(".notice")).toContainText("남은 이전 학습 환경은 다음 학습 환경 준비 때 정리합니다.");
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: ["b".repeat(16)], kept_in_use: [],
+    cleanup_error: "ValueError: unreadable manifest", free_before: 20 * 1024 ** 3, free_after: 19 * 1024 ** 3 } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  // Less than 0.1 GB freed (here the volume even lost space): the count alone, without a GB figure.
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 1개를 지웠습니다.");
+  await expect(page.locator(".notice")).not.toContainText("GB를 확보");
+  await expect(page.locator(".notice")).toContainText("일부 이전 학습 환경은 지우지 못했습니다");
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: ["b".repeat(16)], kept_in_use: [],
+    errors: [], free_before: 20 * 1024 ** 3, free_after: 20.05 * 1024 ** 3 } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).not.toContainText("지우지 못했습니다");   // this preparation's notice
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 1개를 지웠습니다.");
+  await expect(page.locator(".notice")).not.toContainText("GB를 확보");
+  // Nothing removed because every removal failed: not a skipped cleanup.
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: [], kept_in_use: [],
+    errors: ["b".repeat(16)], free_before: 20 * 1024 ** 3, free_after: 20 * 1024 ** 3 } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("이전 학습 환경을 지우지 못했습니다(학습 환경 준비에는 영향이 없습니다).");
+  await expect(page.locator(".notice")).not.toContainText("건너뛰었습니다");
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: [], kept_in_use: [], cleanup_error: "cleanup report missing" } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("이전 학습 환경 정리는 건너뛰었습니다(학습 환경 준비에는 영향이 없습니다).");
+  await expect(page.locator(".notice")).not.toContainText("지우지 못했습니다");
+  await overrideActions(page, { runtime_prepare: { ...report, cleanup: { removed: [], kept_in_use: [] } } });
+  await page.getByRole("button", { name: "학습 환경 준비", exact: true }).click();
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("학습 환경과 CUDA를 확인했습니다.");
+  await expect(page.locator(".notice")).not.toContainText("이전");
+});
+
 test("changed S3 object clears its inspected version and access errors prevent import", async ({ page }) => {
   await page.evaluate(() => {
     const original = (window as any).__TAURI_INTERNALS__.invoke;
@@ -437,9 +491,10 @@ test("a missing RunPod runtime is folded into the single run approval", async ({
   await page.getByRole("button", { name: "데이터 전송에 동의하고 학습 시작" }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toContainText("학습 환경이 없어 학습 전에 먼저 설치합니다");
+  await expect(dialog).toContainText("이전 앱 버전의 학습 환경 중 쓰지 않는 것을 지웁니다");
   await expect(dialog).toContainText("예상 메모리가 GPU 메모리에 빠듯합니다.");
   await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
-  await expect(page.getByText("Pod에 학습 환경을 준비한 뒤 학습을 시작합니다. 최대 30분 걸릴 수 있습니다.", { exact: true })).toBeVisible();
+  await expect(page.getByText("Pod에 학습 환경을 준비한 뒤 학습을 시작합니다. 최대 30분 걸릴 수 있으며, 쓰지 않는 이전 앱 버전 학습 환경을 정리합니다.", { exact: true })).toBeVisible();
   await expect.poll(() => page.evaluate(() => (window as any).__overridden
     .find((args: any) => args.action === "execute")?.data?.prepare_runtime)).toBe(true);
   const check = await page.evaluate(() => (window as any).__overridden.find((args: any) => args.action === "runtime_check"));
@@ -453,6 +508,17 @@ const startRun = async (page: import("@playwright/test").Page) => {
 };
 const calledActions = (page: import("@playwright/test").Page) => page.evaluate(() => [
   ...(window as any).__testCalls.map((c: any) => c.args?.action), ...(window as any).__overridden.map((a: any) => a.action)]);
+
+test("a preparation in the run approval reports what it pruned with the result", async ({ page }) => {
+  await overrideActions(page, { runtime_check: { ready: false, runtime_state: "missing", findings: [] },
+    execute: { id: "c".repeat(32), status: "COMPLETED", runtime_cleanup: { removed: ["b".repeat(16)], kept_in_use: [],
+      errors: [], free_before: 10 * 1024 ** 3, free_after: 12 * 1024 ** 3 } } });
+  await startRun(page);
+  await expect(page.getByRole("dialog")).toContainText("이전 앱 버전의 학습 환경 중 쓰지 않는 것을 지웁니다");
+  await page.getByRole("button", { name: "내용 확인 · 진행", exact: true }).click();
+  await expect(page.locator(".notice")).toContainText("학습 처리가 끝났습니다.");
+  await expect(page.locator(".notice")).toContainText("이전 앱 버전의 학습 환경 1개를 지워 2.0GB를 확보했습니다.");
+});
 
 test("a ready environment is approved without preparing the runtime", async ({ page }) => {
   await overrideActions(page, { runtime_check: { ready: true, runtime_state: "ready", findings: [] }, execute: null });

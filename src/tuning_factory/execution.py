@@ -23,6 +23,15 @@ from .registry import canonical, digest, file_digest
 from .remote_model_cache import CachedTransfer, ensure_cached, remote_exists  # CachedTransfer is re-exported
 from .worker_protocol import COMMAND, RESULT, START_MARKER, OperationResult, WorkerRequest, is_v2_directory
 
+SSH_KEEPALIVE_SECONDS = 30   # long silent probes (up to 900 s) and result polls must survive idle NAT/proxy timeouts
+
+
+def keep_alive(client):
+    """Ask paramiko to send SSH keepalives on a connected client; a client without a transport is left alone."""
+    transport = client.get_transport()
+    if transport is not None:
+        transport.set_keepalive(SSH_KEEPALIVE_SECONDS)
+
 
 class CapacityUnavailable(RuntimeError):
     pass
@@ -278,7 +287,8 @@ class SSHExecutor(ExecutionBackend):
 
     def __init__(self, host, port, username, key_file, remote_root="/workspace/factory", client=None, pod=None,
                  remote_python="python", worker_lock_file=None, hf_home=None,
-                 server_profile=None, server_facts=None, recovery_only=False, model_cache_root=None):
+                 server_profile=None, server_facts=None, recovery_only=False, model_cache_root=None,
+                 runtime_lock_file=None):
         if model_cache_root is not None:
             try:
                 safe_remote_root(model_cache_root)
@@ -309,6 +319,7 @@ class SSHExecutor(ExecutionBackend):
             self.client.set_missing_host_key_policy(paramiko.RejectPolicy())
             self.client.connect(host, port=port, username=username, key_filename=str(key_file), timeout=20,
                                 allow_agent=False, look_for_keys=False)
+            keep_alive(self.client)
         self.root = remote_root
         self.pod = pod
         self.server_profile = server_profile
@@ -319,6 +330,7 @@ class SSHExecutor(ExecutionBackend):
         self.worker_lock_file = worker_lock_file
         self.hf_home = hf_home
         self.model_cache_root = model_cache_root
+        self.runtime_lock_file = runtime_lock_file
 
     def validate_config(self, config):
         """A v1 job: its per-GPU price times its GPU count is the hourly budget."""
@@ -470,7 +482,7 @@ class SSHExecutor(ExecutionBackend):
                 if checkpoint:
                     command += ["--checkpoint", Path(checkpoint).resolve().relative_to(directory).as_posix()]
                 # Worker remains alive on controller disconnect and enforces its own deadline.
-                launch = "nohup " + shlex.join(command) + " > " + shlex.quote(remote + "/worker.log") + " 2>&1 < /dev/null &"
+                launch = self._launch_line(command, ">", remote + "/worker.log")
                 submitted = True
                 _, stdout, stderr = self.client.exec_command(launch, timeout=20)
                 if stdout.channel.recv_exit_status() != 0:
@@ -494,6 +506,12 @@ class SSHExecutor(ExecutionBackend):
             raise
         finally:
             self.client.close()
+
+    def _launch_line(self, command, redirect, log):
+        """The detached worker launch. With a runtime lock the worker holds it shared for its whole life, so
+        desktop_runtime.PRUNE_SOURCE never removes a runtime that a running attempt uses."""
+        prefix = ["nohup", "flock", "-s", self.runtime_lock_file] if self.runtime_lock_file else ["nohup"]
+        return shlex.join([*prefix, *command]) + f" {redirect} " + shlex.quote(log) + " 2>&1 < /dev/null &"
 
     def _environment(self):
         """Worker environment shared by v1 and v2 launches (selected GPUs, runtime lock, HF cache)."""
@@ -650,8 +668,7 @@ class SSHExecutor(ExecutionBackend):
                 command = ["env", *self._environment(), "FACTORY_MODEL_CACHE=" + cache, self.remote_python, "-m",
                            "tuning_factory.worker", remote, "--request", command_sha256]
                 # Append, so a duplicate start (refused by the worker's O_EXCL marker) never truncates the log.
-                launch_line = ("nohup " + shlex.join(command) + " >> " + shlex.quote(remote + "/worker.log")
-                               + " 2>&1 < /dev/null &")
+                launch_line = self._launch_line(command, ">>", remote + "/worker.log")
                 submitted = True
                 _, stdout, stderr = self.client.exec_command(launch_line, timeout=20)
                 if stdout.channel.recv_exit_status() != 0:

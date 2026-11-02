@@ -497,6 +497,9 @@ def test_simulated_outputs_chain_through_compile_node(tmp_path):
     assert descriptors["merge"].adapter.rank == 5 and descriptors["merge"].effective_base == w.refs.base
     assert set(descriptors["merge"].parents) == {w.refs.first, w.refs.second, w.refs.base}
     assert descriptors["full"].storage_kind == "full_model" and models["merge"] in descriptors["full"].parents
+    for node_id in ("merge", "full"):   # simulated receipts carry the policy real operations run under
+        receipt = json.loads((launch_dir(w, outcomes[node_id][0]) / "operation-receipt.json").read_bytes())
+        assert receipt["receipt"]["policy_id"] == "model-ops-f32-v2" and receipt["simulated"] is True
     targets = outcomes["full"][1].inspected_targets
     assert [item.base for item in targets] == [models["full"]]
     ledger = {evidence.node_id: saved for evidence, saved in store.ledger(w.run_id)}
@@ -506,6 +509,70 @@ def test_simulated_outputs_chain_through_compile_node(tmp_path):
     assert selection.model is None and selection.selection.status == "no_winner"
     assert ledger["select"].selection == selection.selection
     assert store.finalize_run(w.ctl) == "COMPLETED"
+
+
+# -- 10b. processor files of composite models ----------------------------------------------------
+
+PROCESSOR = canonical({"image_processor_type": "Qwen2VLImageProcessorFast", "processor_class": "Qwen3VLProcessor"})
+
+
+def processor_base(monkeypatch):
+    """The plan's base artifact (frozen by ``build``) carries the processor file too, as a composite base would."""
+    full_model = inputs.full_model
+
+    def with_processor(path, marker, **kwargs):
+        directory, descriptor = full_model(path, marker, **kwargs)
+        (directory / "preprocessor_config.json").write_bytes(PROCESSOR)
+        return directory, descriptor
+    monkeypatch.setattr(inputs, "full_model", with_processor)
+
+
+def processor_chain(r):
+    """An adapter trained on the HF root and materialized; a merge of adapters on the base artifact, materialized.
+    (A graph merge takes real artifacts only, so a simulated training output is never a merge input.)"""
+    return [node_train(r, "a", base=r.root), node_materialize("full_a", "a"),
+            node_merge("merge", (r.first, r.second)), node_materialize("full_merge", "merge")]
+
+
+def test_root_processor_files_travel_byte_for_byte_through_train_merge_and_materialize(tmp_path, monkeypatch):
+    processor_base(monkeypatch)
+    w = build(tmp_path, processor_chain)
+    snapshot = write_root_snapshot(tmp_path)
+    (snapshot / "preprocessor_config.json").write_bytes(PROCESSOR)   # outside tokenizer_fingerprint
+    d = dispatcher(w)
+    descriptors = {}
+    for node_id in ("a", "full_a", "merge", "full_merge"):
+        claimed, outcome = run_node(w, d, node_id)
+        ref = outcome.outputs.model.model
+        descriptors[node_id] = w.store.artifacts.verify(ref)
+        files = w.store.artifacts.path(ref)
+        assert (files / "preprocessor_config.json").read_bytes() == PROCESSOR, node_id
+        assert descriptors[node_id].tokenizer_fingerprint == inputs.ROOT.tokenizer_fingerprint, node_id
+        for name in inputs.TOKENIZER:
+            assert (files / name).read_bytes() == (snapshot / name).read_bytes(), (node_id, name)
+        result = accepted_result(w.state, claimed["id"], claimed["launch_id"], claimed["lease"].attempt_id)
+        prefix = "base-snapshot" if node_id == "a" else "model-op/output"
+        assert f"{prefix}/preprocessor_config.json" in result.evidence, node_id
+    assert (descriptors["a"].storage_kind, descriptors["a"].effective_base) == ("adapter", inputs.ROOT)
+    assert (descriptors["merge"].storage_kind, descriptors["merge"].effective_base) == ("adapter", w.refs.base)
+    assert {descriptors[node_id].storage_kind for node_id in ("full_a", "full_merge")} == {"full_model"}
+
+
+def test_a_base_snapshot_file_outside_the_allowlist_is_still_refused(tmp_path, monkeypatch):
+    sd = api()
+    w = build(tmp_path, lambda r: [node_train(r, "train", base=r.root)])
+    snapshot = write_root_snapshot(tmp_path)
+    (snapshot / "preprocessor_config.json").write_bytes(PROCESSOR)
+    (snapshot / "image_processing_custom.py").write_bytes(b"print('custom code')")
+    # A worker that copied every snapshot file into base-snapshot/ (the real one copies only the allowlist).
+    monkeypatch.setattr(sd, "_snapshot_files", lambda directory, prefix: [
+        (f"{prefix}/{relative}", file.read_bytes()) for relative, file in sd.list_files(directory)])
+    claimed = claim(w, "train")
+    outcome = dispatcher(w).run_claimed(claimed, None, approval=w.approval)
+    assert outcome.status == "FAILED" and outcome.outputs is None
+    assert "base snapshot holds files outside the accepted config/tokenizer evidence" in outcome.error
+    assert artifact_entries(w.store) == sorted(
+        f"{ref.artifact_id}/{ref.inventory_sha256}" for ref in (w.refs.base, w.refs.first, w.refs.second))
 
 
 # -- 11. HF roots need a local snapshot ----------------------------------------------------------
