@@ -84,6 +84,22 @@ const saves = (page: Page) => page.evaluate(() => (window as any).__testCalls.fi
 const connectionsPage = (page: Page) => page.locator('nav [data-action="nav:connections"]').click();
 const trainingPage = (page: Page) => page.locator('nav [data-action="nav:training"]').click();
 
+test("a fresh install has an empty MLflow address and the overview says it is not set", async ({ page }) => {
+  await open(page, {});
+  await expect(page.getByText("미설정").first()).toBeVisible();
+  await expect(page.getByText("주소 저장됨")).toHaveCount(0);
+  await connectionsPage(page);
+  await expect(page.getByLabel("MLflow 서버 주소", { exact: true })).toHaveValue("");
+  await expect(page.getByText("예: https://mlflow.example.org", { exact: true })).toBeVisible();
+});
+
+test("a saved MLflow address wins over the empty default", async ({ page }) => {
+  await open(page, { MLFLOW_TRACKING_URI: "https://tracking.example" });
+  await expect(page.getByText("주소 저장됨")).toBeVisible();
+  await connectionsPage(page);
+  await expect(page.getByLabel("MLflow 서버 주소", { exact: true })).toHaveValue("https://tracking.example");
+});
+
 test("provider switch shows server fields and save/reopen persists them without secrets", async ({ page }) => {
   await open(page, { pod_id: "assigned-pod", RUNPOD_API_KEY_saved: true });
   await connectionsPage(page);

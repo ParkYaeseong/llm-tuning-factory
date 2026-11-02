@@ -10,7 +10,7 @@
    the automatic approval rejection; do not bypass it.
 
 Initial live evidence: Keycloak token and authenticated experiment search succeed. The legacy MLflow URL
-redirects to https://mlflow.kbiofoundry.kr. KBF Pods are stopped; kbf-fix's API rate is $5.29/hour.
+redirects to https://mlflow.example.org. KBF Pods are stopped; kbf-fix's API rate is $5.29/hour.
 Subsequent explicit user approvals authorized 20 minutes plus an additional 10 minutes on the existing H200,
 synthetic examples only, followed by stop and EXITED confirmation. No further paid extension is authorized.
 Live production tracking/artifact checks, registered native prediction and detached result reconciliation

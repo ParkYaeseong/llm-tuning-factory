@@ -24,10 +24,10 @@ Windows 설치 앱에서 실제 H100 80GB와 공용 MLflow를 연결해 합성 �
 
 | 인정한 실행 | 원격 불변 파일 / PC 목록 / MLflow output 왕복 검증 파일 |
 |---|---|
-| [LoRA 12단계](https://mlflow.kbiofoundry.kr/#/experiments/16/runs/6a12982b12344b1a8aabd4e8aaeb3957) | 40 / 44 / 23 |
-| [취소 후 100단계 재개](https://mlflow.kbiofoundry.kr/#/experiments/16/runs/a43fd2727a5441b58fb5d920f746ab59) | 58 / 84 / 56 |
-| [설치 앱 LoRA 재확인](https://mlflow.kbiofoundry.kr/#/experiments/16/runs/df6c2cc533204533aa1b7fd76c3dcb0d) | 40 / 44 / 23 |
-| [최종 실제 4비트 QLoRA·연결 복구](https://mlflow.kbiofoundry.kr/#/experiments/16/runs/ddc1585a277e4e5091c13f52a6a5873d) | 40 / 44 / 23 |
+| [LoRA 12단계](https://mlflow.example.org/#/experiments/16/runs/6a12982b12344b1a8aabd4e8aaeb3957) | 40 / 44 / 23 |
+| [취소 후 100단계 재개](https://mlflow.example.org/#/experiments/16/runs/a43fd2727a5441b58fb5d920f746ab59) | 58 / 84 / 56 |
+| [설치 앱 LoRA 재확인](https://mlflow.example.org/#/experiments/16/runs/df6c2cc533204533aa1b7fd76c3dcb0d) | 40 / 44 / 23 |
+| [최종 실제 4비트 QLoRA·연결 복구](https://mlflow.example.org/#/experiments/16/runs/ddc1585a277e4e5091c13f52a6a5873d) | 40 / 44 / 23 |
 
 파일 수는 각기 다른 범위입니다. PC에는 원격 결과 외에 회수 메타데이터와 이전 시도 체크포인트가 보존됩니다.
 재개 시험의 최초 취소 실행 `1b9247d89f414dfbae43aeea52bea0bd`는 MLflow KILLED이며,
