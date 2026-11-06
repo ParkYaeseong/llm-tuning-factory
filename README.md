@@ -67,9 +67,8 @@ Real synthetic-data GPU checks are recorded separately in
 
 ### Windows app
 
-The desktop source and latest local build record are **0.6.0**. Check
-[repository releases](https://github.com/ParkYaeseong/llm-tuning-factory/releases)
-for available installers; a local build record does not guarantee a published release.
+Download the [Windows v0.6.1 prerelease](https://github.com/ParkYaeseong/llm-tuning-factory/releases/tag/v0.6.1),
+including English/Korean UI and matching SHA-256 checksums.
 The unsigned Windows x64 installer bundles the Python control engine. Training
 libraries run on the remote GPU machine.
 

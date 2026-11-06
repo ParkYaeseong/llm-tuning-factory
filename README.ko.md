@@ -65,9 +65,8 @@ CSV·JSON·JSONL을 가져와 열을 학습 항목에 연결하고, 등록 전�
 
 ### Windows 앱
 
-데스크톱 소스와 최신 로컬 빌드 기록은 **0.6.0**입니다.
-배포된 설치 파일은 [저장소 릴리스](https://github.com/ParkYaeseong/llm-tuning-factory/releases)에서
-확인하세요. 로컬 빌드 기록이 릴리스 공개를 의미하지는 않습니다.
+[Windows v0.6.1 프리릴리스](https://github.com/ParkYaeseong/llm-tuning-factory/releases/tag/v0.6.1)에서
+영어/한국어 UI가 포함된 설치 파일과 SHA-256 체크섬을 내려받을 수 있습니다.
 코드 서명하지 않은 Windows x64 설치 파일에 Python 관리 엔진이 포함되며,
 학습 라이브러리는 원격 GPU 머신에서 실행합니다.
 
