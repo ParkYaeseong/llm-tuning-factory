@@ -1,3 +1,4 @@
+import { t as tr, msg, html as ui, staticHtml, localized } from "../i18n";
 // The training-option fields shared by the single-job training form (`data-config`) and the recipe editor
 // (`data-recipe`) (D17). With `data-config` the markup is exactly the training form's; recipe mode omits the PPO
 // reward-model fields, which a recipe never holds (RecipeSpec has none). Labels are fixed strings; values are escaped.
@@ -36,14 +37,14 @@ export function sourceCheck(source: FieldSource, label: string, path: string) {
 export function stageSelect(ctx: RecipeFieldContext): string {
   const supported = ctx.capabilities?.supported_stages;
   const current = ctx.value("training_stage");
-  return decorated(ctx, "training_stage", `<label class="field"><span>학습 단계</span><select aria-label="학습 단계" ${ctx.attr}="training_stage">${ctx.stages.map(stage => `<option value="${escapeHtml(stage.id)}" ${current === stage.id ? "selected" : ""} ${supported && !supported.includes(stage.id) ? "disabled" : ""}>${escapeHtml(stage.label)}${supported && !supported.includes(stage.id) ? " · 이 모델 미지원" : ""}</option>`).join("")}</select></label>`);
+  return decorated(ctx, "training_stage", ui`<label class="field"><span>학습 단계</span><select aria-label="학습 단계" ${ctx.attr}="training_stage">${ctx.stages.map(stage => `<option value="${escapeHtml(stage.id)}" ${current === stage.id ? "selected" : ""} ${supported && !supported.includes(stage.id) ? "disabled" : ""}>${escapeHtml(tr(stage.label))}${supported && !supported.includes(stage.id) ? tr(" · 이 모델 미지원") : ""}</option>`).join("")}</select></label>`);
 }
 
 export function methodSelect(ctx: RecipeFieldContext): string {
-  const methods = [["lora", "LoRA"], ["qlora", "QLoRA · 양자화 LoRA"], ["full", "Full · 전체 갱신"], ["freeze", "Freeze · 일부 레이어"], ["oft", "OFT"]];
+  const methods = [["lora", "LoRA"], ["qlora", tr("QLoRA · 양자화 LoRA")], ["full", tr("Full · 전체 갱신")], ["freeze", tr("Freeze · 일부 레이어")], ["oft", "OFT"]];
   const supported = ctx.capabilities?.methods;
   const current = ctx.value("training_method");
-  return decorated(ctx, "training_method", `<label class="field"><span>학습 방법</span><select aria-label="학습 방법" ${ctx.attr}="training_method">${methods.map(([id, name]) => `<option value="${id}" ${current === id ? "selected" : ""} ${supported && !supported.includes(id) ? "disabled" : ""}>${name}${supported && !supported.includes(id) ? " · 현재 단계 미지원" : ""}</option>`).join("")}</select></label>`);
+  return decorated(ctx, "training_method", ui`<label class="field"><span>학습 방법</span><select aria-label="학습 방법" ${ctx.attr}="training_method">${methods.map(([id, name]) => `<option value="${id}" ${current === id ? "selected" : ""} ${supported && !supported.includes(id) ? "disabled" : ""}>${name}${supported && !supported.includes(id) ? tr(" · 현재 단계 미지원") : ""}</option>`).join("")}</select></label>`);
 }
 
 /** The stage card and the method card of the training form (markup identical to the training page's). */
@@ -56,24 +57,24 @@ export function trainingOptions(ctx: RecipeFieldContext): string {
   const method = ctx.value("training_method");
   let fields = "";
   if (stage === "dpo" || stage === "kto") {
-    if (stage === "dpo") fields += choice("선호 학습 loss", "stage_options.pref_loss", [["sigmoid", "DPO · sigmoid"], ["hinge", "Hinge"], ["ipo", "IPO"], ["kto_pair", "KTO pair"], ["orpo", "ORPO"], ["simpo", "SimPO"]]);
-    fields += f("선호 학습 beta", "stage_options.pref_beta", "number");
-    if (stage === "dpo") fields += f("SFT 보조 loss 비중", "stage_options.pref_ftx", "number") + f("DPO label smoothing", "stage_options.dpo_label_smoothing", "number") + f("BCO 가중치", "stage_options.pref_bco_weight", "number");
+    if (stage === "dpo") fields += choice(tr("선호 학습 loss"), "stage_options.pref_loss", [["sigmoid", "DPO · sigmoid"], ["hinge", "Hinge"], ["ipo", "IPO"], ["kto_pair", "KTO pair"], ["orpo", "ORPO"], ["simpo", "SimPO"]]);
+    fields += f(tr("선호 학습 beta"), "stage_options.pref_beta", "number");
+    if (stage === "dpo") fields += f(tr("SFT 보조 loss 비중"), "stage_options.pref_ftx", "number") + f("DPO label smoothing", "stage_options.dpo_label_smoothing", "number") + f(tr("BCO 가중치"), "stage_options.pref_bco_weight", "number");
     if (stage === "dpo" && ctx.value("stage_options.pref_loss") === "simpo") fields += f("SimPO gamma", "stage_options.simpo_gamma", "number");
-    if (stage === "kto") fields += f("Chosen 가중치", "stage_options.kto_chosen_weight", "number") + f("Rejected 가중치", "stage_options.kto_rejected_weight", "number");
+    if (stage === "kto") fields += f(tr("Chosen 가중치"), "stage_options.kto_chosen_weight", "number") + f(tr("Rejected 가중치"), "stage_options.kto_rejected_weight", "number");
   }
   if (stage === "ppo") {
-    if (!ctx.recipeMode) fields += optional("보상 모델 원격 경로", "stage_options.reward_model", "text", "GPU에 관리자가 미리 준비한 보상 모델의 절대 경로입니다.") + choice("보상 모델 종류", "stage_options.reward_model_type", [["lora", "LoRA 어댑터"], ["full", "전체 모델"]]) + optional("보상 모델 SHA256", "stage_options.reward_model_sha256", "text", "관리자가 제공한 파일 목록 {상대경로: SHA256}의 정규 JSON SHA256을 입력하세요.");
+    if (!ctx.recipeMode) fields += optional(tr("보상 모델 원격 경로"), "stage_options.reward_model", "text", tr("GPU에 관리자가 미리 준비한 보상 모델의 절대 경로입니다.")) + choice(tr("보상 모델 종류"), "stage_options.reward_model_type", [["lora", tr("LoRA 어댑터")], ["full", tr("전체 모델")]]) + optional(tr("보상 모델 SHA256"), "stage_options.reward_model_sha256", "text", tr("관리자가 제공한 파일 목록 {상대경로: SHA256}의 정규 JSON SHA256을 입력하세요."));
     fields += f("PPO buffer size", "stage_options.ppo_buffer_size", "number") + f("PPO epoch", "stage_options.ppo_epochs", "number") + f("PPO KL target", "stage_options.ppo_target", "number");
   }
   let methods = "";
   if (method === "lora" || method === "qlora") {
-    methods += f("LoRA rank", "hyperparameters.lora_rank", "number") + choice("LoRA 대상", "hyperparameters.lora_target", [["all", "전체"], ["q_proj,v_proj", "q_proj · v_proj"]]) + optional("LoRA alpha · 비우면 자동", "finetuning_options.lora_alpha", "number") + f("LoRA dropout", "finetuning_options.lora_dropout", "number") + optional("LoRA+ 학습률 비율 · 선택", "finetuning_options.loraplus_lr_ratio", "number") + f("LoRA+ embedding 학습률", "finetuning_options.loraplus_lr_embedding", "number") + f("PiSSA 초기화 반복 수", "finetuning_options.pissa_iter", "number");
-    if (method === "qlora") methods += choice("양자화 비트", "quantization_bit", (ctx.capabilities?.quantization_bits || [4, 8]).map((bit: number) => [String(bit), `${bit}-bit · bitsandbytes`]), 'data-number="true"');
+    methods += f("LoRA rank", "hyperparameters.lora_rank", "number") + choice(tr("LoRA 대상"), "hyperparameters.lora_target", [["all", tr("전체")], ["q_proj,v_proj", "q_proj · v_proj"]]) + optional(tr("LoRA alpha · 비우면 자동"), "finetuning_options.lora_alpha", "number") + f("LoRA dropout", "finetuning_options.lora_dropout", "number") + optional(tr("LoRA+ 학습률 비율 · 선택"), "finetuning_options.loraplus_lr_ratio", "number") + f(tr("LoRA+ embedding 학습률"), "finetuning_options.loraplus_lr_embedding", "number") + f(tr("PiSSA 초기화 반복 수"), "finetuning_options.pissa_iter", "number");
+    if (method === "qlora") methods += choice(tr("양자화 비트"), "quantization_bit", (ctx.capabilities?.quantization_bits || [4, 8]).map((bit: number) => [String(bit), `${bit}-bit · bitsandbytes`]), 'data-number="true"');
   }
-  if (method === "freeze") methods += f("학습할 레이어 수", "finetuning_options.freeze_trainable_layers", "number") + choice("학습할 모듈", "finetuning_options.freeze_trainable_modules", [["all", "전체"], ["self_attn", "Attention"], ["mlp", "MLP"], ["self_attn,mlp", "Attention + MLP"]]) + choice("추가 학습 모듈 · 선택", "finetuning_options.freeze_extra_modules", [["", "추가 없음"], ["embed_tokens", "Embedding"], ["lm_head", "LM head"], ["norm", "Normalization"], ["embed_tokens,lm_head", "Embedding + LM head"]], 'data-optional="true"');
-  if (method === "oft") methods += f("OFT rank", "finetuning_options.oft_rank", "number") + f("OFT block size", "finetuning_options.oft_block_size", "number") + choice("OFT 대상", "finetuning_options.oft_target", [["all", "전체"], ["q_proj,v_proj", "q_proj · v_proj"]]) + f("OFT module dropout", "finetuning_options.module_dropout", "number");
-  return `${fields ? `<section class="card"><h3>학습 단계별 설정</h3><div class="grid">${fields}</div>${stage === "ppo" ? check("PPO score normalization", "stage_options.ppo_score_norm") + check("PPO reward whitening", "stage_options.ppo_whiten_rewards") : ""}</section>` : ""}${methods ? `<section class="card"><h3>파라미터 갱신 설정</h3><div class="grid">${methods}</div>${method === "lora" || method === "qlora" ? check("rsLoRA 사용", "finetuning_options.use_rslora") + check("DoRA 사용", "finetuning_options.use_dora") + check("PiSSA 초기화", "finetuning_options.pissa_init") + check("PiSSA 변환 저장", "finetuning_options.pissa_convert") : ""}</section>` : ""}`;
+  if (method === "freeze") methods += f(tr("학습할 레이어 수"), "finetuning_options.freeze_trainable_layers", "number") + choice(tr("학습할 모듈"), "finetuning_options.freeze_trainable_modules", [["all", tr("전체")], ["self_attn", "Attention"], ["mlp", "MLP"], ["self_attn,mlp", "Attention + MLP"]]) + choice(tr("추가 학습 모듈 · 선택"), "finetuning_options.freeze_extra_modules", [["", tr("추가 없음")], ["embed_tokens", "Embedding"], ["lm_head", "LM head"], ["norm", "Normalization"], ["embed_tokens,lm_head", "Embedding + LM head"]], 'data-optional="true"');
+  if (method === "oft") methods += f("OFT rank", "finetuning_options.oft_rank", "number") + f("OFT block size", "finetuning_options.oft_block_size", "number") + choice(tr("OFT 대상"), "finetuning_options.oft_target", [["all", tr("전체")], ["q_proj,v_proj", "q_proj · v_proj"]]) + f("OFT module dropout", "finetuning_options.module_dropout", "number");
+  return `${fields ? ui`<section class="card"><h3>학습 단계별 설정</h3><div class="grid">${fields}</div>${stage === "ppo" ? check("PPO score normalization", "stage_options.ppo_score_norm") + check("PPO reward whitening", "stage_options.ppo_whiten_rewards") : ""}</section>` : ""}${methods ? ui`<section class="card"><h3>파라미터 갱신 설정</h3><div class="grid">${methods}</div>${method === "lora" || method === "qlora" ? check(tr("rsLoRA 사용"), "finetuning_options.use_rslora") + check(tr("DoRA 사용"), "finetuning_options.use_dora") + check(tr("PiSSA 초기화"), "finetuning_options.pissa_init") + check(tr("PiSSA 변환 저장"), "finetuning_options.pissa_convert") : ""}</section>` : ""}`;
 }
 
 /** Reads every `[attr]` control under `root` into `target` by its dotted path (the training form's capture rules):

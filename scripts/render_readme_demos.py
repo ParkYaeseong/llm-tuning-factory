@@ -6,6 +6,9 @@ No native app, credentials, GPU, model download or dataset transfer is used.
 
 from __future__ import annotations
 
+import argparse
+import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -21,6 +24,10 @@ SCENES = {
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--language", choices=("en", "ko"), default="ko")
+    args = parser.parse_args()
+    english = json.loads((ROOT / "desktop/src/locales/en.json").read_text(encoding="utf-8"))
     desktop = ROOT / "desktop"
     ffmpeg = shutil.which("ffmpeg")
     npx = shutil.which("npx")
@@ -38,6 +45,20 @@ def main() -> None:
             text = text.replace("${HOSTILE}", "Demo")
             text = text.replace("단백질 서열 요약", "논문 정보 추출")
             text = text.replace("논문 없이 서열 설명 생성", "논문에서 구조화된 항목 추출")
+            if args.language == "en":
+                # These are temporary synthetic scenario copies, not application/user data.
+                text = text.replace("논문 정보 추출", "Paper extraction")
+                text = text.replace("논문에서 구조화된 항목 추출", "Extract structured fields from papers")
+                text = text.replace("기준 학습", "Baseline training").replace("그래프 프로젝트", "Training experiments")
+                text = text.replace("질문 ", "Question ").replace("맥락 ", "Context ").replace("답 ", "Answer ")
+                text = re.sub(r"열 (\d+)개", r"\1 columns", text)
+                text = re.sub(r"행 (\d+)개", r"\1 rows", text)
+                text = re.sub(r"([{,]\s*)([가-힣][가-힣\d_]*)\s*:",
+                              lambda match: match[1] + json.dumps(match[2], ensure_ascii=False) + ":", text)
+                for korean in sorted(english, key=len, reverse=True):
+                    text = text.replace(korean, english[korean].replace('"', '\\"'))
+            text += ('\ntest.beforeEach(async ({ page }) => { await page.addInitScript(() => '
+                     f'localStorage.setItem("factory.language", "{args.language}")); }});\n')
             text += '\ntest.afterEach(async ({ page }) => { await page.waitForTimeout(1800); });\n'
             (capture / f"{source}.spec.ts").write_text(text, encoding="utf-8")
         titles = "|".join(title for title, _ in SCENES.values())
@@ -62,8 +83,8 @@ export default defineConfig({
                             "-filter_complex",
                             "fps=6,scale=1056:-1:flags=lanczos,split[a][b];"
                             "[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer",
-                            "-loop", "0", str(output / f"factory-{name}.gif")], check=True)
-            print(f"Created docs/images/factory-{name}.gif")
+                            "-loop", "0", str(output / f"factory-{name}{'-en' if args.language == 'en' else ''}.gif")], check=True)
+            print(f"Created {name} GIF ({args.language})")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import { t as tr, msg, html as ui, staticHtml, localized } from "../i18n";
 // Graph editor (10.5, D4–D7, D13): the open project's training graph as cards in topological columns plus an SVG
 // preview, both from the same draft (`graph-model.layout`). Click and keyboard only: a card is a button (roving
 // tabindex, ArrowUp/ArrowDown move, Enter selects); "다음 단계 추가" adds a serial child of the selected card and
@@ -33,16 +34,16 @@ const TARGETS_SHORT = "기반 모델의 모듈 구조를 아직 확인하지 않
 const MERGE_SHORT = "실제로 완료된 결과만 병합 · 모의 실행은 이 단계에서 멈춥니다.";
 const SNAPSHOT_HINT = "이 기반 모델의 설정·토크나이저를 아직 받지 않았습니다 · ‘기반 모델’에서 먼저 받으세요.";
 const TARGET_CODES = new Set(["base_targets_missing", "simulated_execution_needs_targets"]);
-const STARTERS: [StarterShape, string, string][] = [["single", "단일 학습", "학습 단계 하나"], ["serial", "직렬 추가 학습", "학습 결과로 이어서 학습"],
-  ["parallel", "병렬 비교", "학습 두 개를 같은 평가 기준으로 비교"], ["parallel_merge", "병렬 비교 후 병합", "두 학습, 병합과 세 평가 중 자동 선택"]];
+const STARTERS: [StarterShape, string, string][] = localized(() => ([["single", "단일 학습", "학습 단계 하나"], ["serial", "직렬 추가 학습", "학습 결과로 이어서 학습"],
+  ["parallel", "병렬 비교", "학습 두 개를 같은 평가 기준으로 비교"], ["parallel_merge", "병렬 비교 후 병합", "두 학습, 병합과 세 평가 중 자동 선택"]]));
 const METHOD_LABELS: Record<string, string> = { lora: "LoRA", qlora: "QLoRA", full: "Full", freeze: "Freeze", oft: "OFT" };
-const INITIALIZATION_LABELS: Record<string, string> = { new_adapter: "새 어댑터 (new_adapter)", full_weights: "전체 가중치 (full_weights)",
-  continue_adapter: "어댑터 이어 학습 (continue_adapter)" };
-const ROLE_LABELS: Record<string, string> = { train: "학습", validation: "검증", test: "시험" };
+const INITIALIZATION_LABELS: Record<string, string> = localized(() => ({ new_adapter: "새 어댑터 (new_adapter)", full_weights: "전체 가중치 (full_weights)",
+  continue_adapter: "어댑터 이어 학습 (continue_adapter)" }));
+const ROLE_LABELS: Record<string, string> = localized(() => ({ train: "학습", validation: "검증", test: "시험" }));
 /** The short name of a missing field, for the cards' "채울 항목". */
-const TODO_NAMES: Record<string, string> = { [REASONS.label]: "이름", [REASONS.recipe]: "레시피", [REASONS.modelInput]: "입력 모델",
+const TODO_NAMES: Record<string, string> = localized(() => ({ [REASONS.label]: "이름", [REASONS.recipe]: "레시피", [REASONS.modelInput]: "입력 모델",
   [REASONS.dataset]: "학습 데이터", [REASONS.benchmark]: "평가 기준", [REASONS.evaluations]: "비교할 평가", [REASONS.metric]: "선택 지표",
-  [REASONS.profiles]: "실행 프로필" };
+  [REASONS.profiles]: "실행 프로필" }));
 
 // -- module state (the project drafts themselves live in ctx.store) --
 const selection = new Map<string, string>();             // project → selected card
@@ -70,7 +71,7 @@ const notAvailable = (result: WorkflowResult<unknown>) => result.issues.some(iss
 const describe = (issues: WorkflowIssue[]) => issues.map(issue => {
   const { text, original } = localize(issue);
   return original ? `${text} (${original})` : text;
-}).join("\n") || "요청을 처리하지 못했습니다.";
+}).join("\n") || tr("요청을 처리하지 못했습니다.");
 const short = (hash: unknown) => escapeHtml(String(hash ?? "").slice(0, 8));
 const isObject = (value: unknown): value is Obj => typeof value === "object" && value !== null && !Array.isArray(value);
 /** Whether the user is still on the page an action started from (its follow-up may only then move the focus). */
@@ -168,24 +169,24 @@ function targetsHint(view: Shown, node: NodeJson): { text: string; short: string
   const root = upstreamRoot(view.graph, node.id);
   const entry = findRoot(root);
   const inspectable = entry?.snapshot_ready && !entry.targets_ready ? root : null;
-  if (flagged) return { text: "이 단계에는 기반 모델의 모듈 구조 정보가 필요합니다.", short: "모듈 구조 정보가 필요합니다.", root: inspectable };
+  if (flagged) return { text: tr("이 단계에는 기반 모델의 모듈 구조 정보가 필요합니다."), short: tr("모듈 구조 정보가 필요합니다."), root: inspectable };
   if (node.kind !== "train" || !isRootInput((node as Obj).model_input)) return null;
   if (!rootsState.loaded || rootsState.unavailable) return null;
-  if (!entry) return { text: SNAPSHOT_HINT, short: SNAPSHOT_HINT, root: null };
-  return entry.snapshot_ready && !entry.targets_ready ? { text: TARGETS_HINT, short: TARGETS_SHORT, root } : null;
+  if (!entry) return { text: tr(SNAPSHOT_HINT), short: tr(SNAPSHOT_HINT), root: null };
+  return entry.snapshot_ready && !entry.targets_ready ? { text: tr(TARGETS_HINT), short: tr(TARGETS_SHORT), root } : null;
 }
 
 // -- rendering --
 function headHtml(ctx: ViewContext, view: Shown): string {
   const { draft, graph } = view;
   const revision = draft.saved?.revision_sha256;
-  const state = draft.dirty ? statusPill("warn", "저장 안 된 변경")
-    : revision && validated.get(view.projectId) === revision ? statusPill("good", "저장한 버전 검사 통과")
-    : revision ? statusPill("neutral", `저장된 버전 ${String(revision).slice(0, 8)}`) : "";
-  return `<div class="section-title"><h3>${escapeHtml(draft.spec.name)}</h3></div>${state}
-    <p class="muted">단계 ${graph.nodes.length}개 · 최대 ${MAX_NODES}개${revision ? ` · 저장된 버전 <span class="mono">${short(revision)}</span>` : ""}</p>
-    <div class="actions"><button type="button" class="primary" data-action="wf:graph:save" data-focus-key="graph-save"${unavailable ? " disabled" : ""}>저장</button>${button("프로젝트로 돌아가기", `nav:project:${view.projectId}`, "quiet")}</div>
-    <p class="muted">${unavailable ? NOT_AVAILABLE : "저장하면 저장한 버전을 바로 검사합니다. 계획과 실행은 저장한 버전으로만 합니다."}</p>`;
+  const state = draft.dirty ? statusPill("warn", tr("저장 안 된 변경"))
+    : revision && validated.get(view.projectId) === revision ? statusPill("good", tr("저장한 버전 검사 통과"))
+    : revision ? statusPill("neutral", msg`저장된 버전 ${String(revision).slice(0, 8)}`) : "";
+  return ui`<div class="section-title"><h3>${escapeHtml(draft.spec.name)}</h3></div>${state}
+    <p class="muted">단계 ${graph.nodes.length}개 · 최대 ${MAX_NODES}개${revision ? ui` · 저장된 버전 <span class="mono">${short(revision)}</span>` : ""}</p>
+    <div class="actions"><button type="button" class="primary" data-action="wf:graph:save" data-focus-key="graph-save"${unavailable ? " disabled" : ""}>저장</button>${button(tr("프로젝트로 돌아가기"), `nav:project:${view.projectId}`, "quiet")}</div>
+    <p class="muted">${unavailable ? tr(NOT_AVAILABLE) : tr("저장하면 저장한 버전을 바로 검사합니다. 계획과 실행은 저장한 버전으로만 합니다.")}</p>`;
 }
 
 function settingsHtml(ctx: ViewContext, view: Shown): string {
@@ -193,22 +194,22 @@ function settingsHtml(ctx: ViewContext, view: Shown): string {
   const value = (number: unknown) => typeof number === "number" && Number.isFinite(number) ? String(number) : "";
   const input = (id: string, key: string, label: string, current: unknown, attributes: string, placeholder: string) =>
     `<label class="field"><span>${label}</span><input id="${id}" type="number" data-setting="${key}" aria-label="${label}" ${attributes} value="${escapeHtml(value(current))}" placeholder="${placeholder}"></label>`;
-  return `<form id="graph-settings-form" class="card graph-settings" novalidate aria-labelledby="graph-settings-title">
+  return ui`<form id="graph-settings-form" class="card graph-settings" novalidate aria-labelledby="graph-settings-title">
     <h3 id="graph-settings-title">실행 설정</h3><fieldset class="graph-fieldset"${ctx.busy ? " disabled" : ""}><div class="graph-settings-grid">
-    ${input("graph-concurrent", "max_concurrent", "최대 동시 실행", graph.max_concurrent, 'min="1" max="64" step="1"', "기본 1")}
-    ${input("graph-cost", "max_total_cost_usd", "최대 총비용 (USD)", graph.max_total_cost_usd, 'min="0" step="any"', "기본 100")}
-    ${input("graph-attempts", "retry_policy.max_attempts", "재시도 횟수", graph.retry_policy?.max_attempts, 'min="1" max="5" step="1"', "기본 1")}
-    ${input("graph-backoff", "retry_policy.backoff_seconds", "재시도 간격 (초)", graph.retry_policy?.backoff_seconds, 'min="0" max="3600" step="1"', "기본 0")}
+    ${input("graph-concurrent", "max_concurrent", tr("최대 동시 실행"), graph.max_concurrent, 'min="1" max="64" step="1"', tr("기본 1"))}
+    ${input("graph-cost", "max_total_cost_usd", tr("최대 총비용 (USD)"), graph.max_total_cost_usd, 'min="0" step="any"', tr("기본 100"))}
+    ${input("graph-attempts", "retry_policy.max_attempts", tr("재시도 횟수"), graph.retry_policy?.max_attempts, 'min="1" max="5" step="1"', tr("기본 1"))}
+    ${input("graph-backoff", "retry_policy.backoff_seconds", tr("재시도 간격 (초)"), graph.retry_policy?.backoff_seconds, 'min="0" max="3600" step="1"', tr("기본 0"))}
     </div></fieldset><div id="graph-settings-note" class="graph-settings-note" role="status">${settingsNoteHtml(view)}</div></form>`;
 }
 function settingsNoteHtml(view: Shown): string {
   const problems = view.local.filter(issue => issue.code === "local_settings");
   return problems.length ? `<ul class="graph-reasons">${problems.map(issue => `<li>${escapeHtml(issue.message)}</li>`).join("")}</ul>`
-    : '<small class="muted">최대 총비용은 재시도를 포함한 그래프 전체의 계획 상한입니다.</small>';
+    : staticHtml('<small class="muted">최대 총비용은 재시도를 포함한 그래프 전체의 계획 상한입니다.</small>');
 }
 
 function startersHtml(ctx: ViewContext): string {
-  return `<div class="graph-starters" role="group" aria-label="시작 모양"><p class="muted">아직 단계가 없습니다. 시작 모양을 고르면 카드가 만들어지고, 그다음 카드마다 레시피·데이터·실행 프로필을 고칠 수 있습니다.</p>
+  return ui`<div class="graph-starters" role="group" aria-label="시작 모양"><p class="muted">아직 단계가 없습니다. 시작 모양을 고르면 카드가 만들어지고, 그다음 카드마다 레시피·데이터·실행 프로필을 고칠 수 있습니다.</p>
     <div class="graph-starter-list">${STARTERS.map(([shape, label, help]) => `<div class="graph-starter"><button type="button" data-action="wf:graph:start:${shape}"${ctx.busy ? " disabled" : ""}>${label}</button><small>${help}</small></div>`).join("")}</div></div>`;
 }
 
@@ -227,21 +228,21 @@ function cardsHtml(ctx: ViewContext, view: Shown): string {
     const status = [
       waiting.has(id) ? `<p class="graph-card-wait">${escapeHtml(NOTES.waiting)}</p>` : "",
       reasons.length ? `<ul class="graph-reasons">${reasons.map(reason => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>` : "",
-      todo.length ? `<p class="graph-card-todo">채울 항목: ${escapeHtml(todo.join(", "))}</p>` : "",
+      todo.length ? ui`<p class="graph-card-todo">채울 항목: ${escapeHtml(todo.join(", "))}</p>` : "",
       checked.length ? quiet(issueList(checked)) : "",
-      warned.length ? quiet(issueList(warned, { heading: "계획 경고" })) : "",
-      hint ? `<p class="graph-card-hint">${escapeHtml(hint.short)}${hint.root ? ` <button type="button" class="quiet" tabindex="-1" data-action="wf:graph:card-targets:${escapeHtml(id)}">모듈 구조 확인</button>` : ""}</p>` : "",
-      node.kind === "merge" ? `<p class="graph-card-todo">${MERGE_SHORT}</p>` : "",
+      warned.length ? quiet(issueList(warned, { heading: tr("계획 경고") })) : "",
+      hint ? `<p class="graph-card-hint">${escapeHtml(hint.short)}${hint.root ? ui` <button type="button" class="quiet" tabindex="-1" data-action="wf:graph:card-targets:${escapeHtml(id)}">모듈 구조 확인</button>` : ""}</p>` : "",
+      node.kind === "merge" ? `<p class="graph-card-todo">${tr(MERGE_SHORT)}</p>` : "",
     ].join("");
     const flagged = reasons.length || checked.length;
     return `<div class="graph-card${id === selected ? " selected" : ""}${flagged ? " flagged" : ""}${waiting.has(id) ? " waiting" : ""}" data-card="${escapeHtml(id)}" role="listitem">
       <button type="button" class="graph-card-button" data-node-card="${escapeHtml(id)}" data-action="wf:graph:select:${escapeHtml(id)}" data-focus-key="card:${escapeHtml(id)}"
         tabindex="${id === tabStop ? "0" : "-1"}" aria-pressed="${id === selected}"${status ? ` aria-describedby="card-status-${escapeHtml(id)}"` : ""}>
-        <span class="graph-card-label">${escapeHtml(labelOf(node))}</span><span class="graph-card-meta">${escapeHtml(KIND_LABELS[node.kind] ?? "알 수 없는 단계")} · ${escapeHtml(id)}</span></button>
+        <span class="graph-card-label">${escapeHtml(labelOf(node))}</span><span class="graph-card-meta">${escapeHtml(KIND_LABELS[node.kind] ?? tr("알 수 없는 단계"))} · ${escapeHtml(id)}</span></button>
       ${status ? `<div class="graph-card-status" id="card-status-${escapeHtml(id)}">${status}</div>` : ""}</div>`;
   };
-  return `<div class="graph-columns" role="group" aria-label="학습 단계 카드 · 위아래 화살표로 이동, Enter로 선택">${plan.columns.map((column, index) =>
-    `<div class="graph-column" role="list" aria-label="${index + 1}번째 열">${column.map(card).join("")}</div>`).join("")}</div>`;
+  return ui`<div class="graph-columns" role="group" aria-label="학습 단계 카드 · 위아래 화살표로 이동, Enter로 선택">${plan.columns.map((column, index) =>
+    ui`<div class="graph-column" role="list" aria-label="${index + 1}번째 열">${column.map(card).join("")}</div>`).join("")}</div>`;
 }
 
 function toolbarHtml(ctx: ViewContext, view: Shown): string {
@@ -251,13 +252,13 @@ function toolbarHtml(ctx: ViewContext, view: Shown): string {
   // A serial or parallel card connects to the graph: at 256 connections only an unconnected new train card fits.
   const linked = full || graphEdgeCount(graph) >= MAX_EDGES;
   const off = (flag: boolean) => flag ? " disabled" : "";
-  const menu = addMenu && selected && !linked ? `<div id="graph-add-kinds" class="graph-kinds" role="group" aria-label="추가할 단계 종류">
+  const menu = addMenu && selected && !linked ? ui`<div id="graph-add-kinds" class="graph-kinds" role="group" aria-label="추가할 단계 종류">
       ${serialKinds(graph, selected, dctx).map(choice => `<span class="graph-kind"><button type="button" data-action="wf:graph:add:${choice.kind}"${off(!choice.allowed)}>${escapeHtml(choice.label)}</button>${choice.reason ? `<small>${escapeHtml(choice.reason)}</small>` : ""}</span>`).join("")}
       <button type="button" class="quiet" data-action="wf:graph:add-menu-close">닫기</button></div>` : "";
-  const note = (full ? `<p class="graph-limit">${REASONS.limit} · 단계를 삭제한 뒤 추가하세요.</p>`
-    : !selected ? '<p class="muted">카드를 고르면 그 카드 다음 단계나 나란히 놓을 카드를 추가할 수 있습니다.</p>' : "")
-    + (graphEdgeCount(graph) >= MAX_EDGES ? `<p class="graph-limit">${REASONS.edgeLimit} · 연결을 지운 뒤 추가하세요.</p>` : "");
-  return `<div class="graph-toolbar"><button type="button" data-action="wf:graph:add-menu" aria-expanded="${Boolean(menu)}" aria-controls="graph-add-kinds"${off(!selected || linked)}>다음 단계 추가</button>
+  const note = (full ? ui`<p class="graph-limit">${REASONS.limit} · 단계를 삭제한 뒤 추가하세요.</p>`
+    : !selected ? staticHtml('<p class="muted">카드를 고르면 그 카드 다음 단계나 나란히 놓을 카드를 추가할 수 있습니다.</p>') : "")
+    + (graphEdgeCount(graph) >= MAX_EDGES ? ui`<p class="graph-limit">${REASONS.edgeLimit} · 연결을 지운 뒤 추가하세요.</p>` : "");
+  return ui`<div class="graph-toolbar"><button type="button" data-action="wf:graph:add-menu" aria-expanded="${Boolean(menu)}" aria-controls="graph-add-kinds"${off(!selected || linked)}>다음 단계 추가</button>
     <button type="button" data-action="wf:graph:add-parallel"${off(!selected || linked)}>나란히 추가</button>
     <button type="button" data-action="wf:graph:add-root"${off(full)}>새 학습 단계</button>
     <button type="button" data-action="wf:graph:remove"${off(!selected)}>단계 삭제</button></div>${menu}${note}
@@ -265,10 +266,10 @@ function toolbarHtml(ctx: ViewContext, view: Shown): string {
 }
 
 function previewHtml(view: Shown): string {
-  if (!view.graph.nodes.length) return '<p class="muted">카드를 추가하면 같은 초안으로 그린 미리보기가 여기에 나타납니다.</p>';
+  if (!view.graph.nodes.length) return staticHtml('<p class="muted">카드를 추가하면 같은 초안으로 그린 미리보기가 여기에 나타납니다.</p>');
   const flagged = new Set([...view.local.filter(issue => issue.code !== "local_required" && issue.node_id).map(issue => issue.node_id!),
     ...view.graph.nodes.filter(node => cardIssues(view, node.id).length).map(node => node.id)]);
-  return `${previewSvg(view.graph, view.plan, { selected: view.selected ?? undefined, waiting: view.waiting, issues: flagged })}
+  return ui`${previewSvg(view.graph, view.plan, { selected: view.selected ?? undefined, waiting: view.waiting, issues: flagged })}
     <p class="graph-preview-caption">카드와 같은 초안으로 그립니다 · 점선은 실행 순서만 정한 연결입니다 · 테두리 점선은 같은 실행 자원을 기다리는 단계입니다.</p>`;
 }
 
@@ -277,15 +278,15 @@ function summaryHtml(view: Shown): string {
   const unplaced = view.draft.issues.filter(issue => !view.graph.nodes.some(node => cardIssues(view, node.id).includes(issue)));
   if (!unplaced.length) return "";
   const datasets = unplaced.some(issue => issue.path === "/datasets" || issue.path.startsWith("/datasets/"));
-  return `<div class="graph-summary" role="status">${issueList(unplaced, { heading: "저장한 그래프 검사 결과" })}
-    ${datasets ? `<div class="actions">${button("프로젝트에서 데이터 연결 확인", `nav:project:${view.projectId}`)}</div>` : ""}</div>`;
+  return `<div class="graph-summary" role="status">${issueList(unplaced, { heading: tr("저장한 그래프 검사 결과") })}
+    ${datasets ? `<div class="actions">${button(tr("프로젝트에서 데이터 연결 확인"), `nav:project:${view.projectId}`)}</div>` : ""}</div>`;
 }
 
 function conflictHtml(draft: ProjectDraft): string {
   if (!draft.conflict) return "";
   const revision = draft.conflict.find(issue => issue.code === "revision_conflict");
-  return `<div class="wf-banner warn graph-banner" role="status"><div>${revision ? escapeHtml(localize(revision).text) : issueList(draft.conflict)}
-    <small>내 초안은 그대로 남아 있습니다.</small></div>${revision ? `<div class="actions">${button("최신 버전 불러오기", "wf:graph:reload")}${button("내 변경으로 덮어쓰기", "wf:graph:overwrite")}</div>` : ""}</div>`;
+  return ui`<div class="wf-banner warn graph-banner" role="status"><div>${revision ? escapeHtml(localize(revision).text) : issueList(draft.conflict)}
+    <small>내 초안은 그대로 남아 있습니다.</small></div>${revision ? `<div class="actions">${button(tr("최신 버전 불러오기"), "wf:graph:reload")}${button(tr("내 변경으로 덮어쓰기"), "wf:graph:overwrite")}</div>` : ""}</div>`;
 }
 
 // -- the card form --
@@ -311,7 +312,7 @@ function blockedHtml(view: Shown, nodeId: string, port: InputPort, onlyEvaluatio
   const blocked = inputOptions(view.graph, nodeId, port, view.dctx).filter(option => !option.allowed
     && (!onlyEvaluations || findNode(view.graph, option.value.node_id)?.kind === "evaluate"));
   if (!blocked.length) return "";
-  return `<div class="graph-blocked"><p class="graph-blocked-title">연결할 수 없는 단계</p><ul>${blocked.map(option =>
+  return ui`<div class="graph-blocked"><p class="graph-blocked-title">연결할 수 없는 단계</p><ul>${blocked.map(option =>
     `<li>${isolate(labelOf(findNode(view.graph, option.value.node_id)))} · ${escapeHtml(option.reason)}</li>`).join("")}</ul></div>`;
 }
 const refValue = (value: unknown) => isRef(value) ? `node:${value.node_id}` : value === undefined || value === null ? "" : "keep";
@@ -319,11 +320,11 @@ const refValue = (value: unknown) => isRef(value) ? `node:${value.node_id}` : va
 function profilesHtml(view: Shown, node: Obj, issues: WorkflowIssue[]): string {
   const chosen: string[] = Array.isArray(node.executor_profile_ids) ? node.executor_profile_ids.map(String) : [];
   const items = [...(profileList ?? []).map(profile => ({ id: profile.profile_id, label: `${profile.fields?.name || profile.profile_id} · ${profile.profile_id}` })),
-    ...view.draft.planning.estimates.map(estimate => ({ id: estimate.profile_id, label: `계획용 추정 · ${estimate.gpu_type} × ${estimate.gpu_count} · ${estimate.profile_id}` }))];
-  for (const id of chosen) if (!items.some(item => item.id === id)) items.push({ id, label: `${id} · 목록에 없음` });
+    ...view.draft.planning.estimates.map(estimate => ({ id: estimate.profile_id, label: msg`계획용 추정 · ${estimate.gpu_type} × ${estimate.gpu_count} · ${estimate.profile_id}` }))];
+  for (const id of chosen) if (!items.some(item => item.id === id)) items.push({ id, label: msg`${id} · 목록에 없음` });
   const boxes = items.map((item, index) => `<label class="check"><input type="checkbox" id="node-profile-${index}" data-focus-key="profile:${escapeHtml(item.id)}" data-node-profile="${escapeHtml(item.id)}"${chosen.includes(item.id) ? " checked" : ""}>${escapeHtml(item.label)}</label>`).join("");
-  return `<fieldset class="graph-choices"${issues.length ? ' aria-invalid="true"' : ""}><legend>실행 프로필</legend>${boxes || '<p class="muted">저장한 실행 프로필이 없습니다. 설정 › 실행 프로필에서 만드세요.</p>'}
-    ${profileError ? `<p class="error-text">실행 프로필 목록을 불러오지 못했습니다. ${escapeHtml(profileError)}</p>` : ""}
+  return ui`<fieldset class="graph-choices"${issues.length ? ' aria-invalid="true"' : ""}><legend>실행 프로필</legend>${boxes || staticHtml('<p class="muted">저장한 실행 프로필이 없습니다. 설정 › 실행 프로필에서 만드세요.</p>')}
+    ${profileError ? ui`<p class="error-text">실행 프로필 목록을 불러오지 못했습니다. ${escapeHtml(profileError)}</p>` : ""}
     <small class="muted">여러 개를 고르면 비어 있는 곳에서 실행합니다. 하나만 고른 단계끼리는 같은 자원을 기다립니다.</small>${issueList(issues)}</fieldset>`;
 }
 
@@ -331,73 +332,73 @@ function trainFields(view: Shown, node: Obj, at: (field: string) => WorkflowIssu
   const recipes = recipeList ?? [];
   const current: string = typeof node.recipe_revision === "string" ? node.recipe_revision : "";
   const pinned = current && !recipes.some(recipe => recipe.revision_sha256 === current) ? pinnedRecipes.get(current) : undefined;
-  const choices: Choice[] = [{ value: "", label: "레시피 선택" }, ...recipes.map(recipe => ({ value: recipe.revision_sha256, label: recipeText(recipe) }))];
+  const choices: Choice[] = [{ value: "", label: tr("레시피 선택") }, ...recipes.map(recipe => ({ value: recipe.revision_sha256, label: recipeText(recipe) }))];
   let recipeHelp = "";
   if (current && !recipes.some(recipe => recipe.revision_sha256 === current)) {
-    choices.push({ value: current, label: `고정된 이전 버전 · ${current.slice(0, 8)}${pinned ? ` · ${recipeText(pinned)}` : " · 레시피 정보를 찾을 수 없음"}` });
+    choices.push({ value: current, label: msg`고정된 이전 버전 · ${current.slice(0, 8)}${pinned ? ` · ${recipeText(pinned)}` : tr(" · 레시피 정보를 찾을 수 없음")}` });
     const newer = pinned ? recipes.find(recipe => recipe.recipe_id === pinned.recipe_id) : undefined;
-    recipeHelp = `<small class="muted">이 카드는 레시피의 이전 버전을 고정해 씁니다.</small>${newer ? `<div class="actions">${button("현재 버전으로 바꾸기", "wf:graph:recipe-current")}</div>` : ""}`;
+    recipeHelp = ui`<small class="muted">이 카드는 레시피의 이전 버전을 고정해 씁니다.</small>${newer ? `<div class="actions">${button(tr("현재 버전으로 바꾸기"), "wf:graph:recipe-current")}</div>` : ""}`;
   }
-  if (recipeError) recipeHelp += `<small class="error-text">레시피 목록을 불러오지 못했습니다. ${escapeHtml(recipeError)}</small>`;
+  if (recipeError) recipeHelp += ui`<small class="error-text">레시피 목록을 불러오지 못했습니다. ${escapeHtml(recipeError)}</small>`;
   const recipe = view.dctx.recipes.get(current);
-  if (recipe) recipeHelp = `<small class="muted">${escapeHtml(String(recipe.training_stage).toUpperCase())} · ${escapeHtml(METHOD_LABELS[recipe.training_method] ?? recipe.training_method)} · 입력 ${escapeHtml(recipe.input_kind)}</small>${recipeHelp}`;
+  if (recipe) recipeHelp = ui`<small class="muted">${escapeHtml(String(recipe.training_stage).toUpperCase())} · ${escapeHtml(METHOD_LABELS[recipe.training_method] ?? recipe.training_method)} · 입력 ${escapeHtml(recipe.input_kind)}</small>${recipeHelp}`;
   const roots = rootsState.roots;
   const input = node.model_input;
-  const inputChoices: Choice[] = [{ value: "", label: "입력 모델 선택" }, ...roots.map((entry, index) => ({ value: `root:${index}`,
-    label: `기반 모델 · ${entry.root.repo_id} · ${entry.root.revision.slice(0, 8)}${entry.snapshot_ready ? "" : " · 설정·토크나이저 없음"}` })),
+  const inputChoices: Choice[] = [{ value: "", label: tr("입력 모델 선택") }, ...roots.map((entry, index) => ({ value: `root:${index}`,
+    label: msg`기반 모델 · ${entry.root.repo_id} · ${entry.root.revision.slice(0, 8)}${entry.snapshot_ready ? "" : tr(" · 설정·토크나이저 없음")}` })),
     ...sourceChoices(view, node.id, "model_input")];
   let inputValue = refValue(input);
   if (isRootInput(input)) {
     const index = roots.findIndex(entry => sameRoot(entry.root, input.policy.base));
     if (index >= 0) inputValue = `root:${index}`;
-    else { inputValue = "keep"; inputChoices.push({ value: "keep", label: `기반 모델 · ${input.policy.base.repo_id} · ${String(input.policy.base.revision).slice(0, 8)} · 목록에 없음` }); }
-  } else if (inputValue === "keep") inputChoices.push({ value: "keep", label: "이전 실행의 산출물 · 지원하지 않는 입력" });
-  const inputHelp = isRootInput(input) ? `<small class="muted">초기화: ${escapeHtml(INITIALIZATION_LABELS[input.initialization] ?? input.initialization)} · 레시피의 학습 방법에서 정합니다.</small>`
-    : isRef(input) ? '<small class="muted">이전 단계의 결과 모델에서 이어 학습합니다.</small>' : "";
+    else { inputValue = "keep"; inputChoices.push({ value: "keep", label: msg`기반 모델 · ${input.policy.base.repo_id} · ${String(input.policy.base.revision).slice(0, 8)} · 목록에 없음` }); }
+  } else if (inputValue === "keep") inputChoices.push({ value: "keep", label: tr("이전 실행의 산출물 · 지원하지 않는 입력") });
+  const inputHelp = isRootInput(input) ? ui`<small class="muted">초기화: ${escapeHtml(INITIALIZATION_LABELS[input.initialization] ?? input.initialization)} · 레시피의 학습 방법에서 정합니다.</small>`
+    : isRef(input) ? staticHtml('<small class="muted">이전 단계의 결과 모델에서 이어 학습합니다.</small>') : "";
   const bindings = view.draft.spec.datasets;
-  const dataChoices: Choice[] = [{ value: "", label: "학습 데이터 선택" }, ...bindings.map(binding => ({ value: binding.binding_id,
+  const dataChoices: Choice[] = [{ value: "", label: tr("학습 데이터 선택") }, ...bindings.map(binding => ({ value: binding.binding_id,
     label: `${binding.binding_id} · ${ROLE_LABELS[binding.role] ?? binding.role} · ${binding.dataset.dataset_id} v${binding.dataset.version}`, disabled: binding.role !== "train" }))];
   if (node.dataset_binding && !bindings.some(binding => binding.binding_id === node.dataset_binding))
-    dataChoices.push({ value: String(node.dataset_binding), label: `${node.dataset_binding} · 프로젝트에 없음` });
-  const dataHelp = `<small class="muted">${bindings.some(binding => binding.role !== "train") ? REASONS.trainRole : "데이터는 프로젝트 화면에서 연결합니다."}</small>`;
+    dataChoices.push({ value: String(node.dataset_binding), label: msg`${node.dataset_binding} · 프로젝트에 없음` });
+  const dataHelp = `<small class="muted">${bindings.some(binding => binding.role !== "train") ? REASONS.trainRole : tr("데이터는 프로젝트 화면에서 연결합니다.")}</small>`;
   let reward = "";
   if (recipe?.training_stage === "ppo" || node.reward_binding != null) {
-    const rewardChoices: Choice[] = [{ value: "", label: "보상 모델 선택" }, ...roots.map((entry, index) => ({ value: `root:${index}`,
-      label: `기반 모델 · ${entry.root.repo_id} · ${entry.root.revision.slice(0, 8)}` })), ...sourceChoices(view, node.id, "reward_binding")];
+    const rewardChoices: Choice[] = [{ value: "", label: tr("보상 모델 선택") }, ...roots.map((entry, index) => ({ value: `root:${index}`,
+      label: msg`기반 모델 · ${entry.root.repo_id} · ${entry.root.revision.slice(0, 8)}` })), ...sourceChoices(view, node.id, "reward_binding")];
     let rewardValue = refValue(node.reward_binding);
     if (isObject(node.reward_binding) && !isRef(node.reward_binding)) {
       const base = node.reward_binding.base;
       const index = node.reward_binding.adapter == null && isObject(base) ? roots.findIndex(entry => sameRoot(entry.root, base as HFRootRef)) : -1;
       if (index >= 0) rewardValue = `root:${index}`;
-      else { rewardValue = "keep"; rewardChoices.push({ value: "keep", label: "저장된 보상 모델 · 목록에 없음" }); }
+      else { rewardValue = "keep"; rewardChoices.push({ value: "keep", label: tr("저장된 보상 모델 · 목록에 없음") }); }
     }
-    reward = selectHtml("node-reward", "보상 모델", "reward_binding", rewardChoices, rewardValue, at("reward_binding"),
-      `<small class="muted">${recipe?.training_stage === "ppo" ? "PPO 학습에만 씁니다." : REASONS.rewardNotPpo}</small>`);
+    reward = selectHtml("node-reward", tr("보상 모델"), "reward_binding", rewardChoices, rewardValue, at("reward_binding"),
+      `<small class="muted">${recipe?.training_stage === "ppo" ? tr("PPO 학습에만 씁니다.") : REASONS.rewardNotPpo}</small>`);
   }
-  return `${selectHtml("node-recipe", "레시피", "recipe_revision", choices, current, at("recipe_revision"), recipeHelp)}
-    ${selectHtml("node-model-input", "입력 모델", "model_input", inputChoices, inputValue, at("model_input"), inputHelp)}
+  return `${selectHtml("node-recipe", tr("레시피"), "recipe_revision", choices, current, at("recipe_revision"), recipeHelp)}
+    ${selectHtml("node-model-input", tr("입력 모델"), "model_input", inputChoices, inputValue, at("model_input"), inputHelp)}
     ${blockedHtml(view, node.id, "model_input")}
-    ${selectHtml("node-dataset", "학습 데이터", "dataset_binding", dataChoices, String(node.dataset_binding ?? ""), at("dataset_binding"), dataHelp)}
+    ${selectHtml("node-dataset", tr("학습 데이터"), "dataset_binding", dataChoices, String(node.dataset_binding ?? ""), at("dataset_binding"), dataHelp)}
     ${reward}${profilesHtml(view, node, at("executor_profile_ids"))}`;
 }
 
 function modelSelect(view: Shown, node: Obj, label: string, at: (field: string) => WorkflowIssue[]): string {
-  const choices: Choice[] = [{ value: "", label: `${label} 선택` }, ...sourceChoices(view, node.id, "model")];
+  const choices: Choice[] = [{ value: "", label: msg`${label} 선택` }, ...sourceChoices(view, node.id, "model")];
   const value = refValue(node.model);
-  if (value === "keep") choices.push({ value: "keep", label: "이전 실행의 산출물 · 지원하지 않는 입력" });
+  if (value === "keep") choices.push({ value: "keep", label: tr("이전 실행의 산출물 · 지원하지 않는 입력") });
   return `${selectHtml("node-model", label, "model", choices, value, at("model"))}${blockedHtml(view, node.id, "model")}`;
 }
 
 function evaluateFields(view: Shown, node: Obj, at: (field: string) => WorkflowIssue[]): string {
   const current: string = typeof node.benchmark_revision === "string" ? node.benchmark_revision : "";
   const list = benchmarkList ?? [];
-  const choices: Choice[] = [{ value: "", label: "평가 기준 선택" }, ...list.map(item => ({ value: item.revision_sha256,
-    label: `${EVALUATOR_LABELS[item.spec.evaluator_kind as keyof typeof EVALUATOR_LABELS] ?? item.spec.evaluator_kind} · ${item.spec.dataset.dataset_id} v${item.spec.dataset.version} · 샘플 ${item.spec.ordered_sample_ids.length} · ${item.revision_sha256.slice(0, 8)}` }))];
-  if (current && !list.some(item => item.revision_sha256 === current)) choices.push({ value: current, label: `저장된 평가 기준 · ${current.slice(0, 8)} · 목록에 없음` });
-  const help = `<div class="actions"><button type="button" data-action="wf:graph:benchmark-new" data-focus-key="benchmark-new">새 평가 기준</button></div>
-    ${benchmarkError ? `<small class="error-text">평가 기준 목록을 불러오지 못했습니다. ${escapeHtml(benchmarkError)}</small>` : '<small class="muted">평가 기준은 검증·시험 데이터의 고정된 샘플과 기반 모델의 토크나이저로 저장합니다.</small>'}`;
-  return `${modelSelect(view, node, "평가할 모델", at)}
-    ${selectHtml("node-benchmark", "평가 기준", "benchmark_revision", choices, current, at("benchmark_revision"), help)}
+  const choices: Choice[] = [{ value: "", label: tr("평가 기준 선택") }, ...list.map(item => ({ value: item.revision_sha256,
+    label: msg`${EVALUATOR_LABELS[item.spec.evaluator_kind as keyof typeof EVALUATOR_LABELS] ?? item.spec.evaluator_kind} · ${item.spec.dataset.dataset_id} v${item.spec.dataset.version} · 샘플 ${item.spec.ordered_sample_ids.length} · ${item.revision_sha256.slice(0, 8)}` }))];
+  if (current && !list.some(item => item.revision_sha256 === current)) choices.push({ value: current, label: msg`저장된 평가 기준 · ${current.slice(0, 8)} · 목록에 없음` });
+  const help = ui`<div class="actions"><button type="button" data-action="wf:graph:benchmark-new" data-focus-key="benchmark-new">새 평가 기준</button></div>
+    ${benchmarkError ? ui`<small class="error-text">평가 기준 목록을 불러오지 못했습니다. ${escapeHtml(benchmarkError)}</small>` : staticHtml('<small class="muted">평가 기준은 검증·시험 데이터의 고정된 샘플과 기반 모델의 토크나이저로 저장합니다.</small>')}`;
+  return `${modelSelect(view, node, tr("평가할 모델"), at)}
+    ${selectHtml("node-benchmark", tr("평가 기준"), "benchmark_revision", choices, current, at("benchmark_revision"), help)}
     ${profilesHtml(view, node, at("executor_profile_ids"))}`;
 }
 
@@ -415,39 +416,39 @@ function selectFields(view: Shown, node: Obj, at: (field: string) => WorkflowIss
   const kinds = selectionEvaluators(view.graph, node as NodeJson, view.dctx);
   const choices = kinds === null ? null : metricChoices(kinds);
   const metric = typeof selection.metric === "string" ? selection.metric : "";
-  const metricOptions: Choice[] = [{ value: "", label: "선택 지표 선택" }, ...(choices ?? []).filter(choice => choice.metric).map(choice => ({ value: choice.metric,
+  const metricOptions: Choice[] = [{ value: "", label: tr("선택 지표 선택") }, ...(choices ?? []).filter(choice => choice.metric).map(choice => ({ value: choice.metric,
     label: choice.allowed ? choice.label : `${choice.label} — ${choice.reason}`, disabled: !choice.allowed }))];
-  if (metric && !metricOptions.some(choice => choice.value === metric)) metricOptions.push({ value: metric, label: `${metric} · 이 평가 기준에 없는 지표` });
+  if (metric && !metricOptions.some(choice => choice.value === metric)) metricOptions.push({ value: metric, label: msg`${metric} · 이 평가 기준에 없는 지표` });
   const picked = choices?.find(choice => choice.metric === metric);
   const blockedReason = choices && !choices.some(choice => choice.allowed) ? choices[0].reason : null;
   const metricHelp = [picked?.note ? `<small class="graph-note">${escapeHtml(picked.note)}</small>` : "",
     blockedReason ? `<p class="graph-reason">${escapeHtml(blockedReason)}</p>` : "",
-    kinds === null ? '<small class="muted">평가 기준 정보를 불러오지 못해 지표를 확인할 수 없습니다.</small>' : ""].join("");
+    kinds === null ? staticHtml('<small class="muted">평가 기준 정보를 불러오지 못해 지표를 확인할 수 없습니다.</small>') : ""].join("");
   const thresholds: Obj[] = Array.isArray(selection.thresholds) ? selection.thresholds : [];
   const editable = thresholds.length === 0 || (thresholds.length === 1 && thresholds[0]?.metric === metric && thresholds[0]?.direction === (selection.direction ?? "max"));
   // A threshold belongs to the selection metric: without one it cannot be kept, so it waits for the metric.
   const threshold = editable
-    ? numberHtml("node-threshold", "기준값 (선택)", "threshold", thresholds[0]?.value, metric ? 'step="any"' : 'step="any" disabled', at("selection/thresholds"),
-      `<small class="muted">${!metric ? "선택 지표를 고른 뒤 입력할 수 있습니다." : (selection.direction ?? "max") === "min" ? "이 값보다 높은 후보는 제외합니다." : "이 값보다 낮은 후보는 제외합니다."}</small>`)
-    : `<p class="muted">저장된 기준 ${thresholds.length}개는 그대로 둡니다.</p>`;
-  return `<fieldset class="graph-choices"${at("evaluations").length ? ' aria-invalid="true"' : ""}><legend>비교할 평가</legend>${boxes || '<p class="muted">평가 단계를 먼저 추가하세요.</p>'}${issueList(at("evaluations"))}</fieldset>
-    ${selectHtml("node-metric", "선택 지표", "selection.metric", metricOptions, metric, at("selection/metric"), metricHelp)}
-    ${selectHtml("node-direction", "방향", "selection.direction", [...(selection.direction ? [] : [{ value: "", label: "방향 선택" }]),
-      { value: "max", label: "높을수록 좋음 (max)" }, { value: "min", label: "낮을수록 좋음 (min)" }], String(selection.direction ?? ""), at("selection/direction"))}
+    ? numberHtml("node-threshold", tr("기준값 (선택)"), "threshold", thresholds[0]?.value, metric ? 'step="any"' : 'step="any" disabled', at("selection/thresholds"),
+      `<small class="muted">${!metric ? tr("선택 지표를 고른 뒤 입력할 수 있습니다.") : (selection.direction ?? "max") === "min" ? tr("이 값보다 높은 후보는 제외합니다.") : tr("이 값보다 낮은 후보는 제외합니다.")}</small>`)
+    : ui`<p class="muted">저장된 기준 ${thresholds.length}개는 그대로 둡니다.</p>`;
+  return ui`<fieldset class="graph-choices"${at("evaluations").length ? ' aria-invalid="true"' : ""}><legend>비교할 평가</legend>${boxes || staticHtml('<p class="muted">평가 단계를 먼저 추가하세요.</p>')}${issueList(at("evaluations"))}</fieldset>
+    ${selectHtml("node-metric", tr("선택 지표"), "selection.metric", metricOptions, metric, at("selection/metric"), metricHelp)}
+    ${selectHtml("node-direction", tr("방향"), "selection.direction", [...(selection.direction ? [] : [{ value: "", label: tr("방향 선택") }]),
+      { value: "max", label: tr("높을수록 좋음 (max)") }, { value: "min", label: tr("낮을수록 좋음 (min)") }], String(selection.direction ?? ""), at("selection/direction"))}
     ${threshold}
     <div class="graph-field"><label class="check"><input type="checkbox" id="node-partial" data-node-field="selection.allow_partial"${selection.allow_partial ? " checked" : ""}>일부 평가만 성공해도 선택</label></div>
-    ${numberHtml("node-min-success", "최소 성공 수", "selection.min_success", selection.min_success ?? 2, 'min="2" step="1"', at("selection/min_success"))}
-    ${numberHtml("node-tolerance", "병합 회귀 허용치", "selection.merge_regression_tolerance", selection.merge_regression_tolerance ?? 0, 'min="0" step="any"', at("selection/merge_regression_tolerance"))}
+    ${numberHtml("node-min-success", tr("최소 성공 수"), "selection.min_success", selection.min_success ?? 2, 'min="2" step="1"', at("selection/min_success"))}
+    ${numberHtml("node-tolerance", tr("병합 회귀 허용치"), "selection.merge_regression_tolerance", selection.merge_regression_tolerance ?? 0, 'min="0" step="any"', at("selection/merge_regression_tolerance"))}
     <p class="graph-note">${escapeHtml(NOTES.select)}</p>`;
 }
 
 function mergeSum(node: Obj): string {
   const count = Array.isArray(node.models) ? node.models.length : 0;
-  if (weightTextInvalid) return "가중치는 0보다 큰 숫자(%)로 입력하세요. 숫자가 아닌 값은 반영하지 않았습니다.";
-  if (!count) return "병합할 모델을 2–4개 고르세요.";
+  if (weightTextInvalid) return tr("가중치는 0보다 큰 숫자(%)로 입력하세요. 숫자가 아닌 값은 반영하지 않았습니다.");
+  if (!count) return tr("병합할 모델을 2–4개 고르세요.");
   const weights: unknown[] = Array.isArray(node.weights) ? node.weights : [];
   const total = weights.map(percentText).filter(Boolean).reduce((sum, text) => sum + Math.round(Number(text) * 1e6), 0) / 1e6;
-  return weightsValid(node.weights, count) ? `가중치 합계 100% · 모델 ${count}개` : `가중치 합계 ${total}% · 정확히 100%여야 합니다`;
+  return weightsValid(node.weights, count) ? msg`가중치 합계 100% · 모델 ${count}개` : msg`가중치 합계 ${total}% · 정확히 100%여야 합니다`;
 }
 function mergeFields(view: Shown, node: Obj, at: (field: string) => WorkflowIssue[]): string {
   const models: unknown[] = Array.isArray(node.models) ? node.models : [];
@@ -463,18 +464,18 @@ function mergeFields(view: Shown, node: Obj, at: (field: string) => WorkflowIssu
     if (option.allowed && edgesFull && position < 0) option = { ...option, allowed: false, reason: REASONS.edgeLimit };
     const off = !option.allowed && position < 0;
     return `<div class="graph-merge-row"><label class="check"><input type="checkbox" id="node-merge-${index}" data-focus-key="merge:${escapeHtml(id)}" data-node-merge="${escapeHtml(id)}"${position >= 0 ? " checked" : ""}${off ? " disabled" : ""}>${escapeHtml(label)}</label>
-      ${position >= 0 ? `<label class="graph-weight"><span>가중치 (%)</span><input id="node-weight-${index}" type="text" inputmode="decimal" data-node-weight="${escapeHtml(id)}" aria-label="${escapeHtml(label)} 가중치 (%)" value="${escapeHtml(percentText(weights[position]))}"></label>` : ""}
+      ${position >= 0 ? ui`<label class="graph-weight"><span>가중치 (%)</span><input id="node-weight-${index}" type="text" inputmode="decimal" data-node-weight="${escapeHtml(id)}" aria-label="${escapeHtml(label)} 가중치 (%)" value="${escapeHtml(percentText(weights[position]))}"></label>` : ""}
       ${option.reason ? `<small>${escapeHtml(option.reason)}</small>` : ""}</div>`;
   }).join("");
   const external = chosen.filter(id => id === null).length;
-  return `<fieldset class="graph-choices graph-merge"${at("models").length ? ' aria-invalid="true"' : ""}><legend>병합할 모델 (2–4개)</legend>${rows || '<p class="muted">학습 단계를 먼저 추가하세요.</p>'}
-    ${external ? `<p class="muted">이전 실행의 산출물 ${external}개는 그대로 둡니다.</p>` : ""}
+  return ui`<fieldset class="graph-choices graph-merge"${at("models").length ? ' aria-invalid="true"' : ""}><legend>병합할 모델 (2–4개)</legend>${rows || staticHtml('<p class="muted">학습 단계를 먼저 추가하세요.</p>')}
+    ${external ? ui`<p class="muted">이전 실행의 산출물 ${external}개는 그대로 둡니다.</p>` : ""}
     <p id="merge-sum" class="graph-merge-sum" role="status">${escapeHtml(mergeSum(node))}</p>${issueList([...at("models"), ...at("weights")])}</fieldset>
     <p class="graph-note">${escapeHtml(NOTES.mergeRealOnly)}</p>${profilesHtml(view, node, at("executor_profile_ids"))}`;
 }
 
 function materializeFields(view: Shown, node: Obj, at: (field: string) => WorkflowIssue[]): string {
-  return `${modelSelect(view, node, "확정할 모델", at)}
+  return ui`${modelSelect(view, node, tr("확정할 모델"), at)}
     <p class="graph-note">LoRA·QLoRA 어댑터를 기반 모델에 합쳐 전체 가중치 모델로 확정합니다. 학습 방법이 바뀌는 다음 학습 단계 앞에 넣으세요.</p>
     ${profilesHtml(view, node, at("executor_profile_ids"))}`;
 }
@@ -501,27 +502,27 @@ function nodeReasonsHtml(view: Shown, node: NodeJson): string {
   const hint = targetsHint(view, node);
   return [
     view.waiting.has(node.id) ? `<p class="graph-card-wait">${escapeHtml(NOTES.waiting)}</p>` : "",
-    reasons.length ? `<div class="graph-reason-box"><p class="graph-blocked-title">확인할 점</p><ul class="graph-reasons">${reasons.map(reason => `<li>${escapeHtml(reason)}</li>`).join("")}</ul></div>` : "",
-    todo.length ? `<div class="graph-todo-box"><p class="graph-blocked-title">채울 항목</p><ul>${todo.map(item => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>` : "",
-    checked.length ? issueList(checked, { heading: "저장한 그래프 검사 결과" }) : "",
-    warned.length ? issueList(warned, { heading: "계획 경고" }) : "",
-    hint ? `<p class="graph-card-hint">${escapeHtml(hint.text)}${hint.root ? ` ${button("모듈 구조 확인", `wf:graph:card-targets:${node.id}`)}` : ""}</p>` : "",
+    reasons.length ? ui`<div class="graph-reason-box"><p class="graph-blocked-title">확인할 점</p><ul class="graph-reasons">${reasons.map(reason => `<li>${escapeHtml(reason)}</li>`).join("")}</ul></div>` : "",
+    todo.length ? ui`<div class="graph-todo-box"><p class="graph-blocked-title">채울 항목</p><ul>${todo.map(item => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>` : "",
+    checked.length ? issueList(checked, { heading: tr("저장한 그래프 검사 결과") }) : "",
+    warned.length ? issueList(warned, { heading: tr("계획 경고") }) : "",
+    hint ? `<p class="graph-card-hint">${escapeHtml(hint.text)}${hint.root ? ` ${button(tr("모듈 구조 확인"), `wf:graph:card-targets:${node.id}`)}` : ""}</p>` : "",
   ].join("");
 }
 
 function nodeFormHtml(ctx: ViewContext, view: Shown): string {
   weightTextInvalid = false;
   const id = view.selected;
-  if (!id) return view.graph.nodes.length ? '<section class="card graph-node-empty"><p class="muted">카드를 고르면 여기에서 이름, 입력, 데이터와 실행 프로필을 정합니다.</p></section>' : "";
+  if (!id) return view.graph.nodes.length ? staticHtml('<section class="card graph-node-empty"><p class="muted">카드를 고르면 여기에서 이름, 입력, 데이터와 실행 프로필을 정합니다.</p></section>') : "";
   const node = findNode(view.graph, id)! as Obj;
   const at = fieldIssuesFor(view, id);
   const kind = node.kind as NodeKind;
   const body = kind === "train" ? trainFields(view, node, at) : kind === "evaluate" ? evaluateFields(view, node, at)
     : kind === "select" ? selectFields(view, node, at) : kind === "merge" ? mergeFields(view, node, at)
-    : kind === "materialize" ? materializeFields(view, node, at) : '<p class="muted">이 단계 종류는 화면에서 고칠 수 없습니다. 저장하면 그대로 둡니다.</p>';
+    : kind === "materialize" ? materializeFields(view, node, at) : staticHtml('<p class="muted">이 단계 종류는 화면에서 고칠 수 없습니다. 저장하면 그대로 둡니다.</p>');
   const labelIssues = at("label");
-  return `<form id="node-form" class="card graph-node-form" data-project-id="${escapeHtml(view.projectId)}" data-node-id="${escapeHtml(id)}" novalidate aria-labelledby="node-form-title">
-    <div class="section-title"><h3 id="node-form-title" tabindex="-1">${escapeHtml(KIND_LABELS[kind] ?? "알 수 없는 단계")} · ${escapeHtml(id)}</h3></div>
+  return ui`<form id="node-form" class="card graph-node-form" data-project-id="${escapeHtml(view.projectId)}" data-node-id="${escapeHtml(id)}" novalidate aria-labelledby="node-form-title">
+    <div class="section-title"><h3 id="node-form-title" tabindex="-1">${escapeHtml(KIND_LABELS[kind] ?? tr("알 수 없는 단계"))} · ${escapeHtml(id)}</h3></div>
     <fieldset class="graph-fieldset"${ctx.busy ? " disabled" : ""}>
     <div class="graph-field"><label class="field"><span>단계 이름</span><input id="node-label" data-node-field="label" aria-label="단계 이름" maxlength="200" value="${escapeHtml(typeof node.label === "string" ? node.label : "")}"${labelIssues.length ? ' aria-invalid="true" aria-describedby="node-label-issues"' : ""}></label>${labelIssues.length ? `<div id="node-label-issues">${issueList(labelIssues)}</div>` : ""}</div>
     ${body}</fieldset>
@@ -538,14 +539,14 @@ function benchmarkHtml(ctx: ViewContext, view: Shown): string {
 function graphPage(ctx: ViewContext): string {
   const projectId = ctx.arg;
   const empty = (body: string) => `<div class="graph-page" data-tour="graph-editor"><section class="card graph-empty">${body}</section></div>`;
-  if (!projectId) return empty(`<div class="empty">프로젝트를 먼저 여세요. 학습 그래프는 프로젝트마다 하나씩 있습니다.</div><div class="actions">${button("프로젝트 목록", "nav:projects")}</div>`);
+  if (!projectId) return empty(ui`<div class="empty">프로젝트를 먼저 여세요. 학습 그래프는 프로젝트마다 하나씩 있습니다.</div><div class="actions">${button(tr("프로젝트 목록"), "nav:projects")}</div>`);
   const view = shown(ctx);
   const failed = loadIssues.get(projectId);
-  if (!view) return empty(failed ? `<div class="wf-banner bad">${unavailable ? NOT_AVAILABLE : "프로젝트를 불러오지 못했습니다."}</div>${unavailable ? "" : issueList(failed)}
-      <div class="actions">${button("다시 불러오기", "wf:graph:reopen")}${button("프로젝트 목록", "nav:projects", "quiet")}</div>`
-    : '<div class="empty">프로젝트를 먼저 여세요. 프로젝트를 불러오는 중입니다.</div>');
-  return `<div class="graph-page" data-tour="graph-editor" data-project-id="${escapeHtml(projectId)}">${conflictHtml(view.draft)}
-    ${failed ? `<div class="wf-banner bad">최신 버전을 다시 읽지 못해 이 PC의 초안을 보여 줍니다.</div>${issueList(failed)}` : ""}${summaryHtml(view)}
+  if (!view) return empty(failed ? `<div class="wf-banner bad">${unavailable ? tr(NOT_AVAILABLE) : tr("프로젝트를 불러오지 못했습니다.")}</div>${unavailable ? "" : issueList(failed)}
+      <div class="actions">${button(tr("다시 불러오기"), "wf:graph:reopen")}${button(tr("프로젝트 목록"), "nav:projects", "quiet")}</div>`
+    : staticHtml('<div class="empty">프로젝트를 먼저 여세요. 프로젝트를 불러오는 중입니다.</div>'));
+  return ui`<div class="graph-page" data-tour="graph-editor" data-project-id="${escapeHtml(projectId)}">${conflictHtml(view.draft)}
+    ${failed ? ui`<div class="wf-banner bad">최신 버전을 다시 읽지 못해 이 PC의 초안을 보여 줍니다.</div>${issueList(failed)}` : ""}${summaryHtml(view)}
     <div class="graph-layout"><div class="graph-side"><section class="card graph-head" id="graph-head" aria-label="프로젝트와 저장">${headHtml(ctx, view)}</section>
       ${modelRootsPanel(rootsState, ctx.busy)}${settingsHtml(ctx, view)}</div>
     <section class="card graph-centre" aria-labelledby="graph-cards-title"><div class="section-title"><h3 id="graph-cards-title">단계 카드 <span class="count">${view.graph.nodes.length}</span></h3></div>
@@ -707,7 +708,7 @@ function addAndFocus(ctx: ViewContext, projectId: string, build: (graph: GraphJs
   ctx.store.edit(projectId, spec => { spec.graph = graphToJson(created.graph); });
   selection.set(projectId, created.id);
   addMenu = false;
-  toolbarNote = `‘${isolate(labelOf(findNode(created.graph, created.id)))}’ 단계를 추가했습니다. 저장해야 반영됩니다.`;
+  toolbarNote = msg`‘${isolate(labelOf(findNode(created.graph, created.id)))}’ 단계를 추가했습니다. 저장해야 반영됩니다.`;
   ctx.render();
   focusLabel();
 }
@@ -744,7 +745,7 @@ function removeCard(ctx: ViewContext) {
   if (next) selection.set(projectId, next); else selection.delete(projectId);
   if (benchmarkFor?.nodeId === id) benchmarkFor = null;
   addMenu = false;
-  toolbarNote = `‘${isolate(label)}’ 단계와 이 단계로 들어오던 연결을 지웠습니다. 저장하기 전에는 저장된 그래프가 바뀌지 않습니다.`;
+  toolbarNote = msg`‘${isolate(label)}’ 단계와 이 단계로 들어오던 연결을 지웠습니다. 저장하기 전에는 저장된 그래프가 바뀌지 않습니다.`;
   ctx.render();
   // The last card gone: the empty graph has no toolbar, only its starting shapes.
   if (next) restoreFocus(document, `card:${next}`); else document.querySelector<HTMLButtonElement>(".graph-starters button")?.focus();
@@ -773,7 +774,7 @@ async function readLists(ctx: ViewContext, draft: ProjectDraft | undefined) {
   try {
     const result = await queue.run(() => recipeApi.list());
     if (result.status === "ok" && result.data) { recipeList = result.data.recipes; recipeError = null; }
-    else { recipeError = notAvailable(result) ? NOT_AVAILABLE : describe(result.issues); recipeList ??= []; }
+    else { recipeError = notAvailable(result) ? tr(NOT_AVAILABLE) : describe(result.issues); recipeList ??= []; }
   } catch (error) { recipeError = errorText(error); recipeList ??= []; }
   const pinned = new Set<string>();
   for (const node of draft ? graphOf(draft).nodes : []) {
@@ -792,7 +793,7 @@ async function readLists(ctx: ViewContext, draft: ProjectDraft | undefined) {
   try {
     const result = await queue.run(() => planning.benchmarks());
     if (result.status === "ok" && result.data) { benchmarkList = result.data.benchmarks; benchmarkError = null; }
-    else { benchmarkError = notAvailable(result) ? NOT_AVAILABLE : describe(result.issues); benchmarkList ??= []; }
+    else { benchmarkError = notAvailable(result) ? tr(NOT_AVAILABLE) : describe(result.issues); benchmarkList ??= []; }
   } catch (error) { benchmarkError = errorText(error); benchmarkList ??= []; }
   try { profileList = (await queue.run(() => executorProfiles())).profiles; profileError = null; }
   catch (error) { profileError = errorText(error); }
@@ -804,7 +805,7 @@ async function enterGraph(ctx: ViewContext) {
   if (!projectId) return;
   loadIssues.delete(projectId);
   unavailable = false;                                     // this project's own reads decide again
-  await ctx.task("학습 그래프 불러오는 중", async () => {
+  await ctx.task(tr("학습 그래프 불러오는 중"), async () => {
     // The stored planning inputs first (read-only, 9.8), then the project and its lists as before (10.6).
     await queue.run(() => readPlanningInputs(projectId));
     const opened = await queue.run(() => ctx.store.open(projectId));   // null: a dirty draft is kept as it is
@@ -822,7 +823,7 @@ async function saveGraph(ctx: ViewContext) {
   const draft = projectId ? ctx.store.draft(projectId) : undefined;
   if (!projectId || !draft || ctx.busy) return;
   const still = stillOn(ctx);
-  await ctx.task("학습 그래프 저장 중", async () => {
+  await ctx.task(tr("학습 그래프 저장 중"), async () => {
     const result = await ctx.store.save(projectId);
     if (result.status === "conflict") return;      // the draft keeps its edits; the banner offers the D5 choices
     if (result.status !== "ok") { if (notAvailable(result)) unavailable = true; return; }
@@ -837,25 +838,25 @@ async function validate(ctx: ViewContext, projectId: string) {
   const result = await ctx.store.validate(projectId);
   if (result.status === "ok") {
     if (revision) validated.set(projectId, revision);
-    ctx.notify("학습 그래프를 저장했습니다. 저장한 버전을 검사했고 문제가 없습니다.");
+    ctx.notify(tr("학습 그래프를 저장했습니다. 저장한 버전을 검사했고 문제가 없습니다."));
   } else if (notAvailable(result)) {
     draft.issues = [];
-    ctx.notify(`학습 그래프를 저장했습니다. 그래프 검사는 하지 못했습니다. (${NOT_AVAILABLE})`);
-  } else ctx.notify("학습 그래프를 저장했습니다. 저장한 버전의 검사에서 확인할 점이 나왔습니다.");
+    ctx.notify(msg`학습 그래프를 저장했습니다. 그래프 검사는 하지 못했습니다. (${tr(NOT_AVAILABLE)})`);
+  } else ctx.notify(tr("학습 그래프를 저장했습니다. 저장한 버전의 검사에서 확인할 점이 나왔습니다."));
 }
 
 async function reloadGraph(ctx: ViewContext) {
   const projectId = ctx.arg;
   if (!projectId || !ctx.store.draft(projectId)) return;
-  const answer = await openDialog({ title: "최신 버전 불러오기",
-    bodyHtml: "<p>다른 곳에서 저장한 최신 버전으로 바꿉니다. 저장하지 않은 내 그래프 변경은 사라집니다.</p>",
-    actions: [{ id: "back", label: "돌아가기" }, { id: "reload", label: "불러오기", primary: true }] });
+  const answer = await openDialog({ title: tr("최신 버전 불러오기"),
+    bodyHtml: staticHtml("<p>다른 곳에서 저장한 최신 버전으로 바꿉니다. 저장하지 않은 내 그래프 변경은 사라집니다.</p>"),
+    actions: [{ id: "back", label: tr("돌아가기") }, { id: "reload", label: tr("불러오기"), primary: true }] });
   if (answer?.action !== "reload") return;
   const still = stillOn(ctx);
-  await ctx.task("최신 버전 불러오는 중", async () => {
+  await ctx.task(tr("최신 버전 불러오는 중"), async () => {
     const result = await ctx.store.reloadLatest(projectId);
     if (result.status !== "ok") throw new Error(describe(result.issues));
-    ctx.notify("최신 버전을 불러왔습니다.");
+    ctx.notify(tr("최신 버전을 불러왔습니다."));
   });
   refocus(still, "graph-save");
 }
@@ -863,12 +864,12 @@ async function reloadGraph(ctx: ViewContext) {
 async function overwriteGraph(ctx: ViewContext) {
   const projectId = ctx.arg;
   if (!projectId || !ctx.store.draft(projectId)) return;
-  const answer = await openDialog({ title: "내 변경으로 덮어쓰기",
-    bodyHtml: "<p>다른 곳에서 먼저 저장한 변경을 지금 내 초안으로 덮어씁니다. 그 변경은 최신 버전에서 빠지고 이전 버전 기록으로만 남습니다.</p>",
-    actions: [{ id: "back", label: "돌아가기" }, { id: "overwrite", label: "덮어쓰기", primary: true }] });
+  const answer = await openDialog({ title: tr("내 변경으로 덮어쓰기"),
+    bodyHtml: staticHtml("<p>다른 곳에서 먼저 저장한 변경을 지금 내 초안으로 덮어씁니다. 그 변경은 최신 버전에서 빠지고 이전 버전 기록으로만 남습니다.</p>"),
+    actions: [{ id: "back", label: tr("돌아가기") }, { id: "overwrite", label: tr("덮어쓰기"), primary: true }] });
   if (answer?.action !== "overwrite") return;
   const still = stillOn(ctx);
-  await ctx.task("내 변경으로 저장 중", async () => {
+  await ctx.task(tr("내 변경으로 저장 중"), async () => {
     const result = await ctx.store.overwriteWithDraft(projectId);
     if (result.status === "ok") await validate(ctx, projectId);
     else if (result.status === "invalid") ctx.store.draft(projectId)!.issues = result.issues;
@@ -905,11 +906,11 @@ async function saveBenchmark(ctx: ViewContext) {
   const target = benchmarkFor;
   const still = stillOn(ctx);
   let saved = false;
-  await ctx.task("평가 기준 저장 중", async () => {
+  await ctx.task(tr("평가 기준 저장 중"), async () => {
     benchmarkIssues = [];
     const result = await queue.run(() => planning.benchmarkSave(spec));
     if (result.status !== "ok" || !result.data) {
-      benchmarkIssues = result.issues.length ? result.issues : [{ code: "refused", path: "/spec", message: "평가 기준을 저장하지 못했습니다." }];
+      benchmarkIssues = result.issues.length ? result.issues : [{ code: "refused", path: "/spec", message: tr("평가 기준을 저장하지 못했습니다.") }];
       return;
     }
     const revision = result.data;
@@ -917,7 +918,7 @@ async function saveBenchmark(ctx: ViewContext) {
     benchmarkError = null;
     editNode(ctx, target.projectId, target.nodeId, node => { node.benchmark_revision = revision.revision_sha256; });
     benchmarkFor = null; benchmarkTried = false; saved = true;
-    ctx.notify("평가 기준을 저장하고 이 평가 단계에 연결했습니다. 그래프는 아직 저장하지 않았습니다.");
+    ctx.notify(tr("평가 기준을 저장하고 이 평가 단계에 연결했습니다. 그래프는 아직 저장하지 않았습니다."));
   });
   if (saved && still()) document.getElementById("node-benchmark")?.focus();
 }
@@ -1008,7 +1009,7 @@ async function graphAction(ctx: ViewContext, verb: string, arg: string | null) {
   else if (verb === "add-parallel" && projectId && selected) addAndFocus(ctx, projectId, (graph, dctx) => addParallel(graph, selected, dctx));
   else if (verb === "add-root" && projectId) addAndFocus(ctx, projectId, (graph, dctx) => addNode(graph, "train", dctx));
   else if (verb === "start" && arg && projectId) addAndFocus(ctx, projectId, (graph, dctx) => {
-    if (graph.nodes.length) throw new Error("시작 모양은 빈 그래프에서만 고를 수 있습니다.");
+    if (graph.nodes.length) throw new Error(tr("시작 모양은 빈 그래프에서만 고를 수 있습니다."));
     const built = starter(arg as StarterShape, dctx);
     return { graph: built, id: built.nodes[0].id };
   });
@@ -1035,7 +1036,7 @@ async function graphAction(ctx: ViewContext, verb: string, arg: string | null) {
   } else if (verb === "reopen") await enterGraph(ctx);
 }
 
-export const view: View = {
+export const view: View = localized(() => ({
   id: "graph", parent: "projects", title: "학습 그래프",
   description: "카드로 학습·평가·자동 선택·병합 단계를 직렬·병렬로 잇고, 저장한 버전을 바로 검사합니다.",
   render: graphPage,
@@ -1050,4 +1051,4 @@ export const view: View = {
   async enter(ctx) { await enterGraph(ctx); },
   leave() { addMenu = false; toolbarNote = null; },
   action: graphAction,
-};
+}));

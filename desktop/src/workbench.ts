@@ -1,3 +1,5 @@
+import { t as tr, msg, html as ui, staticHtml, localized } from "./i18n";
+import { locale } from "./i18n";
 type Obj = Record<string, any>;
 export const escapeHtml = (v: unknown) => String(v ?? "").replace(/[&<>"']/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
@@ -43,7 +45,7 @@ export function select(label: string, key: string, value: string, options: [stri
 export const button = (label: string, action: string, cls = "", disabled = false) =>
   `<button type="button" class="${cls}" data-action="${escapeHtml(action)}"${disabled ? " disabled" : ""}>${label}</button>`;
 export function formatDate(seconds: unknown) {
-  return typeof seconds === "number" ? new Date(seconds * 1000).toLocaleString("ko-KR", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
+  return typeof seconds === "number" ? new Date(seconds * 1000).toLocaleString(locale(), { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
 }
 export function filterRuns(runs: Obj[], query: string, status: string) {
   const needle = query.toLocaleLowerCase().trim();
@@ -52,19 +54,19 @@ export function filterRuns(runs: Obj[], query: string, status: string) {
       String(value || "").toLocaleLowerCase().includes(needle)));
 }
 export function progressView(progress: Obj | null) {
-  if (!progress?.available) return `<div class="chart-empty">${icon("history", 24)}<b>실제 학습 지표를 기다리고 있습니다</b><span>원격 진행 상태를 불러오거나 완료된 작업의 기록을 확인하세요.</span></div>`;
+  if (!progress?.available) return ui`<div class="chart-empty">${icon("history", 24)}<b>실제 학습 지표를 기다리고 있습니다</b><span>원격 진행 상태를 불러오거나 완료된 작업의 기록을 확인하세요.</span></div>`;
   const points = progress.points || [];
   const number = (value: unknown) => typeof value === "number" ? value.toLocaleString("ko-KR", { maximumFractionDigits: 4 }) : "—";
-  let chart = '<div class="chart-empty small">Loss가 두 번 이상 기록되면 추이를 표시합니다.</div>';
+  let chart = staticHtml('<div class="chart-empty small">Loss가 두 번 이상 기록되면 추이를 표시합니다.</div>');
   if (points.length >= 2) {
     const losses = points.map((p: Obj) => p.loss);
     const low = Math.min(...losses), high = Math.max(...losses);
     const first = points[0].step, last = points.at(-1).step;
     const coordinates = points.map((p: Obj) => `${36 + (p.step - first) / Math.max(1, last - first) * 574},${24 + (high - p.loss) / (high - low || 1) * 98}`).join(" ");
-    chart = `<svg class="loss-chart" viewBox="0 0 640 158" role="img" aria-label="실제 train loss 추이"><path d="M36 24H610M36 73H610M36 122H610" class="chart-grid"/><text x="0" y="28">${number(high)}</text><text x="0" y="126">${number(low)}</text><text x="36" y="148">step ${first}</text><text x="555" y="148">${last}</text><polyline points="${coordinates}" fill="none" stroke="currentColor" stroke-width="2"/></svg>`;
+    chart = ui`<svg class="loss-chart" viewBox="0 0 640 158" role="img" aria-label="실제 train loss 추이"><path d="M36 24H610M36 73H610M36 122H610" class="chart-grid"/><text x="0" y="28">${number(high)}</text><text x="0" y="126">${number(low)}</text><text x="36" y="148">step ${first}</text><text x="555" y="148">${last}</text><polyline points="${coordinates}" fill="none" stroke="currentColor" stroke-width="2"/></svg>`;
   }
-  return `<div class="progress-summary"><div><small>진행 단계</small><b>${number(progress.current_step)} <span>/ ${number(progress.total_steps)}</span></b></div><div><small>최근 train loss</small><b>${number(progress.loss)}</b></div><div><small>경과 시간</small><b>${escapeHtml(progress.elapsed_time || "—")}</b></div><div><small>남은 시간 · 엔진 추정</small><b>${escapeHtml(progress.remaining_time || "—")}</b></div></div>
-  ${progress.percent !== null && progress.percent !== undefined ? `<progress max="100" value="${Number(progress.percent)}" aria-label="학습 진행률"></progress>` : ""}
+  return ui`<div class="progress-summary"><div><small>진행 단계</small><b>${number(progress.current_step)} <span>/ ${number(progress.total_steps)}</span></b></div><div><small>최근 train loss</small><b>${number(progress.loss)}</b></div><div><small>경과 시간</small><b>${escapeHtml(progress.elapsed_time || "—")}</b></div><div><small>남은 시간 · 엔진 추정</small><b>${escapeHtml(progress.remaining_time || "—")}</b></div></div>
+  ${progress.percent !== null && progress.percent !== undefined ? ui`<progress max="100" value="${Number(progress.percent)}" aria-label="학습 진행률"></progress>` : ""}
   ${chart}<div class="chart-caption">LLaMA-Factory 원본 학습 로그 · 최대 200개 지점 · 업무 품질 점수가 아닙니다</div>`;
 }
 

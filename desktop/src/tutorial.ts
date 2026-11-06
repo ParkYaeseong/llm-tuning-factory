@@ -1,3 +1,4 @@
+import { t as tr, msg, html as ui, staticHtml, localized } from "./i18n";
 import { destinationChange } from "./server-connection";
 import { escapeHtml as esc } from "./workbench";
 import { tutorialSteps, type TutorialContext, type TutorialStep } from "./tutorial-steps";
@@ -220,29 +221,29 @@ export function createTutorial(host: TutorialHost, steps: TutorialStep[] = tutor
     // Coming back to the step's page scrolls its target into view again.
     if (away) scrolled = -1;
     const last = index === steps.length - 1;
-    const status = ending ? ["", "진행 중인 작업이 끝나면 튜토리얼을 종료합니다."]
-      : busy ? ["", "처리 중입니다. 끝나면 계속 진행할 수 있습니다."]
-      : away ? ["", "다른 화면을 보고 있습니다. ‘이 단계로 이동’을 누르세요."]
-      : !element ? ["", "이 단계의 화면 요소를 찾지 못했습니다."]
-      : practice && complete ? ["done", "완료했습니다. 다음으로 진행하세요."]
-      : practice && host.state.error ? ["error", "위의 오류 안내를 확인한 뒤 다시 시도해 보세요."]
+    const status = ending ? ["", tr("진행 중인 작업이 끝나면 튜토리얼을 종료합니다.")]
+      : busy ? ["", tr("처리 중입니다. 끝나면 계속 진행할 수 있습니다.")]
+      : away ? ["", tr("다른 화면을 보고 있습니다. ‘이 단계로 이동’을 누르세요.")]
+      : !element ? ["", tr("이 단계의 화면 요소를 찾지 못했습니다.")]
+      : practice && complete ? ["done", tr("완료했습니다. 다음으로 진행하세요.")]
+      : practice && host.state.error ? ["error", tr("위의 오류 안내를 확인한 뒤 다시 시도해 보세요.")]
       : null;
-    const html = `<div class="tour-meta"><span>${index + 1} / ${steps.length}</span><span class="badge">${practice ? "직접 해 보기" : "설명"}</span></div>
+    const nextMarkup = ui`<div class="tour-meta"><span>${index + 1} / ${steps.length}</span><span class="badge">${practice ? tr("직접 해 보기") : tr("설명")}</span></div>
       <h2 id="tour-title" tabindex="-1">${esc(step.title)}</h2><p id="tour-body">${esc(step.body)}</p>
       ${status ? `<p class="tour-status ${status[0]}">${status[1]}</p>` : ""}
       <div class="tour-actions"><button type="button" class="quiet" data-tour-action="stop" ${ending ? "disabled" : ""}>그만하기</button><span></span>
-      ${index > 0 ? `<button type="button" data-tour-action="back" ${ending ? "disabled" : ""}>이전</button>` : ""}
-      ${away ? `<button type="button" data-tour-action="goto" ${ending ? "disabled" : ""}>이 단계로 이동</button>` : ""}
+      ${index > 0 ? ui`<button type="button" data-tour-action="back" ${ending ? "disabled" : ""}>이전</button>` : ""}
+      ${away ? ui`<button type="button" data-tour-action="goto" ${ending ? "disabled" : ""}>이 단계로 이동</button>` : ""}
       ${step.cta && !away ? `<button type="button" data-tour-action="cta" ${locked ? "disabled" : ""}>${esc(step.cta.label)}</button>` : ""}
-      ${practice && !complete ? `<button type="button" data-tour-action="skip" ${locked ? "disabled" : ""}>건너뛰기</button>` : ""}
-      <button type="button" class="primary" data-tour-action="next" ${locked || (practice && !complete) ? "disabled" : ""}>${last ? "완료" : "다음"}</button></div>`;
+      ${practice && !complete ? ui`<button type="button" data-tour-action="skip" ${locked ? "disabled" : ""}>건너뛰기</button>` : ""}
+      <button type="button" class="primary" data-tour-action="next" ${locked || (practice && !complete) ? "disabled" : ""}>${last ? tr("완료") : tr("다음")}</button></div>`;
     popover.classList.toggle("centered", !element);
     // App renders (such as the jobs poll) leave an unchanged popover alone, so a click on it is not lost.
-    const rewrite = html !== markup;
-    if (rewrite) { popover.innerHTML = html; markup = html; }
+    const rewrite = nextMarkup !== markup;
+    if (rewrite) { popover.innerHTML = nextMarkup; markup = nextMarkup; }
     if (announced !== index) {
       announced = index;
-      root.querySelector(".sr-only")!.textContent = `튜토리얼 ${index + 1}단계: ${step.title}`;
+      root.querySelector(".sr-only")!.textContent = msg`튜토리얼 ${index + 1}단계: ${step.title}`;
     }
     const title = popover.querySelector<HTMLElement>("#tour-title")!;
     if (focused !== index) {

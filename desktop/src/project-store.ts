@@ -1,3 +1,4 @@
+import { t as tr, msg, html as ui, staticHtml, localized } from "./i18n";
 // Project drafts in memory (D4): the saved revision, the edited spec, dirty state, issues, conflicts (D5), planning
 // inputs and the held plan with the basis it is valid for (D8). Pure: the bridge is injected, so Node tests use a fake.
 import type { BindingRole, DatasetBinding, PlanSummary, PlanningEstimate, ProjectRevision, ProjectSpec, Sha256,
@@ -39,14 +40,14 @@ export interface ProjectStore {
   markProfilesChanged(): void; markSettingsChanged(): void; markRecipeChanged(previousRevision: Sha256): void;
 }
 
-export const PLAN_DROPPED = {
-  edit: "프로젝트 초안이 바뀌었습니다. 계획을 다시 확인하세요.",
-  planning: "계획 입력이 바뀌었습니다. 계획을 다시 확인하세요.",
-  revision: "프로젝트가 다른 버전으로 바뀌었습니다. 계획을 다시 확인하세요.",
-  profiles: "실행 프로필이 바뀌었습니다. 계획을 다시 확인하세요.",
-  settings: "연결 설정이 바뀌었습니다. 계획을 다시 확인하세요.",
-  recipe: "계획에 쓴 레시피가 바뀌었습니다. 계획을 다시 확인하세요.",
-} as const;
+export const PLAN_DROPPED = localized(() => ({
+  edit: tr("프로젝트 초안이 바뀌었습니다. 계획을 다시 확인하세요."),
+  planning: tr("계획 입력이 바뀌었습니다. 계획을 다시 확인하세요."),
+  revision: tr("프로젝트가 다른 버전으로 바뀌었습니다. 계획을 다시 확인하세요."),
+  profiles: tr("실행 프로필이 바뀌었습니다. 계획을 다시 확인하세요."),
+  settings: tr("연결 설정이 바뀌었습니다. 계획을 다시 확인하세요."),
+  recipe: tr("계획에 쓴 레시피가 바뀌었습니다. 계획을 다시 확인하세요."),
+} as const));
 
 /** Key-order independent JSON, so a draft edited back to its saved values is clean again. */
 function canonical(value: unknown): string {

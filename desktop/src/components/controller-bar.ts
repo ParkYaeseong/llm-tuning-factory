@@ -1,3 +1,4 @@
+import { t as tr, msg, html as ui, staticHtml, localized } from "../i18n";
 // The background controller bar (10.4; D9, D10): the controller's state from `controller_status`, start and stop with
 // their explanations, and what a restart would change. Shown on the executor profiles page (and on 10.7's runs page).
 // It never starts, stops or restarts anything by itself: polling only reads, and every mutation follows a click.
@@ -17,10 +18,10 @@ const NOT_AVAILABLE = "컨트롤러 기능이 아직 설치되지 않았습니�
 const STATUS_BUSY = "컨트롤러 상태를 지금 읽을 수 없습니다. 작업 기록이 사용 중입니다.";
 const BASE_MS = 5000;                                    // D10: controller_status every 5 s while a page shows the bar
 // controller_entry.provider_profiles: why the running controller left a profile out at its start.
-const SKIP_REASONS: Record<string, string> = {
+const SKIP_REASONS: Record<string, string> = localized(() => ({
   credential_missing: "RunPod API 키 없음", observation_missing: "자원 확인 기록 없음",
   observation_revision_differs: "확인 후 프로필이 바뀜", observation_invalid: "확인 기록 오류", invalid_fields: "프로필 항목 오류",
-};
+}));
 
 export interface ControllerBarState {
   status: ControllerStatus | null; unavailable: boolean; error: string | null;
@@ -49,7 +50,7 @@ let active: Handle | null = null;
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 /** The Korean texts of workflow issues, each with its original when it differs (one line each). */
-export function issueText(issues: WorkflowIssue[], fallback = "요청을 처리하지 못했습니다."): string {
+export function issueText(issues: WorkflowIssue[], fallback = tr("요청을 처리하지 못했습니다.")): string {
   return issues.map(issue => {
     const { text, original } = localize(issue);
     return original ? `${text} (${original})` : text;
@@ -57,13 +58,13 @@ export function issueText(issues: WorkflowIssue[], fallback = "요청을 처리�
 }
 function since(seconds: unknown): string | null {
   if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return null;
-  if (seconds < 60) return `${Math.floor(seconds)}초`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}분`;
-  return `${Math.floor(seconds / 3600)}시간`;
+  if (seconds < 60) return msg`${Math.floor(seconds)}초`;
+  if (seconds < 3600) return msg`${Math.floor(seconds / 60)}분`;
+  return msg`${Math.floor(seconds / 3600)}시간`;
 }
 const note = (kind: "" | "warn" | "bad", text: string | string[], detail = "") =>
   `<div class="wf-banner ${kind} controller-note"><div>${(Array.isArray(text) ? text : [text]).map(line => `<p>${escapeHtml(line)}</p>`).join("")}${detail ? `<small>${escapeHtml(detail)}</small>` : ""}</div></div>`;
-const procedure = `다시 시작하는 순서: ${RESTART_PROCEDURE}`;
+const procedure = () => msg`다시 시작하는 순서: ${tr(RESTART_PROCEDURE)}`;
 
 /** The state the bar shows now: the last read plus what the attached host page knows (profiles, settings). */
 export function controllerBarState(): ControllerBarState {
@@ -72,24 +73,24 @@ export function controllerBarState(): ControllerBarState {
 
 /** The state in words, without the signal age (the pill and the live region; neither changes on an age-only poll). */
 function stateLabel(state: ControllerBarState): { kind: "neutral" | "good" | "warn" | "bad"; text: string } {
-  if (state.unavailable) return { kind: "neutral", text: NOT_AVAILABLE };
+  if (state.unavailable) return { kind: "neutral", text: tr(NOT_AVAILABLE) };
   const status = state.status;
-  if (!status) return state.error ? { kind: "bad", text: "상태를 확인할 수 없음" } : { kind: "neutral", text: "상태 확인 중" };
+  if (!status) return state.error ? { kind: "bad", text: tr("상태를 확인할 수 없음") } : { kind: "neutral", text: tr("상태 확인 중") };
   if (status.controller.state === "running")
-    return status.stop_requested ? { kind: "warn", text: "정지 요청됨 · 진행 중 단계가 끝나면 정지합니다" } : { kind: "good", text: "동작 중" };
-  if (status.controller.state === "stale") return { kind: "warn", text: "연결 끊김" };
-  return { kind: "neutral", text: "정지" };
+    return status.stop_requested ? { kind: "warn", text: tr("정지 요청됨 · 진행 중 단계가 끝나면 정지합니다") } : { kind: "good", text: tr("동작 중") };
+  if (status.controller.state === "stale") return { kind: "warn", text: tr("연결 끊김") };
+  return { kind: "neutral", text: tr("정지") };
 }
 /** The signal age beside the pill ("" when there is none); a poll updates it in place. */
 function signalText(state: ControllerBarState): string {
   const status = state.unavailable ? null : state.status;
   if (!status) return "";
   const age = since(status.controller.heartbeat_age_seconds);
-  if (status.controller.state === "running") return age ? `마지막 신호 ${age} 전` : "";
-  if (status.controller.state === "stale") return `${age ? `신호 ${age} 전 · ` : ""}PC가 절전·종료되었다면 다시 시작하세요`;
+  if (status.controller.state === "running") return age ? msg`마지막 신호 ${age} 전` : "";
+  if (status.controller.state === "stale") return msg`${age ? msg`신호 ${age} 전 · ` : ""}PC가 절전·종료되었다면 다시 시작하세요`;
   return "";
 }
-const liveText = (state: ControllerBarState) => `백그라운드 컨트롤러: ${stateLabel(state).text}`;
+const liveText = (state: ControllerBarState) => msg`백그라운드 컨트롤러: ${stateLabel(state).text}`;
 /** What a poll compares before patching: the read without its heartbeat age (that only updates the signal text). */
 function signature(read: Read): string {
   const status = read.status && { ...read.status, controller: { ...read.status.controller, heartbeat_age_seconds: null } };
@@ -102,18 +103,18 @@ function trackingCredentialMissing(status: ControllerStatus, settings: Readonly<
   const tracking = isRecord(status.current) ? status.current.tracking : null;
   if (!isRecord(tracking) || tracking.effective_auth_mode !== "none" || !settings) return null;
   const blank = (name: string) => !String(settings[name] ?? "").trim();
-  const then = "연결 설정에서 저장한 뒤 컨트롤러를 다시 시작하세요.";
+  const then = tr("연결 설정에서 저장한 뒤 컨트롤러를 다시 시작하세요.");
   if (settings.auth_mode === "token")
-    return settings.MLFLOW_TRACKING_TOKEN_saved ? null : `MLflow 인증값이 저장되어 있지 않습니다. ${then}`;
+    return settings.MLFLOW_TRACKING_TOKEN_saved ? null : msg`MLflow 인증값이 저장되어 있지 않습니다. ${then}`;
   if (settings.auth_mode !== "oidc") return null;
-  if (blank("MLFLOW_OIDC_TOKEN_URL")) return `MLflow 인증 서버 주소(OIDC)가 저장되어 있지 않습니다. ${then}`;
-  if (blank("MLFLOW_OIDC_CLIENT_ID")) return `MLflow OIDC 클라이언트 ID가 저장되어 있지 않습니다. ${then}`;
-  return settings.MLFLOW_OIDC_CLIENT_SECRET_saved ? null : `MLflow 인증값이 저장되어 있지 않습니다. ${then}`;
+  if (blank("MLFLOW_OIDC_TOKEN_URL")) return msg`MLflow 인증 서버 주소(OIDC)가 저장되어 있지 않습니다. ${then}`;
+  if (blank("MLFLOW_OIDC_CLIENT_ID")) return msg`MLflow OIDC 클라이언트 ID가 저장되어 있지 않습니다. ${then}`;
+  return settings.MLFLOW_OIDC_CLIENT_SECRET_saved ? null : msg`MLflow 인증값이 저장되어 있지 않습니다. ${then}`;
 }
 
 function notes(state: ControllerBarState): string[] {
   const out: string[] = [];
-  if (state.busyRead) out.push(note("", state.busyRead, "자동으로 다시 확인합니다. 아래 표시는 마지막으로 읽은 상태입니다."));
+  if (state.busyRead) out.push(note("", state.busyRead, tr("자동으로 다시 확인합니다. 아래 표시는 마지막으로 읽은 상태입니다.")));
   if (state.error) out.push(note("bad", state.error));
   const status = state.status;
   if (!status || state.unavailable) return out;
@@ -121,32 +122,32 @@ function notes(state: ControllerBarState): string[] {
   const current = isRecord(status.current) ? status.current : null;
   // broker.json only ever describes a start that failed; while a controller runs it describes another start.
   if (!running && status.broker)
-    out.push(note("bad", `최근 컨트롤러 시작 실패 · ${formatDate(status.broker.at)}`, String(status.broker.error ?? "")));
+    out.push(note("bad", msg`최근 컨트롤러 시작 실패 · ${formatDate(status.broker.at)}`, String(status.broker.error ?? "")));
   if (current?.ok === false) {
     const error = typeof current.error === "string" ? current.error : "";
     out.push(note("bad", current.code === "controller_failed"
-      ? `컨트롤러가 오류로 멈췄습니다.${typeof current.error_type === "string" ? ` (${current.error_type})` : ""}`
-      : error || `컨트롤러를 시작하지 못했습니다. (${String(current.code ?? "")})`));
+      ? msg`컨트롤러가 오류로 멈췄습니다.${typeof current.error_type === "string" ? ` (${current.error_type})` : ""}`
+      : error || msg`컨트롤러를 시작하지 못했습니다. (${String(current.code ?? "")})`));
   }
   // What a restart would change, in one banner with the D5 procedure once.
   const restart: string[] = [];
   const changed = Array.isArray(status.restart_required?.profiles) ? status.restart_required.profiles : [];
-  if (changed.length) restart.push(`컨트롤러 시작 후 바뀐 실행 프로필: ${changed.join(", ")}`);
+  if (changed.length) restart.push(msg`컨트롤러 시작 후 바뀐 실행 프로필: ${changed.join(", ")}`);
   const credentialMissing = status.restart_required?.tracking === true ? trackingCredentialMissing(status, state.settings) : null;
-  if (status.restart_required?.tracking === true && !credentialMissing) restart.push("MLflow 설정이 바뀌었습니다");
+  if (status.restart_required?.tracking === true && !credentialMissing) restart.push(tr("MLflow 설정이 바뀌었습니다"));
   // What the running controller left out at its start (current.json of this owner only).
   const skipped = running && current?.ok === true && current.owner_id === status.controller.owner_id && isRecord(current.skipped_profiles)
     ? Object.entries(current.skipped_profiles).filter((entry): entry is [string, string] => typeof entry[1] === "string") : [];
   const keyed = skipped.filter(([id, reason]) => reason === "credential_missing"
     && (state.profiles ?? []).some(profile => profile.profile_id === id && profile.RUNPOD_API_KEY_saved));
   const others = skipped.filter(entry => !keyed.includes(entry));
-  if (keyed.length) restart.push(`키 저장 후 컨트롤러를 다시 시작하세요: ${keyed.map(([id]) => id).join(", ")}`);
-  if (restart.length) out.push(note("warn", restart, procedure));
+  if (keyed.length) restart.push(msg`키 저장 후 컨트롤러를 다시 시작하세요: ${keyed.map(([id]) => id).join(", ")}`);
+  if (restart.length) out.push(note("warn", restart, procedure()));
   if (credentialMissing) out.push(note("warn", credentialMissing));
   if (others.length)
-    out.push(note("", `시작할 때 쓰지 않은 실행 프로필: ${others.map(([id, reason]) => `${id} (${SKIP_REASONS[reason] ?? reason})`).join(", ")}`));
+    out.push(note("", msg`시작할 때 쓰지 않은 실행 프로필: ${others.map(([id, reason]) => `${id} (${SKIP_REASONS[reason] ?? reason})`).join(", ")}`));
   if (!running && status.runs?.active > 0)
-    out.push(note("warn", `진행 중인 그래프 실행 ${status.runs.active}개가 있지만 컨트롤러가 동작하지 않아 진행되지 않습니다. 컨트롤러를 시작하세요.`));
+    out.push(note("warn", msg`진행 중인 그래프 실행 ${status.runs.active}개가 있지만 컨트롤러가 동작하지 않아 진행되지 않습니다. 컨트롤러를 시작하세요.`));
   return out;
 }
 
@@ -155,13 +156,13 @@ export function controllerBarInner(state: ControllerBarState, busy: boolean, hos
   const status = state.unavailable ? null : state.status;
   const running = status?.controller.state === "running";
   const label = stateLabel(state), signal = signalText(state);
-  const summary = running ? `진행 중인 그래프 실행 ${status!.runs?.active ?? 0}개` : "";
+  const summary = running ? msg`진행 중인 그래프 실행 ${status!.runs?.active ?? 0}개` : "";
   const startDisabled = busy || state.unavailable || running;
   const stopDisabled = busy || state.unavailable || !running || Boolean(status?.stop_requested);
   const list = notes(state);
-  return `<div class="controller-head"><h3 id="controller-bar-title">백그라운드 컨트롤러</h3>
+  return ui`<div class="controller-head"><h3 id="controller-bar-title">백그라운드 컨트롤러</h3>
     <div class="controller-state">${statusPill(label.kind, label.text)}${signal ? `<span id="controller-bar-signal" class="controller-signal">${escapeHtml(signal)}</span>` : ""}${summary ? `<span>${escapeHtml(summary)}</span>` : ""}</div>
-    <div class="actions">${button("컨트롤러 시작", `wf:${host}:controller-start`, running ? "" : "primary", startDisabled)}${button("컨트롤러 정지", `wf:${host}:controller-stop`, "", stopDisabled)}</div></div>
+    <div class="actions">${button(tr("컨트롤러 시작"), `wf:${host}:controller-start`, running ? "" : "primary", startDisabled)}${button(tr("컨트롤러 정지"), `wf:${host}:controller-stop`, "", stopDisabled)}</div></div>
     ${list.length ? `<div class="controller-notes">${list.join("")}</div>` : ""}
     <p class="muted controller-foot">앱은 컨트롤러를 자동으로 시작하지 않습니다. 실행 프로필의 RunPod 키나 MLflow 인증값을 저장하거나 바꾼 뒤에는 컨트롤러를 다시 시작해야 새 값을 씁니다. 앱을 업데이트하거나 제거하기 전에는 컨트롤러를 정지하세요.</p>`;
 }
@@ -179,9 +180,9 @@ function readOf(result: WorkflowResult<ControllerStatus>): [Read, "ok" | "failed
   if (result.issues.some(issue => issue.code === "not_available")) return [{ ...NONE, unavailable: true }, "unavailable"];
   // `status_busy` is transient: the last status of this visit stays, marked as not current.
   const busy = result.issues.find(issue => issue.code === "status_busy");
-  if (busy) return [{ ...last, error: null, busyRead: busy.message || STATUS_BUSY }, "failed"];
+  if (busy) return [{ ...last, error: null, busyRead: busy.message || tr(STATUS_BUSY) }, "failed"];
   // Never keep showing an unverified controller as running.
-  return [{ ...NONE, error: issueText(result.issues, "컨트롤러 상태를 확인하지 못했습니다.") }, "failed"];
+  return [{ ...NONE, error: issueText(result.issues, tr("컨트롤러 상태를 확인하지 못했습니다.")) }, "failed"];
 }
 
 /**
@@ -242,15 +243,15 @@ export function attachControllerBar(ctx: ViewContext, options: { host?: string; 
 /** "컨트롤러 시작" (D9: only on a click, never automatically): a started controller is followed by an immediate read. */
 export async function startControllerFlow(ctx: ViewContext): Promise<void> {
   const handle = active;
-  await ctx.task("컨트롤러 시작 중", async () => {
+  await ctx.task(tr("컨트롤러 시작 중"), async () => {
     let result: { started: boolean; reason?: string };
     try { result = await (handle?.queue ?? createQueue()).run(() => startController()); }
     catch (error) {
       const text = errorText(error);
-      throw new Error(text.includes(ROOT_UNUSABLE) ? `${text}\n${REDIRECTED_APPDATA}` : text);
+      throw new Error(text.includes(tr(ROOT_UNUSABLE)) ? `${text}\n${tr(REDIRECTED_APPDATA)}` : text);
     }
-    ctx.notify(result.started ? "컨트롤러를 시작했습니다. 상태가 ‘동작 중’이 되는지 확인하세요."
-      : result.reason === "already_running" ? "컨트롤러가 이미 동작 중입니다." : "컨트롤러를 시작하지 않았습니다.");
+    ctx.notify(result.started ? tr("컨트롤러를 시작했습니다. 상태가 ‘동작 중’이 되는지 확인하세요.")
+      : result.reason === "already_running" ? tr("컨트롤러가 이미 동작 중입니다.") : tr("컨트롤러를 시작하지 않았습니다."));
     if (handle && !handle.detached) await handle.read();
   });
 }
@@ -258,18 +259,18 @@ export async function startControllerFlow(ctx: ViewContext): Promise<void> {
 /** "컨트롤러 정지": a dialog explains the drain (D9); Esc or "돌아가기" sends nothing. */
 export async function stopControllerFlow(ctx: ViewContext): Promise<void> {
   const handle = active;
-  const answer = await openDialog({ title: "컨트롤러 정지",
-    bodyHtml: `<p>${escapeHtml(DRAIN_NOTICE)}</p><p>정지 요청 뒤에도 진행 상황은 이 상태 표시줄에서 확인할 수 있습니다.</p>`,
-    actions: [{ id: "back", label: "돌아가기" }, { id: "stop", label: "정지 요청", primary: true }] });
+  const answer = await openDialog({ title: tr("컨트롤러 정지"),
+    bodyHtml: ui`<p>${escapeHtml(tr(DRAIN_NOTICE))}</p><p>정지 요청 뒤에도 진행 상황은 이 상태 표시줄에서 확인할 수 있습니다.</p>`,
+    actions: [{ id: "back", label: tr("돌아가기") }, { id: "stop", label: tr("정지 요청"), primary: true }] });
   if (answer?.action !== "stop") return;
-  await ctx.task("컨트롤러 정지 요청 중", async () => {
+  await ctx.task(tr("컨트롤러 정지 요청 중"), async () => {
     const result = await (handle?.queue ?? createQueue()).run(() => stopController());
     if (result.status !== "ok" || !result.data) {
       if (result.issues.some(issue => issue.code === "not_available") && handle && !handle.detached) last = { ...NONE, unavailable: true };
       throw new Error(issueText(result.issues));
     }
-    ctx.notify(result.data.requested ? "정지를 요청했습니다. 진행 중인 단계가 끝나면 컨트롤러가 정지합니다."
-      : "컨트롤러가 동작 중이 아니어서 정지할 것이 없습니다.");
+    ctx.notify(result.data.requested ? tr("정지를 요청했습니다. 진행 중인 단계가 끝나면 컨트롤러가 정지합니다.")
+      : tr("컨트롤러가 동작 중이 아니어서 정지할 것이 없습니다."));
     if (handle && !handle.detached) await handle.read();
   });
 }

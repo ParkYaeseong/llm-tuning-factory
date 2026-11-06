@@ -1,3 +1,4 @@
+import { t as tr, msg, html as ui, staticHtml, localized } from "../i18n";
 // The plan panel of the graph page (10.6; D5, D8, D9 and the root decision on planning inputs). Planning inputs (the
 // dry-run choice, each non-select card's maximum run time, estimates for dry runs) are kept by 9.8's
 // planning_inputs_get/_save: read when the page is entered, saved by "계획 확인" when they changed, never naming a card
@@ -51,9 +52,9 @@ const RUN_EXISTS = "이 계획으로 등록한 실행이 있습니다";
 /** The next step after RUN_EXISTS (11.5 R3 M5): the same inputs plan to the same hash, so something must change. */
 const RERUN_HINT = "다시 실행하려면 입력(최대 실행 시간 등)을 바꾸거나 실행 프로필에서 자원을 다시 확인한 뒤 ‘계획 확인’으로 새 계획을 만드세요.";
 /** Fixed texts of non-blocking warnings shown at their profile; the backend text stays under "원문 보기". */
-const WARNING_TEXTS: Record<string, string> = {
+const WARNING_TEXTS: Record<string, string> = localized(() => ({
   observation_revision_differs: "자원 확인 후 프로필이 바뀌었습니다 · 모의 계획은 확인 당시 자원으로 계산했습니다",
-};
+}));
 
 // -- module state (session only; the backend keeps the planning inputs and the plans) --
 interface Feedback { revision: Sha256; issues: WorkflowIssue[]; warnings: WorkflowIssue[]; estimates: string[]; nodes: string[] }
@@ -80,7 +81,7 @@ const notAvailable = (result: WorkflowResult<unknown>) => result.issues.some(iss
 const describe = (issues: WorkflowIssue[]) => issues.map(issue => {
   const { text, original } = localize(issue);
   return original ? `${text} (${original})` : text;
-}).join(" ") || "요청을 처리하지 못했습니다.";
+}).join(" ") || tr("요청을 처리하지 못했습니다.");
 const limitKey = (projectId: string, nodeId: string) => `${projectId}\u0000${nodeId}`;
 const planned = (graph: GraphJson) => graph.nodes.filter(node => node.kind !== "select");
 const labelText = (node: NodeJson) => typeof node.label === "string" && node.label.trim() ? node.label : node.id;
@@ -125,7 +126,7 @@ const markStale = (draft: ProjectDraft, issues: WorkflowIssue[]) => {
  * at that estimate instead of an unknown profile on the card.
  */
 export function planRequest(draft: ProjectDraft, graph: GraphJson, recipes: ReadonlyMap<Sha256, RecipeSummary>): PlanRequest {
-  if (!draft.saved) throw new Error(NOT_SAVED);
+  if (!draft.saved) throw new Error(tr(NOT_SAVED));
   const nodes = planned(graph);
   const used = new Set(nodes.flatMap(profilesOf));
   const simulation = draft.planning.simulation;
@@ -148,15 +149,15 @@ function badLimits(draft: ProjectDraft): string[] {
 export function planBlockers(draft: ProjectDraft, settings: Readonly<Record<string, unknown>>,
     recipes?: ReadonlyMap<Sha256, RecipeSummary>): string[] {
   const out: string[] = [];
-  if (!draft.saved || draft.dirty) out.push(NOT_SAVED);
-  else if (!planned(savedGraph(draft)).length) out.push(NO_STEPS);
-  if (projectStale(draft)) out.push(PROJECT_STALE);
+  if (!draft.saved || draft.dirty) out.push(tr(NOT_SAVED));
+  else if (!planned(savedGraph(draft)).length) out.push(tr(NO_STEPS));
+  if (projectStale(draft)) out.push(tr(PROJECT_STALE));
   // A PPO recipe the page could not read would be planned on the wrong runtime: never guessed.
   const unknown = recipes && draft.saved ? planned(savedGraph(draft)).filter(node => recipeUnknown(node, recipes)).map(labelText) : [];
-  if (unknown.length) out.push(`${RECIPE_UNKNOWN}: ${unknown.join(", ")}`);
+  if (unknown.length) out.push(`${tr(RECIPE_UNKNOWN)}: ${unknown.join(", ")}`);
   const bad = badLimits(draft);
-  if (bad.length) out.push(`${BAD_LIMIT}: ${bad.join(", ")}`);
-  if (!draft.planning.simulation && !String(settings.MLFLOW_TRACKING_URI ?? "").trim()) out.push(NO_MLFLOW);
+  if (bad.length) out.push(`${tr(BAD_LIMIT)}: ${bad.join(", ")}`);
+  if (!draft.planning.simulation && !String(settings.MLFLOW_TRACKING_URI ?? "").trim()) out.push(tr(NO_MLFLOW));
   return out;
 }
 
@@ -203,11 +204,11 @@ function validStored(value: unknown): StoredPlanningInputs | null | undefined {
 
 /** `planning_inputs_get` (read-only), kept until `applyPlanningInputs` once the draft is open. */
 export async function readPlanningInputs(projectId: string): Promise<void> {
-  const failed = (why: string) => inputsNote.set(projectId, `저장된 계획 입력을 불러오지 못했습니다. ${why} · 이 화면의 값으로 계획합니다.`);
+  const failed = (why: string) => inputsNote.set(projectId, msg`저장된 계획 입력을 불러오지 못했습니다. ${why} · 이 화면의 값으로 계획합니다.`);
   try {
     const result = await planningInputs.get(projectId);
     const inputs = result.status === "ok" && isObject(result.data) && result.data.project_id === projectId ? validStored(result.data.inputs) : undefined;
-    if (inputs === undefined) { failed(result.status === "ok" ? MALFORMED : notAvailable(result) ? NOT_AVAILABLE : describe(result.issues)); return; }
+    if (inputs === undefined) { failed(result.status === "ok" ? tr(MALFORMED) : notAvailable(result) ? tr(NOT_AVAILABLE) : describe(result.issues)); return; }
     storedInputs.set(projectId, inputs); pendingApply.set(projectId, inputs); inputsNote.delete(projectId);
   } catch (error) { failed(errorText(error)); }
 }
@@ -256,7 +257,7 @@ async function persistInputs(projectId: string, draft: ProjectDraft, graph: Grap
     return true;
   }
   if (notAvailable(result)) {
-    inputsNote.set(projectId, `계획 입력을 이 PC에 저장하지 못했습니다 (${NOT_AVAILABLE}) · 이번 계획은 화면의 값으로 만듭니다.`);
+    inputsNote.set(projectId, msg`계획 입력을 이 PC에 저장하지 못했습니다 (${tr(NOT_AVAILABLE)}) · 이번 계획은 화면의 값으로 만듭니다.`);
     return true;
   }
   markStale(draft, result.issues);                           // a revision_conflict: the project was saved elsewhere
@@ -302,15 +303,15 @@ function estimateProblems(entry: EstimateDraft, draft: ProjectDraft, profiles: r
   const out: string[] = [];
   const name = entry.name.trim(), gpuType = entry.gpuType.trim();
   const id = `estimate-${name}`;
-  if (!ESTIMATE_NAME.test(name)) out.push("추정 자원 이름은 영문·숫자와 _ . - 로 56자 이내로 입력하세요.");
-  else if (draft.planning.estimates.some(estimate => estimateKey(estimate.profile_id) === estimateKey(id))) out.push("같은 이름의 추정 자원이 이미 있습니다.");
-  else if (profiles.some(profile => estimateKey(profile.profile_id) === estimateKey(id))) out.push("저장된 실행 프로필 ID와 같은 이름은 쓸 수 없습니다.");
-  if (!gpuType || gpuType.length > 100 || !GPU_TYPE.test(gpuType)) out.push("GPU 종류는 영문·숫자로 시작하고 영문·숫자·공백·._()- 만 써서 100자 이내로 입력하세요.");
+  if (!ESTIMATE_NAME.test(name)) out.push(tr("추정 자원 이름은 영문·숫자와 _ . - 로 56자 이내로 입력하세요."));
+  else if (draft.planning.estimates.some(estimate => estimateKey(estimate.profile_id) === estimateKey(id))) out.push(tr("같은 이름의 추정 자원이 이미 있습니다."));
+  else if (profiles.some(profile => estimateKey(profile.profile_id) === estimateKey(id))) out.push(tr("저장된 실행 프로필 ID와 같은 이름은 쓸 수 없습니다."));
+  if (!gpuType || gpuType.length > 100 || !GPU_TYPE.test(gpuType)) out.push(tr("GPU 종류는 영문·숫자로 시작하고 영문·숫자·공백·._()- 만 써서 100자 이내로 입력하세요."));
   const count = Number(entry.count.trim());
-  if (!/^\d+$/.test(entry.count.trim()) || count < 1 || count > 8) out.push("GPU 수는 1–8 사이의 정수로 입력하세요.");
+  if (!/^\d+$/.test(entry.count.trim()) || count < 1 || count > 8) out.push(tr("GPU 수는 1–8 사이의 정수로 입력하세요."));
   const price = Number(entry.price.trim());
-  if (!entry.price.trim() || !Number.isFinite(price) || price <= 0 || price > 1000) out.push("시간당 총 요금은 0보다 크고 1000 이하인 USD 금액으로 입력하세요.");
-  if (draft.planning.estimates.length >= MAX_ESTIMATES) out.push(`추정 자원은 ${MAX_ESTIMATES}개까지 둘 수 있습니다.`);
+  if (!entry.price.trim() || !Number.isFinite(price) || price <= 0 || price > 1000) out.push(tr("시간당 총 요금은 0보다 크고 1000 이하인 USD 금액으로 입력하세요."));
+  if (draft.planning.estimates.length >= MAX_ESTIMATES) out.push(msg`추정 자원은 ${MAX_ESTIMATES}개까지 둘 수 있습니다.`);
   return out;
 }
 
@@ -322,7 +323,7 @@ function warningList(warnings: WorkflowIssue[]): string {
   if (!warnings.length) return "";
   return `<ul class="plan-warnings">${warnings.map(warning => {
     const text = WARNING_TEXTS[warning.code] ?? localize(warning).text;
-    const original = text !== warning.message ? `<details><summary>원문 보기</summary><span class="issue-original">${escapeHtml(warning.message)}</span></details>` : "";
+    const original = text !== warning.message ? ui`<details><summary>원문 보기</summary><span class="issue-original">${escapeHtml(warning.message)}</span></details>` : "";
     return `<li data-code="${escapeHtml(warning.code)}"><span>${escapeHtml(text)}</span>${original}</li>`;
   }).join("")}</ul>`;
 }
@@ -351,43 +352,43 @@ function modeHtml(draft: ProjectDraft): string {
     const checked = (value === "simulation") === draft.planning.simulation;
     return `<label class="check plan-radio"><input type="radio" name="plan-mode" value="${value}" data-plan-mode="${value}" data-focus-key="plan-mode-${value}"${checked ? " checked" : ""}>${label}</label><small>${help}</small>`;
   };
-  return `<fieldset class="plan-mode"><legend>계획 종류</legend>
-    ${radio("simulation", "모의 실행 계획 · 기본", "GPU를 쓰지 않고 데이터를 보내지 않습니다. 결과는 실제 품질이 아닙니다.")}
-    ${radio("real", "실제 실행 계획", "승인하면 실행 자원에서 GPU 요금이 발생하고 데이터를 보냅니다.")}</fieldset>`;
+  return ui`<fieldset class="plan-mode"><legend>계획 종류</legend>
+    ${radio("simulation", tr("모의 실행 계획 · 기본"), tr("GPU를 쓰지 않고 데이터를 보내지 않습니다. 결과는 실제 품질이 아닙니다."))}
+    ${radio("real", tr("실제 실행 계획"), tr("승인하면 실행 자원에서 GPU 요금이 발생하고 데이터를 보냅니다."))}</fieldset>`;
 }
 
 function limitsHtml(draft: ProjectDraft, view: PlanView): string {
   const graph = readGraph(draft.spec.graph);
   const nodes = planned(graph);
   const found = current(draft);
-  if (!nodes.length) return '<p class="muted">학습 단계를 추가하면 단계별 최대 실행 시간을 정할 수 있습니다.</p>';
+  if (!nodes.length) return staticHtml('<p class="muted">학습 단계를 추가하면 단계별 최대 실행 시간을 정할 수 있습니다.</p>');
   const rows = nodes.map(node => {
     const typed = limitText.get(limitKey(draft.projectId, node.id));
     const value = typed ?? String(Math.round(secondsOf(draft, node.id) / 60));
     const issues = limitIssues(found, node.id);
     const invalid = typed !== undefined || issues.length > 0;
     const label = labelText(node);
-    return `<tr data-plan-node="${escapeHtml(node.id)}"><th scope="row"><span>${escapeHtml(label)}</span><small>${escapeHtml(kindLabel(node.kind))} · ${escapeHtml(node.id)}</small></th>
+    return ui`<tr data-plan-node="${escapeHtml(node.id)}"><th scope="row"><span>${escapeHtml(label)}</span><small>${escapeHtml(kindLabel(node.kind))} · ${escapeHtml(node.id)}</small></th>
       <td><input type="number" min="1" max="${MAX_MINUTES}" step="1" inputmode="numeric" data-plan-limit="${escapeHtml(node.id)}" data-focus-key="plan-limit:${escapeHtml(node.id)}" aria-label="${escapeHtml(label)} 최대 실행 시간 (분)" value="${escapeHtml(value)}"${invalid ? ' aria-invalid="true"' : ""}>${issueBlock(issues)}</td>
-      <td class="mono">${recipeUnknown(node, view.recipes) ? '<span class="plan-unknown" title="레시피 정보를 확인할 수 없습니다">확인 불가</span>' : runtimeOf(node, view.recipes)}</td></tr>`;
+      <td class="mono">${recipeUnknown(node, view.recipes) ? staticHtml('<span class="plan-unknown" title="레시피 정보를 확인할 수 없습니다">확인 불가</span>') : runtimeOf(node, view.recipes)}</td></tr>`;
   }).join("");
   const selects = graph.nodes.length - nodes.length;
-  return `<table class="plan-limits"><caption>단계별 최대 실행 시간 · 기본 ${DEFAULT_MINUTES}분, 1–${MAX_MINUTES}분</caption>
+  return ui`<table class="plan-limits"><caption>단계별 최대 실행 시간 · 기본 ${DEFAULT_MINUTES}분, 1–${MAX_MINUTES}분</caption>
     <thead><tr><th scope="col">단계</th><th scope="col">최대 실행 시간 (분)</th><th scope="col">실행 환경</th></tr></thead><tbody>${rows}</tbody></table>
-    ${selects ? '<p class="muted">자동 선택 단계는 GPU를 쓰지 않아 시간 제한이 없습니다.</p>' : ""}`;
+    ${selects ? staticHtml('<p class="muted">자동 선택 단계는 GPU를 쓰지 않아 시간 제한이 없습니다.</p>') : ""}`;
 }
 
 function estimatesHtml(draft: ProjectDraft, busy: boolean): string {
   const found = current(draft);
-  const items = draft.planning.estimates.map(estimate => `<li class="plan-estimate" data-plan-estimate="${escapeHtml(estimate.profile_id)}" data-focus-key="estimate:${escapeHtml(estimate.profile_id)}" tabindex="-1">
+  const items = draft.planning.estimates.map(estimate => ui`<li class="plan-estimate" data-plan-estimate="${escapeHtml(estimate.profile_id)}" data-focus-key="estimate:${escapeHtml(estimate.profile_id)}" tabindex="-1">
       <div><b class="mono">${escapeHtml(estimate.profile_id)}</b><small>${escapeHtml(`${estimate.gpu_type} ×${estimate.gpu_count}`)} · ${escapeHtml(usd(estimate.total_hourly_cost_usd))}/시간</small></div>
       <button type="button" class="quiet" data-action="wf:graph:plan-estimate-remove:${escapeHtml(estimate.profile_id)}" aria-label="${escapeHtml(estimate.profile_id)} 삭제"${busy ? " disabled" : ""}>삭제</button>
       ${issueBlock(estimateIssues(found, "issues", estimate.profile_id))}${warningList(estimateIssues(found, "warnings", estimate.profile_id))}</li>`).join("");
   const open = estimateDraft?.projectId === draft.projectId;
-  return `<div class="plan-estimates" role="group" aria-labelledby="plan-estimates-title"><h4 id="plan-estimates-title">계획용 추정 자원</h4>
-    <p class="muted">${draft.planning.simulation ? "모의 실행 계획에만 씁니다. 카드의 실행 프로필에서 고를 수 있습니다." : "실제 실행 계획에는 쓸 수 없습니다. 카드가 고른 추정 자원은 계획에서 거부됩니다."}</p>
-    ${items ? `<ul class="plan-estimate-list">${items}</ul>` : '<p class="muted">추정 자원이 없습니다. 기본 요금은 없으니 견적이나 요금표의 시간당 총액을 입력하세요.</p>'}
-    ${open ? "" : `<div class="actions"><button type="button" data-action="wf:graph:plan-estimate-new" data-focus-key="plan-estimate-new"${busy ? " disabled" : ""}>추정 자원 추가</button></div>`}</div>`;
+  return ui`<div class="plan-estimates" role="group" aria-labelledby="plan-estimates-title"><h4 id="plan-estimates-title">계획용 추정 자원</h4>
+    <p class="muted">${draft.planning.simulation ? tr("모의 실행 계획에만 씁니다. 카드의 실행 프로필에서 고를 수 있습니다.") : tr("실제 실행 계획에는 쓸 수 없습니다. 카드가 고른 추정 자원은 계획에서 거부됩니다.")}</p>
+    ${items ? `<ul class="plan-estimate-list">${items}</ul>` : staticHtml('<p class="muted">추정 자원이 없습니다. 기본 요금은 없으니 견적이나 요금표의 시간당 총액을 입력하세요.</p>')}
+    ${open ? "" : ui`<div class="actions"><button type="button" data-action="wf:graph:plan-estimate-new" data-focus-key="plan-estimate-new"${busy ? " disabled" : ""}>추정 자원 추가</button></div>`}</div>`;
 }
 
 function estimateFormHtml(draft: ProjectDraft, busy: boolean): string {
@@ -395,12 +396,12 @@ function estimateFormHtml(draft: ProjectDraft, busy: boolean): string {
   const entry = estimateDraft;
   const input = (key: string, label: string, value: string, attributes: string) =>
     `<label class="field"><span>${label}</span><input id="plan-estimate-${key}" data-estimate="${key}" aria-label="${label}" ${attributes} value="${escapeHtml(value)}"></label>`;
-  return `<form id="plan-estimate-form" class="plan-estimate-form" novalidate aria-labelledby="plan-estimate-title">
+  return ui`<form id="plan-estimate-form" class="plan-estimate-form" novalidate aria-labelledby="plan-estimate-title">
     <h4 id="plan-estimate-title">추정 자원 추가</h4><fieldset class="plan-fieldset"${busy ? " disabled" : ""}><div class="plan-estimate-grid">
     <label class="field"><span>추정 자원 이름</span><span class="plan-prefixed"><span class="mono" aria-hidden="true">estimate-</span><input id="plan-estimate-name" data-estimate="name" aria-label="추정 자원 이름" maxlength="56" spellcheck="false" value="${escapeHtml(entry.name)}"></span><small>영문·숫자와 _ . - · 56자 이내</small></label>
-    ${input("gpu_type", "GPU 종류", entry.gpuType, 'maxlength="100" spellcheck="false" placeholder="예: NVIDIA A100"')}
-    ${input("count", "GPU 수", entry.count, 'type="number" min="1" max="8" step="1"')}
-    ${input("price", "시간당 총 요금 (USD)", entry.price, 'type="number" min="0" max="1000" step="any"')}
+    ${input("gpu_type", tr("GPU 종류"), entry.gpuType, tr('maxlength="100" spellcheck="false" placeholder="예: NVIDIA A100"'))}
+    ${input("count", tr("GPU 수"), entry.count, 'type="number" min="1" max="8" step="1"')}
+    ${input("price", tr("시간당 총 요금 (USD)"), entry.price, 'type="number" min="0" max="1000" step="any"')}
     </div></fieldset>
     ${entry.problems.length ? `<ul class="issue-list" id="plan-estimate-problems">${entry.problems.map(problem => `<li>${escapeHtml(problem)}</li>`).join("")}</ul>` : ""}
     <p class="muted">GPU 전체의 시간당 총액입니다. 모의 실행의 비용 추정에만 쓰고 어디에도 연결하지 않습니다.</p>
@@ -408,11 +409,11 @@ function estimateFormHtml(draft: ProjectDraft, busy: boolean): string {
 }
 
 function inspectionText(inspection: InspectionSummary | undefined): { text: string; fresh: boolean } {
-  if (!inspection) return { text: "이 세션에서 자원을 확인하지 않았습니다", fresh: false };
+  if (!inspection) return { text: tr("이 세션에서 자원을 확인하지 않았습니다"), fresh: false };
   const age = (Date.now() - Date.parse(inspection.observedAt)) / 1000;
-  if (!Number.isFinite(age) || age < 0 || age > 3600) return { text: "자원을 확인한 지 1시간이 지났습니다", fresh: false };
+  if (!Number.isFinite(age) || age < 0 || age > 3600) return { text: tr("자원을 확인한 지 1시간이 지났습니다"), fresh: false };
   const facts = inspection.facts;
-  return { text: `${Math.max(0, Math.floor(age / 60))}분 전 확인 · ${facts.gpu_type} ×${facts.gpu_count} · ${usd(facts.total_hourly_cost_usd)}/시간`, fresh: true };
+  return { text: msg`${Math.max(0, Math.floor(age / 60))}분 전 확인 · ${facts.gpu_type} ×${facts.gpu_count} · ${usd(facts.total_hourly_cost_usd)}/시간`, fresh: true };
 }
 
 function resourcesHtml(draft: ProjectDraft, view: PlanView): string {
@@ -426,22 +427,22 @@ function resourcesHtml(draft: ProjectDraft, view: PlanView): string {
     const native = view.profiles.some(profile => profile.profile_id === id);
     const inspection = native ? inspectionText(view.inspections[id]) : null;
     if (real && native && inspection && !inspection.fresh) stale.push(profileText(id, view.profiles));
-    const state = !native ? statusPill("bad", "목록에 없는 실행 프로필") : inspection!.fresh ? statusPill("good", "자원 확인함") : statusPill(real ? "warn" : "neutral", "확인 필요");
+    const state = !native ? statusPill("bad", tr("목록에 없는 실행 프로필")) : inspection!.fresh ? statusPill("good", tr("자원 확인함")) : statusPill(real ? "warn" : "neutral", tr("확인 필요"));
     return `<li class="plan-profile" data-plan-profile="${escapeHtml(id)}"><div><b>${escapeHtml(profileName(id, view.profiles))}</b> <small class="mono">${escapeHtml(id)}</small> ${state}</div>
       ${inspection ? `<small>${escapeHtml(inspection.text)}</small>` : ""}
       ${issueBlock(found ? inSection(found.issues, "profile", id) : [])}${warningList(found ? inSection(found.warnings, "profile", id) : [])}</li>`;
   }).join("");
-  const hint = stale.length ? `<p class="plan-hint">${INSPECT_HINT}: ${escapeHtml(stale.join(", "))} · 저장된 확인 기록은 계획이 판단합니다.</p><div class="actions">${button("실행 프로필 열기", "nav:profiles")}</div>` : "";
-  return `<div class="plan-resources" role="group" aria-labelledby="plan-resources-title"><h4 id="plan-resources-title">실행 자원</h4>
-    ${items ? `<ul class="plan-profile-list">${items}</ul>` : '<p class="muted">카드에서 실행 프로필을 고르면 여기에 나타납니다.</p>'}${hint}</div>`;
+  const hint = stale.length ? ui`<p class="plan-hint">${tr(INSPECT_HINT)}: ${escapeHtml(stale.join(", "))} · 저장된 확인 기록은 계획이 판단합니다.</p><div class="actions">${button(tr("실행 프로필 열기"), "nav:profiles")}</div>` : "";
+  return ui`<div class="plan-resources" role="group" aria-labelledby="plan-resources-title"><h4 id="plan-resources-title">실행 자원</h4>
+    ${items ? `<ul class="plan-profile-list">${items}</ul>` : staticHtml('<p class="muted">카드에서 실행 프로필을 고르면 여기에 나타납니다.</p>')}${hint}</div>`;
 }
 
 function trackingHtml(draft: ProjectDraft, view: PlanView): string {
   const found = current(draft);
   const uri = String(view.settings.MLFLOW_TRACKING_URI ?? "").trim();
-  const text = draft.planning.simulation ? "모의 실행 계획은 MLflow에 기록하지 않습니다."
-    : uri ? `기록 위치: <span class="plan-uri">${escapeHtml(uri)}</span> · 연결 설정의 저장된 주소` : "MLflow 서버 주소가 없습니다. 연결 설정에서 저장하세요.";
-  return `<div class="plan-tracking" data-plan-tracking><h4>MLflow 기록</h4><p>${text}</p>${issueBlock(found ? inSection(found.issues, "tracking") : [])}${warningList(found ? inSection(found.warnings, "tracking") : [])}</div>`;
+  const text = draft.planning.simulation ? tr("모의 실행 계획은 MLflow에 기록하지 않습니다.")
+    : uri ? ui`기록 위치: <span class="plan-uri">${escapeHtml(uri)}</span> · 연결 설정의 저장된 주소` : tr("MLflow 서버 주소가 없습니다. 연결 설정에서 저장하세요.");
+  return ui`<div class="plan-tracking" data-plan-tracking><h4>MLflow 기록</h4><p>${text}</p>${issueBlock(found ? inSection(found.issues, "tracking") : [])}${warningList(found ? inSection(found.warnings, "tracking") : [])}</div>`;
 }
 
 function otherChecksHtml(draft: ProjectDraft): string {
@@ -451,8 +452,8 @@ function otherChecksHtml(draft: ProjectDraft): string {
   const graph = readGraph(draft.saved?.project.graph ?? {});
   // Card issues the editor cannot place on a card (no node ID and no node index of the saved graph).
   const loose = inSection(found.issues, "graph").filter(issue => !issue.node_id && !(/^\/graph\/nodes\/(\d+)/.exec(issue.path) && graph.nodes[Number(/^\/graph\/nodes\/(\d+)/.exec(issue.path)![1])]));
-  return `${datasets.length ? `<div class="plan-datasets" data-plan-datasets><h4>데이터</h4>${issueList(datasets)}<div class="actions">${button("데이터 연결 확인", `nav:project:${draft.projectId}`)}</div></div>` : ""}
-    ${loose.length ? `<div class="plan-graph-issues"><h4>그래프</h4>${issueList(loose)}</div>` : ""}`;
+  return `${datasets.length ? ui`<div class="plan-datasets" data-plan-datasets><h4>데이터</h4>${issueList(datasets)}<div class="actions">${button(tr("데이터 연결 확인"), `nav:project:${draft.projectId}`)}</div></div>` : ""}
+    ${loose.length ? ui`<div class="plan-graph-issues"><h4>그래프</h4>${issueList(loose)}</div>` : ""}`;
 }
 
 function actionsHtml(draft: ProjectDraft, view: PlanView, busy: boolean): string {
@@ -461,31 +462,31 @@ function actionsHtml(draft: ProjectDraft, view: PlanView, busy: boolean): string
   const general = found ? [...inSection(found.issues, "project"), ...inSection(found.issues, "other"), ...inSection(found.issues, "approval")] : [];
   const held = Boolean(draft.plan && view.usable);
   const note = inputsNote.get(draft.projectId)
-    ?? (changedInputs.has(draft.projectId) ? "바뀐 계획 입력은 ‘계획 확인’ 때 이 PC에 저장합니다." : storedInputs.get(draft.projectId) ? "계획 입력을 이 PC에 저장해 두었습니다." : "계획 입력은 ‘계획 확인’ 때 이 PC에 저장합니다.");
+    ?? (changedInputs.has(draft.projectId) ? tr("바뀐 계획 입력은 ‘계획 확인’ 때 이 PC에 저장합니다.") : storedInputs.get(draft.projectId) ? tr("계획 입력을 이 PC에 저장해 두었습니다.") : tr("계획 입력은 ‘계획 확인’ 때 이 PC에 저장합니다."));
   // The latest version is offered here when no plan banner offers it (an inputs save refused for a changed project).
   const reload = projectStale(draft) && !droppedReason(draft, view) ? reloadButton(busy) : "";
-  return `<div class="plan-blockers" role="status">${blockers.length ? `<ul>${blockers.map(reason => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>` : ""}</div>
-    ${general.length ? issueList(general, { heading: "계획 확인 결과" }) : ""}
+  return ui`<div class="plan-blockers" role="status">${blockers.length ? `<ul>${blockers.map(reason => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>` : ""}</div>
+    ${general.length ? issueList(general, { heading: tr("계획 확인 결과") }) : ""}
     <div class="actions">${reload}<button type="button"${held || reload ? "" : ' class="primary"'} data-action="wf:graph:plan-run" data-focus-key="plan-run"${busy || blockers.length ? " disabled" : ""}>계획 확인</button></div>
     <p class="muted plan-note">${escapeHtml(note)}</p>`;
 }
 /** The graph page's own "최신 버전 불러오기" (it confirms, then replaces the clean draft with the latest revision). */
 const reloadButton = (busy: boolean) =>
-  `<button type="button" class="primary" data-action="wf:graph:reload" data-focus-key="plan-reload"${busy ? " disabled" : ""}>최신 버전 불러오기</button>`;
+  ui`<button type="button" class="primary" data-action="wf:graph:reload" data-focus-key="plan-reload"${busy ? " disabled" : ""}>최신 버전 불러오기</button>`;
 
 function droppedReason(draft: ProjectDraft, view: PlanView): string | null {
   if (draft.plan && view.usable) return null;
-  if (draft.plan) return draft.dirty ? PLAN_DROPPED.edit : draft.saved?.revision_sha256 !== draft.plan.basis.projectRevision ? PLAN_DROPPED.revision : CHANGED_WHILE_PLANNING;
+  if (draft.plan) return draft.dirty ? PLAN_DROPPED.edit : draft.saved?.revision_sha256 !== draft.plan.basis.projectRevision ? PLAN_DROPPED.revision : tr(CHANGED_WHILE_PLANNING);
   return draft.planDropped;
 }
 
 function issuesWithSteps(issues: WorkflowIssue[], summary: PlanSummary): string {
   if (!issues.length) return "";
   const label = (nodeId: string | null | undefined) => summary.nodes.find(node => node.node_id === nodeId)?.label || nodeId || "";
-  return `<ul class="issue-list" aria-label="실행 등록 결과">${issues.map(issue => {
+  return ui`<ul class="issue-list" aria-label="실행 등록 결과">${issues.map(issue => {
     const { text, original } = localize(issue);
     const step = issue.node_id ? `<b>${isolate(label(issue.node_id))}</b> · ` : "";
-    return `<li data-code="${escapeHtml(issue.code)}"><span>${step}${escapeHtml(text)}</span>${original ? `<details><summary>원문 보기</summary><span class="issue-original">${escapeHtml(original)}</span></details>` : ""}</li>`;
+    return `<li data-code="${escapeHtml(issue.code)}"><span>${step}${escapeHtml(text)}</span>${original ? ui`<details><summary>원문 보기</summary><span class="issue-original">${escapeHtml(original)}</span></details>` : ""}</li>`;
   }).join("")}</ul>`;
 }
 
@@ -499,23 +500,23 @@ function summaryHtml(draft: ProjectDraft, view: PlanView): string {
   const refused = submitFeedback.get(draft.projectId);
   const steps = (Array.isArray(summary.nodes) ? summary.nodes : []).map(node => {
     const places = (node.allowed ?? []).map(resource => profileText(resource.profile_id, view.profiles));
-    return `<li data-plan-step="${escapeHtml(node.node_id)}"><b>${isolate(node.label || node.node_id)}</b> · ${escapeHtml(kindLabel(node.kind))} · ${places.length ? escapeHtml(places.join(", ")) : "GPU를 쓰지 않음"} · 최대 ${escapeHtml(usd(node.max_estimated_cost_usd))}${waiting.has(node.node_id) ? ` <span class="plan-wait">${WAITING_TEXT}</span>` : ""}</li>`;
+    return ui`<li data-plan-step="${escapeHtml(node.node_id)}"><b>${isolate(node.label || node.node_id)}</b> · ${escapeHtml(kindLabel(node.kind))} · ${places.length ? escapeHtml(places.join(", ")) : tr("GPU를 쓰지 않음")} · 최대 ${escapeHtml(usd(node.max_estimated_cost_usd))}${waiting.has(node.node_id) ? ` <span class="plan-wait">${tr(WAITING_TEXT)}</span>` : ""}</li>`;
   }).join("");
-  return `<section class="plan-summary" aria-labelledby="plan-summary-title"><div class="plan-summary-head"><h4 id="plan-summary-title" tabindex="-1">${summary.simulation ? "모의 실행 계획" : "실제 실행 계획"}</h4>
-      ${statusPill(summary.simulation ? "neutral" : "warn", summary.simulation ? "GPU·데이터 전송 없음" : "승인 필요 · 실행·데이터 전송")}</div>
+  return ui`<section class="plan-summary" aria-labelledby="plan-summary-title"><div class="plan-summary-head"><h4 id="plan-summary-title" tabindex="-1">${summary.simulation ? tr("모의 실행 계획") : tr("실제 실행 계획")}</h4>
+      ${statusPill(summary.simulation ? "neutral" : "warn", summary.simulation ? tr("GPU·데이터 전송 없음") : tr("승인 필요 · 실행·데이터 전송"))}</div>
     <dl class="plan-totals">
-      <div><dt>최대 추정 비용</dt><dd>${escapeHtml(usd(summary.max_estimated_cost_usd))}<small>${COST_NOTE}</small></dd></div>
+      <div><dt>최대 추정 비용</dt><dd>${escapeHtml(usd(summary.max_estimated_cost_usd))}<small>${tr(COST_NOTE)}</small></dd></div>
       <div><dt>최대 소요 시간</dt><dd>${escapeHtml(durationText(summary.max_duration_seconds))}</dd></div>
       <div><dt>최대 동시 GPU</dt><dd>${escapeHtml(String(summary.max_concurrent_gpu_count ?? "—"))}개</dd></div>
       <div><dt>계획 해시</dt><dd class="mono">${escapeHtml(String(summary.plan_sha256).slice(0, 12))}…</dd></div></dl>
     <ul class="plan-steps">${steps}</ul>
-    ${warnings ? `<p class="plan-hint">계획 경고 ${warnings}건 · 실행을 막지 않습니다. 실행 자원과 카드에 표시했습니다.</p>` : ""}
+    ${warnings ? ui`<p class="plan-hint">계획 경고 ${warnings}건 · 실행을 막지 않습니다. 실행 자원과 카드에 표시했습니다.</p>` : ""}
     ${refused?.plan === summary.plan_sha256 ? issuesWithSteps(refused.issues, summary) : ""}
-    ${submitted ? `<p class="plan-submitted">${RUN_EXISTS} · 실행 <span class="mono">${escapeHtml(submitted.runId.slice(0, 12))}</span>${submitted.status ? ` · ${escapeHtml(RUN_STATUS[submitted.status as keyof typeof RUN_STATUS] ?? submitted.status)}` : ""} · 같은 계획은 다시 등록하지 않습니다.</p>
-        <p class="plan-hint">${RERUN_HINT}</p>
+    ${submitted ? ui`<p class="plan-submitted">${tr(RUN_EXISTS)} · 실행 <span class="mono">${escapeHtml(submitted.runId.slice(0, 12))}</span>${submitted.status ? ` · ${escapeHtml(RUN_STATUS[submitted.status as keyof typeof RUN_STATUS] ?? submitted.status)}` : ""} · 같은 계획은 다시 등록하지 않습니다.</p>
+        <p class="plan-hint">${tr(RERUN_HINT)}</p>
         <div class="actions"><button type="button" data-action="${escapeHtml(`nav:runs:${submitted.runId}`)}" data-focus-key="plan-run-open">실행 보기</button></div>`
-      : `<div class="actions"><button type="button" class="primary" data-action="wf:graph:plan-approve" data-focus-key="plan-approve">계획 승인·실행…</button></div>
-        <p class="muted">${summary.simulation ? "대화상자에서 내용을 확인한 뒤 모의 실행으로 등록합니다." : "대화상자에서 실행과 데이터 전송을 각각 승인해야 등록합니다."} 등록한 뒤에도 컨트롤러는 자동으로 시작하지 않습니다.</p>`}</section>`;
+      : ui`<div class="actions"><button type="button" class="primary" data-action="wf:graph:plan-approve" data-focus-key="plan-approve">계획 승인·실행…</button></div>
+        <p class="muted">${summary.simulation ? tr("대화상자에서 내용을 확인한 뒤 모의 실행으로 등록합니다.") : tr("대화상자에서 실행과 데이터 전송을 각각 승인해야 등록합니다.")} 등록한 뒤에도 컨트롤러는 자동으로 시작하지 않습니다.</p>`}</section>`;
 }
 
 function resultHtml(draft: ProjectDraft, view: PlanView, busy: boolean): string {
@@ -525,14 +526,14 @@ function resultHtml(draft: ProjectDraft, view: PlanView, busy: boolean): string 
   const blocked = busy || planBlockers(draft, view.settings, view.recipes).length > 0;
   // Saved elsewhere since: planning this revision again could never be registered, so the latest version comes first.
   const action = projectStale(draft) ? reloadButton(busy)
-    : `<button type="button" data-action="wf:graph:plan-run" data-focus-key="plan-rerun"${blocked ? " disabled" : ""}>다시 계획</button>`;
-  return `<div class="wf-banner warn plan-dropped" role="status"><div><p>${escapeHtml(DROPPED_PREFIX + reason)}</p><small>승인하지 않은 계획은 실행되지 않습니다. 초안은 그대로 남아 있습니다.</small></div>
+    : ui`<button type="button" data-action="wf:graph:plan-run" data-focus-key="plan-rerun"${blocked ? " disabled" : ""}>다시 계획</button>`;
+  return ui`<div class="wf-banner warn plan-dropped" role="status"><div><p>${escapeHtml(tr(DROPPED_PREFIX) + reason)}</p><small>승인하지 않은 계획은 실행되지 않습니다. 초안은 그대로 남아 있습니다.</small></div>
     <div class="actions">${action}</div></div>`;
 }
 
 /** The panel's inside (what the editor patches when the draft changes). */
 export function planPanelBody(draft: ProjectDraft, view: PlanView, busy: boolean): string {
-  return `<div class="section-title"><h3 id="plan-panel-title">계획과 승인</h3></div>
+  return ui`<div class="section-title"><h3 id="plan-panel-title">계획과 승인</h3></div>
     <p class="muted plan-lead">계획은 저장한 버전으로 만듭니다. 모의 실행이 기본이며, 실제 실행은 승인 대화상자에서 실행과 데이터 전송을 따로 승인해야 등록됩니다.</p>
     <div class="plan-grid"><div class="plan-column">
       <form id="plan-inputs-form" class="plan-inputs" novalidate aria-label="계획 입력"><fieldset class="plan-fieldset"${busy ? " disabled" : ""}>${modeHtml(draft)}${limitsHtml(draft, view)}</fieldset></form>
@@ -667,54 +668,54 @@ export async function runPlan(ctx: ViewContext, projectId: string, env: PlanEnv)
   const inputsAt = inputsKey(draft.planning);
   const still = stillOn(ctx);
   const outcome = { held: false };
-  await ctx.task(request.simulation ? "모의 실행 계획 확인 중" : "실제 실행 계획 확인 중", async () => {
+  await ctx.task(request.simulation ? tr("모의 실행 계획 확인 중") : tr("실제 실행 계획 확인 중"), async () => {
     draft.plan = null; draft.planDropped = null;                 // a new plan replaces the one shown (no approval left)
     feedback.delete(projectId); submitFeedback.delete(projectId);
-    if (!await persistInputs(projectId, draft, graph, env)) { ctx.notify(INPUTS_REFUSED); return; }
+    if (!await persistInputs(projectId, draft, graph, env)) { ctx.notify(tr(INPUTS_REFUSED)); return; }
     const result = await env.queue.run(() => planning.plan(request));
     const data: unknown = result.data;
     const warnings = isObject(data) && Array.isArray(data.warnings) ? data.warnings.filter(isIssue) : [];
     const base = { revision: request.project_revision, estimates: request.estimates.map(item => item.profile_id),
       nodes: request.node_resources.map(item => item.node_id) };
     if (result.status === "ok") {
-      if (!isSummary(data)) throw new Error(MALFORMED);
+      if (!isSummary(data)) throw new Error(tr(MALFORMED));
       if (data.project_id !== projectId || data.project_revision !== request.project_revision || data.simulation !== request.simulation)
-        throw new Error(MISMATCH);
+        throw new Error(tr(MISMATCH));
       ctx.store.holdPlan(projectId, data, recipeRevisions, since);
       feedback.set(projectId, { ...base, issues: [], warnings });
       if (ctx.store.planUsable(projectId) && inputsKey(draft.planning) === inputsAt) {
         outcome.held = true;
-        ctx.notify(`${data.simulation ? "모의" : "실제"} 실행 계획을 만들었습니다. 내용을 확인한 뒤 ‘계획 승인·실행…’을 누르세요.`);
+        ctx.notify(msg`${data.simulation ? tr("모의") : tr("실제")} 실행 계획을 만들었습니다. 내용을 확인한 뒤 ‘계획 승인·실행…’을 누르세요.`);
       } else {
-        ctx.store.dropPlan(projectId, CHANGED_WHILE_PLANNING);
-        ctx.notify(CHANGED_WHILE_PLANNING);
+        ctx.store.dropPlan(projectId, tr(CHANGED_WHILE_PLANNING));
+        ctx.notify(tr(CHANGED_WHILE_PLANNING));
       }
       return;
     }
     markStale(draft, result.issues);
     feedback.set(projectId, { ...base, issues: result.issues, warnings });
-    ctx.notify(PLAN_REFUSED);
+    ctx.notify(tr(PLAN_REFUSED));
   });
   const active = document.activeElement;
   if (outcome.held && still() && (!active || active === document.body || active.closest("#plan-panel")))
     document.getElementById("plan-summary-title")?.focus();
 }
 
-const STALE_PARTS: Record<string, string> = { project: "프로젝트", tracking: "MLflow 설정" };
+const STALE_PARTS: Record<string, string> = localized(() => ({ project: "프로젝트", tracking: "MLflow 설정" }));
 /** What changed since the plan (D5), named by path: 프로젝트, each profile, MLflow 설정. */
 function staleReason(issues: WorkflowIssue[], profiles: readonly PublicProfile[]): string {
   const parts = issues.map(issue => {
     const [first = "", ...rest] = issue.path.split("/").slice(1);
-    if (first === "profiles" && rest.length) return `실행 프로필 ${profileText(rest.join("/").replace(/~1/g, "/").replace(/~0/g, "~"), profiles)}`;
-    return STALE_PARTS[first] ?? "계획에 쓴 설정";
+    if (first === "profiles" && rest.length) return msg`실행 프로필 ${profileText(rest.join("/").replace(/~1/g, "/").replace(/~0/g, "~"), profiles)}`;
+    return STALE_PARTS[first] ?? tr("계획에 쓴 설정");
   });
-  return `계획 이후 바뀐 것 · ${[...new Set(parts)].join(", ")}. 다시 계획하세요.`;
+  return msg`계획 이후 바뀐 것 · ${[...new Set(parts)].join(", ")}. 다시 계획하세요.`;
 }
 const isControllerView = (value: unknown): value is ControllerView => isObject(value) && typeof value.state === "string";
 function registeredText(controller: ControllerView | null): string {
-  if (controller?.state === "running") return "실행을 등록했습니다. 동작 중인 백그라운드 컨트롤러가 진행합니다.";
-  const why = controller?.state === "stale" ? "백그라운드 컨트롤러의 연결이 끊겨" : "백그라운드 컨트롤러가 동작하지 않아";
-  return `실행을 등록했습니다. ${why} 아직 진행되지 않습니다. 앱은 컨트롤러를 자동으로 시작하지 않으니 ‘컨트롤러 시작’을 눌러 시작하세요.`;
+  if (controller?.state === "running") return tr("실행을 등록했습니다. 동작 중인 백그라운드 컨트롤러가 진행합니다.");
+  const why = controller?.state === "stale" ? tr("백그라운드 컨트롤러의 연결이 끊겨") : tr("백그라운드 컨트롤러가 동작하지 않아");
+  return msg`실행을 등록했습니다. ${why} 아직 진행되지 않습니다. 앱은 컨트롤러를 자동으로 시작하지 않으니 ‘컨트롤러 시작’을 눌러 시작하세요.`;
 }
 
 /**
@@ -736,19 +737,19 @@ export async function approveAndSubmit(ctx: ViewContext, projectId: string, env:
   // still read first, so such a run is shown instead of an approval for a plan that will not run again. No list, no
   // approval.
   const found: { run?: string; read?: boolean } = {};
-  await ctx.task("이 계획의 기존 실행 확인 중", async () => {
+  await ctx.task(tr("이 계획의 기존 실행 확인 중"), async () => {
     let result: WorkflowResult<unknown>;
     try { result = await env.queue.run(() => runs.list()); }
-    catch (error) { throw new Error(`${RUNS_UNREAD} (${errorText(error)})`); }
+    catch (error) { throw new Error(`${tr(RUNS_UNREAD)} (${errorText(error)})`); }
     const data: unknown = result.data;
     if (result.status !== "ok" || !isObject(data) || !Array.isArray(data.runs))
-      throw new Error(`${RUNS_UNREAD} (${result.status === "ok" ? MALFORMED : notAvailable(result) ? NOT_AVAILABLE : describe(result.issues)})`);
+      throw new Error(`${tr(RUNS_UNREAD)} (${result.status === "ok" ? tr(MALFORMED) : notAvailable(result) ? tr(NOT_AVAILABLE) : describe(result.issues)})`);
     found.read = true;
     const match = data.runs.find(entry => isObject(entry) && entry.plan_sha256 === hash && typeof entry.run_id === "string" && entry.run_id);
     if (isObject(match)) {
       submittedRuns.set(hash, { runId: String(match.run_id), status: typeof match.status === "string" ? match.status : null });
       found.run = String(match.run_id);
-      ctx.notify(`${RUN_EXISTS}. 같은 계획을 다시 등록하지 않습니다. ${RERUN_HINT}`);
+      ctx.notify(msg`${tr(RUN_EXISTS)}. 같은 계획을 다시 등록하지 않습니다. ${tr(RERUN_HINT)}`);
     }
   });
   if (found.run) { focusIfLost(still, "plan-run-open"); return; }
@@ -759,9 +760,9 @@ export async function approveAndSubmit(ctx: ViewContext, projectId: string, env:
   const choice = await openApproval(held.summary, [...env.profiles], planWaiting(held.summary, savedGraph(draft)), draft.spec.name);
   if (!choice) return;
   // The approval covers the plan the dialog showed, only while its basis still holds.
-  if (ctx.busy) { ctx.fail("다른 작업이 진행 중이어서 등록하지 않았습니다. 작업이 끝난 뒤 다시 승인하세요."); return; }
+  if (ctx.busy) { ctx.fail(tr("다른 작업이 진행 중이어서 등록하지 않았습니다. 작업이 끝난 뒤 다시 승인하세요.")); return; }
   if (ctx.store.draft(projectId)?.plan !== held || !ctx.store.planUsable(projectId)) {
-    ctx.fail("계획이 바뀌어 등록하지 않았습니다. 다시 계획하세요.");
+    ctx.fail(tr("계획이 바뀌어 등록하지 않았습니다. 다시 계획하세요."));
     return;
   }
   const simulation = held.summary.simulation === true;
@@ -769,12 +770,12 @@ export async function approveAndSubmit(ctx: ViewContext, projectId: string, env:
   const request = { plan_sha256: held.summary.plan_sha256, request_id: held.requestId,
     approve_execution: !simulation && choice.approveExecution, approve_data_transfer: !simulation && choice.approveDataTransfer };
   const outcome: { run?: { id: string; controller: ControllerView | null }; stale?: boolean; existing?: boolean } = {};
-  await ctx.task(simulation ? "모의 실행 등록 중" : "실행 등록 중", async () => {
+  await ctx.task(simulation ? tr("모의 실행 등록 중") : tr("실행 등록 중"), async () => {
     submitFeedback.delete(projectId);
     const result = await env.queue.run(() => runs.submit(request));
     if (result.status === "ok") {
       const data: unknown = result.data;
-      if (!isObject(data) || typeof data.run_id !== "string" || !data.run_id) throw new Error(MALFORMED);
+      if (!isObject(data) || typeof data.run_id !== "string" || !data.run_id) throw new Error(tr(MALFORMED));
       submittedRuns.set(held.summary.plan_sha256, { runId: data.run_id, status: typeof data.status === "string" ? data.status : null });
       outcome.run = { id: data.run_id, controller: isControllerView(data.controller) ? data.controller : null };
       return;
@@ -785,7 +786,7 @@ export async function approveAndSubmit(ctx: ViewContext, projectId: string, env:
         && typeof existing.run_id === "string" && existing.run_id) {
       submittedRuns.set(held.summary.plan_sha256, { runId: existing.run_id, status: typeof existing.status === "string" ? existing.status : null });
       outcome.existing = true;
-      ctx.notify(`${RUN_EXISTS}. 같은 계획을 다시 등록하지 않습니다. ${RERUN_HINT}`);
+      ctx.notify(msg`${tr(RUN_EXISTS)}. 같은 계획을 다시 등록하지 않습니다. ${tr(RERUN_HINT)}`);
       return;
     }
     const stale = result.status === "conflict" ? result.issues.filter(issue => issue.code === "plan_stale") : [];
@@ -793,12 +794,12 @@ export async function approveAndSubmit(ctx: ViewContext, projectId: string, env:
       markStale(draft, stale);                             // /project: another window saved; the latest version first
       ctx.store.dropPlan(projectId, staleReason(stale, env.profiles));
       outcome.stale = true;
-      ctx.notify(projectStale(draft) ? "계획 이후 다른 곳에서 프로젝트를 저장해 실행을 등록하지 않았습니다. 초안은 그대로입니다. ‘최신 버전 불러오기’를 누르세요."
-        : "계획 이후 바뀐 것이 있어 실행을 등록하지 않았습니다. 초안은 그대로입니다. ‘다시 계획’을 누르세요.");
+      ctx.notify(projectStale(draft) ? tr("계획 이후 다른 곳에서 프로젝트를 저장해 실행을 등록하지 않았습니다. 초안은 그대로입니다. ‘최신 버전 불러오기’를 누르세요.")
+        : tr("계획 이후 바뀐 것이 있어 실행을 등록하지 않았습니다. 초안은 그대로입니다. ‘다시 계획’을 누르세요."));
       return;
     }
     submitFeedback.set(projectId, { plan: held.summary.plan_sha256, issues: result.issues });
-    ctx.notify("실행을 등록하지 못했습니다. 계획 아래의 확인할 점을 보세요.");
+    ctx.notify(tr("실행을 등록하지 못했습니다. 계획 아래의 확인할 점을 보세요."));
   });
   if (outcome.stale) { focusIfLost(still, projectStale(draft) ? "plan-reload" : "plan-rerun"); return; }
   if (outcome.existing) { focusIfLost(still, "plan-run-open"); return; }
@@ -810,5 +811,5 @@ export async function approveAndSubmit(ctx: ViewContext, projectId: string, env:
     await ctx.navigate("runs", run.id);
     ctx.notify(message);
     if (ctx.page === "runs" && ctx.arg === run.id) focusIfLost(() => true, "run-detail-title");
-  } else ctx.notify(`${message} 실행 ID: ${run.id}`);
+  } else ctx.notify(msg`${message} 실행 ID: ${run.id}`);
 }

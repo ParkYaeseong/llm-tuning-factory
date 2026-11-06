@@ -18,7 +18,7 @@ and inspect a plan before committing GPU time.
 
 The GIFs show the **actual desktop frontend with a local test bridge and synthetic
 fixtures**. Backend responses, resources and prices are mocked. These clips show
-UI behavior, not live GPU training or model quality. The current UI is Korean.
+UI behavior, not live GPU training or model quality. These recordings use the English UI.
 [Recording details and reproduction](docs/images/README.md).
 
 ### 1. Start with your task
@@ -26,7 +26,7 @@ UI behavior, not live GPU training or model quality. The current UI is Korean.
 Create a blank project with a name and purpose. Keep its data bindings and training
 graph together, so each experiment starts from the problem you want to solve.
 
-![Create a project and enter its purpose](docs/images/factory-project.gif)
+![Create a project and enter its purpose](docs/images/factory-project-en.gif)
 
 ### 2. Turn existing tables into training data
 
@@ -34,7 +34,7 @@ Import CSV, JSON or JSONL, map columns to training fields and inspect samples be
 registration. Immutable versions and content hashes identify the data behind each
 experiment. Register train/validation/test splits to keep evaluation inputs distinct.
 
-![Map CSV columns and preview question, context and answer samples](docs/images/factory-data.gif)
+![Map CSV columns and preview question, context and answer samples](docs/images/factory-data-en.gif)
 
 ### 3. Connect experiments and reuse recipes
 
@@ -43,7 +43,7 @@ and serial evaluation steps using cards and a shared graph preview. Selection,
 merge and full-model materialization nodes support longer workflows where
 compatibility and required evidence permit them.
 
-![Add parallel training and a following evaluation step with keyboard controls](docs/images/factory-graph.gif)
+![Add parallel training and a following evaluation step with keyboard controls](docs/images/factory-graph-en.gif)
 
 ### 4. Review the plan before execution
 
@@ -52,7 +52,7 @@ before submission. Live execution requires separate execution and dataset-transf
 approvals. Estimates are not provider billing caps. This clip shows the default
 **simulated** planning and submission path.
 
-![Inspect a dry-run plan and register a simulated graph execution](docs/images/factory-plan.gif)
+![Inspect a dry-run plan and register a simulated graph execution](docs/images/factory-plan-en.gif)
 
 ### 5. Follow the run and retain its evidence
 
@@ -74,10 +74,15 @@ The unsigned Windows x64 installer bundles the Python control engine. Training
 libraries run on the remote GPU machine.
 
 1. Install an available Windows build and open the workspace.
-2. Choose **튜토리얼 시작** (Start tutorial) to explore bundled practice data.
-3. Create a project, import data, save a recipe and build a training graph.
-4. Inspect a **모의 실행 계획** (dry-run plan) first.
-5. Configure your execution profile and MLflow connection for live training.
+2. Select **ENG** or **KOR** at the top right. The choice is saved on this PC; the initial default is KOR.
+3. Choose **Start tutorial** to explore bundled practice data.
+4. Create a project, import data, save a recipe and build a training graph.
+5. Inspect a **dry-run plan** first.
+6. Configure your execution profile and MLflow connection for live training.
+
+Language changes take effect immediately and preserve drafts and reviewed plans.
+Project names, datasets, model identifiers and original diagnostics/logs retain their
+original content. Changing the language does not save connections or submit jobs.
 
 The tutorial needs no credentials or GPU and transfers no data. Practice data is
 blocked from real training. The [Windows guide](docs/WINDOWS_APP.md) and

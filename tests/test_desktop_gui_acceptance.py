@@ -196,7 +196,9 @@ def test_status_names_cover_the_app_badges_and_their_terminal_states(gui):
 def test_screenshots_mask_every_credential_field_of_the_screen(gui):
     assert 'input[type="password"]' in gui.MASK_SELECTORS
     sources = "".join(path.read_text(encoding="utf-8") for path in (ROOT / "desktop" / "src").glob("*.ts"))
-    password_keys = set(re.findall(r'field\("[^"]*", "([A-Za-z0-9_]+)",[^\n]*?"password"', sources))
+    password_keys = set(re.findall(
+        r'field\((?:tr\()?"[^"]*"\)?, "([A-Za-z0-9_]+)",[^\n]*?"password"', sources
+    ))
     assert {"RUNPOD_API_KEY", "MLFLOW_OIDC_CLIENT_SECRET", "MLFLOW_TRACKING_TOKEN", "S3_SECRET_ACCESS_KEY",
             "HF_TOKEN"} <= password_keys
 

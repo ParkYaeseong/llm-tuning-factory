@@ -1,3 +1,4 @@
+import { t as tr, msg, html as ui, staticHtml, localized } from "../i18n";
 // The "기반 모델" panel of the graph page (10.5, D13): indexed HF roots from `model_roots_list`, pinning a model with the
 // legacy metadata search/inspection (a 40-hex revision), and two separate downloads behind their own notice dialogs:
 // "설정·토크나이저 받기" (`model_root_snapshot`) and "모듈 구조 확인" (`model_root_targets`, after a snapshot). Nothing
@@ -34,7 +35,7 @@ const notAvailable = (result: WorkflowResult<unknown>) => result.issues.some(iss
 const describe = (issues: WorkflowIssue[]) => issues.map(issue => {
   const { text, original } = localize(issue);
   return original ? `${text} (${original})` : text;
-}).join("\n") || "요청을 처리하지 못했습니다.";
+}).join("\n") || tr("요청을 처리하지 못했습니다.");
 const short = (revision: string) => escapeHtml(revision.slice(0, 8));
 const disabled = (flag: boolean) => flag ? " disabled" : "";
 
@@ -42,26 +43,26 @@ export function modelRootsPanel(state: RootsState, busy: boolean): string {
   const list = state.roots.map((entry, index) => {
     const name = escapeHtml(entry.root.repo_id);
     const actions = [
-      !entry.snapshot_ready ? `<button type="button" data-action="wf:graph:root-snapshot:${index}" aria-label="${name} 설정·토크나이저 받기"${disabled(busy || state.unavailable)}>설정·토크나이저 받기</button>` : "",
-      entry.snapshot_ready && !entry.targets_ready ? `<button type="button" data-action="wf:graph:root-targets:${index}" aria-label="${name} 모듈 구조 확인"${disabled(busy || state.unavailable)}>모듈 구조 확인</button>` : "",
+      !entry.snapshot_ready ? ui`<button type="button" data-action="wf:graph:root-snapshot:${index}" aria-label="${name} 설정·토크나이저 받기"${disabled(busy || state.unavailable)}>설정·토크나이저 받기</button>` : "",
+      entry.snapshot_ready && !entry.targets_ready ? ui`<button type="button" data-action="wf:graph:root-targets:${index}" aria-label="${name} 모듈 구조 확인"${disabled(busy || state.unavailable)}>모듈 구조 확인</button>` : "",
     ].join("");
-    return `<li class="root-item" data-root="${escapeHtml(rootKey(entry.root))}" tabindex="-1"><div><b>${name}</b> <span class="mono">${short(entry.root.revision)}</span>
+    return ui`<li class="root-item" data-root="${escapeHtml(rootKey(entry.root))}" tabindex="-1"><div><b>${name}</b> <span class="mono">${short(entry.root.revision)}</span>
       <small>${escapeHtml(entry.profile?.architecture ?? "")} · 템플릿 ${escapeHtml(entry.profile?.template ?? "")}</small></div>
-      <div class="root-states">${entry.snapshot_ready ? statusPill("good", "설정·토크나이저 받음") : statusPill("warn", "설정·토크나이저 없음")}
-      ${entry.targets_ready ? statusPill("good", "모듈 구조 확인됨") : statusPill("neutral", "모듈 구조 확인 전")}</div>
+      <div class="root-states">${entry.snapshot_ready ? statusPill("good", tr("설정·토크나이저 받음")) : statusPill("warn", tr("설정·토크나이저 없음"))}
+      ${entry.targets_ready ? statusPill("good", tr("모듈 구조 확인됨")) : statusPill("neutral", tr("모듈 구조 확인 전"))}</div>
       ${actions ? `<div class="actions">${actions}</div>` : ""}</li>`;
   }).join("");
-  const empty = !state.loaded ? '<p class="muted">기반 모델 목록을 불러오는 중입니다.</p>'
-    : state.unavailable ? `<p class="muted">${NOT_AVAILABLE}</p>` : '<p class="muted">아직 받은 기반 모델이 없습니다. 아래에서 모델을 고르고 설정·토크나이저를 받으세요.</p>';
-  const results = state.results === null ? "" : state.results.length ? `<ul class="root-results" aria-label="검색 결과">${state.results.map((model, index) =>
-    `<li><span><b>${escapeHtml(model.id)}</b><small>${escapeHtml(model.tag)}${model.downloads !== null ? ` · 다운로드 ${model.downloads.toLocaleString("ko-KR")}` : ""}</small></span>
+  const empty = !state.loaded ? staticHtml('<p class="muted">기반 모델 목록을 불러오는 중입니다.</p>')
+    : state.unavailable ? `<p class="muted">${tr(NOT_AVAILABLE)}</p>` : staticHtml('<p class="muted">아직 받은 기반 모델이 없습니다. 아래에서 모델을 고르고 설정·토크나이저를 받으세요.</p>');
+  const results = state.results === null ? "" : state.results.length ? ui`<ul class="root-results" aria-label="검색 결과">${state.results.map((model, index) =>
+    ui`<li><span><b>${escapeHtml(model.id)}</b><small>${escapeHtml(model.tag)}${model.downloads !== null ? msg` · 다운로드 ${model.downloads.toLocaleString("ko-KR")}` : ""}</small></span>
       <button type="button" class="quiet" data-action="wf:graph:root-pick:${index}" aria-label="${escapeHtml(model.id)} 고르기">고르기</button></li>`).join("")}</ul>`
-    : '<p class="muted">검색 결과가 없습니다.</p>';
+    : staticHtml('<p class="muted">검색 결과가 없습니다.</p>');
   const inspected = state.inspected;
-  const pinned = inspected ? `<div class="root-inspected${inspected.supported ? "" : " blocked"}" role="status"><b>${escapeHtml(inspected.repo_id)}</b>
-      <span class="mono">${escapeHtml(inspected.revision)}</span><small>구조 ${escapeHtml(inspected.architecture || "확인 불가")} · ${inspected.supported ? "학습 기반 모델로 쓸 수 있는 구조입니다." : escapeHtml(inspected.reasons.join(" · ") || "학습 기반 모델로 지원하지 않습니다.")}</small>
+  const pinned = inspected ? ui`<div class="root-inspected${inspected.supported ? "" : " blocked"}" role="status"><b>${escapeHtml(inspected.repo_id)}</b>
+      <span class="mono">${escapeHtml(inspected.revision)}</span><small>구조 ${escapeHtml(inspected.architecture || tr("확인 불가"))} · ${inspected.supported ? tr("학습 기반 모델로 쓸 수 있는 구조입니다.") : escapeHtml(inspected.reasons.join(" · ") || tr("학습 기반 모델로 지원하지 않습니다."))}</small>
       <div class="actions"><button type="button" data-action="wf:graph:root-snapshot"${disabled(busy || state.unavailable || !inspected.supported || !HEX40.test(inspected.revision))}>설정·토크나이저 받기</button></div></div>` : "";
-  return `<section class="card graph-roots" id="model-roots" aria-labelledby="model-roots-title">
+  return ui`<section class="card graph-roots" id="model-roots" aria-labelledby="model-roots-title">
     <div class="section-title"><h3 id="model-roots-title">기반 모델 <span class="count">${state.roots.length}</span></h3></div>
     ${state.error ? `<p class="error-text root-error" role="status">${escapeHtml(state.error)}</p>` : ""}
     ${list ? `<ul class="root-list">${list}</ul>` : empty}
@@ -102,12 +103,12 @@ export async function loadRoots(): Promise<void> {
 /** Legacy HF metadata search (no download). */
 export async function searchModels(ctx: ViewContext): Promise<void> {
   const query = rootsState.query.trim();
-  if (query.length < 2) { rootsState.error = "검색어를 두 글자 이상 입력하세요."; ctx.render(); return; }
-  await ctx.task("Hugging Face 모델 검색 중", async () => {
+  if (query.length < 2) { rootsState.error = tr("검색어를 두 글자 이상 입력하세요."); ctx.render(); return; }
+  await ctx.task(tr("Hugging Face 모델 검색 중"), async () => {
     rootsState.error = null; rootsState.results = null;
     const found = await ctx.legacy<{ models?: { id?: unknown; downloads?: unknown; pipeline_tag?: unknown }[] }>("model_search", { query, sort: "downloads" });
     rootsState.results = (Array.isArray(found?.models) ? found.models : []).filter(model => typeof model?.id === "string").slice(0, 20)
-      .map(model => ({ id: String(model.id), downloads: typeof model.downloads === "number" ? model.downloads : null, tag: String(model.pipeline_tag ?? "확인 필요") }));
+      .map(model => ({ id: String(model.id), downloads: typeof model.downloads === "number" ? model.downloads : null, tag: String(model.pipeline_tag ?? tr("확인 필요")) }));
   });
 }
 export function pickModel(ctx: ViewContext, index: number): void {
@@ -120,8 +121,8 @@ export function pickModel(ctx: ViewContext, index: number): void {
 /** Legacy HF metadata inspection: pins the immutable 40-hex revision the inspection returns. */
 export async function inspectModel(ctx: ViewContext): Promise<void> {
   const model = rootsState.model.trim();
-  if (!model) { rootsState.error = "모델 ID를 입력하세요."; ctx.render(); return; }
-  await ctx.task("모델 버전 확인 중", async () => {
+  if (!model) { rootsState.error = tr("모델 ID를 입력하세요."); ctx.render(); return; }
+  await ctx.task(tr("모델 버전 확인 중"), async () => {
     rootsState.error = null; rootsState.inspected = null; rootsState.pinned = null;
     const found = await ctx.legacy<Record<string, unknown>>("model_inspect", { model });
     const revision = typeof found?.revision === "string" ? found.revision : "";
@@ -135,14 +136,14 @@ export async function inspectModel(ctx: ViewContext): Promise<void> {
 
 /** "설정·토크나이저 받기": its notice dialog first; then `model_root_snapshot` and a fresh root list. */
 export async function snapshotRoot(ctx: ViewContext, repoId: string, revision: string): Promise<void> {
-  const answer = await openDialog({ title: "설정·토크나이저 받기",
-    bodyHtml: `<p><b>${escapeHtml(repoId)}</b> · 버전 <span class="mono">${escapeHtml(revision)}</span></p>
-      <p>이 버전의 설정(config)과 토크나이저 파일만 이 PC에 받습니다. 학습 그래프의 기반 모델과 평가 기준의 토크나이저로 씁니다.</p><p>${SNAPSHOT_NOTE}</p>`,
-    actions: [{ id: "back", label: "돌아가기" }, { id: "fetch", label: "받기", primary: true }] });
+  const answer = await openDialog({ title: tr("설정·토크나이저 받기"),
+    bodyHtml: ui`<p><b>${escapeHtml(repoId)}</b> · 버전 <span class="mono">${escapeHtml(revision)}</span></p>
+      <p>이 버전의 설정(config)과 토크나이저 파일만 이 PC에 받습니다. 학습 그래프의 기반 모델과 평가 기준의 토크나이저로 씁니다.</p><p>${tr(SNAPSHOT_NOTE)}</p>`,
+    actions: [{ id: "back", label: tr("돌아가기") }, { id: "fetch", label: tr("받기"), primary: true }] });
   if (answer?.action !== "fetch") return;
   const back = focusRootLater(ctx, repoId, revision);
   let done = false;
-  await ctx.task("설정·토크나이저 받는 중", async () => {
+  await ctx.task(tr("설정·토크나이저 받는 중"), async () => {
     rootsState.error = null;
     const result = await planning.rootSnapshot(repoId, revision);
     if (result.status !== "ok") {
@@ -151,7 +152,7 @@ export async function snapshotRoot(ctx: ViewContext, repoId: string, revision: s
     }
     await loadRoots();
     rootsState.inspected = null; rootsState.pinned = null; rootsState.results = null; rootsState.model = "";
-    ctx.notify(`${repoId}의 설정·토크나이저를 받았습니다. 가중치는 받지 않았습니다.`);
+    ctx.notify(msg`${repoId}의 설정·토크나이저를 받았습니다. 가중치는 받지 않았습니다.`);
     done = true;
   });
   if (done) back();
@@ -170,14 +171,14 @@ function focusRootLater(ctx: ViewContext, repoId: string, revision: string): () 
 
 /** "모듈 구조 확인": its own notice dialog; then `model_root_targets` (header-only) and a fresh root list. */
 export async function inspectTargets(ctx: ViewContext, root: HFRootRef): Promise<void> {
-  const answer = await openDialog({ title: "모듈 구조 확인",
-    bodyHtml: `<p><b>${escapeHtml(root.repo_id)}</b> · 버전 <span class="mono">${escapeHtml(root.revision)}</span></p>
-      <p>${TARGETS_NOTE}</p><p>확인한 모듈 구조는 이 PC에 기록되어 LoRA 대상 모듈(lora_target: all)과 Full·Freeze 학습의 계획·모의 실행에 쓰입니다.</p>`,
-    actions: [{ id: "back", label: "돌아가기" }, { id: "inspect", label: "확인", primary: true }] });
+  const answer = await openDialog({ title: tr("모듈 구조 확인"),
+    bodyHtml: ui`<p><b>${escapeHtml(root.repo_id)}</b> · 버전 <span class="mono">${escapeHtml(root.revision)}</span></p>
+      <p>${tr(TARGETS_NOTE)}</p><p>확인한 모듈 구조는 이 PC에 기록되어 LoRA 대상 모듈(lora_target: all)과 Full·Freeze 학습의 계획·모의 실행에 쓰입니다.</p>`,
+    actions: [{ id: "back", label: tr("돌아가기") }, { id: "inspect", label: tr("확인"), primary: true }] });
   if (answer?.action !== "inspect") return;
   const back = focusRootLater(ctx, root.repo_id, root.revision);
   let done = false;
-  await ctx.task("모듈 구조 확인 중", async () => {
+  await ctx.task(tr("모듈 구조 확인 중"), async () => {
     rootsState.error = null;
     const result = await planning.rootTargets(root.repo_id, root.revision);
     if (result.status !== "ok") {
@@ -185,7 +186,7 @@ export async function inspectTargets(ctx: ViewContext, root: HFRootRef): Promise
       throw new Error(describe(result.issues));
     }
     await loadRoots();
-    ctx.notify(`${root.repo_id}의 모듈 구조를 확인했습니다. 가중치는 받지 않았습니다.`);
+    ctx.notify(msg`${root.repo_id}의 모듈 구조를 확인했습니다. 가중치는 받지 않았습니다.`);
     done = true;
   });
   if (done) back();

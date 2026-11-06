@@ -1,3 +1,4 @@
+import { t as tr, msg, html as ui, staticHtml, localized } from "./i18n";
 type Obj = Record<string, any>;
 
 export const TUTORIAL_DATASET = { id: "tutorial_sample", version: "1" } as const;
@@ -27,7 +28,7 @@ export interface TutorialStep {
 
 const practiceData = (id: unknown, version: unknown) => id === TUTORIAL_DATASET.id && version === TUTORIAL_DATASET.version;
 
-export const tutorialSteps: TutorialStep[] = [
+export const tutorialSteps: TutorialStep[] = localized(() => ([
   { id: "welcome", page: "overview", anchor: "overview-setup", kind: "explain", title: "작업 공간 둘러보기",
     body: "왼쪽 메뉴의 워크스페이스에서는 프로젝트 → 데이터 → 레시피 → 그래프 실행 순서로 여러 학습을 이어서 진행하고, 단일 학습(학습 설정 · 실행 관리)에서는 학습 하나를 바로 계획합니다. 오른쪽 ‘시작하기’ 목록은 아직 남은 준비 단계를 보여 줍니다.\n이 튜토리얼은 약 7분 걸립니다. 단일 학습으로 실습한 뒤 프로젝트 화면을 둘러보며, GPU를 쓰거나 데이터를 전송하지 않습니다." },
   { id: "connection-provider", page: "connections", anchor: "connection-provider", kind: "explain", title: "GPU 연결 방식 고르기",
@@ -52,7 +53,7 @@ export const tutorialSteps: TutorialStep[] = [
     async enter(context) {
       const templates: Obj[] = context.state.catalog?.templates || [];
       const template = templates.find(t => t.name === "paper_extraction") || templates[0];
-      if (!template) throw new Error("예제 학습 설정을 찾지 못했습니다.");
+      if (!template) throw new Error(tr("예제 학습 설정을 찾지 못했습니다."));
       context.state.config = structuredClone(template.config);
       context.normalizeConfig();
       context.state.plan = null; context.state.capabilities = null;
@@ -80,4 +81,4 @@ export const tutorialSteps: TutorialStep[] = [
   { id: "finish", page: "overview", anchor: "overview-setup", kind: "explain", title: "튜토리얼 완료",
     body: "실제 학습은 두 방법으로 진행합니다. 프로젝트·그래프는 ① 실행 프로필에 배정받은 Pod나 GPU 서버 저장 ② 프로젝트를 만들어 데이터를 가져오고 레시피 준비 ③ 학습 그래프를 저장하고 모의 실행부터 계획 확인 순서입니다. 단일 학습은 ① 연결 설정에서 배정받은 RunPod 또는 GPU 서버 연결 ② 실제 데이터 등록과 GPU 전송 허용 선택 ③ 학습 설정과 실행 계획 확인 순서입니다.\n등록한 tutorial_sample은 연습용으로 남으며 실제 학습에는 쓸 수 없습니다. 튜토리얼은 왼쪽 메뉴의 ‘튜토리얼’에서 다시 볼 수 있습니다.",
     cta: { label: "연결 설정으로 이동", async run(context) { await context.finish(); await context.navigate("connections"); } } },
-];
+]));

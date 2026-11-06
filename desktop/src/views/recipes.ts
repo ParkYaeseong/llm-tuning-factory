@@ -1,3 +1,4 @@
+import { t as tr, msg, html as ui, staticHtml, localized } from "../i18n";
 // Recipes (10.2): reusable training options kept apart from data, models, GPUs and approvals. List, create, edit,
 // clone and "예제에서 만들기". The fields are the training form's own (components/recipe-fields.ts, D17) in recipe mode.
 // Saving is explicit (D4); a stale save keeps the draft and offers the D5 choices. Every dynamic text is escaped.
@@ -29,7 +30,7 @@ const STAGE_OPTIONS = { pref_loss: "sigmoid", pref_beta: 0.1, pref_ftx: 0, pref_
 const EVALUATION = { kind: "pipeline", thresholds: {}, max_samples: 32, max_new_tokens: 256 };
 const REWARD_FIELDS = ["reward_model", "reward_model_type", "reward_model_sha256"];
 const METHOD_LABELS: Record<string, string> = { lora: "LoRA", qlora: "QLoRA", full: "Full", freeze: "Freeze", oft: "OFT" };
-const KIND_LABELS: Record<string, string> = { text: "텍스트", instruction: "지시·대화", preference: "선호 쌍", prompt: "프롬프트", kto: "선호 라벨" };
+const KIND_LABELS: Record<string, string> = localized(() => ({ text: "텍스트", instruction: "지시·대화", preference: "선호 쌍", prompt: "프롬프트", kto: "선호 라벨" }));
 
 const without = (value: unknown, keys: string[]) =>
   Object.fromEntries(Object.entries((value ?? {}) as Obj).filter(([key]) => !keys.includes(key)));
@@ -67,7 +68,7 @@ const canonical = (value: unknown): string => Array.isArray(value) ? `[${value.m
   : JSON.stringify(value) ?? "null";
 const dirty = (draft: RecipeDraft) => !draft.saved || canonical(draft.spec) !== canonical(draft.saved.recipe);
 const notAvailable = (result: WorkflowResult<unknown>) => result.issues.some(issue => issue.code === "not_available");
-const describe = (issues: WorkflowIssue[]) => issues.map(issue => localize(issue).text).join("\n") || "요청을 처리하지 못했습니다.";
+const describe = (issues: WorkflowIssue[]) => issues.map(issue => localize(issue).text).join("\n") || tr("요청을 처리하지 못했습니다.");
 const newRecipeId = () => crypto.randomUUID().replace(/-/g, "");
 const stagesOf = (ctx: ViewContext): Stages => ctx.catalog.training_stages ?? [];
 const stageLabel = (ctx: ViewContext, stage: string) => stagesOf(ctx).find(item => item.id === stage)?.label ?? stage.toUpperCase();
@@ -97,10 +98,10 @@ function remember(revision: RecipeRevision) {
 
 // -- rendering --
 function recipeList(ctx: ViewContext) {
-  if (list === null && !listIssues.length) return '<div class="empty">레시피 목록을 불러오는 중입니다.</div>';
-  if (listIssues.length) return `<div class="wf-banner bad">${unavailable ? NOT_AVAILABLE : "레시피 목록을 불러오지 못했습니다."}</div>${unavailable ? "" : issueList(listIssues)}`;
-  if (!list!.length) return '<div class="empty">아직 저장한 레시피가 없습니다. 새 레시피를 만들거나 예제에서 시작하세요.</div>';
-  return `<div class="table-scroll"><table><thead><tr><th>레시피</th><th>학습 단계 · 방법</th><th>입력 형식</th><th>저장된 버전</th><th></th></tr></thead><tbody>${list!.map(recipe => `<tr${recipe.recipe_id === openId ? ' class="current"' : ""}>
+  if (list === null && !listIssues.length) return staticHtml('<div class="empty">레시피 목록을 불러오는 중입니다.</div>');
+  if (listIssues.length) return `<div class="wf-banner bad">${unavailable ? tr(NOT_AVAILABLE) : tr("레시피 목록을 불러오지 못했습니다.")}</div>${unavailable ? "" : issueList(listIssues)}`;
+  if (!list!.length) return staticHtml('<div class="empty">아직 저장한 레시피가 없습니다. 새 레시피를 만들거나 예제에서 시작하세요.</div>');
+  return ui`<div class="table-scroll"><table><thead><tr><th>레시피</th><th>학습 단계 · 방법</th><th>입력 형식</th><th>저장된 버전</th><th></th></tr></thead><tbody>${list!.map(recipe => ui`<tr${recipe.recipe_id === openId ? ' class="current"' : ""}>
     <td><b>${escapeHtml(recipe.name)}</b>${recipe.description ? `<small>${escapeHtml(recipe.description)}</small>` : ""}</td>
     <td>${escapeHtml(stageLabel(ctx, recipe.training_stage))} · ${escapeHtml(METHOD_LABELS[recipe.training_method] ?? recipe.training_method)}</td>
     <td>${escapeHtml(KIND_LABELS[recipe.input_kind] ?? recipe.input_kind)}</td><td class="mono">${escapeHtml(recipe.revision_sha256.slice(0, 8))}</td>
@@ -109,9 +110,9 @@ function recipeList(ctx: ViewContext) {
 
 function exampleCard(ctx: ViewContext) {
   const templates = ctx.catalog.templates ?? [];
-  return `<section class="card recipe-example" aria-labelledby="recipe-example-title"><div class="section-title"><h3 id="recipe-example-title">예제에서 만들기</h3></div>
+  return ui`<section class="card recipe-example" aria-labelledby="recipe-example-title"><div class="section-title"><h3 id="recipe-example-title">예제에서 만들기</h3></div>
     <p>예제의 학습 단계·방법·옵션만 가져와 새 레시피 초안을 만듭니다. 데이터, 기반 모델, GPU·Pod와 승인은 가져오지 않습니다.</p>
-    ${templates.length ? `${select("예제", "recipe_example", example, templates.map((template, index) => [String(index), template.name])).replace("<select ", ctx.busy ? "<select disabled " : "<select ")}<div class="actions">${button("예제에서 만들기", "wf:recipes:from-example", "", unavailable)}</div>` : '<div class="empty">불러올 예제가 없습니다.</div>'}</section>`;
+    ${templates.length ? `${select(tr("예제"), "recipe_example", example, templates.map((template, index) => [String(index), template.name])).replace("<select ", ctx.busy ? "<select disabled " : "<select ")}<div class="actions">${button(tr("예제에서 만들기"), "wf:recipes:from-example", "", unavailable)}</div>` : staticHtml('<div class="empty">불러올 예제가 없습니다.</div>')}</section>`;
 }
 
 function editor(ctx: ViewContext, recipeId: string, draft: RecipeDraft) {
@@ -128,39 +129,39 @@ function editor(ctx: ViewContext, recipeId: string, draft: RecipeDraft) {
     capabilities: draft.spec.training_stage === "ppo" ? { methods: METHODS.filter(method => method !== "oft") } : null };
   const f = (label: string, path: string, type = "text", help = "") => sourceField(fields, label, path, type, help);
   const choice = (label: string, path: string, options: [string, string][]) => sourceSelect(fields, label, path, options);
-  const description = decorate("description", `<label class="field"><span>설명</span><textarea id="recipe-description" aria-label="설명" data-recipe="description" rows="2" maxlength="2000">\n${escapeHtml(draft.spec.description)}</textarea></label>`);
-  const body = `<div class="grid">${f("레시피 이름", "name").replace("<input ", '<input id="recipe-name" maxlength="200" aria-required="true" ')}${description}</div>
+  const description = decorate("description", ui`<label class="field"><span>설명</span><textarea id="recipe-description" aria-label="설명" data-recipe="description" rows="2" maxlength="2000">\n${escapeHtml(draft.spec.description)}</textarea></label>`);
+  const body = ui`<div class="grid">${f(tr("레시피 이름"), "name").replace("<input ", '<input id="recipe-name" maxlength="200" aria-required="true" ')}${description}</div>
     <h4>학습 방식</h4><div class="grid">${stageSelect(fields)}${methodSelect(fields)}
-    ${f("학습 횟수 (epoch)", "hyperparameters.num_train_epochs", "number")}${f("학습률", "hyperparameters.learning_rate", "number")}
-    ${f("배치 크기", "hyperparameters.per_device_train_batch_size", "number")}${f("최대 토큰 길이", "hyperparameters.cutoff_len", "number")}
-    ${choice("정밀도", "hyperparameters.precision", [["bf16", "BF16 · 권장"], ["fp16", "FP16"]])}${f("최대 step (-1은 epoch 기준)", "hyperparameters.max_steps", "number")}
-    ${f("기울기 누적", "hyperparameters.gradient_accumulation_steps", "number")}${f("무작위 시드", "hyperparameters.seed", "number")}
-    ${f("체크포인트 저장 간격 (step)", "hyperparameters.save_steps", "number")}${f("체크포인트 보관 수", "hyperparameters.save_total_limit", "number")}</div>
+    ${f(tr("학습 횟수 (epoch)"), "hyperparameters.num_train_epochs", "number")}${f(tr("학습률"), "hyperparameters.learning_rate", "number")}
+    ${f(tr("배치 크기"), "hyperparameters.per_device_train_batch_size", "number")}${f(tr("최대 토큰 길이"), "hyperparameters.cutoff_len", "number")}
+    ${choice(tr("정밀도"), "hyperparameters.precision", [["bf16", tr("BF16 · 권장")], ["fp16", "FP16"]])}${f(tr("최대 step (-1은 epoch 기준)"), "hyperparameters.max_steps", "number")}
+    ${f(tr("기울기 누적"), "hyperparameters.gradient_accumulation_steps", "number")}${f(tr("무작위 시드"), "hyperparameters.seed", "number")}
+    ${f(tr("체크포인트 저장 간격 (step)"), "hyperparameters.save_steps", "number")}${f(tr("체크포인트 보관 수"), "hyperparameters.save_total_limit", "number")}</div>
     ${trainingOptions(fields)}
-    <section class="card"><h3>평가 기본값</h3><div class="grid">${choice("평가 방식", "evaluation_defaults.kind", [["pipeline", "학습 완료 확인"], ["json", "JSON 형식"], ["classification", "분류"], ["extraction", "정보 추출"], ["kbf_extraction", "KBF 추출"], ["reward", "보상 점수 · RM"]])}
-    ${f("검증 최대 건수", "evaluation_defaults.max_samples", "number")}${f("답변 최대 토큰", "evaluation_defaults.max_new_tokens", "number")}</div></section>`;
+    <section class="card"><h3>평가 기본값</h3><div class="grid">${choice(tr("평가 방식"), "evaluation_defaults.kind", [["pipeline", tr("학습 완료 확인")], ["json", tr("JSON 형식")], ["classification", tr("분류")], ["extraction", tr("정보 추출")], ["kbf_extraction", tr("KBF 추출")], ["reward", tr("보상 점수 · RM")]])}
+    ${f(tr("검증 최대 건수"), "evaluation_defaults.max_samples", "number")}${f(tr("답변 최대 토큰"), "evaluation_defaults.max_new_tokens", "number")}</div></section>`;
   const rest = draft.issues.filter(issue => !placed.has(issue));
   const revision = draft.saved?.revision_sha256;
-  const state = !draft.saved ? statusPill("neutral", "아직 저장하지 않음") : dirty(draft) ? statusPill("warn", "저장 안 된 변경") : statusPill("neutral", `저장된 버전 ${revision!.slice(0, 8)}`);
-  const conflict = draft.conflict ? `<div class="wf-banner warn recipe-banner" role="status"><div>${draft.conflict.some(issue => issue.code === "revision_conflict")
+  const state = !draft.saved ? statusPill("neutral", tr("아직 저장하지 않음")) : dirty(draft) ? statusPill("warn", tr("저장 안 된 변경")) : statusPill("neutral", msg`저장된 버전 ${revision!.slice(0, 8)}`);
+  const conflict = draft.conflict ? ui`<div class="wf-banner warn recipe-banner" role="status"><div>${draft.conflict.some(issue => issue.code === "revision_conflict")
     ? escapeHtml(localize(draft.conflict.find(issue => issue.code === "revision_conflict")!).text) : issueList(draft.conflict)}<small>내 초안은 그대로 남아 있습니다.</small></div>
-    ${draft.conflict.some(issue => issue.code === "revision_conflict") ? `<div class="actions">${button("최신 버전 불러오기", "wf:recipes:reload")}${button("내 변경으로 덮어쓰기", "wf:recipes:overwrite")}</div>` : ""}</div>` : "";
-  return `<form id="recipe-form" class="card recipe-editor" data-recipe-id="${escapeHtml(recipeId)}" novalidate aria-labelledby="recipe-editor-title">
-    <div class="section-title"><h3 id="recipe-editor-title" tabindex="-1">${draft.saved ? escapeHtml(draft.saved.recipe.name) : "새 레시피"}</h3>${state}</div>
-    ${conflict}${rest.length ? `<div class="recipe-summary" role="status">${issueList(rest, { heading: "저장하지 못한 이유" })}</div>` : ""}
+    ${draft.conflict.some(issue => issue.code === "revision_conflict") ? `<div class="actions">${button(tr("최신 버전 불러오기"), "wf:recipes:reload")}${button(tr("내 변경으로 덮어쓰기"), "wf:recipes:overwrite")}</div>` : ""}</div>` : "";
+  return ui`<form id="recipe-form" class="card recipe-editor" data-recipe-id="${escapeHtml(recipeId)}" novalidate aria-labelledby="recipe-editor-title">
+    <div class="section-title"><h3 id="recipe-editor-title" tabindex="-1">${draft.saved ? escapeHtml(draft.saved.recipe.name) : tr("새 레시피")}</h3>${state}</div>
+    ${conflict}${rest.length ? `<div class="recipe-summary" role="status">${issueList(rest, { heading: tr("저장하지 못한 이유") })}</div>` : ""}
     <fieldset class="recipe-fieldset"${ctx.busy ? " disabled" : ""}>${body}</fieldset>
     <p class="muted recipe-note">레시피에는 데이터, 기반 모델, GPU·Pod, 승인 정보가 들어가지 않습니다. 학습 그래프의 단계에서 데이터와 실행 위치를 따로 연결합니다.</p>
-    <div class="actions"><button type="submit" class="primary" data-focus-key="recipe-save"${unavailable ? " disabled" : ""}>저장</button>${draft.saved ? button("복제", `wf:recipes:clone:${recipeId}`, "", unavailable) : ""}${button("닫기", "wf:recipes:close", "quiet")}</div></form>`;
+    <div class="actions"><button type="submit" class="primary" data-focus-key="recipe-save"${unavailable ? " disabled" : ""}>저장</button>${draft.saved ? button(tr("복제"), `wf:recipes:clone:${recipeId}`, "", unavailable) : ""}${button(tr("닫기"), "wf:recipes:close", "quiet")}</div></form>`;
 }
 
 // -- actions --
 async function loadList(ctx: ViewContext, open: string | null) {
-  await ctx.task("레시피 목록 불러오는 중", async () => {
+  await ctx.task(tr("레시피 목록 불러오는 중"), async () => {
     const result = await recipeApi.list();
     if (result.status === "ok" && result.data) { list = result.data.recipes; listIssues = []; }
     else {
       if (notAvailable(result)) unavailable = true;
-      listIssues = result.issues.length ? result.issues : [{ code: "refused", path: "", message: "레시피 목록을 불러오지 못했습니다." }];
+      listIssues = result.issues.length ? result.issues : [{ code: "refused", path: "", message: tr("레시피 목록을 불러오지 못했습니다.") }];
     }
     if (open) await read(open);
   });
@@ -192,10 +193,10 @@ async function cloneRecipe(ctx: ViewContext, recipeId: string) {
   const revision = saved?.revision_sha256 ?? listed?.revision_sha256;
   const base = saved?.recipe.name ?? listed?.name;
   if (!revision || base === undefined) return;
-  const name = `${base.slice(0, 196)} 복사본`;
+  const name = msg`${base.slice(0, 196)} 복사본`;
   const still = stillOn(ctx);
   let cloned = false;
-  await ctx.task("레시피 복제 중", async () => {
+  await ctx.task(tr("레시피 복제 중"), async () => {
     const result = await recipeApi.clone({ recipe_id: recipeId, revision, name });
     if (result.status !== "ok" || !result.data) {
       if (notAvailable(result)) unavailable = true;
@@ -203,7 +204,7 @@ async function cloneRecipe(ctx: ViewContext, recipeId: string) {
     }
     remember(result.data);
     openId = result.data.recipe.recipe_id; cloned = true;
-    ctx.notify("레시피를 복제했습니다. 원본은 바뀌지 않습니다.");
+    ctx.notify(tr("레시피를 복제했습니다. 원본은 바뀌지 않습니다."));
   });
   if (cloned && still()) focusEditor();
 }
@@ -217,7 +218,7 @@ async function saveAgainst(ctx: ViewContext, draft: RecipeDraft, expected: Sha25
     const previous = draft.saved?.revision_sha256 ?? null;
     remember(result.data);
     for (const replaced of new Set([previous, expected])) if (replaced && replaced !== result.data.revision_sha256) ctx.store.markRecipeChanged(replaced);
-    ctx.notify("레시피를 저장했습니다.");
+    ctx.notify(tr("레시피를 저장했습니다."));
     return;
   }
   if (notAvailable(result)) unavailable = true;
@@ -230,15 +231,15 @@ async function saveRecipe(ctx: ViewContext) {
   const draft = openId ? drafts.get(openId) : undefined;
   if (!draft) return;
   if (!draft.spec.name.trim()) {
-    draft.issues = [{ code: "required", path: "/spec/name", message: "레시피 이름을 입력하세요." }];
+    draft.issues = [{ code: "required", path: "/spec/name", message: tr("레시피 이름을 입력하세요.") }];
     ctx.render(); document.getElementById("recipe-name")?.focus(); return;
   }
   if (draft.spec.training_stage === "ppo" && draft.spec.training_method === "oft") {
-    draft.issues = [{ code: "invalid_value", path: "/spec/training_method", message: PPO_WITHOUT_OFT }];
+    draft.issues = [{ code: "invalid_value", path: "/spec/training_method", message: tr(PPO_WITHOUT_OFT) }];
     ctx.render(); document.querySelector<HTMLElement>('#recipe-form [data-recipe="training_method"]')?.focus(); return;
   }
   const still = stillOn(ctx);
-  await ctx.task("레시피 저장 중", () => saveAgainst(ctx, draft, draft.saved?.revision_sha256 ?? null));
+  await ctx.task(tr("레시피 저장 중"), () => saveAgainst(ctx, draft, draft.saved?.revision_sha256 ?? null));
   // The shell gives the focus back to the control that started the save; this only covers a control that is gone.
   refocus(still, "recipe-save");
 }
@@ -247,18 +248,18 @@ async function reloadRecipe(ctx: ViewContext) {
   const draft = openId ? drafts.get(openId) : undefined;
   if (!openId || !draft) return;
   const recipeId = openId;
-  const answer = await openDialog({ title: "최신 버전 불러오기",
-    bodyHtml: "<p>다른 곳에서 저장한 최신 버전으로 바꿉니다. 저장하지 않은 내 변경은 사라집니다.</p>",
-    actions: [{ id: "back", label: "돌아가기" }, { id: "reload", label: "불러오기", primary: true }] });
+  const answer = await openDialog({ title: tr("최신 버전 불러오기"),
+    bodyHtml: staticHtml("<p>다른 곳에서 저장한 최신 버전으로 바꿉니다. 저장하지 않은 내 변경은 사라집니다.</p>"),
+    actions: [{ id: "back", label: tr("돌아가기") }, { id: "reload", label: tr("불러오기"), primary: true }] });
   if (answer?.action !== "reload") return;
   const still = stillOn(ctx);
-  await ctx.task("최신 버전 불러오는 중", async () => {
+  await ctx.task(tr("최신 버전 불러오는 중"), async () => {
     const previous = draft.saved?.revision_sha256;
     const result = await recipeApi.get(recipeId);
     if (result.status !== "ok" || !result.data) throw new Error(describe(result.issues));
     remember(result.data);
     if (previous && previous !== result.data.revision_sha256) ctx.store.markRecipeChanged(previous);
-    ctx.notify("최신 버전을 불러왔습니다.");
+    ctx.notify(tr("최신 버전을 불러왔습니다."));
   });
   refocus(still, "recipe-save");
 }
@@ -267,12 +268,12 @@ async function overwriteRecipe(ctx: ViewContext) {
   const draft = openId ? drafts.get(openId) : undefined;
   if (!openId || !draft) return;
   const recipeId = openId;
-  const answer = await openDialog({ title: "내 변경으로 덮어쓰기",
-    bodyHtml: "<p>다른 곳에서 먼저 저장한 변경을 지금 내 초안으로 덮어씁니다. 그 변경은 최신 버전에서 빠지고 이전 버전 기록으로만 남습니다.</p>",
-    actions: [{ id: "back", label: "돌아가기" }, { id: "overwrite", label: "덮어쓰기", primary: true }] });
+  const answer = await openDialog({ title: tr("내 변경으로 덮어쓰기"),
+    bodyHtml: staticHtml("<p>다른 곳에서 먼저 저장한 변경을 지금 내 초안으로 덮어씁니다. 그 변경은 최신 버전에서 빠지고 이전 버전 기록으로만 남습니다.</p>"),
+    actions: [{ id: "back", label: tr("돌아가기") }, { id: "overwrite", label: tr("덮어쓰기"), primary: true }] });
   if (answer?.action !== "overwrite") return;
   const still = stillOn(ctx);
-  await ctx.task("내 변경으로 저장 중", async () => {
+  await ctx.task(tr("내 변경으로 저장 중"), async () => {
     const latest = await recipeApi.get(recipeId);
     if (latest.status !== "ok" || !latest.data) throw new Error(describe(latest.issues));
     await saveAgainst(ctx, draft, latest.data.revision_sha256);
@@ -300,12 +301,12 @@ function captureForm(ctx: ViewContext) {
   draft.spec.input_kind = inputKindFor(draft.spec.training_stage, stagesOf(ctx));
 }
 
-export const view: View = {
+export const view: View = localized(() => ({
   id: "recipes", title: "레시피", description: "학습 단계·방법·옵션을 데이터와 GPU에서 떼어 저장하고 다시 씁니다.",
   nav: { group: "workspace", label: "레시피", icon: "recipes", order: 40 },
   render(ctx) {
     const draft = openId ? drafts.get(openId) : undefined;
-    return `<div class="recipes-top"><section class="card recipe-list" aria-labelledby="recipe-list-title"><div class="section-title"><h3 id="recipe-list-title">저장한 레시피 ${list ? `<span class="count">${list.length}</span>` : ""}</h3><div class="actions">${button("새 레시피", "wf:recipes:new", "primary", unavailable)}</div></div>${recipeList(ctx)}</section>
+    return ui`<div class="recipes-top"><section class="card recipe-list" aria-labelledby="recipe-list-title"><div class="section-title"><h3 id="recipe-list-title">저장한 레시피 ${list ? `<span class="count">${list.length}</span>` : ""}</h3><div class="actions">${button(tr("새 레시피"), "wf:recipes:new", "primary", unavailable)}</div></div>${recipeList(ctx)}</section>
       ${exampleCard(ctx)}</div>${openId && draft ? editor(ctx, openId, draft) : ""}`;
   },
   bind(ctx) {
@@ -335,7 +336,7 @@ export const view: View = {
     }
     else if (verb === "open" && arg) {
       const still = stillOn(ctx);
-      await ctx.task("레시피 불러오는 중", () => read(arg));
+      await ctx.task(tr("레시피 불러오는 중"), () => read(arg));
       if (openId === arg && still()) focusEditor();
     }
     else if (verb === "clone" && arg) await cloneRecipe(ctx, arg);
@@ -344,4 +345,4 @@ export const view: View = {
     else if (verb === "overwrite") await overwriteRecipe(ctx);
     else if (verb === "close") { openId = null; ctx.render(); document.querySelector<HTMLElement>('[data-action="wf:recipes:new"]')?.focus(); }
   },
-};
+}));

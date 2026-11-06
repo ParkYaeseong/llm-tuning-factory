@@ -1,3 +1,4 @@
+import { t as tr, msg, html as ui, staticHtml, localized } from "./i18n";
 // The typed bridge of the workflow channel: the only module that calls `invoke` for Task 10 (D3).
 // It never logs request data; native `Err` strings (Korean) become BridgeErrors shown verbatim.
 import { invoke } from "@tauri-apps/api/core";
@@ -24,14 +25,14 @@ const validIssue = (value: unknown) => isObject(value) && typeof value.code === 
 export function parseWorkflowResult<T>(value: unknown): WorkflowResult<T> {
   if (!isObject(value) || typeof value.status !== "string" || !STATUSES.has(value.status) || !Array.isArray(value.issues)
       || !value.issues.every(validIssue) || !("data" in value) || value.data === undefined)
-    throw new BridgeError(MALFORMED);
+    throw new BridgeError(tr(MALFORMED));
   return value as unknown as WorkflowResult<T>;
 }
 
 const toBridgeError = (reason: unknown): never => { throw new BridgeError(String(reason)); };
 
 export async function workflow<T>(action: WorkflowAction, data: object = {}): Promise<WorkflowResult<T>> {
-  if (!(WORKFLOW_ACTIONS as readonly string[]).includes(action)) throw new BridgeError("허용하지 않은 작업");
+  if (!(WORKFLOW_ACTIONS as readonly string[]).includes(action)) throw new BridgeError(tr("허용하지 않은 작업"));
   return parseWorkflowResult<T>(await invoke("workflow_action", { action, data }).catch(toBridgeError));
 }
 

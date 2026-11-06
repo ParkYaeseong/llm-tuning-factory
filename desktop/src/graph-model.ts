@@ -1,3 +1,4 @@
+import { t as tr, msg, html as ui, staticHtml, localized } from "./i18n";
 // The training graph draft (10.5, D6, D7): pure operations on the project's draft `graph` JSON. Cards and the SVG
 // preview both come from `layout` of the same draft; connection reasons and metric choices are what the draft alone
 // proves (the backend's `graph_validate`/`graph_plan` stay authoritative). Pure: imports only types.
@@ -48,63 +49,63 @@ export type StarterShape = "single" | "serial" | "parallel" | "parallel_merge";
 export interface MetricChoice { metric: string; label: string; note?: string; allowed: boolean; reason?: string }
 
 /** Fixed Korean texts: local reasons (D7) and notes. */
-export const REASONS = {
-  limit: "단계는 최대 64개입니다",
-  cycle: "연결하면 순환이 생깁니다",
-  cycleExists: "그래프에 순환 연결이 있습니다",
-  missingNode: "연결된 단계를 찾을 수 없습니다",
-  duplicateId: "단계 ID가 중복되었습니다",
-  unknownKind: "이 단계 종류는 화면에서 추가하거나 고칠 수 없습니다",
-  evaluationAsModel: "평가 결과는 모델 입력으로 쓸 수 없습니다",
-  notEvaluation: "자동 선택에는 평가 결과만 연결할 수 있습니다",
-  oftParent: "OFT 결과는 다음 단계로 넘길 수 없습니다",
-  oftRecipe: "그래프에서는 OFT 학습을 쓸 수 없습니다",
-  materialize: "학습 방법이 바뀌는 연결은 먼저 ‘전체 모델 확정’ 단계가 필요합니다",
-  ppoRoute: "PPO 학습과 다른 학습 단계는 결과를 서로 넘길 수 없습니다",
-  ppoContinuation: "PPO는 이전 단계의 어댑터를 이어서 학습할 수 없습니다",
-  ppoReward: "PPO 학습에는 보상 모델 연결이 필요합니다",
-  rewardNotPpo: "보상 모델은 PPO 학습에서만 연결할 수 있습니다",
-  mergeLimit: "병합은 최대 4개 모델까지입니다",
-  mergeSource: "병합에는 LoRA·QLoRA로 학습한 단계만 쓸 수 있습니다",
-  mergeCount: "병합에는 서로 다른 모델 2–4개가 필요합니다",
-  mergeWeights: "병합 가중치는 모두 0보다 크고 합이 정확히 100%여야 합니다",
-  materializeSource: "전체 모델 확정에는 LoRA·QLoRA 학습 결과만 쓸 수 있습니다",
-  noMetrics: "평가 지표가 없어 자동 선택에 쓸 수 없습니다",
-  mixedEvaluators: "서로 다른 평가 기준은 비교할 수 없습니다",
-  noEvaluations: "평가 결과를 먼저 연결하세요",
-  unknownMetric: "이 평가 기준에 없는 지표입니다",
-  minSuccess: "최소 성공 수는 2 이상의 정수여야 합니다",
-  tolerance: "병합 회귀 허용치는 0 이상이어야 합니다",
-  trainRole: "학습 단계에는 학습용(train) 데이터만 연결할 수 있습니다",
-  bindingMissing: "연결한 데이터를 프로젝트에서 찾을 수 없습니다",
-  label: "단계 이름을 입력하세요",
-  recipe: "레시피를 고르세요",
-  modelInput: "입력 모델을 고르세요",
-  model: "입력 모델을 고르세요",
-  dataset: "학습 데이터를 고르세요",
-  benchmark: "평가 기준을 고르세요",
-  evaluations: "비교할 평가를 고르세요",
-  metric: "선택 지표를 고르세요",
-  profiles: "실행 프로필을 하나 이상 고르세요",
-  settingsConcurrent: "최대 동시 실행은 1–64 사이의 정수여야 합니다",
-  settingsCost: "최대 총비용은 0보다 커야 합니다",
-  settingsAttempts: "재시도 횟수는 1–5 사이의 정수여야 합니다",
-  settingsBackoff: "재시도 간격은 0–3600초 사이의 정수여야 합니다",
-  edgeLimit: "그래프 연결은 최대 256개입니다",
-} as const;
-export const NOTES = {
-  text: "텍스트 정답 일치 지표 · 의미적 품질 점수가 아닙니다",
-  format: "형식 지표 · 품질 지표가 아닙니다",
-  select: "자동 선택은 추천 결과 확정이며 배포하지 않습니다. 텍스트 정답 일치 지표는 의미적 품질을 보장하지 않습니다.",
-  mergeRealOnly: "병합은 실제로 완료된 LoRA·QLoRA 결과만 합칩니다(가중치 합 100%, 합친 rank 256 이하). 모의 실행 계획에서는 모의 결과를 병합할 수 없어 이 단계에서 멈춥니다.",
-  waiting: "같은 실행 자원을 써서 순서대로 실행됩니다 (대기)",
-} as const;
-export const KIND_LABELS: Record<NodeKind, string> = { train: "학습", evaluate: "평가", select: "자동 선택", merge: "병합", materialize: "전체 모델 확정" };
+export const REASONS = localized(() => ({
+  limit: tr("단계는 최대 64개입니다"),
+  cycle: tr("연결하면 순환이 생깁니다"),
+  cycleExists: tr("그래프에 순환 연결이 있습니다"),
+  missingNode: tr("연결된 단계를 찾을 수 없습니다"),
+  duplicateId: tr("단계 ID가 중복되었습니다"),
+  unknownKind: tr("이 단계 종류는 화면에서 추가하거나 고칠 수 없습니다"),
+  evaluationAsModel: tr("평가 결과는 모델 입력으로 쓸 수 없습니다"),
+  notEvaluation: tr("자동 선택에는 평가 결과만 연결할 수 있습니다"),
+  oftParent: tr("OFT 결과는 다음 단계로 넘길 수 없습니다"),
+  oftRecipe: tr("그래프에서는 OFT 학습을 쓸 수 없습니다"),
+  materialize: tr("학습 방법이 바뀌는 연결은 먼저 ‘전체 모델 확정’ 단계가 필요합니다"),
+  ppoRoute: tr("PPO 학습과 다른 학습 단계는 결과를 서로 넘길 수 없습니다"),
+  ppoContinuation: tr("PPO는 이전 단계의 어댑터를 이어서 학습할 수 없습니다"),
+  ppoReward: tr("PPO 학습에는 보상 모델 연결이 필요합니다"),
+  rewardNotPpo: tr("보상 모델은 PPO 학습에서만 연결할 수 있습니다"),
+  mergeLimit: tr("병합은 최대 4개 모델까지입니다"),
+  mergeSource: tr("병합에는 LoRA·QLoRA로 학습한 단계만 쓸 수 있습니다"),
+  mergeCount: tr("병합에는 서로 다른 모델 2–4개가 필요합니다"),
+  mergeWeights: tr("병합 가중치는 모두 0보다 크고 합이 정확히 100%여야 합니다"),
+  materializeSource: tr("전체 모델 확정에는 LoRA·QLoRA 학습 결과만 쓸 수 있습니다"),
+  noMetrics: tr("평가 지표가 없어 자동 선택에 쓸 수 없습니다"),
+  mixedEvaluators: tr("서로 다른 평가 기준은 비교할 수 없습니다"),
+  noEvaluations: tr("평가 결과를 먼저 연결하세요"),
+  unknownMetric: tr("이 평가 기준에 없는 지표입니다"),
+  minSuccess: tr("최소 성공 수는 2 이상의 정수여야 합니다"),
+  tolerance: tr("병합 회귀 허용치는 0 이상이어야 합니다"),
+  trainRole: tr("학습 단계에는 학습용(train) 데이터만 연결할 수 있습니다"),
+  bindingMissing: tr("연결한 데이터를 프로젝트에서 찾을 수 없습니다"),
+  label: tr("단계 이름을 입력하세요"),
+  recipe: tr("레시피를 고르세요"),
+  modelInput: tr("입력 모델을 고르세요"),
+  model: tr("입력 모델을 고르세요"),
+  dataset: tr("학습 데이터를 고르세요"),
+  benchmark: tr("평가 기준을 고르세요"),
+  evaluations: tr("비교할 평가를 고르세요"),
+  metric: tr("선택 지표를 고르세요"),
+  profiles: tr("실행 프로필을 하나 이상 고르세요"),
+  settingsConcurrent: tr("최대 동시 실행은 1–64 사이의 정수여야 합니다"),
+  settingsCost: tr("최대 총비용은 0보다 커야 합니다"),
+  settingsAttempts: tr("재시도 횟수는 1–5 사이의 정수여야 합니다"),
+  settingsBackoff: tr("재시도 간격은 0–3600초 사이의 정수여야 합니다"),
+  edgeLimit: tr("그래프 연결은 최대 256개입니다"),
+} as const));
+export const NOTES = localized(() => ({
+  text: tr("텍스트 정답 일치 지표 · 의미적 품질 점수가 아닙니다"),
+  format: tr("형식 지표 · 품질 지표가 아닙니다"),
+  select: tr("자동 선택은 추천 결과 확정이며 배포하지 않습니다. 텍스트 정답 일치 지표는 의미적 품질을 보장하지 않습니다."),
+  mergeRealOnly: tr("병합은 실제로 완료된 LoRA·QLoRA 결과만 합칩니다(가중치 합 100%, 합친 rank 256 이하). 모의 실행 계획에서는 모의 결과를 병합할 수 없어 이 단계에서 멈춥니다."),
+  waiting: tr("같은 실행 자원을 써서 순서대로 실행됩니다 (대기)"),
+} as const));
+export const KIND_LABELS: Record<NodeKind, string> = localized(() => ({ train: "학습", evaluate: "평가", select: "자동 선택", merge: "병합", materialize: "전체 모델 확정" }));
 export const KINDS: readonly NodeKind[] = ["train", "evaluate", "select", "merge", "materialize"];
 const ID_PREFIX: Record<NodeKind, string> = { train: "train", evaluate: "eval", select: "select", merge: "merge", materialize: "model" };
-export const METRIC_LABELS: Record<string, string> = { exact_match: "정확 일치 (exact_match)", character_f1: "문자 F1 (character_f1)",
+export const METRIC_LABELS: Record<string, string> = localized(() => ({ exact_match: "정확 일치 (exact_match)", character_f1: "문자 F1 (character_f1)",
   accuracy: "정확도 (accuracy)", macro_f1: "매크로 F1 (macro_f1)", f1: "F1 (f1)", json_validity: "JSON 형식 유효성 (json_validity)",
-  mean_name_f1: "이름 평균 F1 (mean_name_f1)", mean_id_f1: "ID 평균 F1 (mean_id_f1)" };
+  mean_name_f1: "이름 평균 F1 (mean_name_f1)", mean_id_f1: "ID 평균 F1 (mean_id_f1)" }));
 const METRIC_NOTES: Record<string, string> = { exact_match: NOTES.text, character_f1: NOTES.text, json_validity: NOTES.format };
 
 type Obj = Record<string, any>;
@@ -114,7 +115,7 @@ export const isRef = (value: unknown): value is NodeOutputRef => isObject(value)
   && (value.output_name === "model" || value.output_name === "evaluation") && Object.keys(value).length === 2;
 export const outputRef = (node_id: string, output_name: "model" | "evaluation" = "model"): NodeOutputRef => ({ node_id, output_name });
 export const findNode = (graph: GraphJson, id: string): NodeJson | undefined => graph.nodes.find(node => node.id === id);
-export const labelOf = (node: NodeJson | undefined) => node ? (typeof node.label === "string" && node.label.trim() ? node.label : "(이름 없음)") : "(없는 단계)";
+export const labelOf = (node: NodeJson | undefined) => node ? (typeof node.label === "string" && node.label.trim() ? node.label : tr("(이름 없음)")) : tr("(없는 단계)");
 const kindOf = (node: NodeJson | undefined): NodeKind | null => node && KINDS.includes(node.kind) ? node.kind : null;
 
 /** The node's references to other cards, with the port and the output each port requires. */
@@ -463,7 +464,7 @@ export function metricChoices(evaluatorKinds: string[]): MetricChoice[] {
   const choices = metrics.map(metric => ({ metric, label: METRIC_LABELS[metric] ?? metric, ...(METRIC_NOTES[metric] ? { note: METRIC_NOTES[metric] } : {}),
     allowed: !reason, ...(reason ? { reason } : {}) }));
   if (choices.length) return choices;
-  return [{ metric: "", label: reason === REASONS.noEvaluations ? "평가를 먼저 연결하세요" : "고를 수 있는 지표 없음", allowed: false, reason: reason ?? REASONS.noMetrics }];
+  return [{ metric: "", label: reason === REASONS.noEvaluations ? tr("평가를 먼저 연결하세요") : tr("고를 수 있는 지표 없음"), allowed: false, reason: reason ?? REASONS.noMetrics }];
 }
 /** The evaluator kinds of a selection's evaluations whose benchmarks are known (null when one is unknown). */
 export function selectionEvaluators(graph: GraphJson, node: NodeJson, ctx: DraftContext): string[] | null {
@@ -625,15 +626,15 @@ export function previewSvg(graph: GraphJson, plan: Layout, marks: { selected?: s
     const { x, y } = at.get(node.id)!;
     const classes = ["graph-node", `kind-${kindOf(node) ?? "unknown"}`, marks.selected === node.id ? "selected" : "",
       marks.issues.has(node.id) ? "issue" : "", marks.waiting.has(node.id) ? "waiting" : ""].filter(Boolean).join(" ");
-    const kind = KIND_LABELS[node.kind] ?? "알 수 없는 단계";
+    const kind = KIND_LABELS[node.kind] ?? tr("알 수 없는 단계");
     const waiting = marks.waiting.has(node.id);
     return `<g data-node="${attribute(node.id)}" class="${classes}" transform="translate(${x} ${y})"><title>${escape(labelOf(node))}</title>`
-      + `<desc>${escape(`${kind} · ${node.id}${waiting ? ` · ${NOTES.waiting}` : ""}${marks.issues.has(node.id) ? " · 확인 필요" : ""}`)}</desc>`
+      + `<desc>${escape(`${kind} · ${node.id}${waiting ? ` · ${NOTES.waiting}` : ""}${marks.issues.has(node.id) ? tr(" · 확인 필요") : ""}`)}</desc>`
       + `<rect width="${width}" height="${height}" rx="7"/><text class="graph-node-label" x="12" y="24">${escape(truncate(labelOf(node), 15))}</text>`
       + `<text class="graph-node-meta" x="12" y="44">${escape(truncate(`${kind} · ${node.id}`, 20))}</text>`
-      + (waiting ? `<text class="graph-node-wait" x="${width - 12}" y="44" text-anchor="end">대기</text>` : "") + "</g>";
+      + (waiting ? ui`<text class="graph-node-wait" x="${width - 12}" y="44" text-anchor="end">대기</text>` : "") + "</g>";
   }).join("");
-  return `<svg class="graph-preview-svg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="학습 그래프 미리보기: 단계 ${graph.nodes.length}개, 연결 ${plan.edges.length}개" `
+  return ui`<svg class="graph-preview-svg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="학습 그래프 미리보기: 단계 ${graph.nodes.length}개, 연결 ${plan.edges.length}개" `
     + `width="${totalWidth}" height="${totalHeight}" viewBox="0 0 ${totalWidth} ${totalHeight}"><defs><marker id="graph-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 8 4 0 8z"/></marker></defs>`
     + `<g class="graph-edges">${paths}</g>${nodes}</svg>`;
 }
