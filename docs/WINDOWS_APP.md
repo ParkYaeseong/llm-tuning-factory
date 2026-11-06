@@ -1,4 +1,6 @@
-# Windows 앱 · 내부 검토용 0.4.0
+# Windows 앱 · 0.6.1 프리릴리스
+
+[v0.6.1 설치 파일·SHA-256·검증 기록](https://github.com/ParkYaeseong/llm-tuning-factory/releases/tag/v0.6.1)
 
 ## 소스 업데이트: ENG / KOR 언어 선택
 

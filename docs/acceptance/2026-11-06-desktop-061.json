@@ -1,0 +1,78 @@
+{
+  "release": "v0.6.1",
+  "verified_on": "2026-11-06",
+  "source_commit": "9f0c7103752fef192da80074aaf9d5b815585f6a",
+  "installer": "LLM.Tuning.Factory_0.6.1_x64-setup.exe",
+  "installer_sha256": "d3bd47ca31c40bb05fd1ff04d6dc8716ff4dc09edddf5aa2348fb7a26ca43b06",
+  "installer_bytes": 49423915,
+  "frozen_engine": {
+    "bridge": "factory-bridge.exe",
+    "bridge_mode": "frozen",
+    "bridge_sha256": "bbe2ae9290b0e64340aa473e2fe4f1fb86dcdc7fa874f2f2a63c6ff0b84879f2",
+    "checks": [
+      "legacy",
+      "arguments",
+      "workflow",
+      "controller",
+      "wheel"
+    ],
+    "frozen_engine": true,
+    "offline_dry_run": true,
+    "locked_dependencies": true,
+    "all_stage_plans": true,
+    "frozen_s3_sdk_loaded": true,
+    "tutorial_sample_persisted": true,
+    "source_commit": "9f0c7103752fef192da80074aaf9d5b815585f6a",
+    "source_sha256": "0a8f737acf2ab5fde8855f12d5437241cb1ed04ab4b61ea70a3fd93a4b0868d8",
+    "unsupported_args_exit_2": true,
+    "workflow_channel": true,
+    "mapped_import_cp949": true,
+    "split_committed": true,
+    "immutable_plan": true,
+    "frozen_lock_path": true,
+    "workflow_run_submitted": true,
+    "controller_ready": true,
+    "controller_run_completed": true,
+    "controller_profile_loaded": true,
+    "controller_stop_drained": true,
+    "controller_eof_drained": true,
+    "owner_held_exit_3": true,
+    "onefile_child_exited": true,
+    "engine_child_process": true,
+    "broker_secret_not_written": true,
+    "source_and_worker_match": true,
+    "gpu_started": false
+  },
+  "native_language_smoke": {
+    "app_version": "0.6.1",
+    "native_webview": true,
+    "english_navigation": true,
+    "korean_navigation": true,
+    "draft_preserved": true,
+    "language_survives_reload": true,
+    "settings_saved": false,
+    "project_submitted": false,
+    "gpu_started": false,
+    "dataset_transferred": false
+  },
+  "frontend_tests": {
+    "passed": 291
+  },
+  "rust_tests": {
+    "passed": 54
+  },
+  "new_gpu_verification": false,
+  "installer_signed": false,
+  "installer_installation_tested": false,
+  "python_tests": {
+    "passed": 2245,
+    "skipped": 2,
+    "seconds": 739.44
+  },
+  "ruff": "passed",
+  "hosted_ci_at_packaging": {
+    "ubuntu": "success",
+    "windows": "in_progress",
+    "run_url": "https://github.com/ParkYaeseong/llm-tuning-factory/actions/runs/42183843307"
+  }
+}

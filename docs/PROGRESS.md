@@ -1,3 +1,30 @@
+# Windows v0.6.1 프리릴리스 공개 — 2026-11-06
+
+- GitHub 릴리스 `v0.6.1`을 공개했다(기존 공개 설치 파일은 v0.4.0까지였다). 영어/한국어 UI·새 GIF를
+  포함하며, 기존 릴리스는 보존했다. 빌드·릴리스 태그의 소스 커밋은
+  `9f0c7103752fef192da80074aaf9d5b815585f6a`. 데스크톱 버전 필드 6개를 0.6.1로 맞췄으며
+  학습 엔진 패키지와 의존성 잠금은 그대로 유지했다.
+- 설치 파일 `LLM.Tuning.Factory_0.6.1_x64-setup.exe`: 49,423,915 바이트,
+  SHA-256 `d3bd47ca31c40bb05fd1ff04d6dc8716ff4dc09edddf5aa2348fb7a26ca43b06`.
+  `.sha256`과 `verification-0.6.1.json`도 함께 올렸고 GitHub 업로드 digest와 로컬 해시가 같은지 확인했다.
+  릴리스: https://github.com/ParkYaeseong/llm-tuning-factory/releases/tag/v0.6.1
+- 실제 검증: Python 3.12.12 locked sync, `uv run pytest` **2245 passed, 2 skipped**(739.44초),
+  `uv run ruff check src tests scripts` 통과. Playwright **291 passed**(3.8분), Rust release 검사
+  **54 passed**, TypeScript/Vite·PyInstaller·Tauri NSIS 빌드 통과.
+- `scripts/verify_desktop_package.py --receipt dist/verify-0.6.1.json`의 frozen 엔진 검사 5그룹 모두 통과:
+  legacy·인자 거부·workflow·controller·wheel. 기본 dry-run, CP949 가져오기·분할, 고정 계획,
+  모의 controller 완료·정지·EOF 종료와 worker wheel 소스 일치를 확인했다. dist·Tauri sidecar·release
+  폴더 엔진 SHA-256은 모두 `bbe2ae9290b0e64340aa473e2fe4f1fb86dcdc7fa874f2f2a63c6ff0b84879f2`.
+- 실제 release 실행 파일의 Windows WebView에서 ENG/KOR 메뉴, 입력 초안 보존, reload 후 언어 유지를
+  확인했다. 공유 WebView 프로필 첫 시도는 예상 초기 화면과 달라 실패했으며, 별도 테스트 프로필에서
+  overview를 명시해 최종 통과했다. 테스트가 연 프로세스만 닫고 원래 언어 설정을 복구했다.
+  연결 정보 저장·프로젝트 제출·사용자 앱 설치/업데이트는 하지 않았다. 설치/업데이트 자체는 이번 세션에서
+  재검증하지 않았고 코드 서명은 없다.
+- 호스팅 CI는 릴리스 준비 시 Ubuntu 성공, Windows 진행 중이었다. 이를 릴리스 노트와 검증 영수증에
+  구분해 기록했다: https://github.com/ParkYaeseong/llm-tuning-factory/actions/runs/42183843307
+- 새 실제 GPU 검증, 외부 서비스 접속, 데이터 전송, 유료 자원 생성과 사용자 Pod 변경은 없었다.
+  긴 입력 메모리·반복 출력 진단·대형/저속 산출물 회수·실제 그래프/SSH 추가 검증은 계속 남아 있다.
+
 # 데스크톱 ENG/KOR와 영어 GIF — 2026-11-06
 
 - 오른쪽 위 ENG/KOR 선택기, 즉시 전환과 PC별 언어 저장(`factory.language`, 초기 KOR)을 추가했다.
