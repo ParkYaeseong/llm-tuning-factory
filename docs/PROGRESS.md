@@ -1,3 +1,20 @@
+# README 사용 스토리·영어/한국어·GIF — 2026-11-06
+
+- `README.md`를 기본 영어로 재작성하고 `README.ko.md`에 같은 구성의 한국어 안내를 추가했다.
+  프로젝트 → 데이터 매핑 → 레시피·학습 그래프 → 모의 계획 → 실행 기록의 사용 흐름으로 설명한다.
+  기존 0.4.0 소개를 현재 소스·로컬 빌드 0.6.0에 맞추되 공개 릴리스 여부와 구분했다.
+- `docs/images/factory-{project,data,graph,plan}.gif`: 실제 프런트엔드를 Playwright Chromium으로
+  촬영했다. 기존 테스트 브리지와 합성 fixture만 사용했으며 자원·가격·계획·실행 응답은 모의 값이다.
+  GPU 학습이나 모델 품질 영상으로 표시하지 않는다. 재현 도구는 `scripts/render_readme_demos.py`,
+  촬영 설명은 `docs/images/README.md`. 1056×720, 6 fps, 무한 반복 GIF 네 개를 확인했다.
+- 실제 검증: Python 3.12.12에서 `uv sync --python 3.12 --extra dev --extra tracking --locked` 성공.
+  최종 GIF 촬영에 사용한 기존 UI 시나리오 4개 통과(29.3초). README 두 언어와 촬영 안내의 상대 링크 검사,
+  `uv run ruff check src tests scripts`, `git diff --check` 통과.
+  전체 `uv run pytest`: **2245 passed, 2 skipped**, 635.74초. GPU 통합 시험 등 opt-in 검사는 실행하지 않았다.
+- 이 작업에서는 실제 외부 연결·모델 다운로드·데이터 전송·유료 자원 생성·사용자 Pod 변경을 하지 않았다.
+  새 GPU 검증은 없다. 긴 입력 메모리, 반복 출력 원인, 대용량·저속 산출물 회수, 실제 그래프/SSH
+  검증 확대 등 기존 GPU 후속 작업은 그대로 남아 있으며 아래 2026-10-31 기록을 참고한다.
+
 # 0.6.0 최종 빌드·설치와 실제 앱 화면 끝까지 시험, 2026-10-31
 
 - 최종 검증(`63d4f67`, 2026-10-31 06:03–06:25): `uv run pytest` 2245 passed, 2 skipped(492초); `uv run ruff check src tests scripts` 통과;
